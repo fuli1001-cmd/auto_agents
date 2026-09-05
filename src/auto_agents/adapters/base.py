@@ -199,6 +199,20 @@ def run_subprocess_with_optional_streaming(
     assert process.stdout is not None
     assert process.stderr is not None
 
+    stdin_errors: List[Exception] = []
+
+    def feed_input() -> None:
+        try:
+            with process.stdin:
+                if actual_stdin:
+                    process.stdin.write(actual_stdin)
+        except BrokenPipeError:
+            # Providers may exit or close stdin without consuming the prompt.
+            pass
+        except Exception as error:
+            stdin_errors.append(error)
+
+    stdin_thread = Thread(target=feed_input, daemon=True)
     stdout_thread = Thread(
         target=forward_output,
         args=("stdout", stdout_chunks, process.stdout),
@@ -220,13 +234,14 @@ def run_subprocess_with_optional_streaming(
 
     termination_reason = ""
     cleanup_incomplete = watchdog_cleanup_incomplete[0]
+    started_at = time.monotonic()
     try:
-        if actual_stdin:
-            process.stdin.write(actual_stdin)
-        process.stdin.close()
-
-        started_at = time.monotonic()
+        # Pipe writes can block when a provider stops reading. Keep prompt
+        # delivery off the thread that enforces deadlines and health probes.
+        stdin_thread.start()
         while process.poll() is None:
+            if stdin_errors:
+                raise stdin_errors[0]
             if request.termination_probe is not None:
                 termination_reason = request.termination_probe() or ""
             if not termination_reason and supervisor is not None:
@@ -243,6 +258,8 @@ def run_subprocess_with_optional_streaming(
                 cleanup_incomplete = _kill_process_group(process).cleanup_incomplete
                 break
             time.sleep(1)
+        if stdin_errors:
+            raise stdin_errors[0]
     except BaseException:
         termination_reason = "external_interrupt"
         termination_result = _kill_process_group(process)
@@ -255,6 +272,8 @@ def run_subprocess_with_optional_streaming(
         raise
     finally:
         done_event.set()
+        if stdin_thread.ident is not None:
+            stdin_thread.join(timeout=1)
 
     cleanup_incomplete = cleanup_incomplete or watchdog_cleanup_incomplete[0]
 

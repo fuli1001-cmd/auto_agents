@@ -4,6 +4,7 @@ import os
 import signal
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -436,6 +437,36 @@ def test_request_hard_timeout_remains_absolute_with_smart_supervision(tmp_path):
     assert result.termination is not None
     assert result.termination.reason == "timed_out"
     assert "smart timeout: timed out" in result.stderr
+
+
+def test_streaming_timeout_covers_blocked_prompt_delivery(tmp_path):
+    request = _request(tmp_path)
+    request.prompt = "x" * (2 * 1024 * 1024)
+    request.stream_output = lambda *_args: None
+    started = time.monotonic()
+
+    result = run_subprocess_with_optional_streaming(
+        [sys.executable, "-c", "import time; time.sleep(4)"],
+        request, dict(os.environ), timeout=0.1,
+    )
+
+    assert result.returncode == -1
+    assert "timed out after 0.1s" in result.stderr
+    assert time.monotonic() - started < 3
+
+
+def test_streaming_provider_may_close_stdin_before_consuming_prompt(tmp_path):
+    request = _request(tmp_path)
+    request.prompt = "x" * (2 * 1024 * 1024)
+    request.stream_output = lambda *_args: None
+
+    result = run_subprocess_with_optional_streaming(
+        [sys.executable, "-c", "import os; os.close(0); print('finished')"],
+        request, dict(os.environ), timeout=5,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "finished"
 
 
 def test_progress_managed_request_is_not_cut_off_by_absolute_timeout(tmp_path):
