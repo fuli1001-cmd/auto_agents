@@ -2906,14 +2906,14 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     for request in orchestrator.generation_requests
                 )
             )
-            self.assertEqual(len(orchestrator.review_requests), 2)
+            self.assertEqual(len(orchestrator.review_requests), 1)
             review_request = orchestrator.review_requests[0]
             self.assertEqual(review_request.timeout_seconds, 60)
             self.assertEqual(review_request.effort, "max")
             self.assertEqual(review_request.progress_lease_seconds, 60)
             self.assertTrue(review_request.progress_managed_timeout)
             self.assertIn(
-                "REVIEW_PHASE: pre_validation",
+                "REVIEW_PHASE: integration",
                 orchestrator.review_requests[0].prompt,
             )
             self.assertTrue(
@@ -2922,10 +2922,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     for request in orchestrator.review_requests
                 )
             )
-            self.assertIn(
-                "REVIEW_PHASE: integration",
-                orchestrator.review_requests[1].prompt,
-            )
+            self.assertIn("integration review=reused", result.verification)
             self.assertIn("PROOF_SEAL:", result.verification)
             self.assertEqual(result.status, "approved_candidate")
             self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
@@ -3704,7 +3701,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(full_suite_calls, ["full"])
             self.assertEqual(
                 orchestrator.review_phases,
-                ["pre_validation", "pre_validation", "integration"],
+                ["pre_validation", "integration"],
             )
 
     def test_stalled_search_only_admits_causally_anchored_contract_amendment(self):

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import threading
 import time
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from auto_agents.models import CommandResult, GateResult
 from auto_agents.self_repair import (
@@ -154,3 +157,43 @@ def test_overlapping_full_suites_share_exclusive_resources_and_capacity(tmp_path
         assert second.result(timeout=5).ok
 
     assert maximum == 1
+
+
+@pytest.mark.parametrize("change", ["none", "source", "contract", "component", "rejected"])
+def test_integration_review_reuse_requires_same_clean_code_and_contract(tmp_path, change):
+    for args in [
+        ["init", "-q"], ["config", "user.name", "Test"],
+        ["config", "user.email", "test@example.com"],
+    ]:
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    source = tmp_path / "engine.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+    runner = _runner(tmp_path)
+    runner._experiment = SelfRepairExperiment.create(
+        run_id="run", root_fingerprint="root", category="engine", base_commit="base",
+    )
+    runner._candidate_group = {"group_id": "final", "status": "pending"}
+    identity = runner._candidate_review_identity(tmp_path)
+    assert identity
+    if change == "source":
+        source.write_text("VALUE = 2\n", encoding="utf-8")
+    elif change == "contract":
+        runner._experiment.contract_fingerprint = "new contract"
+    elif change == "component":
+        runner._candidate_group = {"group_id": "different", "status": "pending"}
+
+    with patch.object(runner, "_review_candidate", return_value=_VerificationResult(False, "rejected")) as review:
+        result = runner._review_integrated_candidate(
+            tmp_path, "base", prior_review=_VerificationResult(change != "rejected", "approved"),
+            reviewed_identity=identity, progress_lease_seconds=60,
+        )
+
+    if change == "none":
+        assert result.ok
+        assert result.payload["reused"]
+        review.assert_not_called()
+    else:
+        assert not result.ok
+        review.assert_called_once()

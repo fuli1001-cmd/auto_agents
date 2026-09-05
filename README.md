@@ -1627,7 +1627,10 @@ engine code so a newly added regression must actually fail without the implement
 adversarial read-only code review is required before expensive validation. Missing proof that is
 owned by a downstream gate is deferred rather than treated as a code failure. The candidate agent
 runs only focused checks; the orchestrator owns the single authoritative broad-suite execution and
-then performs a proof-aware final adversarial review before approval.
+then deterministically seals all required proof before approval. For the final component, the
+pre-validation review covers the complete integrated repair. Its approval is reused at the
+integration boundary only while the candidate commit is clean and its frozen contract, component,
+and blocking findings remain identical; otherwise a fresh integration review is required.
 
 Candidates are attempted sequentially and the first candidate that crosses every proof gate wins;
 this is not a relative majority vote. If none is approved, auto_agents reports and retains the

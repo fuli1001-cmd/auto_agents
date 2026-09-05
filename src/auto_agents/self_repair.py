@@ -4216,6 +4216,16 @@ class AutoAgentsSelfRepairRunner:
                     "reviewing_candidate",
                     "differential proof completed; starting adversarial review",
                 )
+                review_phase = (
+                    "integration"
+                    if bool(getattr(self, "_candidate_is_final_group", True))
+                    else "pre_validation"
+                )
+                reviewed_identity = (
+                    self._candidate_review_identity(repair_root)
+                    if review_phase == "integration"
+                    else ""
+                )
                 review = self._review_candidate(
                     repair_root,
                     self._experiment.base_commit,
@@ -4223,7 +4233,7 @@ class AutoAgentsSelfRepairRunner:
                     replay_summary="\n\n".join(
                         (replay.summary, differential.summary)
                     ),
-                    phase="pre_validation",
+                    phase=review_phase,
                 )
                 review_findings = [
                     dict(item)
@@ -4539,14 +4549,15 @@ class AutoAgentsSelfRepairRunner:
                     "reviewing_integration",
                     "required verification passed; reviewing the integrated repair",
                 )
-                integration_review = self._review_candidate(
+                integration_review = self._review_integrated_candidate(
                     repair_root,
                     self._experiment.base_commit,
+                    prior_review=review,
+                    reviewed_identity=reviewed_identity,
                     progress_lease_seconds=review_progress_lease,
                     replay_summary="\n\n".join(
                         (replay.summary, differential.summary)
                     ),
-                    phase="integration",
                 )
                 if not integration_review.ok:
                     integration_findings = [
@@ -4673,7 +4684,8 @@ class AutoAgentsSelfRepairRunner:
                         "PRE_VALIDATION_REVIEW:\n"
                         + json.dumps(review.payload, ensure_ascii=False),
                         "INTEGRATION_REVIEW:\n"
-                        + json.dumps(integration_review.payload, ensure_ascii=False),
+                        + json.dumps(integration_review.payload, ensure_ascii=False)
+                        + "\n" + integration_review.summary,
                     )
                     if part
                 )
@@ -5087,6 +5099,44 @@ class AutoAgentsSelfRepairRunner:
         if changed:
             store.save(experiment)
 
+    def _candidate_review_identity(self, repair_root: Path) -> str:
+        experiment = getattr(self, "_experiment", None)
+        if not isinstance(experiment, SelfRepairExperiment):
+            return ""
+        try:
+            commit = head_ref(repair_root)
+            if not commit or changed_paths(repair_root, ignored_prefixes=()):
+                return ""
+        except (OSError, RuntimeError):
+            return ""
+        return _search_stable_hash(
+            "integration-review-v1", commit, experiment.base_commit,
+            experiment.contract_fingerprint, self._repair_contract_payload(experiment),
+            experiment.repair_design_fingerprint,
+            experiment.finding_groups,
+            getattr(self, "_candidate_group", {}),
+            [item.to_dict() for item in experiment.blocking_findings()],
+        )
+
+    def _review_integrated_candidate(
+        self, repair_root: Path, base_head: str, *,
+        prior_review: "_VerificationResult", reviewed_identity: str,
+        progress_lease_seconds: int, replay_summary: str = "",
+    ) -> "_VerificationResult":
+        if (
+            prior_review.ok
+            and reviewed_identity
+            and reviewed_identity == self._candidate_review_identity(repair_root)
+        ):
+            return _VerificationResult(
+                True, "integration review=reused for unchanged candidate and contract",
+                payload={**prior_review.payload, "reused": True, "review_identity": reviewed_identity},
+            )
+        return self._review_candidate(
+            repair_root, base_head, progress_lease_seconds=progress_lease_seconds,
+            replay_summary=replay_summary, phase="integration",
+        )
+
     def _review_candidate(
         self,
         repair_root: Path,
@@ -5129,9 +5179,15 @@ class AutoAgentsSelfRepairRunner:
                 "Do not modify files or run mutating commands.",
                 "Reject test deletion, skip/xfail, weakened safety gates, hard-coded target data, "
                 "or changes that do not address the supplied root cause.",
-                "The repair contract is frozen. Review only the active component, preservation "
-                "of completed components, and regressions introduced by this candidate. Do not "
-                "turn unrelated generic hardening into a blocker or follow-up task.",
+                (
+                    "Review the complete integrated repair against every frozen contract obligation, "
+                    "including completed components and their interactions with the final component. "
+                    "Do not turn unrelated generic hardening into a blocker or follow-up task."
+                    if phase == "integration"
+                    else "The repair contract is frozen. Review only the active component, preservation "
+                    "of completed components, and regressions introduced by this candidate. Do not "
+                    "turn unrelated generic hardening into a blocker or follow-up task."
+                ),
                 "If a contract finding belongs to a pending dependent component, set defer_until "
                 "to that component's group_id; it must not reject the active component.",
                 "The orchestrator will run focused, boundary, and full-suite proof after the "
