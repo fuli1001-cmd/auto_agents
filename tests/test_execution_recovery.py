@@ -59,6 +59,21 @@ from auto_agents.config import (
 
 
 class ExecutionRecoveryTests(unittest.TestCase):
+    def test_local_provider_deadline_is_owned_by_executor(self):
+        incident = provider_incident(
+            run_id="run", stage="prototype", provider="codex",
+            result=AgentResult(
+                ok=False, command=[], output_path=Path("out"),
+                termination=AgentTermination(reason="timed_out", elapsed_seconds=1800),
+            ),
+        )
+        diagnosis = deterministic_diagnosis(incident)
+        self.assertEqual(diagnosis.owner, "auto_agents")
+        self.assertEqual(diagnosis.action, "RETRY")
+        self.assertIn("local wall-clock deadline", diagnosis.reason)
+        classification = classify_auto_agents_error(diagnosis.reason)
+        self.assertEqual(classification.category, "execution_time_budget")
+
     def test_parallel_lane_infrastructure_incident_round_trips(self) -> None:
         payload = ParallelLaneFailure(
             task={"task_id": "lane-a", "status": "blocked"},

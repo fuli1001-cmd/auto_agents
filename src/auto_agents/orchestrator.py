@@ -288,6 +288,7 @@ from .prototype_variants import (
     variant_dir,
     variant_prototype_dir,
 )
+from .prototype_recovery import PrototypeGenerationCheckpoint
 from .supervision import process_start_identity
 from .requirements import (
     AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
@@ -4170,13 +4171,33 @@ class Orchestrator:
         base_variant: Optional[Mapping[str, object]] = None,
         initial: bool = False,
     ) -> Dict[str, object]:
-        variant_id = new_variant_id()
+        checkpoint = PrototypeGenerationCheckpoint(
+            self.project_root,
+            state.run_id,
+            {
+                "spec_sha256": sha256_file(spec_file),
+                "surfaces": surfaces,
+                "prompt": prompt,
+                "name": name,
+                "base_variant": dict(base_variant or {}),
+                "initial": initial,
+                "design_sha256": (
+                    sha256_file(design_md_path(self.project_root))
+                    if design_md_path(self.project_root).is_file() else ""
+                ),
+            },
+        )
+        resumed_variant_id = checkpoint.resumable_variant_id()
+        variant_id = resumed_variant_id or new_variant_id()
         root = variant_dir(self.project_root, variant_id)
         design_docs_root = variant_design_docs_dir(self.project_root, variant_id)
         prototype_root = variant_prototype_dir(self.project_root, variant_id)
-        root.mkdir(parents=True, exist_ok=False)
-        design_docs_root.mkdir(parents=True)
-        prototype_root.mkdir(parents=True)
+        root.mkdir(parents=True, exist_ok=bool(resumed_variant_id))
+        design_docs_root.mkdir(parents=True, exist_ok=bool(resumed_variant_id))
+        prototype_root.mkdir(parents=True, exist_ok=bool(resumed_variant_id))
+        if not resumed_variant_id:
+            checkpoint.payload = {}
+            checkpoint.save(variant_id=variant_id, status="running", phase="design")
         parent_id = str(base_variant.get("id", "")) if isinstance(base_variant, Mapping) else ""
         decision = self._automatic_variant_design_decision(
             prompt,
@@ -4199,7 +4220,11 @@ class Orchestrator:
                 trace,
                 spec_text=read_text(spec_file),
             ) if initial else []
-            if initial and assets:
+            if resumed_variant_id:
+                source = dict(checkpoint.payload["source"])
+                candidate_records = list(checkpoint.payload["candidates"])
+                decision = dict(checkpoint.payload["decision"])
+            elif initial and assets:
                 if design_md_path(self.project_root).is_file():
                     shutil.copy2(
                         design_md_path(self.project_root),
@@ -4328,6 +4353,11 @@ class Orchestrator:
                     "from_cache": snapshot.from_cache,
                 }
 
+            checkpoint.save(
+                status="running", phase="generation", source=source,
+                candidates=candidate_records, decision=decision,
+                design_sha256=sha256_file(variant_design_path(self.project_root, variant_id)),
+            )
             generation_prompt = self._prototype_generation_prompt(
                 spec_file=spec_file,
                 surfaces=surfaces,
@@ -4340,12 +4370,14 @@ class Orchestrator:
                 stage="prototype",
                 stage_key=f"prototype-generate-{variant_id}",
                 prompt=generation_prompt,
+                continuation=checkpoint.continuation() if resumed_variant_id else None,
                 validation_feedback=lambda result: self._prototype_manifest_validation_feedback(
                     result,
                     expected_surfaces=surfaces,
                     prototype_root=prototype_root,
                 ),
             )
+            (root / "interruption.json").unlink(missing_ok=True)
             entry = build_variant_entry(
                 self.project_root,
                 variant_id,
@@ -4374,10 +4406,15 @@ class Orchestrator:
                 max_pages=self.config.frontend_design.max_pages,
             )
             add_variant(self.project_root, registry, entry)
+            checkpoint.save(status="candidate", continuation={})
             return entry
-        except Exception:
-            if root.is_dir():
-                shutil.rmtree(root)
+        except BaseException as error:
+            # Includes host interruption. Drafts are never registry candidates
+            # until generation and manifest validation have both succeeded.
+            try:
+                checkpoint.preserve_interruption(redact_incident_text(str(error))[:2000])
+            except OSError:
+                self.logger.exception("Could not persist prototype interruption: %s", root)
             raise
 
     def generate_prototype_variant(
@@ -39987,6 +40024,7 @@ class Orchestrator:
         effort: Optional[str] = None,
         task_origin: str = "",
         mutable_artifacts: Iterable[str] = (),
+        continuation: Optional[Mapping[str, object]] = None,
     ) -> AgentResult:
         # Complete engine-owned migrations before the mutation snapshot. A
         # provider or health observer can then never be blamed for this write.
@@ -40058,6 +40096,12 @@ class Orchestrator:
                     output_path=output_path,
                     stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
                     attempt_id=artifact_stage,
+                    progress_managed_timeout=(
+                        stage == "prototype" and stage_key.startswith("prototype-generate-")
+                    ),
+                    resume_session_id=str((continuation or {}).get("session_id", "")) if attempt == 1 else "",
+                    resume_provider=str((continuation or {}).get("provider", "")) if attempt == 1 else "",
+                    resume_prompt_hash=str((continuation or {}).get("prompt_hash", "")) if attempt == 1 else "",
                 )
                 if request.prompt_spec is not None and state is not None:
                     policy = state.resume_context.get("authorization_policy", {})
@@ -40903,6 +40947,8 @@ class Orchestrator:
         termination = result.termination
         if termination is not None:
             reason = termination.reason.lower()
+            if reason == "timed_out":
+                return "timeout"
             if any(token in reason for token in ("timeout", "stall", "idle", "ceiling", "loop")):
                 return "timeout"
             if reason == "provider_error":
@@ -41174,6 +41220,7 @@ class Orchestrator:
 
         tried: List[str] = []
         last_error = ""
+        last_result: Optional[AgentResult] = None
         for kind in order:
             adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
             available_fn = getattr(adapter, "available", None)
@@ -41202,6 +41249,7 @@ class Orchestrator:
                 provider_request,
                 kind,
             )
+            last_result = result
             tried.append(kind)
 
             if result.ok:
@@ -41230,6 +41278,20 @@ class Orchestrator:
                 reporter.emit("provider.recovering")
             last_error = result.stderr or result.summary or "unknown error"
 
+        if (
+            request.stage == "prototype"
+            and request.progress_managed_timeout
+            and last_result is not None
+            and last_result.termination is not None
+            and last_result.termination.reason == "timed_out"
+        ):
+            # Let the bounded stage retry loop handle the preserved draft.
+            # A local deadline is not evidence of provider unavailability.
+            return replace(
+                last_result,
+                stderr="auto_agents execution time budget exhausted during prototype generation. "
+                + (last_result.stderr or last_result.summary),
+            )
         raise RuntimeError(
             f"All providers exhausted. Tried: {tried}. Last error: {last_error}"
         )
@@ -41379,6 +41441,14 @@ class Orchestrator:
                 "loop_detected",
                 "safety_ceiling",
             }
+            resumable = resumable or (
+                reason == "timed_out"
+                and self.config.execution.smart_timeout.enabled
+                and request.stage == "prototype"
+                and request.progress_managed_timeout
+                and not request.timeout_seconds
+                and bool(result.provider_session_id)
+            )
             resume_limit = (
                 self.config.execution.smart_timeout.fresh_continuation_limit
                 if reason == "safety_ceiling"

@@ -89,6 +89,7 @@ _MESSAGES = {
     "repair.not_eligible": ("诊断已完成，本次不会启动自动修复；详情已保存", "Diagnosis completed; automatic repair will not start for this issue; details are saved"),
     "repair.resume_pending": ("修复已通过验证，正在准备恢复原任务", "The repair passed validation; preparing to resume the original task"),
     "diagnosis.unavailable": ("诊断服务暂不可用，详情已保存", "The diagnosis provider is unavailable; details are saved"),
+    "diagnosis.review_incomplete": ("根因调查已完成，复核未完成；调查报告已保留，本次不启动自动修复", "Investigation completed; independent review is incomplete. Evidence is preserved; automatic repair will not start"),
     "command.completed": ("本次操作已完成", "This operation is complete"),
     "command.failed": ("本次操作已停止，诊断记录已保存", "This operation stopped; diagnostics are saved"),
 }

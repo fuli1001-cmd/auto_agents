@@ -831,7 +831,7 @@ class RootCauseCoordinator:
                         timeout=self.config.investigator_timeout_seconds,
                     )
                     reviewer_future = pool.submit(
-                        self._invoke,
+                        self._invoke_review,
                         role="reviewer",
                         evidence=prompt_evidence,
                         artifacts=artifacts,
@@ -848,7 +848,7 @@ class RootCauseCoordinator:
                     prior=None,
                     timeout=self.config.investigator_timeout_seconds,
                 )
-                reviewer = self._invoke(
+                reviewer = self._invoke_review(
                     role="reviewer",
                     evidence=prompt_evidence,
                     artifacts=artifacts,
@@ -856,7 +856,8 @@ class RootCauseCoordinator:
                     timeout=self.config.reviewer_timeout_seconds,
                 )
             arbiter: Optional[RootCauseReport] = None
-            if not self._reports_agree(investigator, reviewer):
+            review_incomplete = reviewer.category == "diagnosis_review_incomplete"
+            if not review_incomplete and not self._reports_agree(investigator, reviewer):
                 arbiter = self._invoke(
                     role="arbiter",
                     evidence=prompt_evidence,
@@ -874,7 +875,7 @@ class RootCauseCoordinator:
             if arbiter is not None
             else self.config.confidence_threshold
         )
-        repair_approved = self._repair_approved(
+        repair_approved = not review_incomplete and self._repair_approved(
             final,
             reviewer,
             threshold=threshold,
@@ -885,6 +886,11 @@ class RootCauseCoordinator:
             if repair_approved
             else "root-cause investigation did not approve a bounded auto_agents repair attempt"
         )
+        if review_incomplete:
+            reason = "root-cause investigation completed; independent review is incomplete; investigation evidence is preserved"
+            reporter = getattr(self.orchestrator, "reporter", None)
+            if reporter is not None:
+                reporter.emit("diagnosis.review_incomplete")
         diagnosis = RootCauseDiagnosis(
             diagnosis_id=diagnosis_id,
             evidence_path=str(artifacts / "evidence.json"),
@@ -896,8 +902,29 @@ class RootCauseCoordinator:
             reason=reason,
         )
         write_json(artifacts / "diagnosis.json", diagnosis.to_dict())
-        self._save_certificate(certificate_key, diagnosis)
+        if not review_incomplete:
+            self._save_certificate(certificate_key, diagnosis)
         return diagnosis
+
+    def _invoke_review(self, **kwargs: object) -> RootCauseReport:
+        try:
+            return self._invoke(**kwargs)
+        except Exception as error:
+            # A missing review is not disagreement and cannot authorize repair
+            # or arbitration. Keep the successful investigation independently.
+            artifacts = kwargs["artifacts"]
+            report = RootCauseReport(
+                role="reviewer", verdict="UNKNOWN", owner="unknown",
+                confidence=0.0, category="diagnosis_review_incomplete",
+                generic=False, safe_to_repair=False,
+                causal_chain=["Independent review did not complete: " + _redact_text(str(error))[:2000]],
+                evidence=[RootCauseEvidence(
+                    kind="runtime", ref=str(artifacts / "reviewer.json"),
+                    claim="The reviewer did not return a validated report.",
+                )],
+            )
+            write_json(artifacts / "reviewer-incomplete.json", report.to_dict())
+            return report
 
     def _prompt_evidence(
         self,

@@ -762,6 +762,12 @@ def classify_auto_agents_error(
         return SelfRepairDecision(False, reason="target project preflight failure")
     if "review rejected the task" in lowered:
         return SelfRepairDecision(False, reason="target task review failure")
+    if "auto_agents execution time budget exhausted" in lowered:
+        return SelfRepairDecision(
+            False,
+            category="execution_time_budget",
+            reason="local execution deadline exhausted; inspect timeout policy and recovery evidence",
+        )
     if "all providers exhausted" in lowered:
         return SelfRepairDecision(False, reason="provider availability failure")
 
