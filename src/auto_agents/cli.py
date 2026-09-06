@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from .authorization import authorization_policy_for_state
+from .reporting import reporting_command, print_message as print, notice, find_reporter
 from .config import (
     architecture_path,
     frontend_prototype_variants_registry_path,
@@ -1000,7 +1001,7 @@ def _run_command_for_self_repair_resume(
             answered_context.get("parent_handoff_id", "")
         ).strip()
         if workflow_id and parent_handoff_id:
-            return [
+            command = [
                 sys.executable,
                 str(runtime_root / "auto_agents.py"),
                 "resume",
@@ -1008,8 +1009,12 @@ def _run_command_for_self_repair_resume(
                 str(args.project),
                 "--workflow",
                 workflow_id,
-                "--print-agent-output",
             ]
+            if bool(getattr(args, "print_agent_output", False)):
+                command.append("--print-agent-output")
+            if getattr(args, "log_mode", None):
+                command.extend(["--log-mode", args.log_mode])
+            return command
     resume_command = "run" if source_command == "answer" else source_command
     command = [
         sys.executable,
@@ -1018,6 +1023,10 @@ def _run_command_for_self_repair_resume(
         "--project",
         str(args.project),
     ]
+    if getattr(args, "log_mode", None):
+        command.extend(["--log-mode", args.log_mode])
+    if source_command == "resume" and getattr(args, "workflow", None):
+        command.extend(["--workflow", args.workflow])
     if getattr(args, "command", "run") in {"fix", "collab", "provider-resolve"}:
         session_id = _session_id_for_self_repair_resume(args)
         if session_id:
@@ -1112,14 +1121,22 @@ def _run_self_repair_resume_process(
     pass_fd: int,
 ) -> int:
     """Run the repaired CLI under the same bounded process supervision."""
-    process = subprocess.Popen(
-        command,
-        cwd=str(cwd),
-        env=env,
-        pass_fds=(pass_fd,),
-        text=True,
-        start_new_session=True,
-    )
+    reporter = find_reporter()
+    if reporter is not None:
+        reporter.handoff()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            pass_fds=(pass_fd,),
+            text=True,
+            start_new_session=True,
+        )
+    except BaseException:
+        if reporter is not None:
+            reporter.cancel_handoff()
+        raise
     record = ACTIVE_PROCESSES.register(process, kind="self-repair-resume")
     cleanup_incomplete = False
     try:
@@ -1385,10 +1402,10 @@ def _auto_repair_auto_agents_and_resume(
             result.commit_sha,
             verification=result.verification,
         )
-        print(
+        notice(
+            "repair.resume_pending",
             "Verified auto_agents code resolves this issue at "
             f"{result.commit_sha[:12]}. Resuming run without a new repair...",
-            file=sys.stderr,
         )
         if health_repair:
             orchestrator.stop_health_supervision(status="handoff")
@@ -1449,10 +1466,10 @@ def _auto_repair_auto_agents_and_resume(
             verification=result.verification,
         )
         runtime_root = Path(result.runtime_root).resolve()
-        print(
+        notice(
+            "repair.resume_pending",
             f"auto_agents approved isolated candidate "
             f"{result.candidate_commit[:12]}. Resuming from its worktree...",
-            file=sys.stderr,
         )
         try:
             if health_repair:
@@ -1596,9 +1613,9 @@ def _try_deterministic_self_repair_playbook(
     if not result.ok or not result.changed:
         return None
     save_run_state(project_root, state)
-    print(
+    notice(
+        "repair.resume_pending",
         f"Deterministic self-repair playbook {result.name} succeeded. Resuming run...",
-        file=sys.stderr,
     )
     return _run_self_repair_resume_process(
         _run_command_for_self_repair_resume(args),
@@ -1834,13 +1851,13 @@ def _triage_terminal_run_error(
         if judgment is not None
         else ""
     )
-    print(
+    notice(
+        "repair.eligible" if result.decision.eligible else "repair.not_eligible",
         f"Self-repair triage source={result.source} eligible={result.decision.eligible}"
         f" category={result.decision.category or '-'}{detail}: {result.reason}",
-        file=sys.stderr,
     )
     if result.provider_error:
-        print(f"Self-repair triage provider error: {result.provider_error}", file=sys.stderr)
+        notice("diagnosis.unavailable", f"Self-repair triage provider error: {result.provider_error}")
     return result
 
 
@@ -1866,6 +1883,12 @@ def _record_blocked_self_repair_triage(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    prompt_eval_parser = subparsers.add_parser(
+        "prompt-eval", help="Capture prompt baselines or explicitly evaluate configured providers"
+    )
+    prompt_eval_parser.add_argument("eval_args", nargs=argparse.REMAINDER,
+                                    help="capture or run; use 'prompt-eval run --help' for options")
+
 
     init_parser = subparsers.add_parser("init", help="Bootstrap a new target project.")
     init_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -2477,12 +2500,46 @@ def build_parser() -> argparse.ArgumentParser:
     worker_serve.add_argument("--bind", default="0.0.0.0")
     worker_serve.add_argument("--port", type=int, default=WORKER_API_PORT)
 
+    foreground = {
+        "run", "fix", "collab", "provider-resolve", "resume", "answer", "approve", "reject", "verify",
+        "provider-research", "audit-requirements", "sync-agent-instructions",
+    }
+    for name in foreground:
+        subparsers.choices[name].add_argument(
+            "--log-mode", choices=("auto", "plain", "debug"), default=None,
+            help="Console output: auto progress display, plain user logs, or debug diagnostics.",
+        )
+    prototype_parser = subparsers.choices.get("prototype")
+    if prototype_parser is not None:
+        for action in prototype_parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for name, child in action.choices.items():
+                    if name != "list":
+                        child.add_argument("--log-mode", choices=("auto", "plain", "debug"), default=None)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if hasattr(args, "log_mode"):
+        with reporting_command(args) as reporting:
+            code = _dispatch(args)
+            reporting.finish(code)
+            return code
+    return _dispatch(args)
+
+
+def _dispatch(args) -> int:
+    if args.command == "prompt-eval":
+        from .prompting.evaluate import main as evaluate_prompts
+        _load_cli_dotenv()
+        try:
+            evaluate_prompts(args.eval_args)
+        except (OSError, ValueError) as error:
+            print(f"prompt evaluation failed: {error}", file=sys.stderr)
+            return 1
+        return 0
     _load_cli_dotenv()
 
     if args.command == "_health-sidecar":
@@ -2740,7 +2797,7 @@ def main(argv: list[str] | None = None) -> int:
                             project_root,
                             orchestrator,
                             answer_lock,
-                            print_agent_output=True,
+                            print_agent_output=bool(getattr(args, "print_agent_output", False)),
                         )
                         if parent_result is not None:
                             payload["resumed_workflow"] = parent_result.to_dict()
@@ -2799,7 +2856,7 @@ def main(argv: list[str] | None = None) -> int:
                         project_root,
                         orchestrator,
                         approve_lock,
-                        print_agent_output=True,
+                        print_agent_output=bool(getattr(args, "print_agent_output", False)),
                     )
                     if parent_result is not None:
                         payload["resumed_workflow"] = parent_result.to_dict()
@@ -3089,6 +3146,9 @@ def main(argv: list[str] | None = None) -> int:
                     affected_proof_ids=[],
                 )
                 ensure_release_worker(project_root)
+                reporter = getattr(orchestrator, "reporter", None)
+                if reporter is not None:
+                    reporter.emit("release.pending")
             _safe_notify(notify_run_finished, project_root, state_payload)
             if workflow_store is not None and workflow_snapshot is not None:
                 workflow_store.complete(workflow_snapshot, status="completed")

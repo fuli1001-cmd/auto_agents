@@ -114,13 +114,14 @@ class AgentInstructionSyncTests(unittest.TestCase):
             self.assertIn("Prefer small, directly verifiable changes", agents)
             self.assertEqual(claude, agents)
             self.assertIn("Additional path-specific rules", copilot)
-            self.assertIn('applyTo: "app/**,tests/**,specs/**"', path_rules)
+            self.assertIn('applyTo: "**"', path_rules)
+            self.assertIn(".auto-agents/project-rules.agent.md", path_rules)
 
             lock = json.loads(agent_instructions_lock_path(project_root).read_text(encoding="utf-8"))
             self.assertIn("source_sha256", lock)
             self.assertIn("generated_sha256", lock)
             self.assertIn("CLAUDE.md", lock["generated_sha256"])
-            self.assertNotIn("generator_version", lock)
+            self.assertEqual(lock["generator_version"], 2)
 
     def test_sync_combines_default_rules_with_meaningful_project_rules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -459,7 +460,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
             self.assertTrue(result.synced)
             agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("Project Agent Instructions", agents)
-            self.assertNotIn("manual edit", agents)
+            self.assertIn("manual edit", agents)
 
     def test_render_prioritizes_workflow_and_testing_contracts_in_root_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -510,9 +511,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
                 },
             )
 
-            product_rules = (
-                project_root / ".github" / "instructions" / "product-contract.instructions.md"
-            ).read_text(encoding="utf-8")
+            product_rules = (project_root / ".auto-agents/project-rules.agent.md").read_text(encoding="utf-8")
             self.assertIn("output_review pass to export", product_rules)
             self.assertIn("awaiting_output_confirmation", product_rules)
 
@@ -546,9 +545,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
             sync_agent_instructions(project_root)
 
             agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
-            product_rules = (
-                project_root / ".github" / "instructions" / "product-contract.instructions.md"
-            ).read_text(encoding="utf-8")
+            product_rules = (project_root / ".auto-agents/project-rules.agent.md").read_text(encoding="utf-8")
             self.assertIn("输出审核通过后必须直接进入 export", agents)
             self.assertIn("process_review", product_rules)
             self.assertIn("测试必须遵守产品合同", product_rules)
@@ -571,9 +568,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
             sync_agent_instructions(project_root)
 
             agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
-            product_rules = (
-                project_root / ".github" / "instructions" / "product-contract.instructions.md"
-            ).read_text(encoding="utf-8")
+            product_rules = (project_root / ".auto-agents/project-rules.agent.md").read_text(encoding="utf-8")
             self.assertIn("输入审核结果只能是: pass, review, block", agents)
             self.assertIn("默认合同规定：pass 后直接进入 export", product_rules)
             self.assertNotIn("输入审核结果只能是：\n\nSee", agents)
@@ -599,9 +594,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
             sync_agent_instructions(project_root)
 
             agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
-            product_rules = (
-                project_root / ".github" / "instructions" / "product-contract.instructions.md"
-            ).read_text(encoding="utf-8")
+            product_rules = (project_root / ".auto-agents/project-rules.agent.md").read_text(encoding="utf-8")
             self.assertIn("默认仍保留三个人工确认点: 确认规划, 确认资产, 确认分镜", agents)
             self.assertIn("输入审核和输出审核都必须以真实模型能力落地", agents)
             self.assertNotIn("也就是说，默认合同是", product_rules)

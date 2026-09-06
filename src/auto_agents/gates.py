@@ -73,6 +73,8 @@ _DIAGNOSTIC_PREFIX = re.compile(
 )
 GateProgressCallback = Callable[[str, str, float], None]
 
+from .reporting import GateObservation, find_reporter, observe_gate_result
+
 
 class GateCommandExecutor(Protocol):
     def priority(self, command: str) -> tuple[object, ...]: ...
@@ -1254,6 +1256,9 @@ def _run_command_once(
     env["PYTEST_CURRENT_TEST"] = "auto_agents_gate_run"
     env["AUTO_AGENTS_TEST"] = "True"
     env["TESTING"] = "True"
+    reporter = getattr(progress, "reporter", None)
+    capture = reporter.capture(kind="gate", stage=getattr(progress, "stage", ""),
+                               context=getattr(progress, "context", ""), cwd=str(cwd)) if reporter is not None else None
     if progress is not None:
         progress("start", command, 0.0)
     process = run_supervised_shell_command(
@@ -1270,6 +1275,7 @@ def _run_command_once(
             if progress is not None
             else None
         ),
+        diagnostic_output=capture,
     )
     result = CommandResult(
         command=command,
@@ -1418,6 +1424,7 @@ def _run_parallel_commands(
             try:
                 result = future.result()
                 results[future_to_index[future]] = result
+                observe_gate_result(progress, result)
                 if cancel_on_failure and not result.ok:
                     cancel_event.set()
             except BaseException:
@@ -1499,9 +1506,16 @@ def run_gate_plan(
     progress: Optional[GateProgressCallback] = None,
     gate_executor: Optional[GateCommandExecutor] = None,
 ) -> GateResult:
+    command_list = list(commands)
+    reporter = getattr(progress, "reporter", None) or find_reporter(cwd)
+    observation = None
+    if reporter is not None and (command_list or any(group.commands for group in parallel_groups)):
+        observation = GateObservation(progress, reporter,
+                                      len(command_list) + sum(len(group.commands) for group in parallel_groups))
+        progress = observation
     if gate_executor is not None:
-        return _run_overlapped_gate_plan(
-            list(commands),
+        result = _run_overlapped_gate_plan(
+            command_list,
             parallel_groups,
             collect_all=collect_all,
             parallel_workers=parallel_workers,
@@ -1511,17 +1525,16 @@ def run_gate_plan(
             progress=progress,
             gate_executor=gate_executor,
         )
-    return _run_phased_gate_plan(
-        commands,
-        parallel_groups,
-        cwd,
-        collect_all=collect_all,
-        parallel_workers=parallel_workers,
-        command_timeout_seconds=command_timeout_seconds,
-        adaptive_timeout_enabled=adaptive_timeout_enabled,
-        command_idle_timeout_seconds=command_idle_timeout_seconds,
-        progress=progress,
-    )
+    else:
+        result = _run_phased_gate_plan(
+            command_list, parallel_groups, cwd, collect_all=collect_all,
+            parallel_workers=parallel_workers, command_timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            command_idle_timeout_seconds=command_idle_timeout_seconds, progress=progress,
+        )
+    if observation is not None:
+        observation.finish(result)
+    return result
 
 
 @dataclass(frozen=True)
@@ -1873,6 +1886,7 @@ def _run_overlapped_gate_plan(
                     parallel_results[
                         (scheduled.group_index, scheduled.command_index)
                     ] = result
+                observe_gate_result(progress, result)
                 if not result.ok and (
                     not collect_all
                     or result.termination_reason
@@ -1952,6 +1966,7 @@ def _run_phased_gate_plan(
             progress=progress,
         )
         results.append(result)
+        observe_gate_result(progress, result)
         if result.ok:
             continue
         ok = False

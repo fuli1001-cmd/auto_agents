@@ -17,6 +17,7 @@ from ..models import (
     SmartTimeoutConfig,
 )
 from .base import AgentAdapter, run_subprocess_with_optional_streaming
+from ..prompting.runtime import observed_model_metadata
 from ..supervision import ProgressDecoder
 
 
@@ -205,6 +206,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         return True
 
     def run(self, request: AgentRequest) -> AgentResult:
+        request = self.prepare_request(request)
         command = self._build_command(request)
 
         # Clear stale output so a reused output_path cannot mask fresh results.
@@ -264,6 +266,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         )
 
         return AgentResult(
+            prompt_metadata=observed_model_metadata(request, stdout_raw),
             ok=returncode == 0 and not error_messages,
             command=command,
             output_path=request.output_path,
@@ -343,7 +346,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         Claude Code has no ``--image`` flag; it reads image files through its
         Read tool, so attachments are listed as file paths in the prompt.
         """
-        if not request.attachments:
+        if not request.attachments or request.prompt_spec is not None:
             return request.prompt
         lines = [
             request.prompt.rstrip("\n"),

@@ -100,11 +100,13 @@ class ShellAdapter(AgentAdapter):
         return shutil.which(self.config.binary) is not None
 
     def run(self, request: AgentRequest) -> AgentResult:
+        request = self.prepare_request(request)
         if (
             self.smart_timeout.enabled
             and self.config.progress_protocol != SMART_TIMEOUT_PROGRESS_PROTOCOL
         ):
             return AgentResult(
+                prompt_metadata=dict(request.prompt_metadata),
                 ok=False,
                 command=[self.config.binary] + self.config.extra_args,
                 output_path=request.output_path,
@@ -149,6 +151,7 @@ class ShellAdapter(AgentAdapter):
             write_text(request.output_path, summary + "\n")
 
         return AgentResult(
+            prompt_metadata=dict(request.prompt_metadata),
             ok=returncode == 0,
             command=command,
             output_path=request.output_path,

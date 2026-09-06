@@ -18,6 +18,7 @@ from ..models import (
     SmartTimeoutConfig,
 )
 from .base import AgentAdapter, run_subprocess_with_optional_streaming
+from ..prompting.runtime import observed_model_metadata
 from ..supervision import ProgressDecoder
 
 
@@ -122,6 +123,7 @@ class CodexAdapter(AgentAdapter):
         return True
 
     def run(self, request: AgentRequest) -> AgentResult:
+        request = self.prepare_request(request)
         if request.resume_session_id:
             command: List[str] = [
                 self.config.binary,
@@ -195,6 +197,7 @@ class CodexAdapter(AgentAdapter):
             write_text(request.output_path, summary + "\n")
 
         return AgentResult(
+            prompt_metadata=observed_model_metadata(request, stdout_raw),
             ok=returncode == 0,
             command=command,
             output_path=request.output_path,
@@ -224,11 +227,8 @@ class CodexAdapter(AgentAdapter):
         return "default"
 
     def _explicit_model_arg(self) -> str:
-        extra_args = list(self.config.extra_args)
-        for index, value in enumerate(extra_args):
-            if value in {"--model", "-m"} and index + 1 < len(extra_args):
-                return extra_args[index + 1]
-        return ""
+        from ..prompting.runtime import last_option
+        return last_option(self.config.extra_args, "--model", "-m")
 
     @staticmethod
     def _make_json_stream_filter(

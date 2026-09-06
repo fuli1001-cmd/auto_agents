@@ -1332,6 +1332,19 @@ class LocalGatePlanExecutor:
                         )
                         monitor.start()
                     try:
+                        from .reporting import find_reporter
+                        from .diagnostic_output import OutputCapture
+                        reporter = getattr(progress, "reporter", None) or find_reporter(self.project_root)
+                        capture = (
+                            reporter.capture(kind="gate", job_id=job_id, worker_id=self.worker_id, cwd=str(sandbox))
+                            if reporter is not None else OutputCapture(
+                                auto_agents_state_root() / "diagnostic-output" / self.plan_id / job_id,
+                                {"kind": "gate", "job_id": job_id, "worker_id": self.worker_id},
+                                register=lambda path, metadata: None,
+                                failed=lambda error: None,
+                            )
+                        )
+                        capture.protect(tuple(merged_overrides.values()))
                         process = run_supervised_shell_command(
                             traced_command,
                             cwd=sandbox,
@@ -1341,6 +1354,7 @@ class LocalGatePlanExecutor:
                             idle_timeout_seconds=idle_timeout_seconds,
                             kind="gate",
                             cancel_event=cancel_event,
+                            diagnostic_output=capture,
                             progress=(
                                 (
                                     lambda event, elapsed: progress(

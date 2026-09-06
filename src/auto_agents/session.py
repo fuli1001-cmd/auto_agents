@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -53,6 +54,8 @@ from .git_ops import (
     worktree_fingerprint,
 )
 from .io_utils import read_json, read_text, write_json, write_text
+from .logging_utils import attach_run_file_logger
+from .reporting import reporting_scope
 from .models import (
     AgentRequest,
     AgentResult,
@@ -71,6 +74,8 @@ from .persistence import (
 )
 from .performance_trace import PerformanceTrace
 from .provider_contract import provider_policy_prompt_lines
+from .prompting import (ContextBlock, PromptBlock, append_context, compose_prompt,
+                        instruction_fingerprint, policy_fingerprint)
 from .requirements import (
     load_requirements_trace,
     validate_provider_resolve_trace_transition,
@@ -118,7 +123,7 @@ _ORCHESTRATOR_CONTROL_ASSISTANCE = re.compile(
 )
 # Version 2 makes pre-fix records ineligible after rejected-output and process
 # resume boundaries became explicit continuation invalidation points.
-_PROVIDER_CONTINUATION_POLICY_VERSION = 2
+_PROVIDER_CONTINUATION_POLICY_VERSION = 3
 
 
 class Session:
@@ -419,8 +424,16 @@ class Session:
 
     # ── Main driver ──────────────────────────────────────────────
 
+    @reporting_scope
     def _drive_local(self, state: SessionState) -> SessionState:
         """Drive the session through its phases until completion or pause."""
+        reporter = getattr(self.orch, "reporter", None)
+        if reporter is not None:
+            reporter.bind(self.mode, state.session_id, goal=state.goal, workflow_id=state.workflow_id)
+            self._print_agent_output = self._print_agent_output or reporter.presenter.raw_output
+            self.orch._print_agent_output = self._print_agent_output
+            reporter.observe_session(state)
+            attach_run_file_logger(self.orch.logger, reporter.root / "run.log")
         active_phase = (
             state.status if state.status in {"conversing", "executing"} else ""
         )
@@ -493,6 +506,8 @@ class Session:
             state.resolution = "interrupted_by_user"
             self._save(state)
         except RuntimeError as exc:
+            if reporter is not None:
+                reporter.exception(exc)
             state.resume_phase = (
                 state.status
                 if state.status in {"conversing", "executing"}
@@ -3022,7 +3037,7 @@ class Session:
             for msg in state.conversation:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
-                lines.append(f"\n[{role.upper()}]:\n{content}")
+                lines.append(ContextBlock(content, f"Conversation: {role}"))
             lines.extend([
                 "",
                 "Analyze the unresolved provider references and the user's goal.",
@@ -3032,7 +3047,7 @@ class Session:
                 "- Keep the scope limited to provider reference markdown, provider_references.lock.json, and tightly coupled requirement trace metadata only when the user chooses defer/assumption approval.",
                 self.orch._document_language_instruction(),
             ])
-            return "\n".join(lines)
+            return compose_prompt(lines, purpose=self.mode + "_converse")
 
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
@@ -3077,7 +3092,7 @@ class Session:
         for msg in state.conversation:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            lines.append(f"\n[{role.upper()}]:\n{content}")
+            lines.append(ContextBlock(content, f"Conversation: {role}"))
 
         if self.mode == "collab" or self._goal_environment_confirmed(state):
             lines.extend(["", *self._goal_environment_prompt_lines(state)])
@@ -3094,9 +3109,9 @@ class Session:
                 "- decision='fix' only for a bounded defect against existing behavior; include summary, reason, reproduction, expected, actual, evidence_refs, affected_contracts, verification_command, and persistence_change.",
                 "- decision='run_iteration' when resolution needs new public capability, changed requirements, architecture expansion, or a persistence-model change; include reason and spec_seed with title, goal, gap, capability, acceptance, non_goals, evidence, and open_decisions.",
                 "- decision='not_bug' for expected/configuration/user-misunderstanding cases, decision='need_user' with question when evidence is insufficient, or decision='resume_child' with resume_handoff_id for a prior routed child.",
-                "- Preferred exact wire form: FIX_DISPOSITION v1: {\"decision\":\"...\",...}",
-                "- Do not encode the marker only as a JSON field and do not place the disposition only in commentary or tool output.",
-                "- The final response must contain the valid one-line disposition and no other disposition marker; put the explanation inside its JSON fields.",
+                PromptBlock("- Preferred exact wire form: FIX_DISPOSITION v1: {\"decision\":\"...\",...}", kind="output"),
+                PromptBlock("- Do not encode the marker only as a JSON field and do not place the disposition only in commentary or tool output.", kind="output"),
+                PromptBlock("- The final response must contain the valid one-line disposition and no other disposition marker; put the explanation inside its JSON fields.", kind="output"),
                 "- Match repository verification conventions when choosing verification_command.",
                 "- If the project uses a local conda env at ./.conda, every Python-oriented "
                 "verification_command must run inside it via 'conda run -p ./.conda ...'.",
@@ -3110,7 +3125,7 @@ class Session:
         else:
             lines.extend(
                 [
-                    "- Never output FIX_DISPOSITION in collab mode; that protocol belongs to the child fix workflow.",
+                    PromptBlock("- Never output FIX_DISPOSITION in collab mode; that protocol belongs to the child fix workflow.", kind="output"),
                     "- If an existing-behavior defect is already clear, output one single-line ROUTE_WORKFLOW v1 marker with target='fix', reason, summary, and issue_seed.",
                     "- If a missing capability or requirements, architecture, or persistence change is already clear, output one single-line ROUTE_WORKFLOW v1 marker with target='run', reason, summary, and spec_seed.",
                     "- Otherwise, if the goal is clear enough for more read-only diagnosis, output 'GOAL_CLEAR' on a line by itself at the end.",
@@ -3140,7 +3155,7 @@ class Session:
                 self.orch._document_language_instruction(),
             ]
         )
-        return "\n".join(lines)
+        return compose_prompt(lines, purpose=self.mode + "_converse")
 
     def _build_provider_resolve_prompt(self, state: SessionState, feedback: str) -> str:
         report = self.orch.provider_research_resolution_report()
@@ -3155,7 +3170,7 @@ class Session:
             f"Provider references directory: {refs_dir}",
             "",
             "Recovery goal:",
-            consolidated,
+            ContextBlock(consolidated, "User goal and corrections"),
             "",
             f"Current run error: {report.get('last_error', '')}",
             "",
@@ -3177,7 +3192,7 @@ class Session:
         for msg in state.conversation[-20:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            lines.append(f"\n[{role.upper()}]:\n{content}")
+            lines.append(ContextBlock(content, f"Conversation: {role}"))
 
         if state.execution_log:
             lines.extend(["", "--- Execution Log (recent) ---"])
@@ -3191,7 +3206,7 @@ class Session:
             lines.extend([
                 "",
                 "Previous attempt issues:",
-                feedback,
+                ContextBlock(feedback, "Previous attempt issues"),
                 "",
             ])
 
@@ -3221,9 +3236,9 @@ class Session:
             "- do not add, remove, reorder, reactivate, or supersede requirements in provider-resolve",
             *provider_policy_prompt_lines("provider_research"),
             "",
-            "Final response: brief status update of what you changed and why.",
+            PromptBlock("Final response: brief status update of what you changed and why.", kind="output"),
         ])
-        return "\n".join(lines)
+        return compose_prompt(lines, purpose="provider_resolve")
 
     def _build_fix_prompt(self, state: SessionState, feedback: str) -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
@@ -3235,7 +3250,7 @@ class Session:
             f"Architecture: {architecture}",
             "",
             "Bug description (from conversation):",
-            consolidated,
+            ContextBlock(consolidated, "User goal and corrections"),
             "",
         ]
         if self._goal_environment_confirmed(state):
@@ -3243,11 +3258,10 @@ class Session:
         if feedback:
             lines.extend([
                 "Previous attempt issues:",
-                feedback,
+                ContextBlock(feedback, "Previous attempt issues"),
                 "",
-                "CRITICAL: Before writing or modifying any code, output a step-by-step "
-                "'Fix Plan' in Markdown detailing how you will address the issues above. "
-                "Then proceed to implement the plan.",
+                "Use the failure evidence to identify the root cause and apply a bounded fix. "
+                "Explain the repair target briefly when it helps the user follow progress.",
                 "",
             ])
         lines.extend([
@@ -3255,7 +3269,7 @@ class Session:
             "0. Re-check the scope before editing. If the correct resolution requires new public capability, changed requirements, architecture expansion, or a persistence-model change, do not edit files; output one single-line FIX_DISPOSITION v1 JSON object with decision='run_iteration', reason, and spec_seed.",
             "1. Identify the root cause",
             "2. Apply the minimal fix",
-            "3. Update or add tests to cover the fix",
+            "3. Ensure focused behavioral coverage; reuse sufficient tests or add missing coverage",
             "4. Do not modify .auto-agents state files",
             *provider_policy_prompt_lines("fix"),
             "If this is a Python project, use the project-local conda env at ./.conda and install packages only inside it.",
@@ -3270,10 +3284,14 @@ class Session:
             "- Keep it under 72 characters; write it in the same language as the bug description.",
             "- This line is used verbatim as the git commit subject, so it must stand alone and be human-readable.",
         ])
-        prompt = "\n".join(lines)
+        output_start = next(i for i, line in enumerate(lines)
+                            if isinstance(line, str) and line.startswith("Final response:"))
+        prompt = compose_prompt([*lines[:output_start], *[
+            PromptBlock(line, kind="output") for line in lines[output_start:] if line
+        ]], purpose="fix")
         repo_map = self._build_repo_map_section_for_session(consolidated, feedback)
         if repo_map:
-            prompt = f"{prompt}\n\n{repo_map}"
+            prompt = append_context(prompt, repo_map, "Repo Map")
         return prompt
 
     def _build_repo_map_section_for_session(self, goal: str, feedback: str = "") -> str:
@@ -3367,33 +3385,33 @@ class Session:
             f"Architecture: {architecture}",
             "",
             "User's goal:",
-            consolidated,
+            ContextBlock(consolidated, "User goal and corrections"),
             "",
             *self._goal_environment_prompt_lines(state),
             "",
             "--- Conversation History ---",
         ]
-        for msg in state.conversation[-20:]:  # keep context window manageable
+        for msg in [m for m in state.conversation if m.get("role") != "user"][-20:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            lines.append(f"\n[{role.upper()}]:\n{content}")
+            lines.append(ContextBlock(content, f"Conversation: {role}"))
 
         if state.execution_log:
             lines.extend(["", "--- Execution Log (recent) ---"])
             for entry in state.execution_log[-10:]:
-                lines.append(f"  Attempt {entry.get('attempt')}: {entry.get('action')} -> {str(entry.get('result', ''))[:200]}")
+                lines.append(ContextBlock(f"Attempt {entry.get('attempt')}: {entry.get('action')} -> {str(entry.get('result', ''))[:200]}", "Recent execution log"))
 
         if feedback:
             lines.extend([
                 "",
                 "Previous attempt issues:",
-                feedback,
+                ContextBlock(feedback, "Previous attempt issues"),
                 "",
             ])
 
         lines.extend([
             "",
-            (
+            ContextBlock(
                 "Current local attempt budget: "
                 f"epoch={state.attempt_epoch}, "
                 f"provider_calls={self._attempts_in_current_epoch(state)}, "
@@ -3424,12 +3442,12 @@ class Session:
             "- If an operation is taking too long or keeps failing, stop and report bounded diagnostic evidence; do not edit code.",
             *provider_policy_prompt_lines("collab"),
             "",
-            "If this is a Python project, use the project-local conda env at ./.conda and install packages only inside it.",
+            "If this is a Python project, inspect using its existing project-local conda env at ./.conda. Route missing runtime dependencies through the owning workflow.",
             "Do not modify .auto-agents state files.",
             "",
-            "ROUTE_WORKFLOW v1 must be valid JSON on one line and must be the only route marker in the response.",
+            PromptBlock("ROUTE_WORKFLOW v1 must be valid JSON on one line and must be the only route marker in the response.", kind="output"),
         ])
-        return "\n".join(lines)
+        return compose_prompt(lines, purpose="collab")
 
     # ── Helpers ──────────────────────────────────────────────────
 
@@ -3524,9 +3542,9 @@ class Session:
         write_text(prompt_path, prompt)
         effort_stage = "provider_research" if self.mode == "provider_resolve" else "implement"
         effort = self.config.efforts.get(effort_stage, "deep")
-        # Always stream in collab/fix mode so the user sees real-time progress.
-        # The --print-agent-output flag is not required.
-        should_stream = self._print_agent_output or self.mode in ("collab", "fix", "provider_resolve")
+        # Transport and visible output are independent: hiding the stream must
+        # not disable the legacy idle watchdog when smart supervision is off.
+        should_stream = self._print_agent_output
         acceleration = self.config.execution.acceleration
         continuation_key = (
             "converse" if label.startswith("converse-") else self.mode
@@ -3552,12 +3570,15 @@ class Session:
                 resume_session_id = ""
         request = AgentRequest(
             stage=effort_stage,
+            purpose=(self.mode + "_converse" if label.startswith("converse-") else self.mode),
             effort=effort,
             prompt=prompt,
             cwd=self.project_root,
             output_path=output_path,
             resume_session_id=resume_session_id,
             resume_provider=resume_provider,
+            resume_prompt_hash=str(continuation.get("prompt_compatibility_hash", "")),
+            model_adaptation=self.config.prompting.model_adaptation,
             sandbox_mode=(
                 "read-only"
                 if label.startswith("converse-")
@@ -3573,7 +3594,13 @@ class Session:
                 if should_stream
                 else None
             ),
+            stream_transport=self.mode in ("collab", "fix", "provider_resolve"),
         )
+        if request.prompt_spec is not None and state.authorization_policy:
+            request = replace(request, prompt_spec=replace(request.prompt_spec, blocks=(
+                *request.prompt_spec.blocks,
+                PromptBlock("Workflow policy for new decisions (this invocation already authorizes its stage-permitted task actions): " + json.dumps(state.authorization_policy, sort_keys=True), "stage.authorization"),
+            )))
         started = time.monotonic()
         publish_operation = getattr(self._health_runtime, "set_active_operation", None)
         if callable(publish_operation):
@@ -3594,7 +3621,8 @@ class Session:
             label,
             duration_seconds=time.monotonic() - started,
             metadata={
-                "provider_session_resumed": bool(resume_session_id),
+                "prompt": dict(result.prompt_metadata),
+                "provider_session_resumed": bool(resume_session_id) and bool(result.prompt_metadata.get("resumed", True)),
                 "provider_session_id": result.provider_session_id,
                 "provider": self.orch._current_provider,
                 "head": head_ref(self.project_root),
@@ -3624,6 +3652,7 @@ class Session:
                 "head": head_ref(self.project_root),
                 "workspace_fingerprint": worktree_fingerprint(self.project_root),
                 "policy_version": _PROVIDER_CONTINUATION_POLICY_VERSION,
+                "prompt_compatibility_hash": result.prompt_metadata.get("compatibility_hash", ""),
                 "updated_at": self._now(),
             }
             self._save(state)
@@ -4829,16 +4858,12 @@ class Session:
         # record after committing the candidate.
 
     def _consolidate_goal(self, state: SessionState) -> str:
-        """Build a consolidated goal description from the conversation."""
-        parts = []
-        for msg in state.conversation:
-            if msg.get("role") == "user":
-                parts.append(msg.get("content", ""))
-            elif msg.get("role") == "agent":
-                content = msg.get("content", "")
-                if _GOAL_CLEAR.search(content):
-                    parts.append(f"Agent's understanding:\n{_GOAL_CLEAR.sub('', content).strip()}")
-        return "\n\n".join(parts) if parts else state.goal
+        """Preserve every user correction in order without duplicating agent summaries."""
+        messages = [str(msg.get("content", "")) for msg in state.conversation
+                    if msg.get("role") == "user"]
+        if state.goal and state.goal not in messages:
+            messages.insert(0, state.goal)
+        return "\n\n".join(f"User input {i}:\n{text}" for i, text in enumerate(messages, 1)) or state.goal
 
     def _save(self, state: SessionState) -> None:
         state.updated_at = self._now()
@@ -4846,6 +4871,9 @@ class Session:
         publish = getattr(self._health_runtime, "publish_session", None)
         if callable(publish):
             publish(state)
+        reporter = getattr(self.orch, "reporter", None)
+        if reporter is not None:
+            reporter.observe_session(state)
 
     def _check_health_action(self) -> None:
         pending = getattr(self._health_runtime, "pending_session_action", None)
@@ -4864,7 +4892,11 @@ class Session:
         )
 
     def _print(self, msg: str, flush: bool = False) -> None:
-        print(msg, file=sys.stderr, flush=flush)
+        reporter = getattr(self.orch, "reporter", None)
+        if reporter is not None:
+            reporter.text(msg)
+        else:
+            print(msg, file=sys.stderr, flush=flush)
 
     def _print_agent_thinking(self) -> None:
         self._print("\nAgent is thinking, please wait...", flush=True)

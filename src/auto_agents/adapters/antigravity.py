@@ -16,6 +16,7 @@ from ..models import (
     SmartTimeoutConfig,
 )
 from .base import AgentAdapter, run_subprocess_with_optional_streaming
+from ..prompting.runtime import cli_capabilities, last_option
 from ..supervision import ProgressDecoder
 
 SETTINGS_PATH = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
@@ -166,6 +167,7 @@ class AntigravityAdapter(AgentAdapter):
         return shutil.which(self.config.binary) is not None
 
     def run(self, request: AgentRequest) -> AgentResult:
+        request = self.prepare_request(request)
         log_path = self._progress_log_path(request) if self.smart_timeout.enabled else None
         if log_path is not None:
             write_text(log_path, "")
@@ -178,9 +180,9 @@ class AntigravityAdapter(AgentAdapter):
 
         # 动态修改 settings.json 改变模型选择
         original_content: Optional[str] = None
-        target_model = self.config.profile_map.get(request.effort)
+        target_model = last_option(self.config.extra_args, "--model") or self.config.profile_map.get(request.effort)
         
-        if target_model and SETTINGS_PATH.parent.exists():
+        if target_model and not self._uses_native_model_flag() and SETTINGS_PATH.parent.exists():
             try:
                 if SETTINGS_PATH.is_file():
                     original_content = read_text(SETTINGS_PATH)
@@ -242,6 +244,7 @@ class AntigravityAdapter(AgentAdapter):
             stderr = f"{stderr}\n{detail}".strip() if stderr else detail
 
         return AgentResult(
+            prompt_metadata=dict(request.prompt_metadata),
             ok=returncode == 0 and not protocol_error,
             command=command,
             output_path=request.output_path,
@@ -284,11 +287,17 @@ class AntigravityAdapter(AgentAdapter):
         if request.resume_session_id:
             command.extend(["--conversation", request.resume_session_id])
         
+        model = self.config.profile_map.get(request.effort)
+        if model and not last_option(self.config.extra_args, "--model") and self._uses_native_model_flag():
+            command.extend(["--model", model])
         command.extend(self.config.extra_args)
         # agy parses --print/-p as a string flag. Keep it last so another
         # option can never be consumed as the prompt value.
         command.extend(["--print", self._prompt_argument(request)])
         return command
+
+    def _uses_native_model_flag(self) -> bool:
+        return bool(last_option(self.config.extra_args, "--model")) or "--model" in cli_capabilities(self.config.binary)[1]
 
     @staticmethod
     def _progress_log_path(request: AgentRequest) -> Path:

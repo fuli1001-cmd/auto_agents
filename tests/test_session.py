@@ -626,6 +626,7 @@ class SessionFixFlowTests(unittest.TestCase):
             orchestrator.adapter.run = mock_run
             session = Session(orchestrator, mode="fix")
             captured = io.StringIO()
+            orchestrator.reporter.presenter.stream = captured
             with redirect_stderr(captured):
                 state = session.start()
 
@@ -2622,6 +2623,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             orchestrator.adapter.run = mock_run
             session = Session(orchestrator, mode="collab")
             captured = io.StringIO()
+            orchestrator.reporter.presenter.stream = captured
             with redirect_stderr(captured):
                 state = session.start()
 
@@ -3743,7 +3745,8 @@ class CollabAlwaysStreamTests(unittest.TestCase):
             original_failover = orchestrator._call_with_failover
 
             def capture_failover(request):
-                stream_was_set["value"] = request.stream_output is not None
+                stream_was_set["value"] = request.stream_transport
+                self.assertIsNone(request.stream_output)
                 # Return a successful result with GOAL_CLEAR then GOAL_ACHIEVED
                 content = "Understood.\nGOAL_CLEAR\n"
                 write_text(request.output_path, content)
@@ -3754,9 +3757,9 @@ class CollabAlwaysStreamTests(unittest.TestCase):
 
             orchestrator._call_with_failover = capture_failover
             session = Session(orchestrator, mode="collab", print_agent_output=False)
-            # Just run converse phase to check stream_output is set
+            # Background reading remains enabled without printing provider output.
             state = session.start()
-            self.assertTrue(stream_was_set["value"], "stream_output should be set in collab mode even without print_agent_output flag")
+            self.assertTrue(stream_was_set["value"], "hiding output must preserve the streaming transport and idle watchdog")
 
 
 class SessionContinuationTests(unittest.TestCase):
@@ -3801,7 +3804,7 @@ class SessionContinuationTests(unittest.TestCase):
             self.assertEqual(requests[2].resume_session_id, "")
             self.assertEqual(
                 state.provider_continuations["collab"]["policy_version"],
-                2,
+                3,
             )
             self.assertTrue(
                 all(item.sandbox_mode == "read-only" for item in requests)

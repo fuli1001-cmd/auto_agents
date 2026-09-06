@@ -64,6 +64,7 @@ class BootstrapTests(unittest.TestCase):
                 "state/checkpoint_blobs/\nstate/root_cause_certificates/\n"
                 "state/sessions/*/prompts/\nstate/sessions/*/outputs/\n"
                 "state/sessions/*/health/\n"
+                "state/sessions/*/logs/\n"
                 "state/sessions/*/performance_trace.jsonl\n"
                 "state/workflows/*/checkpoints/\n"
                 "state/workflows/*/event_index.sqlite3\n"

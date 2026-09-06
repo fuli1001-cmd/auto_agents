@@ -1216,6 +1216,7 @@ class AutoAgentsSelfRepairJudge:
             write_text(root / "prompt.txt", prompt)
             request = AgentRequest(
                 stage="self_repair_triage",
+                purpose="diagnosis",
                 effort=self._effort(),
                 prompt=prompt,
                 cwd=root,
@@ -1304,7 +1305,8 @@ class AutoAgentsSelfRepairJudge:
             return ""
         from .config import run_path
 
-        log_text = read_text(run_path(self.target_project_root, run_id) / "run.log")
+        from .logging_utils import read_diagnostic_log
+        log_text = read_diagnostic_log(run_path(self.target_project_root, run_id) / "run.log")
         return log_text[-SELF_REPAIR_TRIAGE_LOG_LIMIT:]
 
     def _execution_incident_evidence(
@@ -2675,6 +2677,9 @@ class AutoAgentsSelfRepairRunner:
         return not thread.is_alive()
 
     def run(self) -> SelfRepairResult:
+        reporter = getattr(getattr(self, "target_orchestrator", None), "reporter", None)
+        if reporter is not None:
+            reporter.repair("starting")
         try:
             result = self._run_search()
         except Exception as error:
@@ -2771,7 +2776,12 @@ class AutoAgentsSelfRepairRunner:
         if rendered_detail:
             message += f" {rendered_detail}"
         try:
-            print(f"[self-repair] {message}", file=sys.stderr, flush=True)
+            reporter = getattr(getattr(self, "target_orchestrator", None), "reporter", None)
+            if reporter is not None:
+                reporter.event("repair.detail", {"candidate_id": candidate_id, "phase": phase, "detail": detail})
+                reporter.repair(normalized_phase, candidate_id=candidate_id)
+            else:
+                print(f"[self-repair] {message}", file=sys.stderr, flush=True)
         except OSError:
             pass
         health_runtime = getattr(
@@ -3101,6 +3111,7 @@ class AutoAgentsSelfRepairRunner:
         )
         request = AgentRequest(
             stage="self_repair_design_review",
+            purpose="self_repair_review",
             effort=self._review_effort(),
             prompt=prompt,
             cwd=self.repo_root,
@@ -3322,6 +3333,7 @@ class AutoAgentsSelfRepairRunner:
         )
         request = AgentRequest(
             stage="self_repair_contract_arbiter",
+            purpose="arbiter",
             effort=self._review_effort(),
             prompt=prompt,
             cwd=self.repo_root,
@@ -3910,6 +3922,9 @@ class AutoAgentsSelfRepairRunner:
         prior_failures: list[str],
         seen_fingerprints: set[str],
     ) -> SelfRepairResult:
+        reporter = getattr(getattr(self, "target_orchestrator", None), "reporter", None)
+        if reporter is not None:
+            reporter.repair("generating_candidate")
         autonomy = self._autonomy_config()
         dirty_before = changed_paths(self.repo_root)
         if dirty_before and not autonomy.allow_isolated_dirty_checkout:
@@ -3954,6 +3969,13 @@ class AutoAgentsSelfRepairRunner:
                     self.target_project_root,
                     target_snapshot,
                 )
+                from .diagnostic_output import diagnostic_attachments, copy_diagnostic_attachments
+                copy_diagnostic_attachments(
+                    diagnostic_attachments(self.target_project_root, str(
+                        read_json(self.target_project_root / ".auto-agents/state/run_state.json", default={}).get("run_id", "")
+                    )),
+                    target_snapshot,
+                )
                 self._candidate_attempt = attempt
                 self._candidate_prior_failures = list(prior_failures)
                 prompt = self._build_prompt(repair_root, target_snapshot)
@@ -3972,6 +3994,7 @@ class AutoAgentsSelfRepairRunner:
                 )
                 request = AgentRequest(
                     stage="self_repair",
+                    purpose="self_repair",
                     effort=self._effort(),
                     prompt=prompt,
                     cwd=repair_root,
@@ -4978,6 +5001,7 @@ class AutoAgentsSelfRepairRunner:
         ).strip()
         request = AgentRequest(
             stage="self_repair",
+            purpose="self_repair",
             effort=self._effort(),
             prompt=prompt,
             cwd=repair_root,
@@ -4991,6 +5015,7 @@ class AutoAgentsSelfRepairRunner:
             ),
             attempt_id=f"self-repair-{candidate_id}-deterministic-correction",
             resume_session_id=initial_result.provider_session_id,
+            resume_prompt_hash=str(initial_result.prompt_metadata.get("compatibility_hash", "")),
             resume_provider=provider,
             record_execution_incidents=False,
             stream_output=(
@@ -5303,6 +5328,7 @@ class AutoAgentsSelfRepairRunner:
         )
         request = AgentRequest(
             stage="self_repair_candidate_review",
+            purpose="self_repair_review",
             effort=self._review_effort(),
             prompt=prompt,
             cwd=repair_root,
@@ -6649,7 +6675,11 @@ class AutoAgentsSelfRepairRunner:
                     detail=detail,
                 )
             if completed in {0, total} or completed % 5 == 0:
-                print(f"[self-repair] {detail}", file=sys.stderr, flush=True)
+                reporter = getattr(getattr(self, "target_orchestrator", None), "reporter", None)
+                if reporter is not None:
+                    reporter.emit("repair.checks", suite=suite_kind, completed=completed, total=total)
+                else:
+                    print(f"[self-repair] {detail}", file=sys.stderr, flush=True)
 
     def _aggregate_full_suite_shards(
         self,
@@ -7149,6 +7179,7 @@ class AutoAgentsSelfRepairRunner:
         _prompt_path, output_path = self._artifact_paths()
         request = AgentRequest(
             stage="self_repair_git_conflict",
+            purpose="self_repair",
             effort=self._effort(),
             prompt=prompt,
             cwd=self.repo_root,
@@ -7424,6 +7455,8 @@ class AutoAgentsSelfRepairRunner:
             )
         lines = [
             f"auto_agents repository root: {repair_root or self.repo_root}",
+            "Additional diagnostic output, when present: "
+            f"{target_evidence_root or self.target_project_root}/.auto-agents/diagnostic-evidence/index.json",
             (
                 "Target project snapshot (read-only evidence): "
                 f"{target_evidence_root or self.target_project_root}"
@@ -7693,6 +7726,12 @@ class AutoAgentsSelfRepairRunner:
                 repository_aliases={self.repo_root.name},
                 python_executable=self._verification_python(),
             )
+            reporter = getattr(getattr(self, "target_orchestrator", None), "reporter", None)
+            def diagnostic_progress(event, command, elapsed):
+                pass
+            diagnostic_progress.reporter = reporter
+            diagnostic_progress.context = "self_repair"
+            diagnostic_progress.stage = "self_repair_validation"
             gate = run_commands(
                 [verification_command],
                 verification_root,
@@ -7701,6 +7740,7 @@ class AutoAgentsSelfRepairRunner:
                 command_idle_timeout_seconds=max(
                     60, int(command_idle_timeout_seconds)
                 ),
+                **({"progress": diagnostic_progress} if reporter is not None else {}),
             )
             process = gate.commands[0]
             duration_seconds += float(process.duration_seconds)

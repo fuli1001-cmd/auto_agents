@@ -14,6 +14,7 @@
     "retries"
   ],
   "properties": {
+    "prompting": {"type": "object", "properties": {"model_adaptation": {"type": "string", "enum": ["auto", "generic"], "default": "auto"}}, "additionalProperties": false},
     "project_name": {
       "type": "string",
       "minLength": 1

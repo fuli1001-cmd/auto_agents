@@ -45,7 +45,10 @@ from .agent_instructions import (
     write_normalized_project_rules,
 )
 from .authorization import authorization_policy_for_state
+from .prompting import (ContextBlock, PromptBlock, PromptSpec, append_context, compose_prompt,
+                        instruction_fingerprint, policy_fingerprint, prepare_request)
 from .repomap import RepoMapBuilder, RepoMapResult
+from .prompting.core import task_context
 from .config import (
     archived_run_state_path,
     archived_task_plan_path,
@@ -214,6 +217,7 @@ from .health_watch import (
     build_progress_vector,
 )
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
+from .reporting import Reporter, get_reporter, reporting_scope
 from .models import (
     APPROVAL_ORDER,
     APPROVAL_BY_STAGE,
@@ -665,12 +669,17 @@ class Orchestrator:
         user_input_fn: Optional[Callable[[str], str]] = None,
         gate_cache_path: Optional[Path] = None,
         gate_preempt_requested: Optional[Callable[[], bool]] = None,
+        reporter: Optional[Reporter] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config = load_project_config(self.project_root)
         self.adapter = self._build_adapter(self.config)
         self.agent_output_stream = agent_output_stream or sys.stderr
-        self.logger = build_run_logger(self.agent_output_stream)
+        self.reporter = reporter or get_reporter(
+            self.project_root, self.agent_output_stream, language=self.config.docs.language,
+        )
+        self.reporter.project_name = self.config.project_name
+        self.logger = build_run_logger(self.agent_output_stream, self.reporter)
         raw_config = read_json(
             self.project_root / ".auto-agents" / "config.json",
             default={},
@@ -790,6 +799,11 @@ class Orchestrator:
             return
         path = run_path(self.project_root, run_id) / "run.log"
         self._active_run_log_path = attach_run_file_logger(self.logger, path)
+        self.reporter.language = self.config.docs.language
+        self.reporter.bind("run", run_id)
+        persisted = read_json(run_state_path(self.project_root), default={})
+        if isinstance(persisted, dict) and persisted.get("run_id") == run_id:
+            self.reporter.observe_run(RunState.from_dict(persisted))
 
     def _failed_verification_log_dir(self) -> Path:
         return self.project_root / ".auto-agents" / "failed-verification-logs"
@@ -814,6 +828,10 @@ class Orchestrator:
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-") or "verification"
         path = log_dir / f"{safe_label}-{uuid.uuid4().hex[:8]}.log"
         write_text(path, raw_output.rstrip() + "\n")
+        capture = self.reporter.capture(kind="verification_summary")
+        capture.start(label, {}, source_path=str(path))
+        capture("stderr", raw_output.rstrip() + "\n")
+        capture.finish(returncode=1)
         try:
             return str(path.relative_to(self.project_root))
         except ValueError:
@@ -1101,7 +1119,8 @@ class Orchestrator:
                     feedback + "\nSelect a materially different visual design system."
                 ).strip()
                 self.logger.warning(
-                    "--reselect-design is deprecated; express the desired visual direction in --reason."
+                    "--reselect-design is deprecated; express the desired visual direction in --reason.",
+                    extra={"audience": "user"},
                 )
             rejected = reject_variants(
                 self.project_root,
@@ -1143,6 +1162,7 @@ class Orchestrator:
         return state
 
     def _rewind_state_from_stage(self, state: RunState, target_stage: str) -> None:
+        self.reporter.rewind(target_stage, source=state.current_stage, reason=state.rejection_reason)
         self._record_health_control(
             "stage_rewind",
             stage=target_stage,
@@ -3250,6 +3270,7 @@ class Orchestrator:
         state.rejection_reason = feedback
         return True
 
+    @reporting_scope
     def run(
         self,
         spec_file: Path,
@@ -3270,6 +3291,7 @@ class Orchestrator:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._ensure_agent_instructions_synced()
         self._print_agent_output = print_agent_output
+        self.reporter.presenter.configure(self.reporter.presenter.mode, print_agent_output)
         self._allow_dirty_tree = allow_dirty_tree
         self._force_full_verify = bool(full_verify)
         self._interaction_mode = str(
@@ -3406,7 +3428,7 @@ class Orchestrator:
                 )
 
             if state.status == "completed":
-                self.logger.info("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]")
+                self.logger.info("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]", extra={"audience": "user"})
                 user_conf = self._prompt_user("").strip().lower()
                 if user_conf in ("y", "yes"):
                     previous_run_id = state.run_id
@@ -3635,6 +3657,8 @@ class Orchestrator:
                 except Exception:
                     self.stop_health_supervision(status="stopped")
             self._print_agent_output = False
+            if getattr(self, "_task_budget_exhausted", False):
+                self.reporter.emit("invocation.stopped")
             self._active_spec_file = None
             self._allow_dirty_tree = False
             self._max_tasks_remaining = None
@@ -4947,7 +4971,7 @@ class Orchestrator:
                     ),
                 })
             write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-            self.logger.info("\nAgent is thinking, please wait...")
+            self.logger.info("\nAgent is thinking, please wait...", extra={"audience": "user"})
 
         if resume_to_confirm:
             # Show the agent's last reply (minus the marker) and re-ask.
@@ -4958,13 +4982,13 @@ class Orchestrator:
                     break
             display = last_agent_content.replace("READY_TO_GENERATE", "").strip()
             if display:
-                self.logger.info("\n[Resuming previous conversation]")
-                self.logger.info("\nAgent:")
-                self.logger.info(display)
-            self.logger.info("\nAgent is ready to generate project_brief.md.")
+                self.logger.info("\n[Resuming previous conversation]", extra={"audience": "user"})
+                self.logger.info("\nAgent:", extra={"audience": "user"})
+                self.logger.info(display, extra={"audience": "user"})
+            self.logger.info("\nAgent is ready to generate project_brief.md.", extra={"audience": "user"})
             if auto_approve:
                 confirmed_generation = True
-                self.logger.info("Generation automatically confirmed by --auto-approve.")
+                self.logger.info("Generation automatically confirmed by --auto-approve.", extra={"audience": "user"})
             else:
                 user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
                 if user_conf.strip().lower() not in ("n", "no"):
@@ -4991,8 +5015,8 @@ class Orchestrator:
                         break
                 if replay_msg:
                     history.append(replay_msg)
-                    self.logger.info("\n[Resuming previous conversation]")
-                    self.logger.info("\nAgent:")
+                    self.logger.info("\n[Resuming previous conversation]", extra={"audience": "user"})
+                    self.logger.info("\nAgent:", extra={"audience": "user"})
                     self.logger.info(replay_msg["content"])
                     user_reply = self._prompt_user("\nYour reply: ", multiline=True)
                     if user_reply.strip():
@@ -5002,7 +5026,7 @@ class Orchestrator:
                 write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
         if not confirmed_generation:
-            self.logger.info("Entering interactive clarify session, please wait for the agent to analyze the spec...")
+            self.logger.info("Entering interactive clarify session, please wait for the agent to analyze the spec...", extra={"audience": "user"})
 
             max_rounds = 15
             rounds = 0
@@ -5064,16 +5088,16 @@ class Orchestrator:
                 if "READY_TO_GENERATE" in reply:
                     display_reply = reply.replace("READY_TO_GENERATE", "").strip()
                     if display_reply:
-                        self.logger.info("\nAgent:")
-                        self.logger.info(display_reply)
+                        self.logger.info("\nAgent:", extra={"audience": "user"})
+                        self.logger.info(display_reply, extra={"audience": "user"})
                     if post_rejection:
                         confirmed_generation = True
                         post_rejection = False
                         break
-                    self.logger.info("\nAgent is ready to generate project_brief.md.")
+                    self.logger.info("\nAgent is ready to generate project_brief.md.", extra={"audience": "user"})
                     if auto_approve:
                         confirmed_generation = True
-                        self.logger.info("Generation automatically confirmed by --auto-approve.")
+                        self.logger.info("Generation automatically confirmed by --auto-approve.", extra={"audience": "user"})
                         break
                     else:
                         user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
@@ -5091,8 +5115,8 @@ class Orchestrator:
                 display_reply = reply.replace("READY_TO_GENERATE", "").strip() if post_rejection else reply
                 post_rejection = False
 
-                self.logger.info("\nAgent:")
-                self.logger.info(display_reply)
+                self.logger.info("\nAgent:", extra={"audience": "user"})
+                self.logger.info(display_reply, extra={"audience": "user"})
 
                 user_reply = self._prompt_user("\nYour reply: ", multiline=True)
 
@@ -5102,7 +5126,7 @@ class Orchestrator:
                     history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
 
                 write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-                self.logger.info("\nAgent is thinking, please wait...")
+                self.logger.info("\nAgent is thinking, please wait...", extra={"audience": "user"})
 
         if not confirmed_generation:
             raise RuntimeError(
@@ -5110,7 +5134,7 @@ class Orchestrator:
             )
 
         # Generate the actual project brief
-        self.logger.info("\nGenerating project_brief.md, please wait...")
+        self.logger.info("\nGenerating project_brief.md, please wait...", extra={"audience": "user"})
         is_iteration = self._is_iteration_run(state)
         # Snapshot active/deferred REQ IDs so _clarify_validation_feedback can
         # detect silent deletion (iteration must use status='superseded' rather
@@ -5493,6 +5517,7 @@ class Orchestrator:
                 "[user-input] task=%s queued unusable request contract for rewrite: %s",
                 task.task_id,
                 usability_issue,
+                extra={"audience": "user"},
             )
         if changed:
             pending_ids = {
@@ -5782,6 +5807,8 @@ class Orchestrator:
                 output_path = root / "answer.json"
                 agent_request = AgentRequest(
                     stage="operator_input",
+                    purpose="operator_input",
+                    model_adaptation=self.config.prompting.model_adaptation,
                     effort=self.config.efforts.get("clarify", "balanced"),
                     prompt=prompt,
                     cwd=root,
@@ -5801,6 +5828,7 @@ class Orchestrator:
                         "[user-input] provider=%s could not interpret the answer: %s",
                         provider,
                         result.stderr or result.summary or "provider call failed",
+                        extra={"audience": "user"},
                     )
                     return None
                 raw = result.summary or result.stdout or read_text(output_path)
@@ -5810,6 +5838,7 @@ class Orchestrator:
                 "[user-input] provider=%s returned an unusable answer interpretation: %s",
                 self.config.active_provider,
                 error,
+                extra={"audience": "user"},
             )
             return None
 
@@ -5845,7 +5874,7 @@ class Orchestrator:
             if interpretation is None:
                 if not error:
                     return normalized
-                self.logger.warning("Invalid answer: %s", error)
+                self.logger.warning("Invalid answer: %s", error, extra={"audience": "user"})
                 continue
             action, interpreted_value, message = interpretation
             if action == "answer":
@@ -5855,12 +5884,12 @@ class Orchestrator:
                 )
                 if not interpreted_error:
                     return normalized
-                self.logger.warning("Invalid answer: %s", interpreted_error)
+                self.logger.warning("Invalid answer: %s", interpreted_error, extra={"audience": "user"})
                 continue
             if message:
-                self.logger.info("[user-input] %s", message)
+                self.logger.info("[user-input] %s", message, extra={"audience": "user"})
             else:
-                self.logger.warning("Invalid answer: %s", error)
+                self.logger.warning("Invalid answer: %s", error, extra={"audience": "user"})
 
     def _process_pending_user_input(
         self, state: RunState, tasks: Optional[List[TaskSpec]] = None
@@ -5893,6 +5922,7 @@ class Orchestrator:
                     request.request_id,
                     request.key,
                     request.render(),
+                    extra={"audience": "user"},
                 )
                 return False
             while True:
@@ -5904,7 +5934,7 @@ class Orchestrator:
                         source="interactive",
                     )
                 except ValueError as error:
-                    self.logger.warning("Invalid answer: %s", error)
+                    self.logger.warning("Invalid answer: %s", error, extra={"audience": "user"})
                     continue
                 break
             refreshed = load_run_state(self.project_root)
@@ -5917,13 +5947,19 @@ class Orchestrator:
                 return True
 
     def _prompt_user(self, prompt: str, default: str = "", multiline: bool = False) -> str:
+        from .reporting_messages import user_text
+        prompt = user_text(prompt, self.reporter.language)
+        with self.reporter.presenter.input():
+            return self._prompt_user_without_display(prompt, default, multiline)
+
+    def _prompt_user_without_display(self, prompt: str, default: str = "", multiline: bool = False) -> str:
         if self._user_input_fn:
             return _utf8_safe_text(self._user_input_fn(prompt))
         if "unittest" in sys.modules:
             return default
         if sys.stdin.isatty():
             if multiline:
-                self.logger.info(prompt + " (Press Ctrl+D or Ctrl+Z to submit):")
+                self.logger.info(prompt + " (Press Ctrl+D or Ctrl+Z to submit):", extra={"audience": "user"})
                 try:
                     text = sys.stdin.read()
                 except EOFError:
@@ -6597,14 +6633,14 @@ class Orchestrator:
             "    multiple distinct subsystems / layers / acceptance criteria fail repeatedly,",
             "    or when each retry trades one blocker for another in different code regions.",
             "",
-            "OUTPUT FORMAT (strict, machine-parsed):",
-            "  Line 1: 'DECISION: CONTINUE' or 'DECISION: SPLIT' (uppercase, exact).",
-            "  Line 2: 'RATIONALE: <one or two sentences>'.",
-            "  Lines 3+: when DECISION is SPLIT, add 'SPLIT_AXIS:' followed by 2-4 bullet",
+            PromptBlock("OUTPUT FORMAT (strict, machine-parsed):", kind="output"),
+            PromptBlock("  Line 1: 'DECISION: CONTINUE' or 'DECISION: SPLIT' (uppercase, exact).", kind="output"),
+            PromptBlock("  Line 2: 'RATIONALE: <one or two sentences>'.", kind="output"),
+            PromptBlock("  Lines 3+: when DECISION is SPLIT, add 'SPLIT_AXIS:' followed by 2-4 bullet", kind="output"),
             "  points, each naming one coherent slice the parent task should be split into",
             "  (e.g. '- backend: stale-flag propagation in regen entrypoints',",
             "  '- API: query-side filtering of stale results').",
-            "  No other text. No code fences. No preamble.",
+            PromptBlock("  No other text. No code fences. No preamble.", kind="output"),
             "",
             f"Task brief:\n{json.dumps(task_brief, indent=2, ensure_ascii=False)}",
             "",
@@ -6627,7 +6663,7 @@ class Orchestrator:
                 f"NOTE: split_depth={task.split_depth} is at MAX_SPLIT_DEPTH={self.MAX_SPLIT_DEPTH}.",
                 "Further SPLIT will be rejected. Prefer CONTINUE unless splitting is the only viable path.",
             ])
-        return "\n".join(prompt_parts)
+        return compose_prompt(prompt_parts, purpose="arbiter")
 
     @staticmethod
     def _parse_arbiter_decision(text: str) -> Dict[str, object]:
@@ -8285,6 +8321,8 @@ class Orchestrator:
                     command[:500],
                 )
 
+        emit.reporter = self.reporter
+        emit.context = context
         return emit
 
     def _raise_for_baseline_termination(
@@ -15628,6 +15666,7 @@ class Orchestrator:
         self.logger.warning(
             "[user-input] resumed stale blocker through WAIT_USER tasks=%s",
             ",".join(task.task_id for task in waiting),
+            extra={"audience": "user"},
         )
         return True
 
@@ -16083,6 +16122,8 @@ class Orchestrator:
             with tempfile.TemporaryDirectory(prefix="auto-agents-incident-judge-") as temp_root:
                 request = AgentRequest(
                     stage="execution_recovery",
+                    purpose="diagnosis",
+                    sandbox_mode="read-only",
                     effort=self.config.efforts.get("incident_judge", "max"),
                     prompt=prompt,
                     cwd=Path(temp_root),
@@ -23334,6 +23375,7 @@ class Orchestrator:
                 worktree_path,
                 agent_output_stream=self.agent_output_stream,
                 user_input_fn=self._user_input_fn,
+                reporter=self.reporter.child(worktree_path, task_id),
             )
             worker._print_agent_output = self._print_agent_output
             worker._allow_dirty_tree = self._allow_dirty_tree
@@ -23675,6 +23717,7 @@ class Orchestrator:
                 worktree_path,
                 agent_output_stream=self.agent_output_stream,
                 user_input_fn=self._user_input_fn,
+                reporter=self.reporter.child(worktree_path, task.task_id),
             )
             worker._print_agent_output = self._print_agent_output
             worker._allow_dirty_tree = True
@@ -34537,6 +34580,7 @@ class Orchestrator:
         effort = self.config.efforts.get("evidence_preflight", "balanced")
         payload = {
             "version": EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION,
+            "prompt_policy_hash": policy_fingerprint(),
             "task": task_payload,
             "requirements": requirements,
             "head": head_ref(self.project_root),
@@ -34644,9 +34688,7 @@ class Orchestrator:
                 )
                 attempt_prompt = prompt
                 if feedback:
-                    attempt_prompt = (
-                        f"{prompt}\n\nPrevious response protocol issue:\n{feedback}\n"
-                    )
+                    attempt_prompt = append_context(prompt, feedback, "Previous response protocol issue")
                     write_run_prompt(
                         self.project_root,
                         state.run_id,
@@ -34655,6 +34697,7 @@ class Orchestrator:
                     )
                 request = AgentRequest(
                     stage="evidence_preflight",
+                    purpose="evidence_preflight",
                     effort=self.config.efforts.get("evidence_preflight", "balanced"),
                     prompt=attempt_prompt.replace(
                         str(self.project_root), str(worktree_path)
@@ -35474,7 +35517,7 @@ class Orchestrator:
                 failure_logs.append(
                     f"Failure log {relative}:\n{content[-12000:]}"
                 )
-        return "\n".join(
+        return compose_prompt(
             [
                 f"Project root: {self.project_root}",
                 "Perform one read-only evidence feasibility preflight for the task below.",
@@ -35502,16 +35545,16 @@ class Orchestrator:
                 "If previously rejected operator-input contracts are listed below, their underlying operator-owned prerequisites remain unresolved. Return a complete valid replacement required_inputs batch in this response. Do not omit the replacements merely because provider_research or another owner also has work; upstream mutations may remain in the same response and will run after the answers are collected.",
                 "A mixed-owner mutation batch is valid. Keep each mutation's actual owner; do not relabel plan or provider-research artifacts as target_project merely because a target-project prerequisite is also present. The orchestrator resolves owner partitions sequentially.",
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
-                "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
+                PromptBlock("Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.", kind="output"),
                 "For every required mutation, set owner to implementation, plan, provider_research, or target_project. Credentials, authorized fixtures, pinned operator artifacts, and network policy are target_project-owned and must never be reported READY while absent.",
-                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE|WAIT_USER\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_inputs\":[{\"key\":\"...\",\"kind\":\"boolean|choice|text|url|path|secret|attestation|install_approval\",\"decision_class\":\"goal_choice|credential|rights_attestation|unbudgeted_external_cost|destructive_change|irreversible_product_decision|external_observation\",\"question\":\"...\",\"purpose\":\"...\",\"why_required\":\"...\",\"how_to_obtain\":[\"...\"],\"recommended_answer\":\"...\",\"default\":false,\"persistence\":\"one_time|run|project\",\"sensitivity\":\"public|private|secret\",\"validation\":{},\"bindings\":[{\"input_key\":\"optional or runtime.<tool_id>\",\"env\":\"NAME\",\"projection\":\"value|artifact_path|runtime_path|version|sha256\"}],\"subject_fingerprint\":\"...\",\"question_version\":1}],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"owner\":\"implementation|plan|provider_research|target_project\",\"config_scope\":\"generated_verification|operator\"}]}",
-                f"Task JSON:\n{json.dumps(task.to_dict(), indent=2, ensure_ascii=False)}",
+                PromptBlock("JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE|WAIT_USER\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_inputs\":[{\"key\":\"...\",\"kind\":\"boolean|choice|text|url|path|secret|attestation|install_approval\",\"decision_class\":\"goal_choice|credential|rights_attestation|unbudgeted_external_cost|destructive_change|irreversible_product_decision|external_observation\",\"question\":\"...\",\"purpose\":\"...\",\"why_required\":\"...\",\"how_to_obtain\":[\"...\"],\"recommended_answer\":\"...\",\"default\":false,\"persistence\":\"one_time|run|project\",\"sensitivity\":\"public|private|secret\",\"validation\":{},\"bindings\":[{\"input_key\":\"optional or runtime.<tool_id>\",\"env\":\"NAME\",\"projection\":\"value|artifact_path|runtime_path|version|sha256\"}],\"subject_fingerprint\":\"...\",\"question_version\":1}],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"owner\":\"implementation|plan|provider_research|target_project\",\"config_scope\":\"generated_verification|operator\"}]}", kind="output"),
+                ContextBlock(json.dumps(task_context(task), indent=2, ensure_ascii=False), "Task JSON"),
                 "Operator input summary (values redacted):\n"
                 + json.dumps(operator_records, indent=2, ensure_ascii=False),
                 rejected_input_context,
                 *(failure_logs or ["Failure logs: (none retained)"]),
-                requirement_context,
-            ]
+                ContextBlock(requirement_context, "Bound requirements"),
+            ], purpose="evidence_preflight"
         )
 
     @staticmethod
@@ -36667,9 +36710,15 @@ class Orchestrator:
             proof_evidence_summary=Orchestrator._format_proof_evidence_summary(proof_evidence),
         )
 
+    def _review_prompt_policy_hash(self) -> str:
+        return hashlib.sha256((policy_fingerprint() + instruction_fingerprint(self.project_root)
+                               + self.config.prompting.model_adaptation).encode("utf-8")).hexdigest()
+
     def _cached_review_result(self, state: RunState, task: TaskSpec, fingerprint: str) -> Optional[Dict[str, object]]:
         cache_entry = state.task_review_cache.get(task.task_id, {})
         if cache_entry.get("fingerprint") != fingerprint:
+            return None
+        if cache_entry.get("prompt_policy_hash") != self._review_prompt_policy_hash():
             return None
         if cache_entry.get("decision") != "pass":
             return None
@@ -36682,6 +36731,7 @@ class Orchestrator:
     def _store_task_review_cache(self, state: RunState, task: TaskSpec, fingerprint: str, summary: str) -> None:
         state.task_review_cache[task.task_id] = {
             "fingerprint": fingerprint,
+            "prompt_policy_hash": self._review_prompt_policy_hash(),
             "decision": "pass",
             "summary": summary.strip(),
         }
@@ -37087,7 +37137,7 @@ class Orchestrator:
 
         # First round (or resume): generate initial proposal if no history yet
         if not history:
-            self.logger.info("Entering README preparation, please wait for the agent to analyze the project...")
+            self.logger.info("Entering README preparation, please wait for the agent to analyze the project...", extra={"audience": "user"})
 
             proposal_prompt = self._build_readme_proposal_prompt(spec_file, history)
             result = self._run_agent_with_retries(
@@ -37113,8 +37163,8 @@ class Orchestrator:
                     last_agent_msg = msg.get("content", "")
                     break
 
-            self.logger.info("\nAgent:")
-            self.logger.info(last_agent_msg)
+            self.logger.info("\nAgent:", extra={"audience": "user"})
+            self.logger.info(last_agent_msg, extra={"audience": "user"})
 
             answer = "n" if auto_approve else self._prompt_user(
                 "\nDo you have anything to add or modify? (y/n) [n]: ", default="n"
@@ -37128,7 +37178,7 @@ class Orchestrator:
             history.append({"role": "user", "content": user_input})
             write_text(history_file, _json.dumps(history, indent=2, ensure_ascii=False))
 
-            self.logger.info("\nAgent is updating the plan, please wait...")
+            self.logger.info("\nAgent is updating the plan, please wait...", extra={"audience": "user"})
             proposal_prompt = self._build_readme_proposal_prompt(spec_file, history)
             result = self._run_agent_with_retries(
                 state=state,
@@ -37144,7 +37194,7 @@ class Orchestrator:
         user_extras = [msg["content"] for msg in history if msg.get("role") == "user"]
 
         # --- generation phase ---
-        self.logger.info("\nGenerating README.md, please wait...")
+        self.logger.info("\nGenerating README.md, please wait...", extra={"audience": "user"})
         prompt = self._build_prompt(stage="readme", spec_file=spec_file)
         if user_extras:
             prompt += "\n\nAdditional user instructions for the README:\n" + "\n".join(user_extras)
@@ -37574,7 +37624,7 @@ class Orchestrator:
                 content = msg.get("content", "")
                 lines.append(f"\n[{role}]:\n{content}")
             lines.append("\nBased on the conversation above, present the UPDATED list of planned README sections.")
-        return "\n".join(lines)
+        return compose_prompt(lines, purpose="readme_proposal")
 
     def _build_provider_research_prompt(self, requirements: List[dict]) -> str:
         trace_path = requirements_trace_path(self.project_root)
@@ -37599,11 +37649,11 @@ class Orchestrator:
             "Update provider_references.lock.json with one entry per provider reference. Each entry must include path, status, retrieved_at, source_urls, and notes.",
             "Allowed lock statuses: verified, blocked, needs_user_input, ambiguous, deferred, temporary_stub, assumption_approved.",
             *provider_policy_prompt_lines("provider_research"),
-            "Final response: 3 short bullets summarizing references created or blockers found.",
+            PromptBlock("Final response: 3 short bullets summarizing references created or blockers found.", kind="output"),
             "",
             req_context,
         ]
-        return "\n".join(lines)
+        return compose_prompt(lines, purpose="provider_research")
 
     def _persist_tasks(self, tasks: Iterable[TaskSpec]) -> None:
         current_payload = load_task_plan(self.project_root)
@@ -37900,8 +37950,8 @@ class Orchestrator:
                     ),
                     "Only unproven active/deferred entries may be refined in place; never use notes as a normative override for a conflicting active contract.",
                 ])
-            lines.append("Final response: 3 short bullets summarizing the clarified scope.")
-            return "\n".join(lines)
+            lines.append(PromptBlock("Final response: 3 short bullets summarizing the clarified scope.", kind="output"))
+            return compose_prompt(lines, purpose=stage)
 
         if stage == "design":
             lines = common + [
@@ -37933,8 +37983,8 @@ class Orchestrator:
                     "If the architecture describes a capability as already implemented but the brief's iteration scope explicitly asks for it as new or upgraded scope, ADD a subsection or bullet under the relevant heading that describes the GAP between what exists and what the new iteration requires.",
                     "Do NOT assume that existing architecture descriptions are accurate for the new iteration — the brief's iteration scope takes precedence over existing architecture claims about what is already real or complete.",
                 ])
-            lines.append("Final response: 3 short bullets summarizing the design.")
-            return "\n".join(lines)
+            lines.append(PromptBlock("Final response: 3 short bullets summarizing the design.", kind="output"))
+            return compose_prompt(lines, purpose=stage)
 
         if stage == "plan":
             lines = common + [
@@ -37989,7 +38039,7 @@ class Orchestrator:
                 "If future implementation will require test updates, encode that need in task scope, acceptance, and expected_test_migrations. Do NOT pre-edit repository tests in this planning stage.",
                 "CRITICAL — COVERAGE VERIFICATION: when determining whether a done task covers a brief requirement, you MUST compare the requirement against the task's ACCEPTANCE CRITERIA and REVIEW SUMMARY, not its title or description alone. A task titled 'Real X Integration' does NOT cover a requirement for actual real-model output if its acceptance criteria only verify adapter switching, infrastructure patterns, or fixture/stub results rather than actual external API calls producing real output.",
                 "If the brief explicitly states that a capability must be 'real' / 'production' / '真实' / '公网', verify that the done task's acceptance criteria confirm actual external API calls producing real output — not just adapter infrastructure or fixture-based testing.",
-                "Before generating the task list, produce a COVERAGE ANALYSIS in your final summary response (NOT in the JSON file): for each key requirement in the brief's current iteration scope, state which done task covers it (citing the specific acceptance criterion that proves delivery) or mark it as UNCOVERED. Any UNCOVERED requirement MUST result in a new task.",
+                PromptBlock("Include a COVERAGE ANALYSIS in your final summary response (NOT in the JSON file): for each key requirement in the brief's current iteration scope, state which done task covers it (citing the specific acceptance criterion that proves delivery) or mark it as UNCOVERED. Any UNCOVERED requirement MUST result in a new task.", kind="output"),
                 "Each task must contain task_id, title, description, acceptance, status, commit_message, mutable_artifacts, and persistence_change. Use mutable_artifacts=[] unless implementation must update an otherwise-protected public artifact such as top-level spec.md.",
                 "mutable_artifacts entries must be exact project-relative files. Never grant the active input spec, specs/** iteration inputs, .auto-agents/**, or DESIGN.md. When the active input is under specs/** and a requirement explicitly synchronizes the public top-level spec.md, declare mutable_artifacts=['spec.md'] on that task.",
                 "Set task_origin='planned', recovery_epoch=0, and recovery_round=0 on every newly planned task. These fields are orchestrator-owned lineage metadata and must not be inferred from task_id spelling.",
@@ -38008,7 +38058,7 @@ class Orchestrator:
                 "3. Test-boundary: if a single task would require tests in 3+ unrelated test files, it likely needs splitting.",
                 "4. Acceptance count rule: aim for 2-4 acceptance criteria per active task. If a task has 6-7 criteria, add scope_boundaries explaining why it remains one coherent slice. Tasks with more than 7 criteria are invalid and must be split.",
                 "",
-                "Final response: 3 short bullets summarizing the plan.",
+                PromptBlock("Final response: include the complete COVERAGE ANALYSIS for every current requirement, followed by up to three short plan summary bullets.", kind="output"),
             ]
             if is_iteration:
                 if archived_plan:
@@ -38028,7 +38078,8 @@ class Orchestrator:
                     ])
             if self.config.execution.parallel_tasks.enabled:
                 required_task_fields = next(
-                    line for line in lines if line.startswith("Each task must contain task_id")
+                    line for line in lines
+                    if isinstance(line, str) and line.startswith("Each task must contain task_id")
                 )
                 lines[lines.index(required_task_fields)] = (
                     "Each task must contain task_id, title, description, acceptance, status, commit_message, depends_on, mutable_artifacts, and persistence_change. Use mutable_artifacts=[] unless the task explicitly owns an otherwise-protected public artifact."
@@ -38037,7 +38088,7 @@ class Orchestrator:
                     lines.index("A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined."),
                     "Experimental parallel task execution is enabled for this project. The planner—not the user—must generate depends_on for every non-done task. Use [] when a task has no prerequisites, and only reference existing task_id values that are true prerequisites.",
                 )
-            return "\n".join(lines)
+            return compose_prompt(lines, purpose=stage)
 
         if stage == "readme":
             readme = self.project_root / "README.md"
@@ -38060,9 +38111,9 @@ class Orchestrator:
                 "Prefer concise sections, bullets, and runnable command examples.",
                 self._readme_spec_instruction(spec_kind),
                 self._readme_language_instruction(),
-                "Final response: 3 short bullets summarizing the README update.",
+                PromptBlock("Final response: 3 short bullets summarizing the README update.", kind="output"),
             ]
-            return "\n".join(lines)
+            return compose_prompt(lines, purpose=stage)
 
         raise RuntimeError(f"Unsupported stage: {stage}")
 
@@ -38260,19 +38311,35 @@ class Orchestrator:
     ) -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
-        task_json = json.dumps(task.to_dict(), indent=2, ensure_ascii=False)
+        task_json = json.dumps(task_context(task), indent=2, ensure_ascii=False)
         requirement_context = format_requirement_context(requirements_for_task(self.project_root, task))
         task_status_migration_context = self._build_task_status_migration_context(task)
         active_spec = self._active_spec_relative_path() or "(external active spec)"
         mutable_artifacts = self._effective_task_mutable_artifacts(task)
+        bound = requirements_for_task(self.project_root, task)
+        has_python = any((self.project_root / name).exists() for name in ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"))
+        has_python = has_python or any(".py" in str(ref) for ref in task.verification_refs)
+        has_python = has_python or bool(re.search(r"\bpython\b", task.description, re.IGNORECASE))
+        has_js = (self.project_root / "package.json").exists()
+        domains = {
+            "frontend": self._task_requires_frontend_design_contract(task),
+            "persistence": (
+                task.persistence_change.get("strategy", "none") != "none"
+                or task.persistence_change.get("storage_transition", "none") != "none"
+                or task.persistence_change.get("compatibility_policy", "not_applicable") != "not_applicable"
+            ),
+        }
+        if has_python or has_js:
+            domains["python"] = has_python
+        # Missing binding metadata is unknown, not proof of non-applicability.
+        if bound and all("external_docs_required" in item for item in bound):
+            domains["provider"] = any(item.get("external_docs_required") or item.get("provider_reference") or item.get("provider_references") for item in bound)
         common = [
             f"Project root: {self.project_root}",
             f"Project brief: {brief}",
             f"Architecture: {architecture}",
             f"Requirements trace: {requirements_trace_path(self.project_root)}",
-            "Work only on the current task.",
-            "Keep changes scoped and testable.",
-            f"Task JSON:\n{task_json}",
+            ContextBlock(task_json, "Task JSON"),
             "If Task JSON includes requirement_proofs, those entries define the current task's "
             "owned requirement-oracle proof pairs. Acceptance oracles from the same requirement "
             "that are absent from this task's requirement_proofs may be covered by other tasks; "
@@ -38291,16 +38358,16 @@ class Orchestrator:
                 "Current task explicitly owns these otherwise-protected public artifacts: "
                 + ", ".join(mutable_artifacts)
             )
-        if task.verification_refs:
+        if task.verification_refs and stage == "review":
             common.extend(
                 [
                     "The orchestrator owns execution of verification_refs and records their proof "
-                    "certificates. Do not run those refs manually; implement the change and let the "
+                    "certificates. Do not run those refs manually; prepare the stage result and let the "
                     "managed verification step provide one canonical result and retry feedback.",
                 ]
             )
         if requirement_context:
-            common.extend(["", requirement_context])
+            common.append(ContextBlock(requirement_context, "Bound requirements"))
         if self._task_requires_frontend_design_contract(task):
             frontend_contract = self._frontend_design_prompt_lines(
                 self._task_frontend_design_requirement_ids(task)
@@ -38311,9 +38378,9 @@ class Orchestrator:
                 )
             common.extend(["", *frontend_contract])
         if plan_migration_context.strip():
-            common.extend(["", plan_migration_context.strip()])
+            common.append(ContextBlock(plan_migration_context.strip(), "Plan migration contract"))
         if task_status_migration_context.strip():
-            common.extend(["", task_status_migration_context.strip()])
+            common.append(ContextBlock(task_status_migration_context.strip(), "Task status migration contract"))
         if (
             stage == "implement"
             and str(task.evidence_preflight.get("decision", "")).upper() == "READY"
@@ -38331,51 +38398,48 @@ class Orchestrator:
         if stage == "implement":
             if task.requirement_proofs:
                 proof_update_lines = [
-                    "When the task has requirement_proofs, do NOT edit .auto-agents/state/task_plan.json directly. Instead, include an ORACLE_PROOF_UPDATES JSON block in your final response.",
-                    "Each ORACLE_PROOF_UPDATES entry must update an existing current-task proof by requirement_id and oracle_index, set status='verified', and include concrete evidence_refs plus proof_type/oracle_strength/evidence_boundary/proxy_oracles when relevant.",
-                    "Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```",
+                    PromptBlock("When the task has requirement_proofs, do NOT edit .auto-agents/state/task_plan.json directly. Instead, include an ORACLE_PROOF_UPDATES JSON block in your final response.", kind="output"),
+                    PromptBlock("Each ORACLE_PROOF_UPDATES entry must update an existing current-task proof by requirement_id and oracle_index, set status='verified', and include concrete evidence_refs plus proof_type/oracle_strength/evidence_boundary/proxy_oracles when relevant.", kind="output"),
+                    PromptBlock("Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```", kind="output"),
                 ]
             else:
                 proof_update_lines = [
-                    "This task has no local requirement_proofs. Do not emit an ORACLE_PROOF_UPDATES block; verification_refs, when present, are the complete executable proof surface owned by this task.",
+                    PromptBlock("This task has no local requirement_proofs. Do not emit an ORACLE_PROOF_UPDATES block; verification_refs, when present, are the complete executable proof surface owned by this task.", kind="output"),
                 ]
             lines = common + [
-                "Implement only this feature slice.",
                 "If local verification exposes a tightly coupled regression in files you touched or in paths explicitly implicated by retry feedback, fix it in the same attempt even if it sits slightly outside the nominal task slice.",
                 "The current task's owned acceptance criteria and owned requirement proof entries are hard requirements, not optional background.",
                 "Honor each owned oracle contract exactly: the implementation and tests must meet or exceed each requirement's oracle_strength, collect proof at the required evidence_boundary, and avoid every forbidden proxy oracle listed in the requirement context.",
                 *proof_update_lines,
                 "Do not submit proof updates for proxy evidence listed in forbidden_proxy_oracles, for final-status-only checks, or for config/metadata-only checks when the requirement demands behavioral/system-boundary proof.",
-                "For frontend/prototype visual fidelity proofs, evidence_refs must include page-level visual evidence such as Playwright screenshot tests, screenshot artifacts, visual snapshots, or equivalent browser-rendered checks, plus deterministic DOM/CSS assertions where practical. Do not mark these proofs verified using payload-only tests or internal-state checks.",
-                "When a frontend/prototype proof has concrete prototype-comparison screenshot artifacts, include visual_evidence on that proof with surface, viewport, distinct raster prototype_image_ref and actual_image_ref paths for the same UI state, prototype_source_ref, and purpose='prototype_fidelity' so auto_agents can run the optional visual_judge gate. Put HTML only in prototype_source_ref; ordinary evidence_refs are never inferred into visual pairs. If the screenshot only proves layout stability, state transitions, no overflow, no overlap, or runtime DOM/CSS behavior, either omit visual_evidence or set purpose='layout_stability'/'state_transition' and visual_judge=false; do not pair those screenshots with a static prototype for visual_judge.",
+                PromptBlock("For frontend/prototype visual fidelity proofs, evidence_refs must include page-level visual evidence such as Playwright screenshot tests, screenshot artifacts, visual snapshots, or equivalent browser-rendered checks, plus deterministic DOM/CSS assertions where practical. Do not mark these proofs verified using payload-only tests or internal-state checks.", domain='frontend'),
+                PromptBlock("When a frontend/prototype proof has concrete prototype-comparison screenshot artifacts, include visual_evidence on that proof with surface, viewport, distinct raster prototype_image_ref and actual_image_ref paths for the same UI state, prototype_source_ref, and purpose='prototype_fidelity' so auto_agents can run the optional visual_judge gate. Put HTML only in prototype_source_ref; ordinary evidence_refs are never inferred into visual pairs. If the screenshot only proves layout stability, state transitions, no overflow, no overlap, or runtime DOM/CSS behavior, either omit visual_evidence or set purpose='layout_stability'/'state_transition' and visual_judge=false; do not pair those screenshots with a static prototype for visual_judge.", domain='frontend'),
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
-                "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
-                "Do not run verification_refs or broad suites inside the implementation agent. auto_agents executes each owned proof once after the candidate is ready and reuses that certificate in review and attestation.",
+                "Ensure behavioral tests verify every acceptance criterion. Reuse sufficient existing coverage; write or update focused tests when coverage is missing or explicitly required.",
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
                 "When task status migration context is present, migrate only repository tests that assert stale task status. Do not edit orchestrator-owned .auto-agents state snapshots to force that transition early.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
-                "PERSISTENCE CONTRACT: obey Task JSON persistence_change exactly. Do not change storage_transition, compatibility_policy, or target_ids. Implement target-native immutable migrations and version guards. rebuild is the only automatic delete-and-initialize transition; application startup must remain read-only for schema.",
+                PromptBlock("PERSISTENCE CONTRACT: obey Task JSON persistence_change exactly. Do not change storage_transition, compatibility_policy, or target_ids. Implement target-native immutable migrations and version guards. rebuild is the only automatic delete-and-initialize transition; application startup must remain read-only for schema.", domain='persistence'),
                 "Before adding or changing tests, inspect nearby repository tests for the same API fields, state-machine outputs, and public payload keys. Preserve existing semantic distinctions unless the task explicitly changes the contract.",
                 "Do not collapse layered semantics in assertions. Distinguish internal failure reasons/error codes from outward-facing state labels, next-action hints, and user-action flags unless the repository already defines them as the same contract.",
-                "Python proof tests must be deterministic under the project's configured verification command. Do not rely on pytest-only or unittest-only ambient state; explicitly configure test adapters, environment variables, and dependency injection needed by the test.",
-                "Python tests must not contact real external services by accident. Use explicit fakes/mocks or test adapters for object storage, providers, databases, and network clients.",
+                PromptBlock("Python proof tests must be deterministic under the project's configured verification command. Do not rely on pytest-only or unittest-only ambient state; explicitly configure test adapters, environment variables, and dependency injection needed by the test.", domain='python'),
+                PromptBlock("Python tests must not contact real external services by accident. Use explicit fakes/mocks or test adapters for object storage, providers, databases, and network clients.", domain='python'),
                 "Use per-test unique temp paths for mutable artifacts such as sqlite databases, object-storage roots, caches, and generated fixtures so repeated, resumed, or mixed-runner verification cannot reuse stale state.",
-                "For external provider integrations, use the listed provider_reference/provider_references files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.",
-                *provider_policy_prompt_lines("implement"),
-                "For protocol/direct-integration tasks, add contract tests that verify outbound request shape, auth/header behavior, response normalization, and forbidden legacy payloads where applicable.",
-                "If this is a Python project, create and use a project-local conda env at ./.conda and install packages only inside it.",
-                "Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.",
+                PromptBlock("For external provider integrations, use the listed provider_reference/provider_references files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.", domain='provider'),
+                *(provider_policy_prompt_lines("implement") if domains.get("provider") is not False else []),
+                PromptBlock("For protocol/direct-integration tasks, add contract tests that verify outbound request shape, auth/header behavior, response normalization, and forbidden legacy payloads where applicable.", domain='provider'),
+                PromptBlock("If this is a Python project, create and use a project-local conda env at ./.conda and install packages only inside it.", domain='python'),
+                PromptBlock("Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.", domain='python'),
                 "Keep mutable local test/runtime artifacts (for example sqlite DBs, temp configs, fixtures, and caches) under ignored temp/data paths such as ./.tmp/, ./.tmp-tests/, or ./.data/ instead of tracked repo-root files.",
                 "For any other stack, keep dependencies and tool state local to the repository and never rely on global installs.",
                 "Do not modify the exact active input spec or any specs/** iteration input. A top-level spec.md may be updated only when it is listed in the current task's mutable_artifacts above.",
-                "Do not modify .auto-agents state files except through ORACLE_PROOF_UPDATES or when explicitly requested.",
                 "Do not modify .auto-agents docs/state/config files or planning artifacts directly as part of implementation. Keep orchestrator-owned files untouched.",
-                "Final response: 3 short bullets describing what changed.",
+                PromptBlock("Final response: give up to three short summary bullets, followed by the complete required ORACLE_PROOF_UPDATES block when this task owns proofs. Include material blockers and distinguish prepared changes from checks actually executed.", kind="output"),
             ]
-            prompt = "\n".join(lines)
+            prompt = compose_prompt(lines, purpose=stage, domains=domains)
             repo_map = self._build_repo_map_section(task, stage="implement")
             if repo_map:
-                prompt = f"{prompt}\n\n{repo_map}"
+                prompt = append_context(prompt, repo_map, "Repo Map")
             return prompt
 
         if stage == "review":
@@ -38390,9 +38454,9 @@ class Orchestrator:
                 "public interfaces, that is a 'DECISION: fail' issue.",
                 "Also fail if tests collapse distinct semantics for neighboring public fields. Check whether reason/error-code fields, public state labels, next-action hints, and waiting/manual-action flags are asserted consistently with adjacent repository tests and the implementation contract.",
                 "Also fail if a new or edited test contradicts nearby existing tests for the same public payload fields without an explicit contract change in the task scope.",
-                "For Python projects, fail tests that depend on runner-specific ambient state, shared fixed "
-                "sqlite/temp paths, or real external services instead of explicit test fakes/adapters.",
-                "PERSISTENCE AUDIT: If persistence_change.strategy is not none, fail unless the implementation matches the user-approved strategy and tests start from a legacy schema fixture (except initial_schema). Fresh-database-only schema checks cannot prove an upgrade or controlled clean break.",
+                PromptBlock("For Python projects, fail tests that depend on runner-specific ambient state, shared fixed "
+                "sqlite/temp paths, or real external services instead of explicit test fakes/adapters.", domain='python'),
+                PromptBlock("PERSISTENCE AUDIT: If persistence_change.strategy is not none, fail unless the implementation matches the user-approved strategy and tests start from a legacy schema fixture (except initial_schema). Fresh-database-only schema checks cannot prove an upgrade or controlled clean break.", domain='persistence'),
                 "If plan migration context lists retired task IDs, stale repository tests that still reference those retired IDs or the pre-split task-plan structure are also a 'DECISION: fail' issue.",
                 "If task status migration context is present, review stale repository test assertions only. Do NOT fail solely because orchestrator-owned .auto-agents state snapshots still show `in_progress` during review.",
                 "SCOPE RULE: Your review scope is bounded by the acceptance criteria in the Task JSON plus the bound requirements and acceptance oracles above. "
@@ -38404,18 +38468,18 @@ class Orchestrator:
                 "When issuing 'DECISION: fail', you MUST cite the specific acceptance criterion (by index or text) "
                 "or requirement ID/oracle/proof entry that is not satisfied. If no acceptance criterion or requirement oracle is violated but you have advisory concerns, "
                 "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
-                "For external provider integrations, verify the code and tests against the provider_reference/provider_references files. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
-                *provider_policy_prompt_lines("review"),
+                PromptBlock("For external provider integrations, verify the code and tests against the provider_reference/provider_references files. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.", domain='provider'),
+                *(provider_policy_prompt_lines("review") if domains.get("provider") is not False else []),
                 "Also fail when the implementation uses a weaker oracle than the requirement allows (for example: proxy-only checks for semantic/human requirements, internal-state-only checks for system_boundary/external_side_effect requirements, or any check explicitly listed in forbidden_proxy_oracles).",
-                "Also fail frontend/prototype visual fidelity proofs when evidence_refs lack page-level visual evidence such as browser screenshots, visual snapshots, Playwright checks, or equivalent rendered-surface validation. Payload-only tests, route existence, or component-count checks cannot be the sole proof for matching a prototype.",
-                "If visual_evidence is present for prototype fidelity, check that it pairs prototype_image_ref and actual_image_ref for the same surface/viewport and the same intended UI state; incorrect, missing, layout-stability-only, or state-transition-only screenshot pairs are blocking for visual fidelity requirements. Non-comparison screenshots should be marked purpose='layout_stability'/'state_transition' with visual_judge=false instead of being treated as prototype_fidelity.",
+                PromptBlock("Also fail frontend/prototype visual fidelity proofs when evidence_refs lack page-level visual evidence such as browser screenshots, visual snapshots, Playwright checks, or equivalent rendered-surface validation. Payload-only tests, route existence, or component-count checks cannot be the sole proof for matching a prototype.", domain='frontend'),
+                PromptBlock("If visual_evidence is present for prototype fidelity, check that it pairs prototype_image_ref and actual_image_ref for the same surface/viewport and the same intended UI state; incorrect, missing, layout-stability-only, or state-transition-only screenshot pairs are blocking for visual fidelity requirements. Non-comparison screenshots should be marked purpose='layout_stability'/'state_transition' with visual_judge=false instead of being treated as prototype_fidelity.", domain='frontend'),
                 "Also fail if a negative requirement was weakened by dropping a concrete forbidden field/path/API token from the task acceptance or proof. Example: if the requirement says default project detail must not include `tasks[].result`, tests that only prove `retry_trace` was removed are insufficient.",
                 "Use the supplied changed-file and diff context first. Only inspect the rest of the repository when the diff is insufficient.",
                 "This stage is read-only. Do not modify any repository files; return only the review result.",
-                "Return only the review result. Do not include any preamble, file path note, or tool narration.",
-                "The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.",
+                PromptBlock("Return only the review result. Do not include any preamble, file path note, or tool narration.", kind="output"),
+                PromptBlock("The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.", kind="output"),
                 self._review_language_instruction(),
-                "After the first line, provide a short review summary.",
+                PromptBlock("After the first line, provide a short review summary.", kind="output"),
             ]
             if task.scope_boundaries.strip():
                 lines.append(
@@ -38423,6 +38487,8 @@ class Orchestrator:
                     f"{task.scope_boundaries.strip()}"
                 )
             if task.review_history:
+                if not review_context.strip():
+                    lines.append(ContextBlock(json.dumps(task.review_history[-2:], ensure_ascii=False), "Recent review findings"))
                 lines.append(
                     "This is a RETRY review. Your PRIMARY job is to verify that the issues from the previous "
                     "review have been addressed. You may note newly discovered issues, but 'DECISION: fail' "
@@ -38431,11 +38497,11 @@ class Orchestrator:
                     "not raised in the previous review."
                 )
             if review_context.strip():
-                lines.extend(["", review_context.strip()])
-            prompt = "\n".join(lines)
+                lines.append(ContextBlock(review_context.strip(), "Review evidence"))
+            prompt = compose_prompt(lines, purpose=stage, domains=domains)
             repo_map = self._build_repo_map_section(task, stage="review")
             if repo_map:
-                prompt = f"{prompt}\n\n{repo_map}"
+                prompt = append_context(prompt, repo_map, "Repo Map")
             return prompt
 
         raise RuntimeError(f"Unsupported task stage: {stage}")
@@ -38730,13 +38796,11 @@ class Orchestrator:
                     plan_migration_context=self._build_task_plan_migration_context(state, task),
                 )
                 if feedback:
-                    implement_prompt = (
-                        f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n\n"
-                        "CRITICAL: Before writing or modifying any code, you MUST first output a step-by-step "
-                        "'Fix Plan' in Markdown detailing how you will address all the issues above. "
-                        "Use the structured verification triage and evidence below to identify the root causes. "
-                        "Do not dismiss tightly coupled regressions in explicitly implicated paths as out of scope. "
-                        "Then, proceed to implement the plan."
+                    implement_prompt = append_context(
+                        implement_prompt,
+                        feedback + "\nUse the supplied evidence to identify the failure and apply a bounded fix. "
+                        "Address tightly coupled regressions in explicitly implicated paths.",
+                        "Previous attempt issues",
                     )
                 try:
                     result = self._run_agent_with_retries(
@@ -39782,6 +39846,7 @@ class Orchestrator:
         write_run_prompt(self.project_root, state.run_id, stage_key, prompt)
         probe_basis = AgentRequest(
             stage="visual_judge",
+            purpose="visual_judge",
             effort=effort,
             prompt=prompt,
             cwd=self.project_root,
@@ -39820,6 +39885,7 @@ class Orchestrator:
                 continue
             request = AgentRequest(
                 stage="visual_judge",
+                purpose="visual_judge",
                 effort=effort,
                 prompt=prompt,
                 cwd=self.project_root,
@@ -39973,15 +40039,19 @@ class Orchestrator:
 
         try:
             for attempt in range(1, attempts + 1):
+                if attempt > 1:
+                    from .reporting import _label
+                    self.reporter.emit("stage.retry", stage=_label(stage, self.reporter.language), attempt=attempt)
                 attempt_prompt = prompt
                 if feedback:
-                    attempt_prompt = f"{prompt}\n\nPrevious attempt issues:\n{feedback}\n"
+                    attempt_prompt = append_context(prompt, feedback, "Previous attempt issues")
 
                 artifact_stage = stage_key if attempt == 1 else f"{stage_key}-attempt-{attempt}"
                 output_path = self._stage_output_path(active_run_id, artifact_stage)
                 write_run_prompt(self.project_root, active_run_id, artifact_stage, attempt_prompt)
                 request = AgentRequest(
                     stage=stage,
+                    purpose=("clarify_converse" if restorable_clarify_conversation else stage),
                     effort=resolved_effort,
                     prompt=attempt_prompt,
                     cwd=self.project_root,
@@ -39989,6 +40059,13 @@ class Orchestrator:
                     stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
                     attempt_id=artifact_stage,
                 )
+                if request.prompt_spec is not None and state is not None:
+                    policy = state.resume_context.get("authorization_policy", {})
+                    if policy:
+                        request = replace(request, prompt_spec=replace(request.prompt_spec, blocks=(
+                            *request.prompt_spec.blocks,
+                            PromptBlock("Workflow policy for new decisions (this invocation already authorizes its stage-permitted task actions): " + json.dumps(policy, sort_keys=True), "stage.authorization"),
+                        )))
                 with log_timing(self.logger, f"agent:{artifact_stage} attempt={attempt}"):
                     result = self._call_with_failover(request)
                 if result.usage is not None:
@@ -40187,11 +40264,13 @@ class Orchestrator:
         if result.stderr and not result.streamed_stderr:
             sections.append(f"[stderr]\n{result.stderr.strip()}")
         self.logger.info("\n\n".join(sections))
+        self.reporter.text("\n\n".join(sections))
 
     def _emit_stage_start(self, stage: str) -> None:
         model = self._model_label_for_top_level_stage(stage)
         self.logger.info(f"[stage:{stage}] start provider={self._current_provider} model={model}")
         self._record_health_control("stage_start", stage=stage)
+        self.reporter.stage(stage)
 
     def _emit_stage_verify_result(self, decision: str, summary: str, route: str = "") -> None:
         header = f"[stage:verify] decision={decision}"
@@ -40201,10 +40280,16 @@ class Orchestrator:
         if summary.strip():
             sections.append(summary.strip())
         self.logger.info("\n".join(sections))
+        if decision == "pass":
+            self.reporter.emit("verify.passed")
+        else:
+            from .reporting import _label
+            self.reporter.emit("verify.failed", route=_label(route or "pending", self.reporter.language))
 
     def _emit_plan_task_count(self, tasks: Iterable[TaskSpec]) -> None:
         task_list = list(tasks)
         self.logger.info(f"[stage:plan] tasks={len(task_list)}")
+        self.reporter.plan(task_list)
 
     def _emit_agent_metrics(
         self,
@@ -40244,15 +40329,18 @@ class Orchestrator:
 
     def _emit_task_activity(self, task: TaskSpec, action: str, attempt: int) -> None:
         self.logger.info(f"[task:{task.task_id}] {action} attempt={attempt} title={task.title}")
+        self.reporter.task(task.task_id, task.title, action, attempt)
 
     def _emit_task_blocked(self, task: TaskSpec, reason: str) -> None:
         self.logger.info(f"[task:{task.task_id}] blocked reason={reason}")
+        self.reporter.emit("task.blocked", title=task.title, task_id=task.task_id)
 
     def _emit_task_review_result(self, task: TaskSpec, decision: str, summary: str) -> None:
         sections = [f"[task:{task.task_id}] review decision={decision}"]
         if summary.strip():
             sections.append(summary.strip())
         self.logger.info("\n".join(sections))
+        self.reporter.task_result(task.task_id, task.title, "review", decision)
 
     @staticmethod
     def _normalize_verify_failure_ids(failure_ids: Iterable[str], reason: str) -> List[str]:
@@ -40685,6 +40773,7 @@ class Orchestrator:
         if summary.strip():
             sections.append(summary.strip())
         self.logger.info("\n".join(sections))
+        self.reporter.task_result(task.task_id, task.title, "verify", decision)
 
     def _emit_task_visual_judge_result(self, task: TaskSpec, decision: str, summary: str) -> None:
         sections = [f"[task:{task.task_id}] visual_judge decision={decision}"]
@@ -40713,20 +40802,28 @@ class Orchestrator:
         return ""
 
     def _stream_agent_output_callback(self, stage_key: str) -> Callable[[str, str], None]:
-        line_starts = {"stdout": True, "stderr": True}
+        pending = {"stdout": "", "stderr": ""}
+        self.reporter.presenter.configure(self.reporter.presenter.mode, True)
 
         def stream_output(stream_name: str, chunk: str) -> None:
             if not chunk:
                 return
-            prefix = f"[agent:{stage_key}:{stream_name}] "
-            parts = chunk.splitlines(keepends=True)
-            for part in parts:
-                if line_starts.get(stream_name, True):
-                    self.agent_output_stream.write(prefix)
-                self.agent_output_stream.write(part)
-                line_starts[stream_name] = part.endswith("\n")
-            self.agent_output_stream.flush()
+            text = pending.get(stream_name, "") + chunk
+            lines = text.splitlines(keepends=True)
+            pending[stream_name] = ""
+            for line in lines:
+                if line.endswith(("\n", "\r")):
+                    self.reporter.text(f"[agent:{stage_key}:{stream_name}] {line.rstrip()}")
+                else:
+                    pending[stream_name] = line
 
+        def finish() -> None:
+            for stream_name, line in pending.items():
+                if line:
+                    self.reporter.text(f"[agent:{stage_key}:{stream_name}] {line}")
+            pending.clear()
+
+        stream_output.finish = finish
         return stream_output
 
     def _model_label_for_top_level_stage(self, stage: str) -> str:
@@ -41128,6 +41225,9 @@ class Orchestrator:
                 snippet,
                 max(0, int(health_state.next_probe_at - self._provider_now())),
             )
+            reporter = getattr(self, "reporter", None)
+            if reporter is not None:
+                reporter.emit("provider.recovering")
             last_error = result.stderr or result.summary or "unknown error"
 
         raise RuntimeError(
@@ -41173,12 +41273,44 @@ class Orchestrator:
                 matches.append((updated, provider))
         return max(matches)[1] if matches else ""
 
+    def _prepare_prompt_request(self, adapter: AgentAdapter, request: AgentRequest) -> AgentRequest:
+        if request.prompt_spec is None:
+            return request
+        from .prompting import ProviderRuntime
+        mode = getattr(getattr(self.config, "prompting", None), "model_adaptation", "auto")
+        request = replace(request, model_adaptation=mode)
+        describe = getattr(adapter, "describe_runtime", None)
+        runtime = describe(request) if callable(describe) else ProviderRuntime()
+        return prepare_request(request, runtime)
+
+    @staticmethod
+    def _write_prompt_attempt(request: AgentRequest) -> None:
+        if not request.prompt_metadata or not request.progress_report_path:
+            return
+        write_text(request.progress_report_path.with_suffix(".prompt.txt"), str(request.prompt))
+        write_json(request.progress_report_path.with_suffix(".prompt.json"), dict(request.prompt_metadata))
+
+    @staticmethod
+    def _prompt_handoff(request: AgentRequest, handoff: str, session_id: str) -> AgentRequest:
+        spec = request.prompt_spec
+        if spec is not None and not session_id:
+            spec = replace(spec, contexts=(*spec.contexts, ContextBlock(handoff, "Recovery progress")))
+        return replace(
+            request, prompt=handoff if session_id else f"{request.prompt}\n\n{handoff}",
+            prompt_spec=spec, prompt_metadata={},
+            resume_session_id=session_id,
+            resume_prompt_hash=str(request.prompt_metadata.get("compatibility_hash", "")),
+            prompt_is_continuation=bool(session_id),
+            prompt_continuation=handoff if session_id else "",
+        )
+
     def _run_provider_with_smart_recovery(
         self,
         adapter: AgentAdapter,
         request: AgentRequest,
         provider: str,
     ) -> AgentResult:
+        request = self._prepare_prompt_request(adapter, request)
         resume_count = 0
         provider_request = self._provider_request_for_attempt(
             request,
@@ -41190,7 +41322,20 @@ class Orchestrator:
         if resume_match:
             resume_count = int(resume_match.group(1))
         while True:
+            provider_request = self._prepare_prompt_request(adapter, provider_request)
+            self._write_prompt_attempt(provider_request)
+            call_started = time.monotonic()
             result = adapter.run(provider_request)
+            if provider_request.prompt_metadata:
+                if not result.prompt_metadata:
+                    result = replace(result, prompt_metadata=dict(provider_request.prompt_metadata))
+                metadata = {**result.prompt_metadata, "ok": result.ok,
+                            "duration_seconds": time.monotonic() - call_started}
+                if result.usage is not None:
+                    metadata["usage"] = asdict(result.usage)
+                if provider_request.progress_report_path:
+                    write_json(provider_request.progress_report_path.with_suffix(".prompt.json"), metadata)
+
             reason = result.termination.reason if result.termination is not None else ""
             if reason == "health_quiesce":
                 triage = self._process_health_action()
@@ -41210,11 +41355,7 @@ class Orchestrator:
                 handoff = self._smart_timeout_handoff(result, reason)
                 session_id = result.provider_session_id
                 provider_request = self._provider_request_for_attempt(
-                    replace(
-                        request,
-                        prompt=(handoff if session_id else f"{request.prompt}\n\n{handoff}"),
-                        resume_session_id=session_id,
-                    ),
+                    self._prompt_handoff(provider_request, handoff, session_id),
                     provider=provider,
                     resume_index=resume_count,
                     allow_interrupted_resume=False,
@@ -41253,11 +41394,7 @@ class Orchestrator:
                 )
                 prompt = handoff if session_id else f"{request.prompt}\n\n{handoff}"
                 provider_request = self._provider_request_for_attempt(
-                    replace(
-                        request,
-                        prompt=prompt,
-                        resume_session_id=session_id,
-                    ),
+                    self._prompt_handoff(provider_request, handoff, session_id),
                     provider=provider,
                     resume_index=resume_count,
                     allow_interrupted_resume=False,
@@ -41377,6 +41514,7 @@ class Orchestrator:
         resume_session_id = request.resume_session_id
         prompt = request.prompt
         interrupted_resume = False
+        resume_prompt_hash = request.resume_prompt_hash
         payload: object = {}
         if allow_interrupted_resume:
             candidates = sorted(
@@ -41419,10 +41557,18 @@ class Orchestrator:
                     current_fingerprint = worktree_fingerprint(request.cwd)
                 except Exception:
                     current_fingerprint = ""
-                if payload.get("workspace_fingerprint") == current_fingerprint:
+                prompt_compatible = (
+                    request.prompt_spec is None or (
+                        request.prompt_metadata.get("compatibility_hash")
+                        and payload.get("prompt_metadata", {}).get("compatibility_hash")
+                        == request.prompt_metadata.get("compatibility_hash")
+                    )
+                )
+                if payload.get("workspace_fingerprint") == current_fingerprint and prompt_compatible:
                     resume_session_id = str(payload.get("session_id", ""))
                     if resume_session_id:
                         interrupted_resume = True
+                        resume_prompt_hash = str(request.prompt_metadata.get("compatibility_hash", ""))
                         prompt = self._interrupted_provider_handoff(payload)
                         self.logger.info(
                             "[smart-timeout] provider=%s action=resume-interrupted session=%s",
@@ -41439,6 +41585,8 @@ class Orchestrator:
             attempt_id=f"{attempt_id}:{provider}:{resume_index}",
             progress_report_path=report_path,
             resume_session_id=resume_session_id,
+            resume_prompt_hash=resume_prompt_hash,
+            prompt_is_continuation=interrupted_resume or request.prompt_is_continuation,
             termination_probe=self._health_termination_probe,
         )
 

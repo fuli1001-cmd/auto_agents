@@ -255,7 +255,10 @@ python3 -m auto_agents sync-agent-instructions --project /tmp/demo
 
 `sync-agent-instructions` uses the configured provider to normalize the human-readable source into
 `.auto-agents/project-rules.normalized.json`, then renders concise agent-facing rules from that
-structured file instead of copying the whole document into provider context. The normalization stage
+structured file instead of copying the whole document into provider context.
+The complete generated contract is retained in `.auto-agents/project-rules.agent.md`;
+native entry files reference it, and Antigravity also receives an always-on
+`.agents/rules/auto-agents.md`. Human-written content outside managed blocks is preserved. The normalization stage
 uses `efforts.sync-agent-instructions` when configured, otherwise it falls back to `efforts.plan`.
 If `.auto-agents/project-rules.md` is empty or clearly placeholder text, auto_agents skips the LLM
 call and emits only the default engineering rules.
@@ -468,6 +471,20 @@ Run the real Codex provider demo:
 ```bash
 ./examples/run_codex_demo.sh
 ```
+
+## Prompt policies
+
+Prompt policy v2 separates real stage duties from effort routing, renders a small
+model-specific supplement after provider selection, and keeps required machine
+output complete even when the human summary is short. Native model configuration
+remains authoritative. Unknown models use the generic policy.
+
+`prompting.model_adaptation` defaults to `auto`; set it to `generic` to disable
+model supplements. Resumed workflows use the new policy at their next call while
+retaining task progress; incompatible native conversations are rebuilt.
+See [prompt policies and evaluation](docs/prompting.md) for native configuration
+resolution, rule-file synchronization, attempt diagnostics and the explicit CLI
+comparison command.
 
 ## Provider model
 
@@ -1188,8 +1205,39 @@ the next batch's concurrency instead of incorrectly scaling it up. Integration m
 in the run state's `resume_context.parallel_integration_metrics` object.
 For `copilot-cli`, `subscription_tier` can also be set to `pro+`.
 
-Run logs are written both to stderr and to `.auto-agents/runs/<run_id>/run.log`. CLI command results
-remain on stdout for scripts.
+Foreground workflows show timestamped user logs on stderr. By default, interactive terminals also
+show the current goal, stages, active tasks and a task progress bar; redirected output is plain text.
+The bar counts completed tasks in the **current accepted plan**, not elapsed time or a forecast.
+Plan changes explain changes to the denominator. Retries do not count as new tasks, and parallel
+work counts as complete only after the controller accepts its integration. Stage rewinds explicitly
+invalidate affected stages. Sessions without a task plan show their current operation instead.
+
+Use `--log-mode plain` to disable the live display or `--log-mode debug` to print technical
+diagnostics. `--print-agent-output` additionally expands visible Agent output and disables the live
+display. These choices are inherited by nested workflows and automatic recovery. Built-in user
+messages follow `docs.language`; Agent replies remain verbatim. Questions and confirmations remain
+visible in concise mode. CLI command results remain on stdout for scripts.
+
+Diagnostics are collected even in concise mode. The startup message links to `diagnostics.json`:
+
+- Runs use `.auto-agents/runs/<run_id>/`; sessions use
+  `.auto-agents/state/sessions/<session_id>/logs/`.
+- `user.log` records user events; `events.jsonl` records structured execution and diagnostic events.
+- `run.log` retains the detailed legacy messages with UTC timestamps. Self-repair reads the original
+  message bodies before applying its evidence limits; display refreshes never enter this file.
+- `diagnostic-output/<capture_id>/` contains redacted output and `attempt.json` with command,
+  execution identity, exit status and capture mode. Gate output is archived before the returned tail
+  is truncated. Provider output is captured live when its existing transport streams, or at completion
+  when it uses buffered transport.
+- For LAN gates, the controller retains received output and the worker/job identity. Full worker
+  output is retained under `<worker managed_root>/diagnostic-output/<job_id>/`. Local gates without
+  a foreground reporter use `<auto_agents state home>/diagnostic-output/<plan_id>/<job_id>/`
+  so diagnostics cannot change an arbitrary target repository's snapshot or cache identity.
+
+Logs have no terminal control sequences. The index links related subjects and attempts, and selected
+output evidence is copied into private diagnosis and repair snapshots. New diagnostic output has no
+automatic deletion policy. Display failures degrade to plain output; recording failures report that
+diagnostics are incomplete. Neither display mode nor refreshes renew health or provider leases.
 
 ## Enterprise WeChat notifications
 

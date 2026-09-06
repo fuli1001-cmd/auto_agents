@@ -102,7 +102,8 @@ class ImplementPipelineTests(unittest.TestCase):
             )
 
             prompt = orchestrator._build_task_prompt(task, "implement")
-            self.assertIn("MUST also write or update tests", prompt)
+            self.assertIn("Reuse sufficient existing coverage", prompt)
+            self.assertIn("coverage is missing or explicitly required", prompt)
             self.assertIn("observable behavior", prompt)
             self.assertIn("same API fields", prompt)
             self.assertIn("internal failure reasons/error codes", prompt)
@@ -155,8 +156,8 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn(".auto-agents/docs/provider_references/doubao_tts.md", prompt)
             self.assertIn("Do not search for alternate docs", prompt)
             self.assertIn("requirement_proofs", prompt)
-            self.assertIn("evidence_refs", prompt)
             self.assertIn("This task has no local requirement_proofs", prompt)
+            self.assertNotIn("For frontend/prototype visual fidelity proofs", prompt)
             self.assertNotIn("set status='verified'", prompt)
 
     def test_implement_prompt_includes_task_status_migration_context(self) -> None:

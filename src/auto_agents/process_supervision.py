@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -314,9 +315,30 @@ def run_supervised_shell_command(
     heartbeat_seconds: float = 60.0,
     progress: Optional[Callable[[str, float], None]] = None,
     on_start: Optional[Callable[[int, int], None]] = None,
+    diagnostic_output: object = None,
 ) -> SupervisedCommandResult:
     """Run one shell command with an absolute ceiling and optional activity lease."""
     started = time.monotonic()
+    if diagnostic_output is None:
+        from .reporting import find_reporter
+        reporter = find_reporter(cwd)
+        if reporter is not None:
+            diagnostic_output = reporter.capture(kind=kind, cwd=str(cwd))
+    if diagnostic_output is not None:
+        try:
+            diagnostic_output.start(command, env or {}, cwd=str(cwd), capture_mode="file",
+                                    timeout_seconds=timeout_seconds)
+        except Exception:
+            pass
+
+    def capture_files(stdout_file, stderr_file, **metadata: object) -> None:
+        if diagnostic_output is not None:
+            try:
+                diagnostic_output.file("stdout", stdout_file)
+                diagnostic_output.file("stderr", stderr_file)
+                diagnostic_output.finish(**metadata)
+            except Exception:
+                pass
     with tempfile.TemporaryFile(mode="w+b") as stdout_file, \
             tempfile.TemporaryFile(mode="w+b") as stderr_file:
         try:
@@ -330,6 +352,8 @@ def run_supervised_shell_command(
                 start_new_session=True,
             )
         except OSError as error:
+            capture_files(stdout_file, stderr_file, status="launch_error", error=str(error), returncode=127,
+                          traceback=traceback.format_exc())
             return SupervisedCommandResult(
                 stdout="",
                 stderr=str(error),
@@ -417,9 +441,11 @@ def run_supervised_shell_command(
                     **residual_snapshot,
                     "post_exit_cleanup": post_exit_cleanup,
                 }
-        except BaseException:
+        except BaseException as error:
             terminated = terminate_process_group(process, pgid=pgid)
             cleanup_incomplete = terminated.cleanup_incomplete
+            capture_files(stdout_file, stderr_file, status="interrupted", error=str(error),
+                          traceback=traceback.format_exc())
             raise
         finally:
             ACTIVE_PROCESSES.unregister(
@@ -427,6 +453,8 @@ def run_supervised_shell_command(
                 preserve_if_alive=cleanup_incomplete,
             )
 
+        capture_files(stdout_file, stderr_file, returncode=int(returncode),
+                      termination_reason=termination_reason, cleanup_incomplete=cleanup_incomplete)
         stdout = _bounded_output(stdout_file).strip()
         stderr = _bounded_output(stderr_file).strip()
         elapsed = time.monotonic() - started

@@ -41,6 +41,7 @@ def test_antigravity_build_command():
         binary="agy",
         timeout_seconds=600,
         extra_args=["--sandbox"],
+        profile_map={},
     )
     adapter = AntigravityAdapter(config)
     request = AgentRequest(

@@ -1697,6 +1697,13 @@ def worker_execute(
                         runtime_profile=runtime_profile,
                         dynamic_ports=dynamic_ports,
                     )
+                    from .diagnostic_output import OutputCapture
+                    capture = OutputCapture(
+                        config.managed_root / "diagnostic-output" / job_id,
+                        {"kind": "gate-worker", "job_id": job_id, "worker_id": config.worker_id},
+                        register=lambda path, metadata: None,
+                        failed=lambda error: LOGGER.warning("Worker diagnostic output could not be saved: %s", error),
+                    )
                     process = run_supervised_shell_command(
                         isolated_command(command),
                         cwd=sandbox,
@@ -1715,6 +1722,7 @@ def worker_execute(
                         on_start=on_start,
                         kind="gate-worker",
                         cancel_event=cancel_event,
+                        diagnostic_output=capture,
                     )
             mutations = _worker_mutations(sandbox, list(links))
             stderr = redact_values(process.stderr, list(forwarded.values()))

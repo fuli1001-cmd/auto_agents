@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from threading import Event, Thread
@@ -15,9 +16,27 @@ from ..process_supervision import (
     terminate_process_group,
 )
 from ..supervision import ProgressDecoder, ProgressSupervisor
+from ..reporting import find_reporter
 
 
 class AgentAdapter(ABC):
+    def describe_runtime(self, request: AgentRequest):
+        from ..prompting import ProviderRuntime
+        from ..prompting.runtime import resolve_runtime
+        config = getattr(self, "config", None)
+        return resolve_runtime(config, request) if config is not None else ProviderRuntime()
+
+    def prepare_request(self, request: AgentRequest) -> AgentRequest:
+        from ..prompting import prepare_request
+        if request.prompt_spec is None:
+            return request
+        prepared = prepare_request(request, self.describe_runtime(request))
+        if prepared.progress_report_path is not None:
+            from ..io_utils import write_json, write_text
+            write_text(prepared.progress_report_path.with_suffix(".prompt.txt"), str(prepared.prompt))
+            write_json(prepared.progress_report_path.with_suffix(".prompt.json"), dict(prepared.prompt_metadata))
+        return prepared
+
     def supports_image_attachments(self) -> bool:
         """Return whether this adapter can attach image files to a request.
 
@@ -94,19 +113,53 @@ def run_subprocess_with_optional_streaming(
     send nothing (e.g. when the prompt is passed via command-line args).
     """
     actual_stdin = stdin_input if stdin_input is not None else request.prompt
+    observer = request.diagnostic_output
+    if observer is None:
+        reporter = find_reporter(request.cwd)
+        if reporter is not None:
+            observer = reporter.capture(stage=request.stage, attempt_id=request.attempt_id,
+                                        kind="provider", provider=provider)
+    def observe(stream_name: str, chunk: str) -> None:
+        if observer is not None:
+            try:
+                observer(stream_name, chunk)
+            except Exception:
+                pass
 
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        bufsize=1,
-        cwd=str(request.cwd),
-        env=env,
-        start_new_session=True,
-    )
+    def finish_capture(**metadata: object) -> None:
+        finish = getattr(observer, "finish", None)
+        if callable(finish):
+            try:
+                finish(**metadata)
+            except Exception:
+                pass
+
+    def finish_visible() -> None:
+        finish = getattr(request.stream_output, "finish", None)
+        if callable(finish):
+            try:
+                finish()
+            except Exception:
+                pass
+
+    start_capture = getattr(observer, "start", None)
+    if callable(start_capture):
+        try:
+            start_capture(command, env, cwd=str(request.cwd), provider=provider,
+                          capture_mode="live" if request.stream_transport or request.stream_output is not None
+                          or (smart_timeout and smart_timeout.enabled) else "completion")
+        except Exception:
+            pass
+
+    try:
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", bufsize=1, cwd=str(request.cwd), env=env,
+            start_new_session=True,
+        )
+    except BaseException as error:
+        finish_capture(status="launch_error", error=str(error), traceback=traceback.format_exc())
+        raise
     ACTIVE_PROCESSES.register(process, kind=f"provider:{provider or 'agent'}")
 
     smart_enabled = bool(smart_timeout and smart_timeout.enabled)
@@ -115,7 +168,7 @@ def run_subprocess_with_optional_streaming(
         # loop detection, and the smart-timeout safety ceiling. Keep the supplied
         # timeout as the legacy fallback when smart supervision is disabled.
         timeout = None
-    if request.stream_output is None and not smart_enabled:
+    if request.stream_output is None and not request.stream_transport and not smart_enabled:
         # Non-streaming: collect all output at once.
         try:
             stdout, stderr = process.communicate(input=actual_stdin, timeout=timeout)
@@ -129,6 +182,9 @@ def run_subprocess_with_optional_streaming(
                 process.pid,
                 preserve_if_alive=termination_result.cleanup_incomplete,
             )
+            observe("stdout", stdout or "")
+            observe("stderr", stderr or "")
+            finish_capture(status="terminated", termination_reason="timed_out", returncode=-1)
             return SubprocessRunResult(
                 stdout or "",
                 (stderr or "") + f"\ntimed out after {timeout}s",
@@ -136,14 +192,19 @@ def run_subprocess_with_optional_streaming(
                 False,
                 False,
             )
-        except BaseException:
+        except BaseException as error:
             termination_result = _kill_process_group(process)
             ACTIVE_PROCESSES.unregister(
                 process.pid,
                 preserve_if_alive=termination_result.cleanup_incomplete,
             )
+            finish_capture(status="interrupted", error=str(error), traceback=traceback.format_exc(),
+                           output_complete=False)
             raise
         ACTIVE_PROCESSES.unregister(process.pid)
+        observe("stdout", stdout or "")
+        observe("stderr", stderr or "")
+        finish_capture(returncode=process.returncode)
         return SubprocessRunResult(
             stdout or "", stderr or "", process.returncode, False, False
         )
@@ -176,6 +237,7 @@ def run_subprocess_with_optional_streaming(
             last_activity[0] = time.monotonic()
             if supervisor is not None:
                 supervisor.observe_io(stream_name, chunk)
+            observe(stream_name, chunk)
             if request.stream_output is not None:
                 streamed[stream_name] = True
                 request.stream_output(stream_name, chunk)
@@ -260,7 +322,7 @@ def run_subprocess_with_optional_streaming(
             time.sleep(1)
         if stdin_errors:
             raise stdin_errors[0]
-    except BaseException:
+    except BaseException as error:
         termination_reason = "external_interrupt"
         termination_result = _kill_process_group(process)
         if supervisor is not None:
@@ -269,6 +331,11 @@ def run_subprocess_with_optional_streaming(
             process.pid,
             preserve_if_alive=termination_result.cleanup_incomplete,
         )
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        finish_capture(status="interrupted", error=str(error), traceback=traceback.format_exc(),
+                       output_complete=False)
+        finish_visible()
         raise
     finally:
         done_event.set()
@@ -331,6 +398,9 @@ def run_subprocess_with_optional_streaming(
         process.pid,
         preserve_if_alive=cleanup_incomplete,
     )
+    finish_capture(returncode=returncode, termination_reason=termination_reason,
+                   cleanup_incomplete=cleanup_incomplete)
+    finish_visible()
 
     return SubprocessRunResult(
         "".join(stdout_chunks),

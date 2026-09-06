@@ -239,6 +239,7 @@ class ProgressSupervisor:
             "reason": reason,
             "provider": self.provider,
             "stage": self.request.stage,
+            "prompt_metadata": dict(self.request.prompt_metadata),
             "attempt_id": self.request.attempt_id,
             "cwd": str(self.request.cwd),
             "session_id": self.session_id,

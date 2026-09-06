@@ -15,6 +15,8 @@ from typing import Dict, List, Mapping, Optional
 from .config import run_path, state_dir
 from .git_ops import is_untracked_vim_swap
 from .io_utils import read_json, read_text, write_json
+from .logging_utils import read_diagnostic_log
+from .diagnostic_output import diagnostic_attachments, copy_diagnostic_attachments
 from .models import AgentRequest, AgentResult, RunState, SelfRepairDiagnosisConfig
 from .repair_cases import RepairCase
 
@@ -492,7 +494,7 @@ class TerminalEvidenceCollector:
                 error_text=str(self.error or ""),
             ),
             "run_log": _compact(
-                read_text(run_path(self.target_root, run_id) / "run.log"),
+                read_diagnostic_log(run_path(self.target_root, run_id) / "run.log"),
                 _TEXT_LIMIT,
             ),
             "active_execution_incident": self._active_execution_incident(
@@ -514,6 +516,9 @@ class TerminalEvidenceCollector:
             "git_history_evidence": self._git_history_evidence(),
         }
         evidence_path = root / "evidence.json"
+        attachments = diagnostic_attachments(self.target_root, run_id)
+        if attachments:
+            payload["diagnostic_attachments"] = attachments
         redacted = _redact_payload(payload)
         assert isinstance(redacted, dict)
         write_json(evidence_path, redacted)
@@ -741,6 +746,16 @@ class RootCauseCoordinator:
         self.diagnostic_target_root = target_root
 
     def run(self) -> RootCauseDiagnosis:
+        reporter = getattr(getattr(self, "orchestrator", None), "reporter", None)
+        if reporter is not None:
+            reporter.repair("diagnosing")
+        try:
+            return self._run_diagnosis()
+        finally:
+            if reporter is not None:
+                reporter.snapshot.repair = ""
+
+    def _run_diagnosis(self) -> RootCauseDiagnosis:
         diagnosis_id, artifacts, evidence = TerminalEvidenceCollector(
             auto_agents_root=self.auto_agents_root,
             target_root=self.target_root,
@@ -775,6 +790,10 @@ class RootCauseCoordinator:
             # intentionally ephemeral and must never defeat an exact replay.
             certificate_key = self._certificate_key(evidence)
             diagnostic_evidence = self._replace_repository_roots(evidence)
+            if evidence.get("diagnostic_attachments"):
+                diagnostic_evidence["diagnostic_attachments"] = copy_diagnostic_attachments(
+                    evidence["diagnostic_attachments"], self.diagnostic_target_root,
+                )
             cached = self._load_certificate(certificate_key)
             if cached is not None:
                 diagnosis = RootCauseDiagnosis(
@@ -940,7 +959,9 @@ class RootCauseCoordinator:
         return getattr(execution, "acceleration", None)
 
     def _certificate_key(self, evidence: Mapping[str, object]) -> str:
+        from .prompting import policy_fingerprint
         payload = {
+            "prompt_policy_hash": policy_fingerprint(),
             "schema_version": ROOT_CAUSE_SCHEMA_VERSION,
             "auto_agents_head": self._git_head(self.auto_agents_root),
             "target_head": self._git_head(self.target_root),
@@ -967,6 +988,12 @@ class RootCauseCoordinator:
                 for key, item in value.items()
                 if str(key) != "diagnosis_id"
             }
+            if "diagnostic_attachments" in value:
+                canonical["diagnostic_attachments"] = sorted(
+                    ({"sha256": item["sha256"], "kind": item["kind"]}
+                     for item in value["diagnostic_attachments"]),
+                    key=lambda item: (item["kind"], item["sha256"]),
+                )
             if {
                 "root",
                 "head",
@@ -1062,6 +1089,8 @@ class RootCauseCoordinator:
         def ignore(current: str, names: List[str]) -> List[str]:
             current_path = Path(current)
             ignored = [name for name in names if name in ignored_names]
+            if current_path.parent.name == "sessions" and "logs" in names:
+                ignored.append("logs")
             if current_path.name == ".auto-agents":
                 for generated in ("runs", "history"):
                     if generated in names:
@@ -1158,13 +1187,18 @@ class RootCauseCoordinator:
         timeout: int,
     ) -> RootCauseReport:
         output_path = artifacts / f"{role}.json"
+        reporter = getattr(getattr(self, "orchestrator", None), "reporter", None)
         request = AgentRequest(
             stage=f"self_repair_{role}",
+            purpose="diagnosis",
             effort=self._effort(),
             prompt=self._prompt(role=role, evidence=evidence, prior=prior),
             cwd=self.diagnostic_auto_root,
             output_path=output_path,
             attempt_id=f"root-cause-{role}",
+            diagnostic_output=(reporter.capture(
+                stage=f"self_repair_{role}", attempt_id=f"root-cause-{role}", kind="provider",
+            ) if reporter is not None else None),
             sandbox_mode="read-only",
             timeout_seconds=timeout,
             # Root-cause roles diagnose an existing failure. Their provider

@@ -133,5 +133,8 @@
       "implement": 4,
       "review": 2
     }
+  },
+  "prompting": {
+    "model_adaptation": "auto"
   }
 }

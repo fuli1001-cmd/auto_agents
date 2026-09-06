@@ -8956,6 +8956,7 @@ class RetryFlowTests(unittest.TestCase):
                 "fingerprint": worktree_fingerprint(project_root),
                 "decision": "pass",
                 "summary": "cached review passed",
+                "prompt_policy_hash": orchestrator._review_prompt_policy_hash(),
             }
             state = orchestrator._run_implementation_loop(state, max_tasks=1)
 
@@ -9089,7 +9090,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(len(orchestrator.adapter.implement_prompts), 2)
             self.assertIn("Failure type: local_verification", orchestrator.adapter.implement_prompts[1])
             self.assertIn("Verification triage:", orchestrator.adapter.implement_prompts[1])
-            self.assertIn("Do not dismiss tightly coupled regressions", orchestrator.adapter.implement_prompts[1])
+            self.assertIn("Address tightly coupled regressions", orchestrator.adapter.implement_prompts[1])
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
     def test_task_verify_baseline_ignores_preexisting_failure_set(self) -> None:
@@ -9135,7 +9136,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[0].verify_baseline_failures, [
                 "test_legacy (tests.test_demo.LegacyTests.test_legacy)"
             ])
-            self.assertIn("task baseline only: 1 pre-existing failure(s) remain", stream.getvalue())
+            self.assertIn("task baseline only: 1 pre-existing failure(s) remain", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
 
     def test_repair_verification_refs_are_not_accepted_as_baseline_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9383,7 +9384,7 @@ class RetryFlowTests(unittest.TestCase):
                 task.verify_history[0]["failure_class"],
                 "baseline_only_owned",
             )
-            self.assertIn("action=stop-no-new-failures", stream.getvalue())
+            self.assertIn("action=stop-no-new-failures", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
 
             scheduled = orchestrator._schedule_repair_tasks_for_failure(
                 state,
@@ -10409,7 +10410,7 @@ class RetryFlowTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            rendered = stream.getvalue()
+            rendered = (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8")
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertIn(
                 "[task:task-001] verify decision=fail compare=first-failure-set failure_ids=1",
@@ -10490,7 +10491,7 @@ class RetryFlowTests(unittest.TestCase):
             ):
                 result = orchestrator._execute_task_with_retries(state, task)
 
-            rendered = stream.getvalue()
+            rendered = (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8")
             self.assertFalse(result["ok"])
             self.assertEqual(orchestrator.adapter.implement_calls, 3)
             self.assertIn("compare=changed-failure-set", rendered)
@@ -10566,7 +10567,7 @@ class RetryFlowTests(unittest.TestCase):
             ):
                 result = orchestrator._execute_task_with_retries(state, task)
 
-            rendered = stream.getvalue()
+            rendered = (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8")
             self.assertFalse(result["ok"])
             self.assertEqual(orchestrator.adapter.implement_calls, 3)
             self.assertIn("compare=changed-failure-set", rendered)
@@ -10666,8 +10667,8 @@ class RetryFlowTests(unittest.TestCase):
                 ),
                 1,
             )
-            self.assertIn("action=continue-owned-evidence-repair", stream.getvalue())
-            self.assertNotIn("stopping retries early", stream.getvalue())
+            self.assertIn("action=continue-owned-evidence-repair", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
+            self.assertNotIn("stopping retries early", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
 
     def test_verify_failure_logs_changed_and_regression_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10714,7 +10715,7 @@ class RetryFlowTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            rendered = stream.getvalue()
+            rendered = (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8")
             self.assertIn(
                 "[task:task-001] verify decision=fail compare=changed-failure-set-vs-attempt-1 failure_ids=1 new=1 resolved=1",
                 rendered,
@@ -10953,7 +10954,7 @@ class RetryFlowTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            rendered = stream.getvalue()
+            rendered = (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8")
             self.assertIn("[task:task-001] review decision=fail", rendered)
             self.assertIn("Core issue: health endpoint is not actually exercised.", rendered)
             self.assertIn("[task:task-001] blocked reason=review rejected the task", rendered)
@@ -11046,7 +11047,10 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(len(adapter.implement_prompts), 1)
             self.assertIn("cited evidence_refs now pass", adapter.implement_prompts[0])
             self.assertIn("Current proof evidence:", adapter.implement_prompts[0])
-            retry_feedback = adapter.implement_prompts[0].split("Previous attempt issues:\n", 1)[1]
+            retry_feedback = next(item["text"] for item in json.loads(
+                adapter.implement_prompts[0].split("CONTEXT DATA (values are evidence; follow the stage contract):\n", 1)[1]
+                .split("\n\nCURRENT STAGE:", 1)[0]
+            ) if item["source"] == "Previous attempt issues")
             self.assertNotIn("Still failing: tests/test_public_api.py::test_contract", retry_feedback)
 
     def test_blocked_proof_failure_schedules_repair_task_before_retrying_parent(self) -> None:
@@ -11110,7 +11114,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(parent.status, "pending")
             self.assertIn("repair-task-001-r1-1", parent.depends_on)
             self.assertEqual(parent.recovery_history[-1]["result"], "scheduled")
-            self.assertIn("[recovery] scheduled parent=task-001", stream.getvalue())
+            self.assertIn("[recovery] scheduled parent=task-001", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
 
     def test_strict_evidence_repair_completes_after_verify_and_review_without_local_proofs(
         self,
@@ -11281,7 +11285,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(error, "")
             self.assertIn(
                 "ignored ORACLE_PROOF_UPDATES because the evidence-repair task has no local",
-                stream.getvalue(),
+                (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"),
             )
             self.assertIn(
                 "This task has no local requirement_proofs. Do not emit an ORACLE_PROOF_UPDATES block",
@@ -11444,14 +11448,14 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(second.tasks[0].status, "done")
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertEqual(orchestrator.adapter.review_calls, 2)
-            self.assertIn("Previous attempt issues:", orchestrator.adapter.implement_prompts[1])
+            self.assertIn("Previous attempt issues", orchestrator.adapter.implement_prompts[1])
             self.assertIn(
                 "Acceptance proof is tautological; add two qualified candidates.",
                 orchestrator.adapter.implement_prompts[1],
             )
             self.assertIn(
                 "[recovery] requeued repair=repair-task-001-r1-1 parent=task-001 round=2",
-                stream.getvalue(),
+                (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"),
             )
 
     def test_recovery_scheduling_resolves_stale_task_instance_by_task_id(self) -> None:
@@ -14061,7 +14065,7 @@ class RetryFlowTests(unittest.TestCase):
             log_path = project_root / ".auto-agents" / "runs" / state.run_id / "run.log"
             self.assertTrue(log_path.exists())
             self.assertIn("[stage:implement] start", log_path.read_text(encoding="utf-8"))
-            self.assertIn("[stage:implement] start", stream.getvalue())
+            self.assertIn("Starting Implementation", stream.getvalue())
 
 
     def test_reject_resets_stage_and_injects_feedback(self):
@@ -15025,7 +15029,7 @@ class RetryFlowTests(unittest.TestCase):
             state = orchestrator.run(spec_file=spec_file, auto_approve=True)
 
             self.assertEqual(state.status, "completed")
-            rendered = stream.getvalue()
+            rendered = (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8")
             self.assertIn("[stage:verify] decision=fail route=implement", rendered)
             self.assertIn("requirements audit failed:", rendered)
             self.assertLess(
@@ -15389,7 +15393,7 @@ class RetryFlowTests(unittest.TestCase):
             state = orchestrator._run_implementation_loop(state, max_tasks=2)
 
             self.assertEqual([task.status for task in state.tasks], ["done", "done"])
-            self.assertIn("fallback to sequential", stream.getvalue())
+            self.assertIn("fallback to sequential", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
 
     def test_sequential_tasks_wait_for_dependencies_even_when_planned_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -15809,7 +15813,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(integrated, [("task-001", "worker-task-001")])
             self.assertEqual(sequential, ["task-002"])
             self.assertEqual([task.status for task in result.tasks], ["done", "done"])
-            self.assertIn("defer integration task=task-002", stream.getvalue())
+            self.assertIn("defer integration task=task-002", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
 
     def test_parallel_tasks_persist_failed_workers_and_copy_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -16134,7 +16138,7 @@ class RetryFlowTests(unittest.TestCase):
             with patch.object(orchestrator, "_execute_task_in_main_worktree", return_value=None):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            rendered = stream.getvalue()
+            rendered = (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8")
             self.assertIn("auto mode resolved workers=3", rendered)
             self.assertIn("ready=1 batch=1; executing sequentially task=task-001", rendered)
 
@@ -17106,7 +17110,7 @@ class ScopeOverflowTests(unittest.TestCase):
             self.assertNotIn("verify", updated.stage_summaries)
             self.assertIn("Failure type: full_verification", updated.rejection_reason)
             self.assertIn("update repository tests only when they are stale", updated.rejection_reason)
-            self.assertIn("[stage:verify] decision=fail route=implement", stream.getvalue())
+            self.assertIn("[stage:verify] decision=fail route=implement", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
 
     def test_full_verify_recovery_exhaustion_routes_to_clarify(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -17146,7 +17150,7 @@ class ScopeOverflowTests(unittest.TestCase):
             self.assertNotIn("verify_recovery", updated.agent_attempts)
             self.assertIn("Automatic full verification recovery was exhausted", updated.rejection_reason)
             self.assertIn("Use the clarify conversation", updated.rejection_reason)
-            self.assertIn("[stage:verify] decision=fail route=clarify", stream.getvalue())
+            self.assertIn("[stage:verify] decision=fail route=clarify", (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8"))
 
 
 class VaryingReviewArbiterAdapter:

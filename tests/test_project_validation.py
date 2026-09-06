@@ -426,7 +426,12 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(command[2], "resume")
             workflow_flag = command.index("--workflow")
             self.assertEqual(command[workflow_flag + 1], "workflow-parent")
-            self.assertIn("--print-agent-output", command)
+            self.assertNotIn("--print-agent-output", command)
+            args.print_agent_output = True
+            args.log_mode = "plain"
+            expanded = _run_command_for_self_repair_resume(args)
+            self.assertIn("--print-agent-output", expanded)
+            self.assertEqual(expanded[expanded.index("--log-mode") + 1], "plain")
 
     def test_removed_self_repair_budget_fields_fail_during_config_load(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_candidates_per_root was removed"):
@@ -3137,7 +3142,11 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(runner_calls["count"], 1)
             self.assertIn("Starting automatic auto_agents self-repair", stderr.getvalue())
-            self.assertIn("Resuming run without a new repair", stderr.getvalue())
+            self.assertIn("preparing to resume the original task", stderr.getvalue())
+            self.assertTrue(any(
+                "Resuming run without a new repair" in path.read_text(encoding="utf-8")
+                for path in (project_root / ".auto-agents/runs").rglob("events.jsonl")
+            ))
             notify_self_repair.assert_called_once()
             self.assertEqual(
                 notify_self_repair.call_args.kwargs["status"],
@@ -4436,9 +4445,11 @@ class ProjectValidationTests(unittest.TestCase):
             )
 
             rendered = stream.getvalue()
-            self.assertIn("[agent:clarify] completed", rendered)
-            self.assertIn("model=profile:h", rendered)
-            self.assertIn("tokens=input=120 cached_input=30 output=10 total=130", rendered)
+            self.assertNotIn("model=profile:h", rendered)
+            diagnostic = (orchestrator.reporter.root / "run.log").read_text(encoding="utf-8")
+            self.assertIn("[agent:clarify] completed", diagnostic)
+            self.assertIn("model=profile:h", diagnostic)
+            self.assertIn("tokens=input=120 cached_input=30 output=10 total=130", diagnostic)
             self.assertNotIn("stage output", rendered)
 
     def test_orchestrator_streams_agent_output_chunks_when_adapter_supports_it(self) -> None:
@@ -4543,7 +4554,10 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertEqual(state.status, "paused")
             rendered = stream.getvalue()
-            self.assertIn("[stage:clarify] start provider=mock model=mock", rendered)
+            self.assertIn("Starting Requirements", rendered)
+            self.assertNotIn("provider=mock", rendered)
+            self.assertIn("[stage:clarify] start provider=mock model=mock",
+                          (orchestrator.reporter.root / "run.log").read_text())
 
     def test_plan_stage_emits_task_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4587,7 +4601,8 @@ class ProjectValidationTests(unittest.TestCase):
             orchestrator._run_agent_stage("plan", state, spec_file)
 
             rendered = stream.getvalue()
-            self.assertIn("[stage:plan] tasks=1", rendered)
+            self.assertIn("Current plan: 1 tasks", rendered)
+            self.assertIn("[stage:plan] tasks=1", (orchestrator.reporter.root / "run.log").read_text())
 
     def test_valid_plan_artifact_is_reconciled_after_retry_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5106,10 +5121,13 @@ class ProjectValidationTests(unittest.TestCase):
             orchestrator._execute_task_with_retries(state, task)
 
             rendered = stream.getvalue()
-            self.assertIn("[task:task-001] implement attempt=1 title=Build health endpoint", rendered)
-            self.assertIn("[task:task-001] review attempt=1 title=Build health endpoint", rendered)
-            self.assertIn("[task:task-001] review decision=pass", rendered)
-            self.assertIn("looks good", rendered)
+            self.assertIn("Build health endpoint: Implementation, attempt 1", rendered)
+            self.assertIn("Build health endpoint: Review passed", rendered)
+            diagnostic = (orchestrator.reporter.root / "run.log").read_text()
+            self.assertIn("[task:task-001] implement attempt=1 title=Build health endpoint", diagnostic)
+            self.assertIn("[task:task-001] review attempt=1 title=Build health endpoint", diagnostic)
+            self.assertIn("[task:task-001] review decision=pass", diagnostic)
+            self.assertIn("looks good", diagnostic)
 
     def test_codex_adapter_parses_usage_from_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5751,6 +5769,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "state/checkpoint_blobs/\nstate/root_cause_certificates/\n"
                 "state/sessions/*/prompts/\nstate/sessions/*/outputs/\n"
                 "state/sessions/*/health/\n"
+                "state/sessions/*/logs/\n"
                 "state/sessions/*/performance_trace.jsonl\n"
                 "state/workflows/*/checkpoints/\n"
                 "state/workflows/*/event_index.sqlite3\n"

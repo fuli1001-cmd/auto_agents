@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from .repomap.config import RepoMapConfig
+from .prompting import PromptingConfig, PromptSpec
 
 
 STAGE_ORDER = ["clarify", "prototype", "design", "plan", "provider_research", "implement", "visual_judge", "verify", "readme"]
@@ -1626,6 +1627,7 @@ class ProjectConfig:
         }
     )
     active_provider: str = "codex"
+    prompting: PromptingConfig = field(default_factory=PromptingConfig)
     docs: DocsConfig = field(default_factory=DocsConfig)
     efforts: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_EFFORTS))
     gates: GateConfig = field(default_factory=GateConfig)
@@ -1669,6 +1671,7 @@ class ProjectConfig:
             project_name=str(data.get("project_name", "unnamed-project")),
             providers=providers,
             active_provider=active_provider,
+            prompting=PromptingConfig.from_dict(dict(data.get("prompting", {}))),
             docs=DocsConfig.from_dict(dict(data.get("docs", {}))),
             efforts={
                 **DEFAULT_EFFORTS,
@@ -1710,6 +1713,7 @@ class ProjectConfig:
             "project_name": self.project_name,
             "providers": {kind: provider.to_dict() for kind, provider in self.providers.items()},
             "active_provider": self.active_provider,
+            "prompting": self.prompting.to_dict(),
             "docs": self.docs.to_dict(),
             "efforts": dict(self.efforts),
             "gates": self.gates.to_dict(),
@@ -2165,6 +2169,28 @@ class AgentRequest:
     progress_managed_timeout: bool = False
     termination_probe: Optional[Callable[[], str]] = None
     record_execution_incidents: bool = True
+    purpose: str = ""
+    prompt_spec: Optional[PromptSpec] = None
+    prompt_metadata: Dict[str, object] = field(default_factory=dict)
+    model_adaptation: str = "auto"
+    resume_prompt_hash: str = ""
+    prompt_is_continuation: bool = False
+    prompt_continuation: str = ""
+    # Observation never selects the subprocess transport or renews a lease.
+    diagnostic_output: Optional[Callable[[str, str], None]] = None
+    stream_transport: bool = False
+
+    def __post_init__(self) -> None:
+        from .prompting import PromptBlock
+        if self.prompt_spec is None:
+            self.prompt_spec = getattr(self.prompt, "spec", None)
+        if self.prompt_spec is None and self.purpose:
+            self.prompt_spec = PromptSpec(self.purpose, (PromptBlock(str(self.prompt), "stage.contract"),))
+        if self.prompt_spec is not None:
+            self.purpose = self.prompt_spec.purpose
+            from .prompting.core import READ_ONLY
+            if self.purpose in READ_ONLY and not self.sandbox_mode:
+                self.sandbox_mode = "read-only"
 
 
 @dataclass
@@ -2229,6 +2255,7 @@ class AgentResult:
     provider_session_id: str = ""
     termination: Optional[AgentTermination] = None
     supervision_report_path: str = ""
+    prompt_metadata: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass

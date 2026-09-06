@@ -19,6 +19,7 @@ from ..models import (
     SmartTimeoutConfig,
 )
 from .base import AgentAdapter, run_subprocess_with_optional_streaming
+from ..prompting.runtime import observed_model_metadata
 from ..supervision import ProgressDecoder
 
 
@@ -135,6 +136,7 @@ class CopilotCliAdapter(AgentAdapter):
         return _copilot_cli_supports_image_attachments(executable)
 
     def run(self, request: AgentRequest) -> AgentResult:
+        request = self.prepare_request(request)
         command = self._build_command(request)
 
         # Clear stale output so a reused output_path doesn't mask fresh results.
@@ -183,6 +185,7 @@ class CopilotCliAdapter(AgentAdapter):
             write_text(request.output_path, summary + "\n")
 
         return AgentResult(
+            prompt_metadata=observed_model_metadata(request, stdout_raw),
             ok=returncode == 0,
             command=command,
             output_path=request.output_path,
@@ -214,9 +217,11 @@ class CopilotCliAdapter(AgentAdapter):
         # Output is captured from stdout and written to output_path by run().
 
         # Resolve profile → config-dir
-        config_dir = self._resolve_config_dir(request.effort)
+        config_dir = self._resolve_config_dir(request.effort, request.cwd)
         if config_dir:
-            command.extend(["--config-dir", str(config_dir)])
+            from ..prompting.runtime import last_option
+            if not last_option(self.config.extra_args, "--config-dir"):
+                command.extend(["--config-dir", str(config_dir)])
             # Copilot currently ignores model in profile config for --config-dir.
             # Inject the profile model explicitly unless caller already provided one.
             if not self._has_model_flag():
@@ -281,7 +286,7 @@ class CopilotCliAdapter(AgentAdapter):
                 messages.append(content if content.endswith("\n") else content + "\n")
         return "".join(messages)
 
-    def _resolve_config_dir(self, effort: str) -> Optional[Path]:
+    def _resolve_config_dir(self, effort: str, cwd: Optional[Path] = None) -> Optional[Path]:
         """Map effort → profile name → config directory path.
 
         Resolution order:
@@ -289,16 +294,19 @@ class CopilotCliAdapter(AgentAdapter):
         2. If the value is an absolute path that exists, use it directly
         3. Otherwise treat it as a profile name under ``~/.copilot/profiles/``
         """
+        from ..prompting.runtime import last_option
+        explicit = last_option(self.config.extra_args, "--config-dir")
+        if explicit:
+            path = Path(explicit).expanduser()
+            return path if path.is_absolute() else (cwd or Path.cwd()) / path
         profile = self.config.profile_map.get(effort)
         if not profile:
             return None
-
-        # Allow absolute path override
-        candidate = Path(profile)
-        if candidate.is_absolute() and candidate.is_dir():
+        candidate = Path(profile).expanduser()
+        if candidate.is_absolute():
             return candidate
-
-        return DEFAULT_PROFILES_ROOT / profile
+        base = Path(os.environ["COPILOT_HOME"]) / "profiles" if os.environ.get("COPILOT_HOME") else DEFAULT_PROFILES_ROOT
+        return base / profile
 
     def _has_tool_permission_flag(self) -> bool:
         permission_flags = {
@@ -311,34 +319,23 @@ class CopilotCliAdapter(AgentAdapter):
         return any(arg in permission_flags for arg in self.config.extra_args)
 
     def _has_model_flag(self) -> bool:
-        for arg in self.config.extra_args:
-            if arg in {"--model", "-m"}:
-                return True
-        return False
+        from ..prompting.runtime import last_option
+        return bool(last_option(self.config.extra_args, "--model", "-m"))
 
     def _load_model_from_config_dir(self, config_dir: Path) -> Optional[str]:
-        config_file = config_dir / "config.json"
-        if not config_file.is_file():
-            return None
+        from ..prompting.runtime import copilot_model
         try:
-            payload = json.loads(read_text(config_file))
-        except (OSError, json.JSONDecodeError):
+            return copilot_model(config_dir) or None
+        except ValueError:
             return None
-        if not isinstance(payload, dict):
-            return None
-        model = payload.get("model")
-        if isinstance(model, str) and model.strip():
-            return model.strip()
-        return None
 
     def _model_label(self, request: AgentRequest) -> str:
-        # Check for explicit --model in extra_args
-        extra = list(self.config.extra_args)
-        for i, val in enumerate(extra):
-            if val in {"--model", "-m"} and i + 1 < len(extra):
-                return extra[i + 1]
+        from ..prompting.runtime import last_option
+        explicit = last_option(self.config.extra_args, "--model", "-m")
+        if explicit:
+            return explicit
 
-        config_dir = self._resolve_config_dir(request.effort)
+        config_dir = self._resolve_config_dir(request.effort, request.cwd)
         if config_dir is not None:
             profile_model = self._load_model_from_config_dir(config_dir)
             if profile_model:

@@ -64,6 +64,7 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/sessions/*/prompts/",
     "state/sessions/*/outputs/",
     "state/sessions/*/health/",
+    "state/sessions/*/logs/",
     "state/sessions/*/performance_trace.jsonl",
     "state/workflows/*/checkpoints/",
     "state/workflows/*/event_index.sqlite3",
@@ -253,6 +254,7 @@ DEFAULT_CONFIG = {
         },
     },
     "active_provider": "codex",
+    "prompting": {"model_adaptation": "auto"},
     "docs": {
         "language": "en",
     },
@@ -792,6 +794,8 @@ def load_run_state(project_root: Path) -> RunState:
 def save_run_state(project_root: Path, state: RunState) -> None:
     ensure_auto_gitignore(project_root)
     write_json(run_state_path(project_root), state.to_dict())
+    from .reporting import observe_saved_run
+    observe_saved_run(project_root, state)
 
 
 def load_task_plan(project_root: Path) -> dict:

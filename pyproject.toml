@@ -12,6 +12,8 @@ authors = [
   { name = "fuli" }
 ]
 dependencies = [
+  "rich>=15,<16",
+  "tomli>=2; python_version < '3.11'",
   "regex>=2024.7.24; python_version >= '3.10'",
   "regex>=2024.7.24,<2026.0; python_version < '3.10'",
 ]
