@@ -16,7 +16,7 @@ from .execution_recovery import redact_incident_text
 from .io_utils import read_json
 
 
-SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 3
+SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 4
 
 
 def _utc_now() -> str:
@@ -157,6 +157,15 @@ class SelfRepairCandidateRecord:
     semantic_state_fingerprint: str = ""
     summary: str = ""
     verification: str = ""
+    reason: str = ""
+    component_receipts: Dict[str, str] = field(default_factory=dict)
+    finding_states: Dict[str, str] = field(default_factory=dict)
+    proof_version: int = SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION
+    duration_seconds: float = 0.0
+    provider_session_id: str = ""
+    provider_kind: str = ""
+    provider_prompt_hash: str = ""
+    provider_context_fingerprint: str = ""
     created_at: str = field(default_factory=_utc_now)
 
     @classmethod
@@ -175,6 +184,9 @@ class SelfRepairCandidateRecord:
             values[key] = [
                 str(item) for item in (raw if isinstance(raw, list) else [])
             ]
+        for key in ("component_receipts", "finding_states"):
+            raw = values.get(key, {})
+            values[key] = dict(raw) if isinstance(raw, Mapping) else {}
         return cls(**values)  # type: ignore[arg-type]
 
     @property
@@ -183,6 +195,8 @@ class SelfRepairCandidateRecord:
             sorted(set(self.passed_obligations)),
             sorted(set(self.failed_obligations)),
             sorted(set(self.resolved_finding_ids)),
+            self.component_receipts,
+            self.finding_states,
             self.validation_rank,
             self.fatal,
         )
@@ -372,6 +386,18 @@ class SelfRepairExperiment:
         }
         if "base" not in candidates:
             raise ValueError("self-repair experiment is missing its base candidate")
+        if int(payload.get("schema_version", 3)) < SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION:
+            for record in candidates.values():
+                record.proof_version = 0
+                record.passed_obligations = [
+                    item for item in record.passed_obligations
+                    if not item.startswith(("root:", "validation:"))
+                ]
+                record.finding_states = {}
+            for finding in findings.values():
+                if finding.status == "resolved":
+                    finding.status = "confirmed"
+                    finding.resolved_by = ""
         return cls(
             experiment_id=str(payload.get("experiment_id", "")),
             run_id=str(payload.get("run_id", "")),
@@ -666,7 +692,7 @@ class SelfRepairExperiment:
         self.automatic_corrections = self.automatic_corrections[-64:]
         self.repair_design = {}
         self.repair_design_fingerprint = ""
-        self.finding_groups = []
+        self.finding_groups = [group for group in self.finding_groups if group.get("status") == "completed"]
         self.active_finding_group_id = ""
         self.best_search_candidate_id = self.best_safe_candidate_id
         self.best_search_ref = self.best_safe_ref or self.base_commit
@@ -685,8 +711,12 @@ class SelfRepairExperiment:
         right_passed = set(right.passed_obligations)
         left_failed = set(left.failed_obligations)
         right_failed = set(right.failed_obligations)
+        left_resolved = {key for key, value in left.finding_states.items() if value == "resolved"}
+        right_resolved = {key for key, value in right.finding_states.items() if value == "resolved"}
         no_worse = bool(
-            left_passed.issuperset(right_passed)
+            left_resolved.issuperset(right_resolved)
+            and set(left.component_receipts).issuperset(right.component_receipts)
+            and left_passed.issuperset(right_passed)
             and left_failed.issubset(right_failed)
             and left.validation_rank >= right.validation_rank
         )
@@ -697,8 +727,7 @@ class SelfRepairExperiment:
         )
         return no_worse and strictly_better
 
-    @staticmethod
-    def _search_score(record: SelfRepairCandidateRecord) -> tuple[object, ...]:
+    def _search_score(self, record: SelfRepairCandidateRecord) -> tuple[object, ...]:
         root_passed = sum(
             1 for item in record.passed_obligations if item.startswith("root:")
         )
@@ -711,12 +740,19 @@ class SelfRepairExperiment:
             if item.startswith("candidate_regression:")
         )
         return (
-            root_passed,
             -safety_failed,
             -candidate_regressions,
-            record.net_progress,
+            len(record.component_receipts),
+            -sum(
+                1 for finding_id, finding in self.findings.items()
+                if finding.disposition == "contract_violation"
+                and finding.status != "invalidated"
+                and record.finding_states.get(finding_id) != "resolved"
+            ),
+            root_passed,
             len(set(record.resolved_finding_ids)),
             record.validation_rank,
+            record.net_progress,
             len(set(record.passed_obligations)),
             -record.diff_line_count,
             record.candidate_id,
@@ -775,6 +811,10 @@ class SelfRepairExperiment:
             record.parent_candidate_id,
             self.candidates["base"],
         )
+        record.component_receipts = {**parent.component_receipts, **record.component_receipts}
+        record.finding_states = {**parent.finding_states, **record.finding_states}
+        if record.status == "candidate_group_completed" and record.finding_group_id:
+            record.component_receipts[record.finding_group_id] = record.candidate_commit or record.candidate_ref
         # Candidate commits are descendants of their selected parent. Keep
         # durable root proof unless this candidate records a concrete
         # regression. Candidate-local validation and safety proof must be
@@ -823,6 +863,7 @@ class SelfRepairExperiment:
                 continue
             if disposition != "contract_violation" or causal_id not in contract_ids:
                 continue
+            record.finding_states[finding.finding_id] = "confirmed"
             existing = self.findings.get(finding.finding_id)
             if existing is None:
                 independently_actionable = bool(
@@ -859,6 +900,7 @@ class SelfRepairExperiment:
                 if causal_id not in record.failed_obligations:
                     record.failed_obligations.append(causal_id)
         for finding_id in record.resolved_finding_ids:
+            record.finding_states[finding_id] = "resolved"
             finding = self.findings.get(finding_id)
             if finding is not None:
                 finding.status = "resolved"
@@ -869,11 +911,17 @@ class SelfRepairExperiment:
                 if finding is not None
                 else f"finding:{finding_id}"
             )
-            record.failed_obligations = [
-                item for item in record.failed_obligations if item != failure_id
-            ]
-            if failure_id not in record.passed_obligations:
-                record.passed_obligations.append(failure_id)
+            # Several independent counterexamples can share one obligation.
+            # Closing one must not erase another, nor manufacture root proof.
+            if not any(
+                other.causal_obligation_id == failure_id
+                and other.disposition == "contract_violation"
+                and record.finding_states.get(other.finding_id) != "resolved"
+                for other in self.findings.values()
+            ):
+                record.failed_obligations = [
+                    item for item in record.failed_obligations if item != failure_id
+                ]
         record.passed_obligations = sorted(
             set(record.passed_obligations) - set(record.failed_obligations)
         )
@@ -923,9 +971,9 @@ class SelfRepairExperiment:
             sorted(
                 item for item in record.passed_obligations if item.startswith("root:")
             ),
+            sorted(record.component_receipts),
             sorted(current_blocking),
             record.validation_stage,
-            record.strategy_fingerprint,
         )
         self.candidates[record.candidate_id] = record
         self.attempt_count += 1
@@ -937,6 +985,13 @@ class SelfRepairExperiment:
             self.semantic_state_history.append(record.semantic_state_fingerprint)
             self.semantic_state_history = self.semantic_state_history[-128:]
         self._recompute_frontier()
+        selected = self.candidates[self.best_search_candidate_id]
+        for finding_id, finding in self.findings.items():
+            if finding.status != "invalidated" and finding.disposition == "contract_violation":
+                finding.status = (
+                    "resolved" if selected.finding_states.get(finding_id) == "resolved"
+                    else "confirmed"
+                )
         progress_kind = "net_progress" if record.net_progress > 0 else ""
         if record.infrastructure_failure:
             self.infrastructure_failures += 1
@@ -1010,6 +1065,9 @@ class SelfRepairExperiment:
                     "strategy_fingerprint": item.strategy_fingerprint,
                     "net_progress": item.net_progress,
                     "summary": " ".join(item.summary.split())[-400:],
+                    "reason": redact_incident_text(item.reason)[-2400:],
+                    "component_receipts": item.component_receipts,
+                    "duration_seconds": item.duration_seconds,
                     "verification_failure": (
                         redact_incident_text(item.verification)[-2400:]
                         if item.status not in {"approved_candidate", "candidate_group_completed"}
@@ -1051,6 +1109,12 @@ class SelfRepairExperimentStore:
 
     def save(self, experiment: SelfRepairExperiment) -> None:
         experiment.updated_at = _utc_now()
+        if self.path.is_file():
+            previous = read_json(self.path, default={})
+            if int(previous.get("schema_version", 3)) < SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION:
+                backup = self.path.with_name("experiment.v3.json")
+                if not backup.exists():
+                    _atomic_json(backup, previous)
         _atomic_json(self.path, experiment.to_dict())
 
     def candidate_root(self, candidate_id: str) -> Path:

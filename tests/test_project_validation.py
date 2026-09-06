@@ -3915,6 +3915,7 @@ class ProjectValidationTests(unittest.TestCase):
                 patch("auto_agents.cli.ProjectRunLock", FakeLock),
                 patch("auto_agents.cli.ForegroundActivity", FakeForeground),
                 patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                patch("auto_agents.cli._prepare_explicit_session", return_value=type("SavedSession", (), {"workflow_id": "wf-session"})()),
                 patch("auto_agents.session.Session", FakeSession),
                 patch("auto_agents.workflow_runtime.WorkflowCoordinator", FakeCoordinator),
                 patch("auto_agents.cli._promote_pending_self_repairs"),
@@ -5767,6 +5768,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "state/release-worker.log\nstate/release-worker.lock\n"
                 "state/health-watch-control.json\nstate/health-watch-control.lock\n"
                 "state/checkpoint_blobs/\nstate/root_cause_certificates/\n"
+                "state/session-restorations/\n"
                 "state/sessions/*/prompts/\nstate/sessions/*/outputs/\n"
                 "state/sessions/*/health/\n"
                 "state/sessions/*/logs/\n"

@@ -436,6 +436,7 @@ _RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT = "retained_repair_preserved_paths"
 _RETAINED_WORKTREE_EXECUTION_RECOVERY_MIGRATIONS_CONTEXT = (
     "retained_worktree_execution_recovery_migrations"
 )
+_SELECTOR_DELTA_RECONCILIATIONS_FIELD = "selector_delta_reconciliations"
 _EXECUTION_RECOVERY_IDENTITY_MIGRATIONS_CONTEXT = (
     "execution_recovery_identity_migrations"
 )
@@ -7271,6 +7272,37 @@ class Orchestrator:
         for task in tasks:
             if task.task_origin != "stage_recovery" or task.status == "done":
                 continue
+            marker = self._execution_recovery_marker(task)
+            selector_recovery = bool(
+                marker.get("selector_owner_transfer")
+                or str(marker.get("incident_kind", "")).strip()
+                == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            )
+            if is_execution_incident_recovery_task(task) and selector_recovery:
+                try:
+                    persisted_state = load_run_state(self.project_root)
+                except (OSError, TypeError, ValueError):
+                    persisted_state = None
+                    ownership_records: Mapping[
+                        str, Mapping[str, object]
+                    ] = {}
+                else:
+                    ownership_records = (
+                        self._retained_worktree_ownership_records(
+                            persisted_state
+                        )
+                    )
+                authorized = self._execution_recovery_selector_transfer_paths(
+                    task,
+                    tasks=tasks,
+                    ownership_records=ownership_records,
+                    state=persisted_state,
+                )
+                if task.mutable_artifacts != authorized:
+                    task.mutable_artifacts = list(authorized)
+                    if task.task_id not in repaired_ids:
+                        repaired_ids.append(task.task_id)
+                continue
             inherited = self._recovery_mutable_artifacts(
                 (source for source in tasks if source is not task),
                 feedback=self._mutable_artifact_recovery_text(task),
@@ -10202,6 +10234,11 @@ class Orchestrator:
                 if isinstance(record.get("path_fingerprints", {}), dict)
                 else {}
             ),
+            "index_fingerprints": dict(
+                record.get("index_fingerprints", {})
+                if isinstance(record.get("index_fingerprints", {}), dict)
+                else {}
+            ),
         }
         digest = hashlib.sha256(
             json.dumps(
@@ -10311,6 +10348,7 @@ class Orchestrator:
             "path_fingerprints": self._retained_worktree_path_fingerprints(
                 paths
             ),
+            "index_fingerprints": self._worktree_index_fingerprints(paths),
             "source": str(source).strip() or "sequential_retry",
             "captured_at": utc_now_iso(),
         }
@@ -14313,6 +14351,8 @@ class Orchestrator:
             or result.cleanup_incomplete
             or result.infrastructure_error
             or result.infrastructure_failure_id
+            or result.cached
+            or cls._pytest_command_is_collection_only(result.command)
         ):
             return "invalid", []
         if cls._is_missing_pytest_target_result(result):
@@ -14325,6 +14365,17 @@ class Orchestrator:
         if failures:
             return "stable_semantic_failure", failures
         return "invalid", []
+
+    @staticmethod
+    def _pytest_command_is_collection_only(command: str) -> bool:
+        try:
+            parts = _unwrap_conda_run(shlex.split(command))
+        except ValueError:
+            return True
+        return any(
+            part.split("=", 1)[0] in {"--collect-only", "--co"}
+            for part in parts
+        )
 
     @classmethod
     def _raise_for_current_verification_contract(
@@ -14391,6 +14442,140 @@ class Orchestrator:
             task_id=task_id,
         )
 
+    def _resume_verified_selector_delta_blocker(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+        blocker: Mapping[str, object],
+    ) -> bool:
+        """Finish a reviewed selector transfer stopped by the old path guard."""
+
+        if not (
+            state.status == "blocked"
+            and incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            and incident.status in {"recovering", "repair_attempt_completed"}
+            and str(blocker.get("category", "")).strip()
+            == "execution_recovery_borrowed_worktree_mutation"
+        ):
+            return False
+        try:
+            tasks = self._load_tasks_from_plan()
+        except (KeyError, OSError, TypeError, ValueError, RuntimeError):
+            return False
+        command = (incident.origin_command or incident.command).strip()
+        matches = [
+            task
+            for task in tasks
+            if task.status in {"blocked", "in_progress", "done"}
+            and self._execution_recovery_incident_id(task) == incident.incident_id
+            and str(
+                self._execution_recovery_marker(task).get(
+                    "verification_command", ""
+                )
+            ).strip() == command
+        ]
+        source_matches = [
+            task for task in tasks if task.task_id == incident.task_id
+        ]
+        if len(matches) != 1 or len(source_matches) != 1:
+            return False
+        recovery_task = matches[0]
+        source_task = source_matches[0]
+        if not (
+            source_task.status == "in_progress"
+            and source_task.task_origin != "stage_recovery"
+            and self._in_progress_implementation_is_ready(state, source_task)
+        ):
+            return False
+        mismatch = self._execution_recovery_borrowed_worktree_mismatch(
+            recovery_task
+        )
+        if not mismatch or not self._selector_resume_blocker_matches(
+            state,
+            incident,
+            recovery_task,
+            mismatch,
+            migrate_legacy_identity=True,
+        ):
+            return False
+        transfer = self._selector_transfer_envelope(recovery_task)
+        if not transfer:
+            transfer = self._legacy_selector_owner_transfer(
+                state,
+                tasks,
+                incident,
+                recovery_task,
+                mismatch,
+            )
+        if not transfer:
+            return False
+        if not self._selector_delta_review_evidence(state, recovery_task):
+            if not self._freshen_legacy_selector_review(
+                state,
+                tasks,
+                recovery_task,
+            ):
+                return False
+        provenance = self._reconcile_verified_selector_delta(
+            state,
+            tasks,
+            recovery_task,
+            mismatch,
+        )
+        if not provenance or not self._record_selector_reconciliation_incident_event(
+            state,
+            recovery_task,
+            provenance,
+        ):
+            return False
+        recovery_task.status = "done"
+        recovery_task.review_summary = str(
+            state.task_review_cache.get(recovery_task.task_id, {}).get(
+                "summary", recovery_task.review_summary
+            )
+        ).strip()
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        self._resolve_execution_incident_for_task(state, recovery_task)
+        if not self._selector_resume_blocker_matches(
+            state,
+            incident,
+            recovery_task,
+            mismatch,
+        ):
+            return False
+        marker = self._execution_recovery_marker(recovery_task)
+        marker["borrowed_worktree_validation"] = {
+            "status": "selector_delta_reconciled",
+            **self._selector_delta_mismatch_identity(mismatch),
+            "paths": self._execution_recovery_borrowed_paths(recovery_task),
+            "reconciliation_digest": str(
+                provenance.get("provenance_digest", "")
+            ),
+            "validated_at": utc_now_iso(),
+        }
+        self._persist_tasks(tasks)
+        self._clear_run_blocker(state)
+        state.status = "pending"
+        state.last_error = ""
+        state.last_recovery_route = {
+            "outcome": "persisted_selector_delta_reconciled",
+            "failure_kind": incident.kind,
+            "incident_id": incident.incident_id,
+            "task_id": source_task.task_id,
+            "recovery_task_id": recovery_task.task_id,
+            "reconciliation_digest": str(
+                provenance.get("provenance_digest", "")
+            ),
+            "reason": (
+                "the reviewed selector postimage was returned to its retained "
+                "source owner; normal source verification is pending"
+            ),
+            "engine_invariant": "",
+        }
+        save_run_state(self.project_root, state)
+        return True
+
     def _resume_reclassified_current_selector_incident(
         self,
         state: RunState,
@@ -14402,6 +14587,12 @@ class Orchestrator:
         if incident is not None and incident.kind == (
             CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
         ):
+            if self._resume_verified_selector_delta_blocker(
+                state,
+                incident,
+                blocker,
+            ):
+                return True
             return self._synchronize_corrected_persisted_selector(
                 state,
                 incident,
@@ -15115,6 +15306,552 @@ class Orchestrator:
             len(refs),
         )
         return True
+
+    def _canonical_recovery_project_path(
+        self,
+        raw_path: object,
+        *,
+        require_regular: bool = False,
+    ) -> str:
+        """Canonicalize one literal path without permitting repository escape."""
+
+        value = str(raw_path or "").strip().replace("\\", "/")
+        if (
+            not value
+            or "\x00" in value
+            or any(character in value for character in "*?[]")
+        ):
+            return ""
+        candidate_path = Path(value)
+        if candidate_path.is_absolute() or ".." in candidate_path.parts:
+            return ""
+        lexical = Path(*candidate_path.parts)
+        if not lexical.parts:
+            return ""
+        root = self.project_root.resolve()
+        candidate = root / lexical
+        cursor = root
+        for part in lexical.parts:
+            cursor = cursor / part
+            try:
+                if cursor.is_symlink():
+                    return ""
+            except OSError:
+                return ""
+        try:
+            resolved = candidate.resolve(strict=False)
+            relative = resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            return ""
+        if require_regular and not candidate.is_file():
+            return ""
+        canonical = relative.as_posix()
+        if not self._is_inheritable_mutable_artifact(canonical):
+            return ""
+        return canonical
+
+    def _single_module_level_pytest_selector(
+        self,
+        command: str,
+        *,
+        require_regular: bool = True,
+    ) -> Tuple[str, str, str]:
+        """Return one safe canonical ``path::function`` pytest target."""
+
+        if not self._is_persisted_selector_pytest_command(command):
+            return "", "", ""
+        try:
+            parts = _unwrap_conda_run(shlex.split(command))
+        except ValueError:
+            return "", "", ""
+        if not parts:
+            return "", "", ""
+        executable = Path(parts[0]).name.lower()
+        if executable in {"pytest", "py.test", "pytest.exe", "py.test.exe"}:
+            args = parts[1:]
+        elif (
+            re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
+            and len(parts) >= 3
+            and parts[1:3] == ["-m", "pytest"]
+        ):
+            args = parts[3:]
+        else:
+            return "", "", ""
+        targets: List[str] = []
+        index = 0
+        options_done = False
+        value_options = {
+            *PYTEST_VALUE_OPTIONS,
+            "-o",
+            "--override-ini",
+            "-p",
+            "--basetemp",
+        }
+        while index < len(args):
+            argument = args[index]
+            if not options_done and argument == "--":
+                options_done = True
+                index += 1
+                continue
+            if not options_done and argument.startswith("-"):
+                option = argument.split("=", 1)[0]
+                if option in value_options and "=" not in argument:
+                    if index + 1 >= len(args):
+                        return "", "", ""
+                    index += 2
+                    continue
+                index += 1
+                continue
+            targets.append(argument)
+            index += 1
+        if len(targets) != 1:
+            return "", "", ""
+        node = targets[0].strip()
+        raw_path, separator, raw_selector = node.partition("::")
+        if not separator or "::" in raw_selector:
+            return "", "", ""
+        test_name = raw_selector.strip()
+        selector_path = self._canonical_recovery_project_path(
+            raw_path,
+            require_regular=require_regular,
+        )
+        if (
+            not selector_path
+            or not selector_path.endswith(".py")
+            or not test_name.isidentifier()
+            or not test_name.startswith("test_")
+        ):
+            return "", "", ""
+        canonical = f"{selector_path}::{test_name}"
+        if not self._looks_like_pytest_evidence_ref(canonical):
+            return "", "", ""
+        return canonical, selector_path, test_name
+
+    @staticmethod
+    def _exact_sha256_fingerprint_map(
+        raw: object,
+        paths: Iterable[str],
+    ) -> Optional[Dict[str, str]]:
+        if not isinstance(raw, dict):
+            return None
+        expected = set(paths)
+        fingerprints: Dict[str, str] = {}
+        for raw_path, raw_fingerprint in raw.items():
+            path = str(raw_path).strip().replace("\\", "/")
+            fingerprint = str(raw_fingerprint).strip()
+            if (
+                not path
+                or path in fingerprints
+                or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+            ):
+                return None
+            fingerprints[path] = fingerprint
+        if not expected or set(fingerprints) != expected:
+            return None
+        return fingerprints
+
+    def _exact_recovery_path_list(self, raw: object) -> Optional[List[str]]:
+        if not isinstance(raw, list) or not raw:
+            return None
+        paths: List[str] = []
+        for item in raw:
+            if not isinstance(item, str) or not item.strip():
+                return None
+            canonical = self._canonical_recovery_project_path(item)
+            normalized = str(item).strip().replace("\\", "/")
+            if not canonical or normalized != canonical or canonical in paths:
+                return None
+            paths.append(canonical)
+        return sorted(paths)
+
+    @staticmethod
+    def _class_scoped_selector_in_snapshot(
+        content: bytes,
+        *,
+        selector_path: str,
+        test_name: str,
+    ) -> str:
+        try:
+            tree = ast.parse(content.decode("utf-8"), filename=selector_path)
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            return ""
+        matches = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == test_name
+        ]
+        class_names = [
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            for member in node.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name == test_name
+        ]
+        if len(matches) != 1 or len(class_names) != 1:
+            return ""
+        return f"{selector_path}::{class_names[0]}::{test_name}"
+
+    def _ready_selector_owner_claims(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+        selector_path: str,
+    ) -> List[str]:
+        """Count ready owner claims before validating any checkpoint details."""
+
+        tasks_by_id = {task.task_id: task for task in tasks}
+        records = self._retained_worktree_ownership_records(state)
+        claims: List[str] = []
+        for owner_id, record in records.items():
+            owner = tasks_by_id.get(owner_id)
+            if (
+                owner is None
+                or owner.status != "in_progress"
+                or not self._in_progress_implementation_is_ready(state, owner)
+            ):
+                continue
+            raw_paths = record.get("changed_paths", [])
+            if not isinstance(raw_paths, list):
+                continue
+            canonical_claims = {
+                canonical
+                for raw_path in raw_paths
+                if (
+                    canonical := self._canonical_recovery_project_path(
+                        raw_path
+                    )
+                )
+            }
+            if selector_path in canonical_claims:
+                claims.append(owner_id)
+        return sorted(claims)
+
+    def _ensure_selector_source_owner_checkpoint(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        *,
+        source_task_id: str,
+        handoff: Mapping[str, object],
+    ) -> None:
+        """Capture or safely enrich the source checkpoint before transfer."""
+
+        records = self._retained_worktree_ownership_records(state)
+        if source_task_id not in records:
+            state.tasks = tasks
+            self._capture_retained_worktree_ownership(
+                state,
+                [source_task_id],
+                source="implementation_ready",
+            )
+            records = self._retained_worktree_ownership_records(state)
+        record = records.get(source_task_id)
+        if not isinstance(record, dict) or "index_fingerprints" in record:
+            return
+        raw_paths = record.get("changed_paths", [])
+        paths = self._exact_recovery_path_list(raw_paths)
+        handoff_paths = self._exact_recovery_path_list(
+            handoff.get("changed_paths")
+        )
+        index_fingerprints = self._exact_sha256_fingerprint_map(
+            handoff.get("index_fingerprints"),
+            handoff_paths or [],
+        )
+        if (
+            paths is None
+            or paths != handoff_paths
+            or index_fingerprints is None
+            or not self._retained_worktree_snapshot_matches(
+                record,
+                allow_pending_planning_changes=False,
+            )
+            or not self._retained_worktree_record_has_exact_path_fingerprints(
+                record
+            )
+        ):
+            return
+        replacement = copy.deepcopy(record)
+        replacement["index_fingerprints"] = dict(index_fingerprints)
+        records[source_task_id] = replacement
+        state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+
+    def _current_selector_overlap_requirement(
+        self,
+        incident: ExecutionIncident,
+    ) -> Tuple[bool, str, str, str]:
+        """Return whether a current-selector incident touches retained work."""
+
+        if incident.kind != CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND:
+            return False, "", "", ""
+        contract = incident.process_snapshot.get(
+            CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY,
+            {},
+        )
+        if not isinstance(contract, dict) or not (
+            str(contract.get("status", "")).strip() == "target_not_found"
+            and str(contract.get("contract", "")).strip()
+            == "exact_pytest_target"
+            and str(contract.get("repair_scope", "")).strip()
+            == "verification_contract"
+        ):
+            return True, "", "", ""
+        canonical, selector_path, test_name = (
+            self._single_module_level_pytest_selector(
+                str(incident.command).strip(),
+                require_regular=False,
+            )
+        )
+        if not canonical:
+            command = str(incident.command).strip()
+            node = (
+                self._exact_pytest_node_from_command(command)
+                if self._is_persisted_selector_pytest_command(command)
+                else ""
+            )
+            raw_path, separator, _selector = node.partition("::")
+            selector_path = (
+                self._canonical_recovery_project_path(raw_path)
+                if separator
+                else ""
+            )
+            if not selector_path:
+                return True, "", "", ""
+            current_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in self._changed_paths_excluding_agent_instructions()
+            }
+            return selector_path in current_paths, "", selector_path, ""
+        current_paths = {
+            str(path).strip().replace("\\", "/")
+            for path in self._changed_paths_excluding_agent_instructions()
+        }
+        return selector_path in current_paths, canonical, selector_path, test_name
+
+    def _current_selector_owner_transfer(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        incident: ExecutionIncident,
+        *,
+        recovery_task_id: str,
+        handoff: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Bind one borrowed selector postimage to its retained source owner."""
+
+        if (
+            incident.kind != CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            or incident.baseline
+            or incident.status != "recovering"
+            or incident.recovery_round <= 0
+            or not str(incident.incident_id).strip()
+            or not str(incident.evidence_fingerprint).strip()
+            or incident.termination_reason
+            or incident.cleanup_incomplete
+        ):
+            return {}
+        contract = incident.process_snapshot.get(
+            CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY,
+            {},
+        )
+        if not isinstance(contract, dict) or not (
+            str(contract.get("status", "")).strip() == "target_not_found"
+            and str(contract.get("contract", "")).strip()
+            == "exact_pytest_target"
+            and str(contract.get("repair_scope", "")).strip()
+            == "verification_contract"
+        ):
+            return {}
+        command = str(incident.command).strip()
+        if not command or str(incident.origin_command).strip() not in {"", command}:
+            return {}
+        canonical, selector_path, test_name = (
+            self._single_module_level_pytest_selector(command)
+        )
+        if not canonical:
+            return {}
+
+        source_id = str(incident.task_id).strip()
+        source_matches = [task for task in tasks if task.task_id == source_id]
+        source = source_matches[0] if len(source_matches) == 1 else None
+        if (
+            not source_id
+            or not recovery_task_id
+            or recovery_task_id == source_id
+            or source is None
+            or source.status != "in_progress"
+            or not self._in_progress_implementation_is_ready(state, source)
+            or not self._task_owns_persisted_pytest_command(source, command)
+            or self._ready_selector_owner_claims(
+                state,
+                tasks,
+                selector_path,
+            )
+            != [source_id]
+        ):
+            return {}
+
+        try:
+            handoff_version = int(handoff.get("version", 0) or 0)
+        except (TypeError, ValueError):
+            return {}
+        handoff_paths = self._exact_recovery_path_list(
+            handoff.get("changed_paths")
+        )
+        borrowed_paths = self._exact_recovery_path_list(
+            handoff.get("borrowed_paths")
+        )
+        if not (
+            handoff_version == 2
+            and handoff_paths is not None
+            and handoff_paths == borrowed_paths
+            and selector_path in handoff_paths
+            and str(handoff.get("source_task_id", "")).strip() == source_id
+        ):
+            return {}
+
+        record = self._retained_worktree_ownership_records(state).get(source_id)
+        if not isinstance(record, dict):
+            return {}
+        try:
+            owner_version = int(record.get("version", 0) or 0)
+            snapshot_version = int(
+                record.get("verify_baseline_snapshot_version", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return {}
+        owner_paths = self._exact_recovery_path_list(record.get("changed_paths"))
+        if not (
+            owner_version == 1
+            and snapshot_version == _RETAINED_VERIFY_BASELINE_SNAPSHOT_VERSION
+            and owner_paths == handoff_paths
+            and str(record.get("owner_task_id", "")).strip() == source_id
+            and str(record.get("source", "")).strip() == "implementation_ready"
+            and str(record.get("captured_at", "")).strip()
+            and str(record.get("verify_baseline_snapshot_id", "")).strip()
+        ):
+            return {}
+        owner_path_fingerprints = self._exact_sha256_fingerprint_map(
+            record.get("path_fingerprints"), owner_paths or []
+        )
+        owner_index_fingerprints = self._exact_sha256_fingerprint_map(
+            record.get("index_fingerprints"), owner_paths or []
+        )
+        handoff_path_fingerprints = self._exact_sha256_fingerprint_map(
+            handoff.get("path_fingerprints"), handoff_paths or []
+        )
+        handoff_index_fingerprints = self._exact_sha256_fingerprint_map(
+            handoff.get("index_fingerprints"), handoff_paths or []
+        )
+        if not (
+            owner_path_fingerprints is not None
+            and owner_index_fingerprints is not None
+            and handoff_path_fingerprints == owner_path_fingerprints
+            and handoff_index_fingerprints == owner_index_fingerprints
+            and owner_path_fingerprints
+            == self._retained_worktree_path_fingerprints(owner_paths or [])
+            and owner_index_fingerprints
+            == self._worktree_index_fingerprints(owner_paths or [])
+        ):
+            return {}
+        current_head = head_ref(self.project_root)
+        current_worktree = self._worktree_fingerprint_excluding_agent_instructions()
+        if not (
+            current_head
+            and str(record.get("head_ref", "")).strip() == current_head
+            and str(handoff.get("head_ref", "")).strip() == current_head
+            and str(incident.head_ref).strip() == current_head
+            and str(record.get("worktree_fingerprint", "")).strip()
+            == current_worktree
+            and str(handoff.get("worktree_fingerprint", "")).strip()
+            == current_worktree
+            and str(incident.worktree_fingerprint).strip()
+            == worktree_fingerprint(self.project_root)
+            and owner_paths
+            == sorted(set(self._changed_paths_excluding_agent_instructions()))
+        ):
+            return {}
+
+        snapshot_ref = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")
+        ).strip()
+        snapshot_commit = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+        ).strip()
+        snapshot_tree = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE, "")
+        ).strip()
+        resolved_commit, resolved_tree = self._git_commit_and_tree(
+            self.project_root,
+            snapshot_ref,
+        )
+        if not (
+            snapshot_ref.startswith("refs/auto-agents/gate-snapshots/")
+            and resolved_commit == snapshot_commit
+            and resolved_tree == snapshot_tree
+            and self._retained_verify_baseline_snapshot_matches_record(record)
+        ):
+            return {}
+        readable, content = self._git_path_bytes_at_commit(
+            snapshot_commit,
+            selector_path,
+        )
+        retained_selector = (
+            self._class_scoped_selector_in_snapshot(
+                content,
+                selector_path=selector_path,
+                test_name=test_name,
+            )
+            if readable
+            else ""
+        )
+        if not retained_selector:
+            return {}
+
+        transfer: Dict[str, object] = {
+            "version": 1,
+            "incident_id": incident.incident_id,
+            "evidence_fingerprint": incident.evidence_fingerprint,
+            "recovery_round": incident.recovery_round,
+            "source_task_id": source_id,
+            "recovery_task_id": recovery_task_id,
+            "handoff_version": handoff_version,
+            "selector_command_digest": "sha256:"
+            + hashlib.sha256(command.encode("utf-8")).hexdigest(),
+            "canonical_selector": canonical,
+            "selector_path": selector_path,
+            "test_name": test_name,
+            "retained_class_selector": retained_selector,
+            "selector_transition": {
+                "from": "target_not_found",
+                "to": "resolved_pass",
+            },
+            "ownership_disposition": {
+                "kind": "return_to_source_owner",
+                "owner_task_id": source_id,
+            },
+            "preimage_snapshot_id": str(
+                record.get("verify_baseline_snapshot_id", "")
+            ).strip(),
+            "preimage_snapshot_ref": snapshot_ref,
+            "preimage_snapshot_commit": snapshot_commit,
+            "preimage_snapshot_tree": snapshot_tree,
+            "preimage_head_ref": current_head,
+            "preimage_worktree_fingerprint": current_worktree,
+            "preimage_changed_paths": list(owner_paths or []),
+            "preimage_path_fingerprints": dict(owner_path_fingerprints),
+            "preimage_index_fingerprints": dict(owner_index_fingerprints),
+        }
+        transfer["transfer_id"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                transfer,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return transfer
 
     def _task_owns_persisted_pytest_command(
         self,
@@ -16344,6 +17081,9 @@ class Orchestrator:
             ),
             None,
         )
+        transfer_required, _selector, _selector_path, _test_name = (
+            self._current_selector_overlap_requirement(incident)
+        )
         if existing_task is None:
             reported_infrastructure = (
                 incident.kind == "gate_reported_infrastructure_error"
@@ -16370,6 +17110,7 @@ class Orchestrator:
             task_marker["implementation_required_round"] = incident.recovery_round
             task_marker["implementation_completed_round"] = 0
             task_marker["evidence_fingerprint"] = incident.evidence_fingerprint
+            task_marker["incident_kind"] = incident.kind
             route_generation = max(
                 len(incident_tasks),
                 max(
@@ -16381,13 +17122,6 @@ class Orchestrator:
                 ),
             ) + 1
             task_marker["route_generation"] = route_generation
-            worktree_handoff = self._capture_execution_recovery_worktree_handoff(
-                state,
-                tasks,
-                source_task_id=incident.task_id,
-            )
-            if worktree_handoff:
-                task_marker["worktree_handoff"] = worktree_handoff
             base_task_id = (
                 f"recover-execution-{incident.incident_id}"
                 f"-r{incident.recovery_round}"
@@ -16400,6 +17134,53 @@ class Orchestrator:
                     route_generation += 1
                     task_marker["route_generation"] = route_generation
                     task_id = f"{base_task_id}-g{route_generation}"
+            worktree_handoff = self._capture_execution_recovery_worktree_handoff(
+                state,
+                tasks,
+                source_task_id=incident.task_id,
+            )
+            if worktree_handoff:
+                task_marker["worktree_handoff"] = worktree_handoff
+            mutable_paths: List[str] = []
+            if transfer_required:
+                if not worktree_handoff:
+                    self._block_current_selector_overlap_authority(
+                        state,
+                        tasks,
+                        incident,
+                    )
+                    return
+                self._ensure_selector_source_owner_checkpoint(
+                    state,
+                    tasks,
+                    source_task_id=str(incident.task_id).strip(),
+                    handoff=worktree_handoff,
+                )
+                selector_transfer = self._current_selector_owner_transfer(
+                    state,
+                    tasks,
+                    incident,
+                    recovery_task_id=task_id,
+                    handoff=worktree_handoff,
+                )
+                if not selector_transfer:
+                    self._block_current_selector_overlap_authority(
+                        state,
+                        tasks,
+                        incident,
+                    )
+                    return
+                selector_path = str(selector_transfer["selector_path"])
+                mutable_paths = [selector_path]
+                task_marker["selector_owner_transfer"] = selector_transfer
+                task_marker["mutable_paths"] = list(mutable_paths)
+                worktree_handoff["immutable_borrowed_paths"] = sorted(
+                    set(worktree_handoff["borrowed_paths"]) - {selector_path}
+                )
+                # The source-owner checkpoint must be durable before an
+                # independent task receives its narrowly bound envelope.
+                state.tasks = tasks
+                save_run_state(self.project_root, state)
             task = TaskSpec(
                 task_id=task_id,
                 title=(
@@ -16459,6 +17240,14 @@ class Orchestrator:
                 recovery_round=incident.recovery_round,
                 recovery_history=[task_marker],
                 verification_refs=[f"cmd:{incident.command}"],
+                mutable_artifacts=list(mutable_paths),
+                scope_boundaries=(
+                    "Modify only the checkpoint-bound selector path recorded in "
+                    "the ownership transfer; every other borrowed path remains "
+                    "immutable."
+                    if mutable_paths
+                    else ""
+                ),
             )
             tasks.insert(0, task)
             self._persist_tasks(tasks)
@@ -16484,7 +17273,16 @@ class Orchestrator:
                 marker["route_generation"] = max(1, route_generation)
             marker["implementation_required_round"] = incident.recovery_round
             marker["evidence_fingerprint"] = incident.evidence_fingerprint
+            marker["incident_kind"] = incident.kind
             marker["result"] = "rescheduled"
+            if incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND:
+                existing_task.mutable_artifacts = []
+                existing_task.scope_boundaries = ""
+                marker.pop("selector_owner_transfer", None)
+                marker.pop("mutable_paths", None)
+                raw_old_handoff = marker.get("worktree_handoff", {})
+                if isinstance(raw_old_handoff, dict):
+                    raw_old_handoff.pop("immutable_borrowed_paths", None)
             if str(incident.task_id).strip() != existing_task.task_id:
                 worktree_handoff = (
                     self._capture_execution_recovery_worktree_handoff(
@@ -16497,6 +17295,54 @@ class Orchestrator:
                     marker["worktree_handoff"] = worktree_handoff
                 else:
                     marker.pop("worktree_handoff", None)
+            raw_handoff = marker.get("worktree_handoff", {})
+            worktree_handoff = (
+                raw_handoff if isinstance(raw_handoff, dict) else {}
+            )
+            if transfer_required:
+                if not worktree_handoff:
+                    self._block_current_selector_overlap_authority(
+                        state,
+                        tasks,
+                        incident,
+                        recovery_task=existing_task,
+                    )
+                    return
+                self._ensure_selector_source_owner_checkpoint(
+                    state,
+                    tasks,
+                    source_task_id=str(incident.task_id).strip(),
+                    handoff=worktree_handoff,
+                )
+                selector_transfer = self._current_selector_owner_transfer(
+                    state,
+                    tasks,
+                    incident,
+                    recovery_task_id=existing_task.task_id,
+                    handoff=worktree_handoff,
+                )
+                if not selector_transfer:
+                    self._block_current_selector_overlap_authority(
+                        state,
+                        tasks,
+                        incident,
+                        recovery_task=existing_task,
+                    )
+                    return
+                selector_path = str(selector_transfer["selector_path"])
+                marker["selector_owner_transfer"] = selector_transfer
+                marker["mutable_paths"] = [selector_path]
+                worktree_handoff["immutable_borrowed_paths"] = sorted(
+                    set(worktree_handoff["borrowed_paths"]) - {selector_path}
+                )
+                existing_task.mutable_artifacts = [selector_path]
+                existing_task.scope_boundaries = (
+                    "Modify only the checkpoint-bound selector path recorded in "
+                    "the ownership transfer; every other borrowed path remains "
+                    "immutable."
+                )
+                state.tasks = tasks
+                save_run_state(self.project_root, state)
             existing_task.recovery_round = incident.recovery_round
             existing_task.status = "blocked"
             existing_task.review_summary = ""
@@ -16551,6 +17397,316 @@ class Orchestrator:
             ):
                 return entry
         return {}
+
+    def _execution_recovery_selector_transfer_paths(
+        self,
+        task: TaskSpec,
+        *,
+        tasks: Iterable[TaskSpec] = (),
+        ownership_records: Optional[
+            Mapping[str, Mapping[str, object]]
+        ] = None,
+        state: Optional[RunState] = None,
+    ) -> List[str]:
+        """Return the sole borrowed path authorized by an intact envelope."""
+
+        marker = self._execution_recovery_marker(task)
+        raw_transfer = marker.get("selector_owner_transfer", {})
+        transfer = raw_transfer if isinstance(raw_transfer, dict) else {}
+        required = {
+            "version",
+            "incident_id",
+            "evidence_fingerprint",
+            "recovery_round",
+            "source_task_id",
+            "recovery_task_id",
+            "handoff_version",
+            "selector_command_digest",
+            "canonical_selector",
+            "selector_path",
+            "test_name",
+            "retained_class_selector",
+            "selector_transition",
+            "ownership_disposition",
+            "preimage_snapshot_id",
+            "preimage_snapshot_ref",
+            "preimage_snapshot_commit",
+            "preimage_snapshot_tree",
+            "preimage_head_ref",
+            "preimage_worktree_fingerprint",
+            "preimage_changed_paths",
+            "preimage_path_fingerprints",
+            "preimage_index_fingerprints",
+            "transfer_id",
+        }
+        if not required.issubset(transfer):
+            return []
+        transfer_id = str(transfer.get("transfer_id", "")).strip()
+        material = {
+            key: value for key, value in transfer.items() if key != "transfer_id"
+        }
+        expected_transfer_id = "sha256:" + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if transfer_id != expected_transfer_id:
+            return []
+
+        path = str(transfer.get("selector_path", "")).strip()
+        canonical = str(transfer.get("canonical_selector", "")).strip()
+        canonical_path, separator, selector_name = canonical.partition("::")
+        test_name = str(transfer.get("test_name", "")).strip()
+        retained_path, retained_selector = self._split_evidence_ref(
+            str(transfer.get("retained_class_selector", "")).strip()
+        )
+        retained_parts = retained_selector.split("::") if retained_selector else []
+        handoff = marker.get("worktree_handoff", {})
+        if not isinstance(handoff, dict):
+            return []
+        handoff_paths = self._exact_recovery_path_list(
+            handoff.get("changed_paths")
+        )
+        borrowed_paths = self._exact_recovery_path_list(
+            handoff.get("borrowed_paths")
+        )
+        preimage_paths = self._exact_recovery_path_list(
+            transfer.get("preimage_changed_paths")
+        )
+        raw_immutable = handoff.get("immutable_borrowed_paths")
+        immutable_paths = (
+            []
+            if raw_immutable == []
+            else self._exact_recovery_path_list(raw_immutable)
+        )
+        if any(
+            item is None
+            for item in (
+                handoff_paths,
+                borrowed_paths,
+                preimage_paths,
+                immutable_paths,
+            )
+        ):
+            return []
+
+        records = ownership_records if isinstance(ownership_records, Mapping) else {}
+        source_id = str(transfer.get("source_task_id", "")).strip()
+        record = records.get(source_id, {})
+        if not isinstance(record, Mapping):
+            return []
+        owner_paths = self._exact_recovery_path_list(record.get("changed_paths"))
+        if owner_paths is None:
+            return []
+        maps = (
+            self._exact_sha256_fingerprint_map(
+                handoff.get("path_fingerprints"), handoff_paths or []
+            ),
+            self._exact_sha256_fingerprint_map(
+                handoff.get("index_fingerprints"), handoff_paths or []
+            ),
+            self._exact_sha256_fingerprint_map(
+                transfer.get("preimage_path_fingerprints"), preimage_paths or []
+            ),
+            self._exact_sha256_fingerprint_map(
+                transfer.get("preimage_index_fingerprints"), preimage_paths or []
+            ),
+            self._exact_sha256_fingerprint_map(
+                record.get("path_fingerprints"), owner_paths
+            ),
+            self._exact_sha256_fingerprint_map(
+                record.get("index_fingerprints"), owner_paths
+            ),
+        )
+        if any(item is None for item in maps):
+            return []
+        (
+            handoff_path_fingerprints,
+            handoff_index_fingerprints,
+            preimage_path_fingerprints,
+            preimage_index_fingerprints,
+            owner_path_fingerprints,
+            owner_index_fingerprints,
+        ) = maps
+        task_list = list(tasks)
+        source_matches = [
+            candidate
+            for candidate in task_list
+            if candidate.task_id == source_id and candidate is not task
+        ]
+        source = source_matches[0] if len(source_matches) == 1 else None
+        disposition = transfer.get("ownership_disposition", {})
+        transition = transfer.get("selector_transition", {})
+        mutable_paths = [
+            self._normalize_mutable_artifact_path(item)
+            for item in task.mutable_artifacts
+            if str(item).strip()
+        ]
+        effective_state = state
+        if effective_state is None:
+            try:
+                effective_state = load_run_state(self.project_root)
+            except (OSError, TypeError, ValueError):
+                effective_state = None
+        claims = (
+            self._ready_selector_owner_claims(
+                effective_state,
+                task_list,
+                path,
+            )
+            if effective_state is not None
+            else []
+        )
+        try:
+            version = int(transfer.get("version", 0) or 0)
+            round_number = int(transfer.get("recovery_round", 0) or 0)
+            handoff_version = int(handoff.get("version", 0) or 0)
+            transfer_handoff_version = int(
+                transfer.get("handoff_version", 0) or 0
+            )
+            owner_version = int(record.get("version", 0) or 0)
+        except (TypeError, ValueError):
+            return []
+        command = str(marker.get("verification_command", "")).strip()
+        command_digest = "sha256:" + hashlib.sha256(
+            command.encode("utf-8")
+        ).hexdigest()
+        bound_selector, bound_path, bound_test_name = (
+            self._single_module_level_pytest_selector(command)
+        )
+        if not bound_selector:
+            return []
+        snapshot_commit = str(
+            transfer.get("preimage_snapshot_commit", "")
+        ).strip()
+        readable, snapshot_content = self._git_path_bytes_at_commit(
+            snapshot_commit,
+            bound_path,
+        )
+        bound_retained_selector = (
+            self._class_scoped_selector_in_snapshot(
+                snapshot_content,
+                selector_path=bound_path,
+                test_name=bound_test_name,
+            )
+            if readable and bound_path and bound_test_name
+            else ""
+        )
+        if not (
+            version == 1
+            and handoff_version == transfer_handoff_version == 2
+            and owner_version == 1
+            and task.task_origin == "stage_recovery"
+            and task.task_id == str(transfer.get("recovery_task_id", "")).strip()
+            and round_number == int(task.recovery_round)
+            and round_number > 0
+            and str(transfer.get("incident_id", "")).strip()
+            == str(marker.get("execution_incident_id", "")).strip()
+            and str(transfer.get("evidence_fingerprint", "")).strip()
+            == str(marker.get("evidence_fingerprint", "")).strip()
+            and str(transfer.get("selector_command_digest", "")).strip()
+            == command_digest
+            and bound_selector == canonical
+            and bound_path == path
+            and bound_test_name == test_name
+            and bound_retained_selector
+            == str(transfer.get("retained_class_selector", "")).strip()
+            and separator
+            and canonical_path == path
+            and selector_name == test_name
+            and retained_path == path
+            and len(retained_parts) == 2
+            and retained_parts[1] == test_name
+            and handoff_paths == borrowed_paths == preimage_paths == owner_paths
+            and path in (handoff_paths or [])
+            and immutable_paths == sorted(set(handoff_paths or []) - {path})
+            and marker.get("mutable_paths") == [path]
+            and mutable_paths == [path]
+            and handoff_path_fingerprints
+            == preimage_path_fingerprints
+            == owner_path_fingerprints
+            and handoff_index_fingerprints
+            == preimage_index_fingerprints
+            == owner_index_fingerprints
+            and source is not None
+            and source.status == "in_progress"
+            and self._task_owns_persisted_pytest_command(source, command)
+            and effective_state is not None
+            and self._in_progress_implementation_is_ready(
+                effective_state,
+                source,
+            )
+            and claims == [source_id]
+            and isinstance(disposition, dict)
+            and disposition
+            == {
+                "kind": "return_to_source_owner",
+                "owner_task_id": source_id,
+            }
+            and isinstance(transition, dict)
+            and transition == {"from": "target_not_found", "to": "resolved_pass"}
+            and str(handoff.get("source_task_id", "")).strip() == source_id
+            and str(record.get("owner_task_id", "")).strip() == source_id
+            and str(transfer.get("preimage_snapshot_id", "")).strip()
+            == str(record.get("verify_baseline_snapshot_id", "")).strip()
+            and str(transfer.get("preimage_snapshot_ref", "")).strip()
+            == str(record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")).strip()
+            and str(transfer.get("preimage_snapshot_commit", "")).strip()
+            == str(record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")).strip()
+            and str(transfer.get("preimage_snapshot_tree", "")).strip()
+            == str(record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE, "")).strip()
+            and str(transfer.get("preimage_head_ref", "")).strip()
+            == str(handoff.get("head_ref", "")).strip()
+            == str(record.get("head_ref", "")).strip()
+            and str(transfer.get("preimage_worktree_fingerprint", "")).strip()
+            == str(handoff.get("worktree_fingerprint", "")).strip()
+            == str(record.get("worktree_fingerprint", "")).strip()
+        ):
+            return []
+        return [path]
+
+    def _block_current_selector_overlap_authority(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        incident: ExecutionIncident,
+        *,
+        recovery_task: Optional[TaskSpec] = None,
+    ) -> None:
+        reason = (
+            "current-selector recovery overlaps retained source work but its "
+            "single-owner transfer authority is incomplete or ambiguous"
+        )
+        if recovery_task is not None:
+            marker = self._execution_recovery_marker(recovery_task)
+            marker.pop("selector_owner_transfer", None)
+            marker.pop("mutable_paths", None)
+            raw_handoff = marker.get("worktree_handoff", {})
+            if isinstance(raw_handoff, dict):
+                raw_handoff.pop("immutable_borrowed_paths", None)
+            recovery_task.mutable_artifacts = []
+            recovery_task.scope_boundaries = ""
+            recovery_task.status = "blocked"
+            recovery_task.review_summary = reason
+            self._clear_implementation_ready_marker(state, recovery_task)
+            self._clear_stale_implementation_resume_markers(
+                state,
+                task_ids=[recovery_task.task_id],
+            )
+            self._persist_tasks(tasks)
+        self._block_run(
+            state,
+            owner="auto_agents",
+            category="execution_recovery_selector_overlap_authority",
+            reason=reason,
+            incident_id=incident.incident_id,
+            fingerprint=incident.evidence_fingerprint,
+        )
+        state.tasks = tasks
+        save_run_state(self.project_root, state)
 
     def _execution_recovery_implementation_required(
         self,
@@ -16970,6 +18126,1092 @@ class Orchestrator:
             "snapshot_incomplete": snapshot_incomplete,
         }
 
+    @staticmethod
+    def _selector_transfer_envelope(task: TaskSpec) -> Dict[str, object]:
+        marker = Orchestrator._execution_recovery_marker(task)
+        raw_transfer = marker.get("selector_owner_transfer", {})
+        transfer = raw_transfer if isinstance(raw_transfer, dict) else {}
+        transfer_id = str(transfer.get("transfer_id", "")).strip()
+        if not transfer_id:
+            return {}
+        material = {
+            key: value for key, value in transfer.items() if key != "transfer_id"
+        }
+        expected = "sha256:" + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return transfer if transfer_id == expected else {}
+
+    @staticmethod
+    def _selector_delta_mismatch_is_exact(
+        detail: Mapping[str, object],
+        selector_path: str,
+    ) -> bool:
+        return bool(
+            selector_path
+            and detail.get("altered_paths") == [selector_path]
+            and detail.get("missing_paths") == []
+            and detail.get("changed_index_paths") == []
+            and detail.get("extra_paths") == []
+            and not bool(detail.get("snapshot_incomplete"))
+            and str(detail.get("expected_head", "")).strip()
+            == str(detail.get("current_head", "")).strip()
+            and str(detail.get("expected_head", "")).strip()
+        )
+
+    @staticmethod
+    def _selector_delta_mismatch_identity(
+        detail: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Return the stable, authorization-relevant part of a mismatch."""
+
+        def exact_list(value: object) -> object:
+            if not isinstance(value, list):
+                return None
+            return list(value)
+
+        return {
+            "source_task_id": str(detail.get("source_task_id", "")).strip(),
+            "expected_paths": exact_list(detail.get("expected_paths")),
+            "current_paths": exact_list(detail.get("current_paths")),
+            "extra_paths": exact_list(detail.get("extra_paths")),
+            "missing_paths": exact_list(detail.get("missing_paths")),
+            "altered_paths": exact_list(detail.get("altered_paths")),
+            "changed_index_paths": exact_list(
+                detail.get("changed_index_paths")
+            ),
+            "expected_head": str(detail.get("expected_head", "")).strip(),
+            "current_head": str(detail.get("current_head", "")).strip(),
+            "snapshot_incomplete": bool(detail.get("snapshot_incomplete")),
+        }
+
+    @classmethod
+    def _selector_delta_mismatch_digest(
+        cls,
+        detail: Mapping[str, object],
+    ) -> str:
+        return "sha256:" + hashlib.sha256(
+            json.dumps(
+                cls._selector_delta_mismatch_identity(detail),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _selector_resume_blocker_matches(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+        recovery_task: TaskSpec,
+        mismatch: Mapping[str, object],
+        *,
+        migrate_legacy_identity: bool = False,
+    ) -> bool:
+        """Bind resume authority to one exact persisted blocker and mismatch."""
+
+        blocker = (
+            state.active_blocker
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        marker = self._execution_recovery_marker(recovery_task)
+        raw_detail = blocker.get("execution_recovery_borrowed_worktree", {})
+        detail = raw_detail if isinstance(raw_detail, dict) else {}
+        marker_detail = marker.get("borrowed_worktree_validation", {})
+        marker_detail = marker_detail if isinstance(marker_detail, dict) else {}
+        expected_identity = self._selector_delta_mismatch_identity(mismatch)
+        mismatch_digest = self._selector_delta_mismatch_digest(mismatch)
+        checkpoint = blocker.get("checkpoint", {})
+        checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+        source_task_id = str(marker.get("worktree_handoff", {}).get(
+            "source_task_id", ""
+        )).strip() if isinstance(marker.get("worktree_handoff"), dict) else ""
+        supplied_bindings = {
+            "incident_id": str(blocker.get("incident_id", "")).strip(),
+            "task_id": str(blocker.get("task_id", "")).strip(),
+            "source_task_id": str(blocker.get("source_task_id", "")).strip(),
+            "evidence_fingerprint": str(
+                blocker.get("evidence_fingerprint", "")
+            ).strip(),
+            "mismatch_digest": str(blocker.get("mismatch_digest", "")).strip(),
+        }
+        expected_bindings = {
+            "incident_id": incident.incident_id,
+            "task_id": recovery_task.task_id,
+            "source_task_id": source_task_id,
+            "evidence_fingerprint": incident.evidence_fingerprint,
+            "mismatch_digest": mismatch_digest,
+        }
+        if not (
+            state.status == "blocked"
+            and bool(incident.incident_id)
+            and bool(incident.task_id)
+            and bool(incident.evidence_fingerprint)
+            and str(blocker.get("owner", "")).strip() == "auto_agents"
+            and str(blocker.get("status", "")).strip() == "blocked"
+            and str(blocker.get("category", "")).strip()
+            == "execution_recovery_borrowed_worktree_mutation"
+            and state.active_execution_incident_id == incident.incident_id
+            and incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            and incident.task_id == source_task_id
+            and incident.status in {"recovering", "repair_attempt_completed"}
+            and str(marker.get("execution_incident_id", "")).strip()
+            == incident.incident_id
+            and str(marker.get("evidence_fingerprint", "")).strip()
+            == incident.evidence_fingerprint
+            and self._selector_delta_mismatch_identity(detail)
+            == expected_identity
+            and self._selector_delta_mismatch_identity(marker_detail)
+            == expected_identity
+            and str(checkpoint.get("head", "")).strip()
+            == head_ref(self.project_root)
+            and str(checkpoint.get("worktree", "")).strip()
+            == worktree_fingerprint(self.project_root)
+        ):
+            return False
+        mismatched_supplied = any(
+            value and value != expected_bindings[key]
+            for key, value in supplied_bindings.items()
+        )
+        if mismatched_supplied:
+            return False
+        missing_bindings = [key for key, value in supplied_bindings.items() if not value]
+        if missing_bindings:
+            if not migrate_legacy_identity:
+                return False
+            try:
+                schema_version = int(blocker.get("schema_version", 0) or 0)
+            except (TypeError, ValueError):
+                return False
+            blocker.update(expected_bindings)
+            blocker["schema_version"] = max(
+                schema_version,
+                2,
+            )
+            blocker["legacy_identity_migration"] = {
+                "version": 1,
+                "fields": missing_bindings,
+                "mismatch_digest": mismatch_digest,
+            }
+            save_run_state(self.project_root, state)
+        return all(
+            str(blocker.get(key, "")).strip() == value
+            for key, value in expected_bindings.items()
+        )
+
+    def _legacy_selector_owner_transfer(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        incident: ExecutionIncident,
+        recovery_task: TaskSpec,
+        mismatch: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Reconstruct the narrow envelope from a fully bound legacy block."""
+
+        marker = self._execution_recovery_marker(recovery_task)
+        handoff = marker.get("worktree_handoff", {})
+        handoff = handoff if isinstance(handoff, dict) else {}
+        contract = incident.process_snapshot.get(
+            CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY,
+            {},
+        )
+        command = (incident.origin_command or incident.command).strip()
+        canonical, selector_path, test_name = (
+            self._single_module_level_pytest_selector(command)
+        )
+        source_id = str(handoff.get("source_task_id", "")).strip()
+        source_matches = [task for task in tasks if task.task_id == source_id]
+        source = source_matches[0] if len(source_matches) == 1 else None
+        records = self._retained_worktree_ownership_records(state)
+        record = records.get(source_id, {})
+        handoff_paths = self._exact_recovery_path_list(handoff.get("changed_paths"))
+        borrowed_paths = self._exact_recovery_path_list(handoff.get("borrowed_paths"))
+        owner_paths = self._exact_recovery_path_list(
+            record.get("changed_paths") if isinstance(record, dict) else None
+        )
+        try:
+            recovery_round = int(recovery_task.recovery_round)
+            incident_round = int(incident.recovery_round)
+            handoff_version = int(handoff.get("version", 0) or 0)
+            owner_version = int(record.get("version", 0) or 0)
+        except (TypeError, ValueError):
+            return {}
+        if not (
+            canonical
+            and source is not None
+            and source.status == "in_progress"
+            and self._in_progress_implementation_is_ready(state, source)
+            and self._task_owns_persisted_pytest_command(source, command)
+            and self._ready_selector_owner_claims(state, tasks, selector_path)
+            == [source_id]
+            and recovery_task.task_origin == "stage_recovery"
+            and recovery_task.status in {"blocked", "in_progress", "done"}
+            and recovery_round == incident_round
+            and incident_round > 0
+            and incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            and not incident.baseline
+            and isinstance(contract, dict)
+            and contract.get("status") == "target_not_found"
+            and contract.get("contract") == "exact_pytest_target"
+            and contract.get("repair_scope") == "verification_contract"
+            and bool(incident.incident_id)
+            and bool(incident.evidence_fingerprint)
+            and not incident.termination_reason
+            and not incident.cleanup_incomplete
+            and incident.task_id == source_id
+            and str(marker.get("verification_command", "")).strip() == command
+            and self._selector_delta_mismatch_is_exact(mismatch, selector_path)
+            and handoff_paths is not None
+            and handoff_paths == borrowed_paths == owner_paths
+            and selector_path in handoff_paths
+            and handoff_version == 2
+            and isinstance(record, dict)
+            and owner_version == 1
+            and str(record.get("owner_task_id", "")).strip() == source_id
+            and str(record.get("source", "")).strip() == "implementation_ready"
+        ):
+            return {}
+        handoff_paths_fingerprint = self._exact_sha256_fingerprint_map(
+            handoff.get("path_fingerprints"), handoff_paths
+        )
+        handoff_index_fingerprint = self._exact_sha256_fingerprint_map(
+            handoff.get("index_fingerprints"), handoff_paths
+        )
+        owner_paths_fingerprint = self._exact_sha256_fingerprint_map(
+            record.get("path_fingerprints"), owner_paths
+        )
+        owner_index_fingerprint = self._exact_sha256_fingerprint_map(
+            record.get("index_fingerprints"), owner_paths
+        )
+        current_paths_fingerprint = self._retained_worktree_path_fingerprints(
+            owner_paths
+        )
+        expected_current_paths = dict(handoff_paths_fingerprint or {})
+        if selector_path:
+            expected_current_paths[selector_path] = current_paths_fingerprint.get(
+                selector_path, ""
+            )
+        if not (
+            handoff_paths_fingerprint is not None
+            and handoff_index_fingerprint is not None
+            and owner_paths_fingerprint == handoff_paths_fingerprint
+            and (
+                owner_index_fingerprint is None
+                or owner_index_fingerprint == handoff_index_fingerprint
+            )
+            and handoff_index_fingerprint
+            == self._worktree_index_fingerprints(owner_paths)
+            and current_paths_fingerprint == expected_current_paths
+            and handoff_paths_fingerprint.get(selector_path)
+            != current_paths_fingerprint.get(selector_path)
+            and str(record.get("head_ref", "")).strip()
+            == str(handoff.get("head_ref", "")).strip()
+            == head_ref(self.project_root)
+            and str(record.get("worktree_fingerprint", "")).strip()
+            == str(handoff.get("worktree_fingerprint", "")).strip()
+        ):
+            return {}
+        snapshot_ref = str(record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")).strip()
+        snapshot_commit = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+        ).strip()
+        snapshot_tree = str(record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE, "")).strip()
+        resolved_commit, resolved_tree = self._git_commit_and_tree(
+            self.project_root, snapshot_ref
+        )
+        readable, content = self._git_path_bytes_at_commit(
+            snapshot_commit, selector_path
+        )
+        retained_selector = self._class_scoped_selector_in_snapshot(
+            content,
+            selector_path=selector_path,
+            test_name=test_name,
+        ) if readable else ""
+        if not (
+            snapshot_ref.startswith("refs/auto-agents/gate-snapshots/")
+            and resolved_commit == snapshot_commit
+            and resolved_tree == snapshot_tree
+            and self._retained_verify_baseline_snapshot_matches_record(record)
+            and retained_selector
+        ):
+            return {}
+        if owner_index_fingerprint is None:
+            replacement = copy.deepcopy(record)
+            replacement["index_fingerprints"] = dict(handoff_index_fingerprint)
+            records[source_id] = replacement
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+            save_run_state(self.project_root, state)
+            record = replacement
+        transfer: Dict[str, object] = {
+            "version": 1,
+            "incident_id": incident.incident_id,
+            "evidence_fingerprint": incident.evidence_fingerprint,
+            "recovery_round": incident.recovery_round,
+            "source_task_id": source_id,
+            "recovery_task_id": recovery_task.task_id,
+            "handoff_version": 2,
+            "selector_command_digest": "sha256:" + hashlib.sha256(
+                command.encode("utf-8")
+            ).hexdigest(),
+            "canonical_selector": canonical,
+            "selector_path": selector_path,
+            "test_name": test_name,
+            "retained_class_selector": retained_selector,
+            "selector_transition": {"from": "target_not_found", "to": "resolved_pass"},
+            "ownership_disposition": {
+                "kind": "return_to_source_owner",
+                "owner_task_id": source_id,
+            },
+            "preimage_snapshot_id": str(record.get("verify_baseline_snapshot_id", "")).strip(),
+            "preimage_snapshot_ref": snapshot_ref,
+            "preimage_snapshot_commit": snapshot_commit,
+            "preimage_snapshot_tree": snapshot_tree,
+            "preimage_head_ref": head_ref(self.project_root),
+            "preimage_worktree_fingerprint": str(
+                handoff.get("worktree_fingerprint", "")
+            ).strip(),
+            "preimage_changed_paths": list(owner_paths),
+            "preimage_path_fingerprints": dict(handoff_paths_fingerprint),
+            "preimage_index_fingerprints": dict(handoff_index_fingerprint),
+            "legacy_reconstruction": {
+                "version": 1,
+                "kind": "blocked_selector_postimage",
+                "mismatch_digest": self._selector_delta_mismatch_digest(mismatch),
+            },
+        }
+        transfer["transfer_id"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                transfer,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        marker["selector_owner_transfer"] = transfer
+        marker["mutable_paths"] = [selector_path]
+        handoff["immutable_borrowed_paths"] = sorted(
+            set(owner_paths) - {selector_path}
+        )
+        recovery_task.mutable_artifacts = [selector_path]
+        recovery_task.scope_boundaries = (
+            "Modify only the checkpoint-bound selector path recorded in the "
+            "ownership transfer; every other borrowed path remains immutable."
+        )
+        self._persist_tasks(tasks)
+        return transfer
+
+    @staticmethod
+    def _selector_review_attestation_digest(
+        attestation: Mapping[str, object],
+    ) -> str:
+        material = {
+            key: value
+            for key, value in attestation.items()
+            if key != "attestation_digest"
+        }
+        return "sha256:" + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _freshen_legacy_selector_review(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+    ) -> bool:
+        """Replace an old unversioned review with a current-policy review."""
+
+        transfer = self._selector_transfer_envelope(task)
+        legacy = transfer.get("legacy_reconstruction", {})
+        review = state.task_review_cache.get(task.task_id, {})
+        current_fingerprint = worktree_fingerprint(self.project_root)
+        if not (
+            isinstance(legacy, dict)
+            and legacy.get("kind") == "blocked_selector_postimage"
+            and isinstance(review, dict)
+            and review.get("decision") == "pass"
+            and str(review.get("summary", "")).strip()
+            and str(review.get("fingerprint", "")).strip() == current_fingerprint
+            and not str(review.get("prompt_policy_hash", "")).strip()
+        ):
+            return False
+        latest_verify = next(
+            (
+                entry
+                for entry in reversed(task.verify_history)
+                if isinstance(entry, dict)
+                and self._verify_history_entry_is_in_active_retry_lifecycle(
+                    task, entry
+                )
+                and entry.get("decision") == "pass"
+            ),
+            {},
+        )
+        if str(latest_verify.get("candidate_fingerprint", "")).strip() != (
+            self._worktree_fingerprint_excluding_agent_instructions()
+        ):
+            return False
+        result = self._run_task_review(
+            state.run_id,
+            task,
+            verify_reason=str(latest_verify.get("summary", "")).strip(),
+            state=state,
+        )
+        if not result.get("ok"):
+            return False
+        self._store_task_review_cache(
+            state,
+            task,
+            current_fingerprint,
+            str(result.get("review", "")),
+        )
+        refreshed = state.task_review_cache.get(task.task_id, {})
+        attestation: Dict[str, object] = {
+            "version": 1,
+            "kind": "fresh_current_policy_review",
+            "incident_id": str(transfer.get("incident_id", "")).strip(),
+            "recovery_task_id": task.task_id,
+            "transfer_id": str(transfer.get("transfer_id", "")).strip(),
+            "fingerprint": str(refreshed.get("fingerprint", "")).strip(),
+            "prompt_policy_hash": str(
+                refreshed.get("prompt_policy_hash", "")
+            ).strip(),
+            "summary_digest": "sha256:" + hashlib.sha256(
+                str(refreshed.get("summary", "")).strip().encode("utf-8")
+            ).hexdigest(),
+        }
+        attestation["attestation_digest"] = (
+            self._selector_review_attestation_digest(attestation)
+        )
+        self._execution_recovery_marker(task)[
+            "selector_review_attestation"
+        ] = attestation
+        self._persist_tasks(tasks)
+        return True
+
+    def _legacy_selector_review_attestation_matches(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        transfer: Mapping[str, object],
+        review: Mapping[str, object],
+    ) -> bool:
+        if not isinstance(transfer.get("legacy_reconstruction"), dict):
+            return True
+        marker = self._execution_recovery_marker(task)
+        raw = marker.get("selector_review_attestation", {})
+        attestation = raw if isinstance(raw, dict) else {}
+        return bool(
+            attestation.get("version") == 1
+            and attestation.get("kind") == "fresh_current_policy_review"
+            and str(attestation.get("incident_id", "")).strip()
+            == str(transfer.get("incident_id", "")).strip()
+            and str(attestation.get("recovery_task_id", "")).strip()
+            == task.task_id
+            and str(attestation.get("transfer_id", "")).strip()
+            == str(transfer.get("transfer_id", "")).strip()
+            and str(attestation.get("fingerprint", "")).strip()
+            == str(review.get("fingerprint", "")).strip()
+            and str(attestation.get("prompt_policy_hash", "")).strip()
+            == str(review.get("prompt_policy_hash", "")).strip()
+            and str(attestation.get("summary_digest", "")).strip()
+            == "sha256:" + hashlib.sha256(
+                str(review.get("summary", "")).strip().encode("utf-8")
+            ).hexdigest()
+            and str(attestation.get("attestation_digest", "")).strip()
+            == self._selector_review_attestation_digest(attestation)
+        )
+
+    def _selector_delta_review_evidence(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> Dict[str, str]:
+        candidate_fingerprint = (
+            self._worktree_fingerprint_excluding_agent_instructions()
+        )
+        active_history = [
+            entry
+            for entry in task.verify_history
+            if isinstance(entry, dict)
+            and self._verify_history_entry_is_in_active_retry_lifecycle(task, entry)
+        ]
+        latest_verify = active_history[-1] if active_history else {}
+        review = state.task_review_cache.get(task.task_id, {})
+        review_fingerprint = worktree_fingerprint(self.project_root)
+        review_policy_hash = self._review_prompt_policy_hash()
+        transfer = self._selector_transfer_envelope(task)
+        try:
+            verified_schema_version = int(
+                latest_verify.get("verify_baseline_schema_version", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return {}
+        if not (
+            str(latest_verify.get("decision", "")).strip() == "pass"
+            and str(latest_verify.get("candidate_fingerprint", "")).strip()
+            == candidate_fingerprint
+            and verified_schema_version == int(task.verify_baseline_schema_version)
+            and isinstance(review, dict)
+            and str(review.get("decision", "")).strip() == "pass"
+            and str(review.get("summary", "")).strip()
+            and str(review.get("fingerprint", "")).strip()
+            == review_fingerprint
+            and str(review.get("prompt_policy_hash", "")).strip()
+            == review_policy_hash
+            and self._legacy_selector_review_attestation_matches(
+                state,
+                task,
+                transfer,
+                review,
+            )
+        ):
+            return {}
+        return {
+            "verification_fingerprint": candidate_fingerprint,
+            "review_fingerprint": review_fingerprint,
+            "review_policy_hash": review_policy_hash,
+        }
+
+    @staticmethod
+    def _selector_reconciliation_digest(
+        provenance: Mapping[str, object],
+    ) -> str:
+        material = {
+            key: value
+            for key, value in provenance.items()
+            if key != "provenance_digest"
+        }
+        return "sha256:" + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _record_selector_reconciliation_incident_event(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        provenance: Mapping[str, object],
+    ) -> bool:
+        """Durably link owner reconciliation to its execution incident once."""
+
+        incident_id = str(provenance.get("incident_id", "")).strip()
+        store = self._incident_store(state)
+        incident = store.load(incident_id) if incident_id else None
+        transfer = self._selector_transfer_envelope(task)
+        provenance_digest = str(provenance.get("provenance_digest", "")).strip()
+        try:
+            incident_round = int(incident.recovery_round) if incident else 0
+            task_round = int(task.recovery_round)
+        except (TypeError, ValueError):
+            return False
+        if not (
+            incident is not None
+            and incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            and incident.task_id == str(provenance.get("source_task_id", "")).strip()
+            and incident_round == task_round
+            and str(transfer.get("transfer_id", "")).strip()
+            == str(provenance.get("transfer_id", "")).strip()
+            and provenance_digest
+            == self._selector_reconciliation_digest(provenance)
+        ):
+            return False
+        matching = [
+            event
+            for event in incident.history
+            if isinstance(event, dict)
+            and event.get("event") == "selector_delta_reconciled"
+            and str(event.get("provenance_digest", "")).strip()
+            == provenance_digest
+        ]
+        if matching:
+            return len(matching) == 1 and matching[0].get("provenance") == dict(
+                provenance
+            )
+        incident.history.append(
+            {
+                "event": "selector_delta_reconciled",
+                "incident_id": incident.incident_id,
+                "source_task_id": incident.task_id,
+                "recovery_task_id": task.task_id,
+                "round": incident.recovery_round,
+                "transfer_id": str(provenance.get("transfer_id", "")).strip(),
+                "provenance_digest": provenance_digest,
+                "provenance": dict(provenance),
+            }
+        )
+        store.save(incident, state)
+        return True
+
+    def _selector_reconciliation_event_for_recovery(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        incident: ExecutionIncident,
+    ) -> Dict[str, object]:
+        """Validate the exact embedded provenance for a completed repair."""
+
+        marker = self._execution_recovery_marker(task)
+        raw_provenance = marker.get("selector_delta_reconciliation", {})
+        provenance = raw_provenance if isinstance(raw_provenance, dict) else {}
+        transfer = self._selector_transfer_envelope(task)
+        provenance_digest = str(provenance.get("provenance_digest", "")).strip()
+        events = [
+            event
+            for event in incident.history
+            if isinstance(event, dict)
+            and event.get("event") == "selector_delta_reconciled"
+            and str(event.get("recovery_task_id", "")).strip() == task.task_id
+        ]
+        event = events[0] if len(events) == 1 else {}
+        embedded = event.get("provenance", {}) if event else {}
+        embedded = embedded if isinstance(embedded, dict) else {}
+        try:
+            event_round = int(event.get("round", 0) or 0)
+            incident_round = int(incident.recovery_round)
+            task_round = int(task.recovery_round)
+        except (TypeError, ValueError):
+            return {}
+        if not (
+            task.task_origin == "stage_recovery"
+            and task.status == "done"
+            and incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            and event_round == incident_round == task_round
+            and str(event.get("incident_id", "")).strip() == incident.incident_id
+            and str(event.get("source_task_id", "")).strip() == incident.task_id
+            and str(event.get("transfer_id", "")).strip()
+            == str(transfer.get("transfer_id", "")).strip()
+            == str(provenance.get("transfer_id", "")).strip()
+            and str(event.get("provenance_digest", "")).strip()
+            == provenance_digest
+            and embedded == provenance
+            and provenance_digest
+            == self._selector_reconciliation_digest(provenance)
+            and str(provenance.get("incident_id", "")).strip()
+            == incident.incident_id
+            and str(provenance.get("source_task_id", "")).strip()
+            == incident.task_id
+            and str(provenance.get("recovery_task_id", "")).strip()
+            == task.task_id
+            and provenance.get("selector_transition")
+            == {"from": "target_not_found", "to": "resolved_pass"}
+            and str(provenance.get("selector_path", "")).strip()
+            == str(transfer.get("selector_path", "")).strip()
+            and str(provenance.get("canonical_selector", "")).strip()
+            == str(transfer.get("canonical_selector", "")).strip()
+            and str(provenance.get("preimage_path_fingerprint", "")).strip()
+            == dict(transfer.get("preimage_path_fingerprints", {})).get(
+                str(transfer.get("selector_path", "")).strip(), ""
+            )
+        ):
+            return {}
+        return dict(provenance)
+
+    def _completed_selector_delta_reconciliation(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        mismatch: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Validate one already-durable source-owner reconciliation."""
+
+        transfer = self._selector_transfer_envelope(task)
+        selector_path = str(transfer.get("selector_path", "")).strip()
+        source_task_id = str(transfer.get("source_task_id", "")).strip()
+        if not self._selector_delta_mismatch_is_exact(mismatch, selector_path):
+            return {}
+        records = self._retained_worktree_ownership_records(state)
+        record = records.get(source_task_id, {})
+        raw_history = (
+            record.get(_SELECTOR_DELTA_RECONCILIATIONS_FIELD, [])
+            if isinstance(record, dict)
+            else []
+        )
+        history = raw_history if isinstance(raw_history, list) else []
+        provenance = next(
+            (
+                item
+                for item in reversed(history)
+                if isinstance(item, dict)
+                and str(item.get("transfer_id", "")).strip()
+                == str(transfer.get("transfer_id", "")).strip()
+            ),
+            {},
+        )
+        if not provenance:
+            return {}
+        marker = self._execution_recovery_marker(task)
+        raw_handoff = marker.get("worktree_handoff", {})
+        handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+        owner_paths = self._exact_recovery_path_list(record.get("changed_paths"))
+        handoff_paths = self._exact_recovery_path_list(
+            handoff.get("changed_paths")
+        )
+        borrowed_paths = self._exact_recovery_path_list(
+            handoff.get("borrowed_paths")
+        )
+        preimage_paths = self._exact_recovery_path_list(
+            transfer.get("preimage_changed_paths")
+        )
+        raw_immutable = handoff.get("immutable_borrowed_paths")
+        immutable_paths = (
+            []
+            if raw_immutable == []
+            else self._exact_recovery_path_list(raw_immutable)
+        )
+        current_path_fingerprints = self._retained_worktree_path_fingerprints(
+            owner_paths or []
+        )
+        owner_path_fingerprints = self._exact_sha256_fingerprint_map(
+            record.get("path_fingerprints"), owner_paths or []
+        )
+        preimage_path_fingerprints = self._exact_sha256_fingerprint_map(
+            transfer.get("preimage_path_fingerprints"), owner_paths or []
+        )
+        handoff_path_fingerprints = self._exact_sha256_fingerprint_map(
+            handoff.get("path_fingerprints"), owner_paths or []
+        )
+        current_index_fingerprints = self._worktree_index_fingerprints(
+            owner_paths or []
+        )
+        transfer_index_fingerprints = self._exact_sha256_fingerprint_map(
+            transfer.get("preimage_index_fingerprints"), owner_paths or []
+        )
+        handoff_index_fingerprints = self._exact_sha256_fingerprint_map(
+            handoff.get("index_fingerprints"), owner_paths or []
+        )
+        owner_index_fingerprints = self._exact_sha256_fingerprint_map(
+            record.get("index_fingerprints"), owner_paths or []
+        )
+        expected_owner_path_fingerprints = dict(
+            preimage_path_fingerprints or {}
+        )
+        expected_owner_path_fingerprints[selector_path] = str(
+            provenance.get("postimage_path_fingerprint", "")
+        ).strip()
+        index_fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(
+                transfer_index_fingerprints or {},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        command = str(marker.get("verification_command", "")).strip()
+        command_digest = "sha256:" + hashlib.sha256(
+            command.encode("utf-8")
+        ).hexdigest()
+        bound_selector, bound_path, bound_test_name = (
+            self._single_module_level_pytest_selector(command)
+        )
+        source_matches = [
+            candidate for candidate in tasks if candidate.task_id == source_task_id
+        ]
+        source = source_matches[0] if len(source_matches) == 1 else None
+        try:
+            transfer_version = int(transfer.get("version", 0) or 0)
+            transfer_round = int(transfer.get("recovery_round", 0) or 0)
+            transfer_handoff_version = int(
+                transfer.get("handoff_version", 0) or 0
+            )
+            handoff_version = int(handoff.get("version", 0) or 0)
+        except (TypeError, ValueError):
+            return {}
+        evidence = self._selector_delta_review_evidence(state, task)
+        if not (
+            owner_paths is not None
+            and handoff_paths is not None
+            and borrowed_paths is not None
+            and preimage_paths is not None
+            and immutable_paths is not None
+            and owner_paths == handoff_paths == borrowed_paths == preimage_paths
+            and selector_path in owner_paths
+            and immutable_paths == sorted(set(owner_paths) - {selector_path})
+            and owner_path_fingerprints == current_path_fingerprints
+            == expected_owner_path_fingerprints
+            and preimage_path_fingerprints == handoff_path_fingerprints
+            and transfer_index_fingerprints
+            == handoff_index_fingerprints
+            == owner_index_fingerprints
+            == current_index_fingerprints
+            and str(record.get("owner_task_id", "")).strip() == source_task_id
+            and str(record.get("source", "")).strip()
+            == "implementation_ready"
+            and str(record.get("head_ref", "")).strip()
+            == str(transfer.get("preimage_head_ref", "")).strip()
+            == str(handoff.get("head_ref", "")).strip()
+            == head_ref(self.project_root)
+            and str(record.get("worktree_fingerprint", "")).strip()
+            == self._worktree_fingerprint_excluding_agent_instructions()
+            and str(handoff.get("worktree_fingerprint", "")).strip()
+            == str(transfer.get("preimage_worktree_fingerprint", "")).strip()
+            and transfer_version == 1
+            and handoff_version == transfer_handoff_version == 2
+            and transfer_round == int(task.recovery_round)
+            and task.task_origin == "stage_recovery"
+            and str(transfer.get("recovery_task_id", "")).strip()
+            == task.task_id
+            and str(transfer.get("incident_id", "")).strip()
+            == str(marker.get("execution_incident_id", "")).strip()
+            and str(transfer.get("evidence_fingerprint", "")).strip()
+            == str(marker.get("evidence_fingerprint", "")).strip()
+            and str(transfer.get("selector_command_digest", "")).strip()
+            == command_digest
+            and bound_selector
+            == str(transfer.get("canonical_selector", "")).strip()
+            and bound_path == selector_path
+            and bound_test_name == str(transfer.get("test_name", "")).strip()
+            and marker.get("mutable_paths") == [selector_path]
+            and str(handoff.get("source_task_id", "")).strip()
+            == source_task_id
+            and source is not None
+            and source.status == "in_progress"
+            and self._in_progress_implementation_is_ready(state, source)
+            and self._task_owns_persisted_pytest_command(source, command)
+            and self._ready_selector_owner_claims(
+                state,
+                tasks,
+                selector_path,
+            )
+            == [source_task_id]
+            and str(transfer.get("preimage_snapshot_id", "")).strip()
+            == str(record.get("verify_baseline_snapshot_id", "")).strip()
+            and str(transfer.get("preimage_snapshot_ref", "")).strip()
+            == str(record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")).strip()
+            and str(transfer.get("preimage_snapshot_commit", "")).strip()
+            == str(record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")).strip()
+            and str(transfer.get("preimage_snapshot_tree", "")).strip()
+            == str(record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE, "")).strip()
+            and evidence
+            and str(provenance.get("transfer_id", "")).strip()
+            == str(transfer.get("transfer_id", "")).strip()
+            and str(provenance.get("incident_id", "")).strip()
+            == str(transfer.get("incident_id", "")).strip()
+            and str(provenance.get("source_task_id", "")).strip()
+            == source_task_id
+            and str(provenance.get("recovery_task_id", "")).strip()
+            == task.task_id
+            and str(provenance.get("selector_path", "")).strip()
+            == selector_path
+            and str(provenance.get("canonical_selector", "")).strip()
+            == bound_selector
+            and provenance.get("selector_transition")
+            == {"from": "target_not_found", "to": "resolved_pass"}
+            and str(provenance.get("preimage_path_fingerprint", "")).strip()
+            == (preimage_path_fingerprints or {}).get(selector_path)
+            and str(provenance.get("postimage_path_fingerprint", "")).strip()
+            == current_path_fingerprints.get(selector_path)
+            and str(provenance.get("postimage_worktree_fingerprint", "")).strip()
+            == self._worktree_fingerprint_excluding_agent_instructions()
+            and str(provenance.get("verification_fingerprint", "")).strip()
+            == evidence["verification_fingerprint"]
+            and str(provenance.get("review_fingerprint", "")).strip()
+            == evidence["review_fingerprint"]
+            and str(provenance.get("review_policy_hash", "")).strip()
+            == evidence["review_policy_hash"]
+            and str(provenance.get("unchanged_index_fingerprint", "")).strip()
+            == index_fingerprint
+            and str(provenance.get("head_ref", "")).strip()
+            == head_ref(self.project_root)
+            and str(provenance.get("provenance_digest", "")).strip()
+            == self._selector_reconciliation_digest(provenance)
+        ):
+            return {}
+        return dict(provenance)
+
+    def _reconcile_verified_selector_delta(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        mismatch: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Return one reviewed selector postimage to its retained source owner."""
+
+        completed = self._completed_selector_delta_reconciliation(
+            state,
+            tasks,
+            task,
+            mismatch,
+        )
+        if completed:
+            marker = self._execution_recovery_marker(task)
+            if marker.get("selector_delta_reconciliation") != completed:
+                marker["selector_delta_reconciliation"] = dict(completed)
+                self._persist_tasks(tasks)
+            return completed
+
+        records = self._retained_worktree_ownership_records(state)
+        transfer_paths = self._execution_recovery_selector_transfer_paths(
+            task,
+            tasks=tasks,
+            ownership_records=records,
+            state=state,
+        )
+        if len(transfer_paths) != 1:
+            return {}
+        selector_path = transfer_paths[0]
+        if not self._selector_delta_mismatch_is_exact(mismatch, selector_path):
+            return {}
+        evidence = self._selector_delta_review_evidence(state, task)
+        if not evidence:
+            return {}
+        transfer = self._selector_transfer_envelope(task)
+        command = str(
+            self._execution_recovery_marker(task).get(
+                "verification_command",
+                "",
+            )
+        ).strip()
+        expected_head = head_ref(self.project_root)
+        expected_worktree = worktree_fingerprint(self.project_root)
+        gate = self._run_persisted_selector_probe(
+            task,
+            [command],
+            expected_head=expected_head,
+            expected_worktree=expected_worktree,
+            context=(
+                "verified selector ownership reconciliation "
+                f"({transfer.get('incident_id', '')})"
+            ),
+        )
+        if (
+            gate is None
+            or len(gate.commands) != 1
+            or self._persisted_selector_probe_status(gate.commands[0])[0]
+            != "resolved_pass"
+        ):
+            return {}
+        post_probe_mismatch = self._execution_recovery_borrowed_worktree_mismatch(
+            task
+        )
+        if (
+            not self._selector_delta_mismatch_is_exact(
+                post_probe_mismatch,
+                selector_path,
+            )
+            or worktree_fingerprint(self.project_root) != expected_worktree
+            or head_ref(self.project_root) != expected_head
+            or self._execution_recovery_selector_transfer_paths(
+                task,
+                tasks=tasks,
+                ownership_records=records,
+                state=state,
+            )
+            != [selector_path]
+        ):
+            return {}
+
+        source_task_id = str(transfer.get("source_task_id", "")).strip()
+        record = records.get(source_task_id, {})
+        owner_paths = self._exact_recovery_path_list(record.get("changed_paths"))
+        preimage_path_fingerprints = self._exact_sha256_fingerprint_map(
+            transfer.get("preimage_path_fingerprints"), owner_paths or []
+        )
+        preimage_index_fingerprints = self._exact_sha256_fingerprint_map(
+            transfer.get("preimage_index_fingerprints"), owner_paths or []
+        )
+        postimage_path_fingerprints = self._retained_worktree_path_fingerprints(
+            owner_paths or []
+        )
+        if not (
+            isinstance(record, dict)
+            and owner_paths is not None
+            and preimage_path_fingerprints is not None
+            and preimage_index_fingerprints is not None
+            and preimage_path_fingerprints.get(selector_path)
+            != postimage_path_fingerprints.get(selector_path)
+            and preimage_index_fingerprints
+            == self._worktree_index_fingerprints(owner_paths)
+        ):
+            return {}
+        index_fingerprint = hashlib.sha256(
+            json.dumps(
+                preimage_index_fingerprints,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        provenance: Dict[str, object] = {
+            "version": 1,
+            "transfer_id": str(transfer.get("transfer_id", "")).strip(),
+            "incident_id": str(transfer.get("incident_id", "")).strip(),
+            "source_task_id": source_task_id,
+            "recovery_task_id": task.task_id,
+            "selector_path": selector_path,
+            "canonical_selector": str(
+                transfer.get("canonical_selector", "")
+            ).strip(),
+            "selector_transition": dict(
+                transfer.get("selector_transition", {})
+            ),
+            "preimage_path_fingerprint": preimage_path_fingerprints[
+                selector_path
+            ],
+            "postimage_path_fingerprint": postimage_path_fingerprints[
+                selector_path
+            ],
+            "postimage_worktree_fingerprint": (
+                self._worktree_fingerprint_excluding_agent_instructions()
+            ),
+            "unchanged_index_fingerprint": "sha256:" + index_fingerprint,
+            "head_ref": expected_head,
+            **evidence,
+        }
+        provenance["provenance_digest"] = self._selector_reconciliation_digest(
+            provenance
+        )
+
+        replacement = copy.deepcopy(record)
+        replacement_path_fingerprints = dict(preimage_path_fingerprints)
+        replacement_path_fingerprints[selector_path] = (
+            postimage_path_fingerprints[selector_path]
+        )
+        replacement["path_fingerprints"] = replacement_path_fingerprints
+        replacement["worktree_fingerprint"] = provenance[
+            "postimage_worktree_fingerprint"
+        ]
+        prior_reconciliations = replacement.get(
+            _SELECTOR_DELTA_RECONCILIATIONS_FIELD,
+            [],
+        )
+        reconciliation_history = (
+            list(prior_reconciliations)
+            if isinstance(prior_reconciliations, list)
+            else []
+        )
+        reconciliation_history.append(dict(provenance))
+        replacement[_SELECTOR_DELTA_RECONCILIATIONS_FIELD] = (
+            reconciliation_history
+        )
+        replacement_records = copy.deepcopy(records)
+        replacement_records[source_task_id] = replacement
+        state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = (
+            replacement_records
+        )
+        save_run_state(self.project_root, state)
+
+        marker = self._execution_recovery_marker(task)
+        marker["selector_delta_reconciliation"] = dict(provenance)
+        self._persist_tasks(tasks)
+        return provenance
+
     def _block_execution_recovery_borrowed_worktree_mutation(
         self,
         state: RunState,
@@ -16991,13 +19233,28 @@ class Orchestrator:
             **detail,
             "updated_at": utc_now_iso(),
         }
+        incident_id = str(marker.get("execution_incident_id", "")).strip()
+        evidence_fingerprint = str(
+            marker.get("evidence_fingerprint", "")
+        ).strip()
+        raw_handoff = marker.get("worktree_handoff", {})
+        handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+        source_task_id = str(handoff.get("source_task_id", "")).strip()
         self._block_run(
             state,
             owner="auto_agents",
             category="execution_recovery_borrowed_worktree_mutation",
             reason=reason,
+            incident_id=incident_id,
+            fingerprint=evidence_fingerprint,
+            task_id=task.task_id,
         )
         state.active_blocker["execution_recovery_borrowed_worktree"] = detail
+        state.active_blocker["source_task_id"] = source_task_id
+        state.active_blocker["evidence_fingerprint"] = evidence_fingerprint
+        state.active_blocker["mismatch_digest"] = (
+            self._selector_delta_mismatch_digest(detail)
+        )
         state.tasks = tasks
         self._persist_tasks(tasks)
         save_run_state(self.project_root, state)
@@ -18125,26 +20382,114 @@ class Orchestrator:
         incident = store.load(incident_id)
         if incident is None:
             return
+        if incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND:
+            if not self._selector_reconciliation_event_for_recovery(
+                state,
+                task,
+                incident,
+            ):
+                return
         # Passing the repair task proves only that a candidate repair was
         # produced. It does not prove that the original owner boundary can now
         # cross the baseline/verification transition that opened the incident.
         # Keep the same incident and recovery budget active until that boundary
         # is observed succeeding.
+        prior = [
+            event
+            for event in incident.history
+            if isinstance(event, dict)
+            and event.get("event") == "repair_attempt_completed"
+            and event.get("task_id") == task.task_id
+            and str(event.get("round", "")).strip()
+            == str(int(incident.recovery_round))
+        ]
         incident.status = "repair_attempt_completed"
-        incident.history.append(
-            {
-                "event": "repair_attempt_completed",
-                "task_id": task.task_id,
-                "commit_sha": task.commit_sha,
-                "round": incident.recovery_round,
-            }
-        )
+        if not prior:
+            incident.history.append(
+                {
+                    "event": "repair_attempt_completed",
+                    "task_id": task.task_id,
+                    "commit_sha": task.commit_sha,
+                    "round": incident.recovery_round,
+                }
+            )
         store.save(incident, state)
-        self._clear_run_blocker(state)
+        if incident.kind != CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND:
+            self._clear_run_blocker(state)
+
+    def _selector_incident_resolution_provenance(
+        self,
+        state: RunState,
+        source_task: TaskSpec,
+        incident: ExecutionIncident,
+    ) -> Dict[str, object]:
+        if not (
+            source_task.status == "done"
+            and source_task.task_origin != "stage_recovery"
+            and incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            and incident.status == "repair_attempt_completed"
+            and incident.task_id == source_task.task_id
+        ):
+            return {}
+        recovery_tasks = [
+            task
+            for task in state.tasks
+            if task.task_origin == "stage_recovery"
+            and self._execution_recovery_incident_id(task) == incident.incident_id
+        ]
+        if len(recovery_tasks) != 1:
+            return {}
+        recovery = recovery_tasks[0]
+        provenance = self._selector_reconciliation_event_for_recovery(
+            state,
+            recovery,
+            incident,
+        )
+        completed = [
+            event
+            for event in incident.history
+            if isinstance(event, dict)
+            and event.get("event") == "repair_attempt_completed"
+            and str(event.get("task_id", "")).strip() == recovery.task_id
+            and str(event.get("round", "")).strip()
+            == str(int(incident.recovery_round))
+        ]
+        return provenance if provenance and len(completed) == 1 else {}
 
     def _resolve_inline_task_incident(self, state: RunState, task: TaskSpec) -> None:
         store = self._incident_store(state)
         incident = store.active(state)
+        if (
+            incident is not None
+            and incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+        ):
+            if not self._selector_incident_resolution_provenance(
+                state,
+                task,
+                incident,
+            ):
+                return
+            incident.status = "resolved"
+            incident.history.append(
+                {
+                    "event": "resolved",
+                    "task_id": task.task_id,
+                    "reason": "source task retry passed with reconciled selector provenance",
+                }
+            )
+            store.save(incident, state)
+            self._record_execution_incident_root_progress(
+                state,
+                incident,
+                reason="task retry passed",
+            )
+            self._advance_execution_incident_budget_epoch(
+                state,
+                reason="task retry passed",
+                incident=incident,
+            )
+            self._clear_run_blocker(state)
+            return
         if (
             incident is None
             or incident.source != "gate"
@@ -20600,13 +22945,34 @@ class Orchestrator:
             if borrowed_recovery_paths
             else {}
         )
+        selector_delta_reconciliation: Dict[str, object] = {}
         if borrowed_worktree_mismatch:
-            return self._block_execution_recovery_borrowed_worktree_mutation(
-                state,
-                tasks,
-                task,
-                borrowed_worktree_mismatch,
+            selector_delta_reconciliation = (
+                self._reconcile_verified_selector_delta(
+                    state,
+                    tasks,
+                    task,
+                    borrowed_worktree_mismatch,
+                )
             )
+            if not selector_delta_reconciliation:
+                return self._block_execution_recovery_borrowed_worktree_mutation(
+                    state,
+                    tasks,
+                    task,
+                    borrowed_worktree_mismatch,
+                )
+            if not self._record_selector_reconciliation_incident_event(
+                state,
+                task,
+                selector_delta_reconciliation,
+            ):
+                return self._block_execution_recovery_borrowed_worktree_mutation(
+                    state,
+                    tasks,
+                    task,
+                    borrowed_worktree_mismatch,
+                )
 
         preserved_repair_paths = self._retained_repair_preserved_paths(
             state,
@@ -20644,8 +23010,24 @@ class Orchestrator:
         if borrowed_recovery_paths:
             marker = self._execution_recovery_marker(task)
             marker["borrowed_worktree_validation"] = {
-                "status": "preserved",
+                "status": (
+                    "selector_delta_reconciled"
+                    if selector_delta_reconciliation
+                    else "preserved"
+                ),
                 "paths": borrowed_recovery_paths,
+                **(
+                    {
+                        "reconciliation_digest": str(
+                            selector_delta_reconciliation.get(
+                                "provenance_digest",
+                                "",
+                            )
+                        )
+                    }
+                    if selector_delta_reconciliation
+                    else {}
+                ),
                 "validated_at": utc_now_iso(),
             }
 
@@ -20674,6 +23056,50 @@ class Orchestrator:
         self._persist_tasks(tasks)
         save_run_state(self.project_root, state)
         previous_head = head_ref(self.project_root)
+        if selector_delta_reconciliation:
+            final_borrowed_mismatch = (
+                self._execution_recovery_borrowed_worktree_mismatch(task)
+            )
+            final_reconciliation = self._completed_selector_delta_reconciliation(
+                state,
+                tasks,
+                task,
+                final_borrowed_mismatch,
+            )
+            if (
+                not final_reconciliation
+                or str(final_reconciliation.get("provenance_digest", ""))
+                != str(
+                    selector_delta_reconciliation.get("provenance_digest", "")
+                )
+            ):
+                return self._block_execution_recovery_borrowed_worktree_mutation(
+                    state,
+                    tasks,
+                    task,
+                    final_borrowed_mismatch
+                    or {
+                        "source_task_id": str(
+                            selector_delta_reconciliation.get(
+                                "source_task_id",
+                                "",
+                            )
+                        ),
+                        "expected_paths": borrowed_recovery_paths,
+                        "current_paths": sorted(
+                            self._changed_paths_excluding_agent_instructions()
+                        ),
+                        "extra_paths": [],
+                        "missing_paths": [],
+                        "altered_paths": [],
+                        "changed_index_paths": [],
+                        "expected_head": str(
+                            selector_delta_reconciliation.get("head_ref", "")
+                        ),
+                        "current_head": head_ref(self.project_root),
+                        "snapshot_incomplete": True,
+                    },
+                )
         excluded_commit_paths = set(preserved_repair_paths) | set(
             borrowed_recovery_paths
         )
@@ -32781,7 +35207,10 @@ class Orchestrator:
             args = parts[1:]
         elif (
             len(parts) >= 3
-            and Path(parts[0]).name in {"python", "python3"}
+            and re.fullmatch(
+                r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?",
+                Path(parts[0]).name.lower(),
+            )
             and parts[1:3] == ["-m", "pytest"]
         ):
             args = parts[3:]
@@ -42880,11 +45309,34 @@ class Orchestrator:
         markers[task.task_id] = bool(ready)
         state.resume_context["implementation_ready_tasks"] = markers
         if ready:
-            preserved_paths = (
+            selector_transfer_paths = set(
+                self._execution_recovery_selector_transfer_paths(
+                    task,
+                    tasks=state.tasks,
+                    ownership_records=(
+                        self._retained_worktree_ownership_records(state)
+                    ),
+                    state=state,
+                )
+            )
+            if selector_transfer_paths:
+                records = self._retained_worktree_ownership_records(state)
+                records.pop(task.task_id, None)
+                if records:
+                    state.resume_context[
+                        _RETAINED_WORKTREE_OWNERSHIP_CONTEXT
+                    ] = records
+                else:
+                    state.resume_context.pop(
+                        _RETAINED_WORKTREE_OWNERSHIP_CONTEXT,
+                        None,
+                    )
+            preserved_paths = set(
                 self._retained_repair_preserved_paths(state, task.task_id)
                 if self._is_repair_task(task)
                 else []
             )
+            preserved_paths.update(selector_transfer_paths)
             self._capture_retained_worktree_ownership(
                 state,
                 [task.task_id],

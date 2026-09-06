@@ -49,6 +49,7 @@ class RepairCase:
     stage: str = ""
     task_id: str = ""
     failure_scope: str = "run"
+    invocation_context: Dict[str, object] = field(default_factory=dict)
     symptom: str = ""
     fingerprint: str = ""
     root_fingerprint: str = ""

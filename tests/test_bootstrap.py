@@ -62,6 +62,7 @@ class BootstrapTests(unittest.TestCase):
                 "state/release-worker.log\nstate/release-worker.lock\n"
                 "state/health-watch-control.json\nstate/health-watch-control.lock\n"
                 "state/checkpoint_blobs/\nstate/root_cause_certificates/\n"
+                "state/session-restorations/\n"
                 "state/sessions/*/prompts/\nstate/sessions/*/outputs/\n"
                 "state/sessions/*/health/\n"
                 "state/sessions/*/logs/\n"

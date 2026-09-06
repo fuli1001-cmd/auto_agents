@@ -1674,13 +1674,14 @@ audit evidence, staged and unstaged diffs, worker capabilities, and durable owne
 The investigator and reviewer run against a sanitized read-only shared Git clone, so bounded history
 and byte-level checkpoints remain inspectable without exposing operator inputs or `.env` files.
 High-confidence, reversible auto_agents defects may set `safe_to_attempt` even before integration is
-proven. In the default `max` mode, auto_agents generates isolated candidates until its semantic
-non-improvement patience is exhausted, rejects duplicate diffs and weakened tests, runs
-base/candidate differential checks, and replays the blocked state in a private target clone.
+proven. In the default `max` mode, auto_agents generates isolated candidates, uses semantic
+non-improvement to trigger strategy correction, rejects duplicate diffs and weakened tests, runs
+base/candidate differential checks, and replays a frozen failure checkpoint in a private target clone.
 Deterministic test deletion, skip/xfail, and invalid pytest-selector findings receive one bounded
 in-place correction in the same provider session when available before the candidate is rejected.
 Candidate-added tests are also applied to base
-engine code so a newly added regression must actually fail without the implementation fix. An
+engine code so a newly added regression must actually fail without the implementation fix;
+missing test collection and environment failures do not count as that proof. An
 adversarial read-only code review is required before expensive validation. Missing proof that is
 owned by a downstream gate is deferred rather than treated as a code failure. The candidate agent
 runs only focused checks; the orchestrator owns the single authoritative broad-suite execution and
@@ -1722,14 +1723,23 @@ discard a useful diagnosis for a one-command overage.
 The repaired process then reconciles only protected paths named by a durable attempt checkpoint and
 restarts the original stateful command. Task-scoped blockers remain localized while independent task
 lineages continue. Self-repair has no root-level candidate or wall-clock ceiling: it persists a
-Pareto frontier, resumes each round from the strongest search candidate, and stops only after
-`max_consecutive_non_improving_candidates` consecutive candidates close no obligation, add no new
-confirmed in-scope finding, and advance no validation boundary. Candidate, review, replay, and test
+Pareto frontier and resumes each round from the strongest revalidated candidate. After
+`max_consecutive_non_improving_candidates` candidates make no semantic improvement, it corrects
+the strategy or component decomposition while retaining verified work. Discovering a new defect
+or rewording a summary does not itself prove repair progress. Candidate, review, replay, and test
 operations retain provider/tool/no-progress leases plus final safety ceilings; ordinary activity no
-longer loses work at a short absolute deadline. On patience exhaustion the complete experiment is
-retained for operator diagnosis. Irreversible production actions, missing
+longer loses work at a short absolute deadline. Normal interruption persists the candidate before
+worktree cleanup. Irreversible production actions, missing
 credentials/authorization, and product semantics that cannot be derived from requirements always
 remain explicit human boundaries, including in `max` mode.
+
+An explicit `collab --session ID` retains the original collab entrypoint across self-repair.
+Missing control files can be recovered from a validated journal/checkpoint boundary for that exact
+session, with a restartable restoration receipt. An unrelated saved run cannot replace that
+session's failure or receive its repair result. Experiment schema v4 separates component receipts
+from whole-repair proof and preserves legacy artifacts for revalidation. See
+[collab recovery and repair evidence](docs/collab-self-repair-recovery.md) for the recovery protocol
+and isolated operational check.
 
 Use `--autonomy off|guarded|max` to override the project setting for one workflow. `guarded` limits
 automatic work to deterministic playbooks or already-proven-safe repairs; `max` also permits bounded

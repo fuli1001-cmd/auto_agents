@@ -44,7 +44,11 @@ from auto_agents.git_ops import (
     head_ref,
     worktree_fingerprint,
 )
-from auto_agents.orchestrator import Orchestrator
+from auto_agents.orchestrator import (
+    CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND,
+    CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY,
+    Orchestrator,
+)
 from auto_agents.self_repair import classify_auto_agents_error
 from auto_agents.validation import (
     validate_task_dependencies,
@@ -1104,6 +1108,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 title="Repair baseline identity",
                 description="",
                 acceptance=[],
+                status="done",
                 task_origin="stage_recovery",
                 recovery_history=[
                     recovery_task_marker(
@@ -1116,6 +1121,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
             )
 
             orchestrator._resolve_execution_incident_for_task(state, task)
+            orchestrator._resolve_execution_incident_for_task(state, task)
 
             saved = ExecutionIncidentStore(root, state.run_id).load(
                 incident.incident_id
@@ -1124,6 +1130,12 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(state.active_execution_incident_id, incident.incident_id)
             self.assertEqual(state.execution_incident_budget_epoch, 0)
             self.assertFalse(state.execution_incident_budget_checkpoint)
+            self.assertEqual(
+                [entry.get("event") for entry in saved.history].count(
+                    "repair_attempt_completed"
+                ),
+                1,
+            )
 
     def test_original_baseline_boundary_resolves_completed_repair_attempt(
         self,
@@ -1896,6 +1908,860 @@ class ExecutionRecoveryTests(unittest.TestCase):
             )
             detail = state.active_blocker["execution_recovery_borrowed_worktree"]
             self.assertEqual(detail["changed_index_paths"], ["owner.py"])
+
+    def _current_selector_reconciliation_case(
+        self,
+        root: Path,
+        *,
+        run_id: str = "",
+        source_task_id: str = "selector-source",
+        incident_id: str = "selector-incident",
+    ) -> dict:
+        Orchestrator.init_project(root, "project", "mock")
+        test_path = root / "tests" / "test_selector_contract.py"
+        owner_path = root / "owner.py"
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+        test_path.write_text("import unittest\n", encoding="utf-8")
+        owner_path.write_text("VALUE = 'base'\n", encoding="utf-8")
+        commit_all(root, "test: add selector reconciliation baseline")
+
+        test_name = "test_public_projection"
+        selector_path = test_path.relative_to(root).as_posix()
+        selector = f"{selector_path}::{test_name}"
+        command = f"{Path(sys.executable).as_posix()} -m pytest -q -s {selector}"
+        retained_body = (
+            "class ContractTests(unittest.TestCase):\n"
+            f"    def {test_name}(self):\n"
+            "        print('RETAINED_ASSERTION_BODY_EXECUTED')\n"
+            "        self.assertEqual({'state': 'recovering'}['state'], 'recovering')\n"
+        )
+        test_path.write_text("import unittest\n\n" + retained_body, encoding="utf-8")
+        owner_path.write_text("VALUE = 'retained'\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "--", selector_path, "owner.py"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+
+        orchestrator = Orchestrator(root)
+        orchestrator.config.gates.steps = []
+        orchestrator.config.gates.distributed.mode = "off"
+        orchestrator.config.gates.adaptive_timeout_enabled = False
+        orchestrator.config.gates.command_timeout_seconds = 30
+        orchestrator.config.gates.command_idle_timeout_seconds = 30
+        state = load_run_state(root)
+        if run_id:
+            state.run_id = run_id
+        source = TaskSpec(
+            task_id=source_task_id,
+            title="Retain the source candidate",
+            description="Own the complete class-scoped selector proof.",
+            acceptance=["The exact selector resolves."],
+            status="in_progress",
+            verification_refs=[selector],
+        )
+        state.tasks = [source]
+        orchestrator._persist_tasks(state.tasks)
+        orchestrator._set_implementation_ready_marker(state, source, True)
+        self.assertIn(
+            source.task_id,
+            state.resume_context["retained_worktree_ownership"],
+        )
+        incident = ExecutionIncident(
+            incident_id=incident_id,
+            run_id=state.run_id,
+            source="gate",
+            kind=CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND,
+            stage="implement",
+            context="task verification",
+            command=command,
+            origin_command=command,
+            task_id=source.task_id,
+            baseline=False,
+            recovery_round=1,
+            status="recovering",
+            evidence_fingerprint="selector-evidence",
+            head_ref=head_ref(root),
+            worktree_fingerprint=worktree_fingerprint(root),
+            process_snapshot={
+                CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY: {
+                    "status": "target_not_found",
+                    "contract": "exact_pytest_target",
+                    "repair_scope": "verification_contract",
+                }
+            },
+        )
+        orchestrator._merge_or_save_execution_incident(state, incident)
+        orchestrator._schedule_prebaseline_recovery_task(state, incident)
+        tasks = orchestrator._load_tasks_from_plan()
+        recovery = next(
+            task for task in tasks if task.task_origin == "stage_recovery"
+        )
+        recovery.status = "in_progress"
+        state.tasks = tasks
+        orchestrator._persist_tasks(tasks)
+
+        wrapper = (
+            "\n\n"
+            f"def {test_name}():\n"
+            f"    ContractTests('{test_name}').{test_name}()\n"
+        )
+        with test_path.open("a", encoding="utf-8") as handle:
+            handle.write(wrapper)
+        return {
+            "orchestrator": orchestrator,
+            "state": state,
+            "tasks": tasks,
+            "source": source,
+            "recovery": recovery,
+            "test_path": test_path,
+            "owner_path": owner_path,
+            "selector_path": selector_path,
+            "command": command,
+            "retained_body": retained_body,
+        }
+
+    def _record_selector_recovery_gate_evidence(self, case: dict) -> dict:
+        orchestrator = case["orchestrator"]
+        state = case["state"]
+        recovery = case["recovery"]
+        orchestrator._record_verify_result(
+            recovery,
+            1,
+            "pass",
+            "focused selector passed",
+        )
+        state.task_review_cache[recovery.task_id] = {
+            "fingerprint": worktree_fingerprint(orchestrator.project_root),
+            "prompt_policy_hash": orchestrator._review_prompt_policy_hash(),
+            "decision": "pass",
+            "summary": "reviewed selector correction",
+        }
+        return {
+            "ok": True,
+            "review": "reviewed selector correction",
+            "verify_current_failure_ids": [],
+        }
+
+    def _legacy_selector_resume_case(
+        self,
+        root: Path,
+        *,
+        representative_ids: bool = False,
+    ) -> dict:
+        case = self._current_selector_reconciliation_case(
+            root,
+            run_id="f6cee14fdf8e" if representative_ids else "",
+            source_task_id="task-454" if representative_ids else "selector-source",
+            incident_id="77588c034a2e" if representative_ids else "selector-incident",
+        )
+        orchestrator = case["orchestrator"]
+        state = case["state"]
+        recovery = case["recovery"]
+        marker = orchestrator._execution_recovery_marker(recovery)
+        marker.pop("selector_owner_transfer")
+        marker.pop("mutable_paths")
+        marker["worktree_handoff"].pop("immutable_borrowed_paths")
+        recovery.mutable_artifacts = []
+        recovery.scope_boundaries = ""
+        recovery.status = "blocked"
+        self._record_selector_recovery_gate_evidence(case)
+        state.task_review_cache[recovery.task_id].pop("prompt_policy_hash")
+        owner = state.resume_context["retained_worktree_ownership"][
+            case["source"].task_id
+        ]
+        owner.pop("index_fingerprints", None)
+        mismatch = orchestrator._execution_recovery_borrowed_worktree_mismatch(
+            recovery
+        )
+        marker["borrowed_worktree_validation"] = {
+            "status": "blocked",
+            **mismatch,
+            "updated_at": "legacy-checkpoint",
+        }
+        state.tasks = case["tasks"]
+        orchestrator._persist_tasks(case["tasks"])
+        orchestrator._block_run(
+            state,
+            owner="auto_agents",
+            category="execution_recovery_borrowed_worktree_mutation",
+            reason="borrowed selector changed before recovery completion",
+        )
+        state.active_blocker["execution_recovery_borrowed_worktree"] = dict(
+            mismatch
+        )
+        state.status = "blocked"
+        state.active_blocker["status"] = "blocked"
+        save_run_state(root, state)
+        case["incident"] = ExecutionIncidentStore(root, state.run_id).load(
+            "77588c034a2e" if representative_ids else "selector-incident"
+        )
+        case["mismatch"] = mismatch
+        return case
+
+    def test_current_selector_recovery_reconciles_verified_borrowed_path_delta(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            case = self._current_selector_reconciliation_case(root)
+            orchestrator = case["orchestrator"]
+            state = case["state"]
+            recovery = case["recovery"]
+            source = case["source"]
+            original_head = head_ref(root)
+            preimage_owner = state.resume_context[
+                "retained_worktree_ownership"
+            ][source.task_id]
+            preimage_path_fingerprints = dict(
+                preimage_owner["path_fingerprints"]
+            )
+            preimage_worktree_fingerprint = preimage_owner[
+                "worktree_fingerprint"
+            ]
+            observed_owner_states = []
+
+            def observe_atomic_state_save(project_root, run_state):
+                save_run_state(project_root, run_state)
+                observed_owner_states.append(
+                    load_run_state(project_root).resume_context[
+                        "retained_worktree_ownership"
+                    ][source.task_id]
+                )
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_route_frontend_design_contract_prerequisite",
+                    return_value=None,
+                ),
+                patch.object(orchestrator, "_ensure_evidence_preflight", return_value={}),
+                patch.object(
+                    orchestrator,
+                    "_execute_task_with_retries",
+                    side_effect=lambda *_args, **_kwargs: (
+                        self._record_selector_recovery_gate_evidence(case)
+                    ),
+                ),
+                patch.object(orchestrator, "_warm_clean_head_verify_baseline"),
+                patch(
+                    "auto_agents.orchestrator.save_run_state",
+                    side_effect=observe_atomic_state_save,
+                ),
+            ):
+                result = orchestrator._execute_task_in_main_worktree(
+                    state,
+                    case["tasks"],
+                    recovery,
+                )
+
+            self.assertIsNone(result)
+            self.assertEqual(recovery.status, "done")
+            committed_paths = commit_changed_paths(root, recovery.commit_sha)
+            self.assertNotIn(case["selector_path"], committed_paths)
+            self.assertNotIn("owner.py", committed_paths)
+            self.assertTrue(
+                all(path.startswith(".auto-agents/") for path in committed_paths)
+            )
+            self.assertNotEqual(head_ref(root), original_head)
+            self.assertIn(case["retained_body"], case["test_path"].read_text())
+            self.assertEqual(
+                subprocess.run(
+                    [sys.executable, "-m", "pytest", "-q", case["selector_path"] + "::test_public_projection"],
+                    cwd=root,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertIn(
+                case["selector_path"],
+                subprocess.run(
+                    ["git", "status", "--short"],
+                    cwd=root,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    check=True,
+                ).stdout,
+            )
+            owner = state.resume_context["retained_worktree_ownership"][
+                source.task_id
+            ]
+            provenance = owner["selector_delta_reconciliations"][-1]
+            self.assertEqual(provenance["selector_path"], case["selector_path"])
+            self.assertEqual(
+                provenance["selector_transition"],
+                {"from": "target_not_found", "to": "resolved_pass"},
+            )
+            self.assertEqual(
+                owner["path_fingerprints"],
+                orchestrator._retained_worktree_path_fingerprints(
+                    owner["changed_paths"]
+                ),
+            )
+            self.assertEqual(
+                owner["worktree_fingerprint"],
+                orchestrator._worktree_fingerprint_excluding_agent_instructions(),
+            )
+            persisted = load_run_state(root).resume_context[
+                "retained_worktree_ownership"
+            ][source.task_id]
+            self.assertEqual(persisted, owner)
+            marker = orchestrator._execution_recovery_marker(recovery)
+            self.assertEqual(
+                marker["selector_delta_reconciliation"]["provenance_digest"],
+                provenance["provenance_digest"],
+            )
+            self.assertTrue(observed_owner_states)
+            for observed in observed_owner_states:
+                reconciliations = observed.get(
+                    "selector_delta_reconciliations",
+                    [],
+                )
+                if not reconciliations:
+                    self.assertEqual(
+                        observed["path_fingerprints"],
+                        preimage_path_fingerprints,
+                    )
+                    self.assertEqual(
+                        observed["worktree_fingerprint"],
+                        preimage_worktree_fingerprint,
+                    )
+                    continue
+                observed_provenance = reconciliations[-1]
+                self.assertEqual(
+                    observed["path_fingerprints"][case["selector_path"]],
+                    observed_provenance["postimage_path_fingerprint"],
+                )
+                self.assertEqual(
+                    observed["worktree_fingerprint"],
+                    observed_provenance["postimage_worktree_fingerprint"],
+                )
+
+        # A crash after atomic owner persistence but before task-plan marking
+        # is retried from the durable provenance without probing or duplicating.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            case = self._current_selector_reconciliation_case(root)
+            orchestrator = case["orchestrator"]
+            self._record_selector_recovery_gate_evidence(case)
+            orchestrator._persist_tasks(case["tasks"])
+            save_run_state(root, case["state"])
+            mismatch = orchestrator._execution_recovery_borrowed_worktree_mismatch(
+                case["recovery"]
+            )
+            with patch.object(
+                orchestrator,
+                "_persist_tasks",
+                side_effect=RuntimeError("task-plan persistence interrupted"),
+            ), self.assertRaisesRegex(RuntimeError, "persistence interrupted"):
+                orchestrator._reconcile_verified_selector_delta(
+                    case["state"],
+                    case["tasks"],
+                    case["recovery"],
+                    mismatch,
+                )
+
+            resumed_state = load_run_state(root)
+            resumed_tasks = orchestrator._load_tasks_from_plan()
+            resumed_recovery = next(
+                task
+                for task in resumed_tasks
+                if task.task_origin == "stage_recovery"
+            )
+            with patch.object(
+                orchestrator,
+                "_run_persisted_selector_probe",
+                side_effect=AssertionError("durable provenance must be reused"),
+            ):
+                resumed = orchestrator._reconcile_verified_selector_delta(
+                    resumed_state,
+                    resumed_tasks,
+                    resumed_recovery,
+                    orchestrator._execution_recovery_borrowed_worktree_mismatch(
+                        resumed_recovery
+                    ),
+                )
+            self.assertTrue(resumed)
+            owner = resumed_state.resume_context["retained_worktree_ownership"][
+                case["source"].task_id
+            ]
+            self.assertEqual(len(owner["selector_delta_reconciliations"]), 1)
+            persisted_recovery = next(
+                task
+                for task in orchestrator._load_tasks_from_plan()
+                if task.task_origin == "stage_recovery"
+            )
+            self.assertEqual(
+                orchestrator._execution_recovery_marker(persisted_recovery)[
+                    "selector_delta_reconciliation"
+                ]["provenance_digest"],
+                resumed["provenance_digest"],
+            )
+
+        reject_cases = (
+            "selector_deleted",
+            "second_borrowed_mutation",
+            "extra_target_path",
+            "post_review_mutation",
+            "incomplete_handoff",
+            "review_fingerprint_mismatch",
+            "head_changed",
+            "collection_unproven",
+            "collection_only",
+            "stable_failure",
+            "cached_probe",
+        )
+        for label in reject_cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "project"
+                case = self._current_selector_reconciliation_case(root)
+                orchestrator = case["orchestrator"]
+
+                if label == "selector_deleted":
+                    case["test_path"].unlink()
+                elif label == "second_borrowed_mutation":
+                    case["owner_path"].write_text(
+                        "VALUE = 'unexpected'\n",
+                        encoding="utf-8",
+                    )
+                elif label == "extra_target_path":
+                    (root / "unexpected.py").write_text(
+                        "UNEXPECTED = True\n",
+                        encoding="utf-8",
+                    )
+                elif label == "incomplete_handoff":
+                    marker = orchestrator._execution_recovery_marker(
+                        case["recovery"]
+                    )
+                    marker["worktree_handoff"].pop("index_fingerprints")
+                elif label == "head_changed":
+                    subprocess.run(
+                        ["git", "commit", "--allow-empty", "-qm", "unrelated head"],
+                        cwd=root,
+                        check=True,
+                        capture_output=True,
+                    )
+
+                gate_result = self._record_selector_recovery_gate_evidence(case)
+                if label == "post_review_mutation":
+                    with case["test_path"].open("a", encoding="utf-8") as handle:
+                        handle.write("# changed after review\n")
+                elif label == "review_fingerprint_mismatch":
+                    case["state"].task_review_cache[
+                        case["recovery"].task_id
+                    ]["fingerprint"] = "0" * 64
+
+                probe = GateResult(
+                    ok=label != "stable_failure",
+                    commands=[
+                        CommandResult(
+                            command=(
+                                case["command"] + " --collect-only"
+                                if label == "collection_only"
+                                else case["command"]
+                            ),
+                            ok=label != "stable_failure",
+                            returncode=1 if label == "stable_failure" else 0,
+                            stdout=(
+                                "FAILED tests/test_selector_contract.py::test_public_projection\n"
+                                if label == "stable_failure"
+                                else (
+                                    "1 test collected in 0.01s\n"
+                                    if label == "collection_only"
+                                    else (
+                                        "1 passed in 0.01s\n"
+                                        if label != "collection_unproven"
+                                        else ""
+                                    )
+                                )
+                            ),
+                            cached=label == "cached_probe",
+                        )
+                    ],
+                    summary="probe",
+                )
+                with (
+                    patch.object(
+                        orchestrator,
+                        "_route_frontend_design_contract_prerequisite",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        orchestrator,
+                        "_ensure_evidence_preflight",
+                        return_value={},
+                    ),
+                    patch.object(
+                        orchestrator,
+                        "_execute_task_with_retries",
+                        return_value=gate_result,
+                    ),
+                    patch.object(
+                        orchestrator,
+                        "_run_persisted_selector_probe",
+                        return_value=probe,
+                    ),
+                    patch.object(orchestrator, "_warm_clean_head_verify_baseline"),
+                    patch("auto_agents.orchestrator.commit_all") as commit_all_mock,
+                    patch("auto_agents.orchestrator.commit_only_paths") as commit_paths_mock,
+                ):
+                    result = orchestrator._execute_task_in_main_worktree(
+                        case["state"],
+                        case["tasks"],
+                        case["recovery"],
+                    )
+
+                self.assertIs(result, case["state"])
+                self.assertEqual(case["recovery"].status, "blocked")
+                commit_all_mock.assert_not_called()
+                commit_paths_mock.assert_not_called()
+
+    def test_current_selector_recovery_reconciles_verified_borrowed_path_delta_from_legacy_checkpoint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            case = self._legacy_selector_resume_case(
+                root,
+                representative_ids=True,
+            )
+            orchestrator = case["orchestrator"]
+            review_calls = []
+            original_probe = orchestrator._run_persisted_selector_probe
+
+            def current_policy_review(*_args, **_kwargs):
+                review_calls.append(True)
+                return {
+                    "ok": True,
+                    "review": "fresh current-policy review passed",
+                }
+
+            def observed_probe(*args, **kwargs):
+                gate = original_probe(*args, **kwargs)
+                self.assertIsNotNone(gate)
+                self.assertIn(
+                    "RETAINED_ASSERTION_BODY_EXECUTED",
+                    gate.commands[0].stdout,
+                )
+                return gate
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_run_task_review",
+                    side_effect=current_policy_review,
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_persisted_selector_probe",
+                    side_effect=observed_probe,
+                ),
+            ):
+                resumed = orchestrator._resume_reclassified_current_selector_incident(
+                    case["state"],
+                    case["incident"],
+                    dict(case["state"].active_blocker),
+                )
+
+            self.assertTrue(resumed)
+            self.assertEqual(review_calls, [True])
+            self.assertEqual(case["state"].status, "pending")
+            self.assertFalse(case["state"].active_blocker)
+            resumed_source = next(
+                task
+                for task in case["state"].tasks
+                if task.task_id == "task-454"
+            )
+            resumed_recovery = next(
+                task
+                for task in case["state"].tasks
+                if task.task_origin == "stage_recovery"
+            )
+            self.assertEqual(resumed_source.status, "in_progress")
+            self.assertEqual(resumed_recovery.status, "done")
+            self.assertFalse(resumed_recovery.commit_sha)
+            self.assertIn(
+                case["selector_path"],
+                subprocess.run(
+                    ["git", "status", "--short"],
+                    cwd=root,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout,
+            )
+            saved = ExecutionIncidentStore(root, case["state"].run_id).load(
+                "77588c034a2e"
+            )
+            self.assertEqual(saved.status, "repair_attempt_completed")
+            self.assertEqual(
+                sum(
+                    event.get("event") == "selector_delta_reconciled"
+                    for event in saved.history
+                ),
+                1,
+            )
+            self.assertEqual(
+                sum(
+                    event.get("event") == "repair_attempt_completed"
+                    for event in saved.history
+                ),
+                1,
+            )
+            attestation = orchestrator._execution_recovery_marker(
+                resumed_recovery
+            )["selector_review_attestation"]
+            self.assertEqual(attestation["kind"], "fresh_current_policy_review")
+
+    def test_current_selector_recovery_reconciles_verified_borrowed_path_delta_fails_closed_on_blocker_identity(
+        self,
+    ) -> None:
+        mutations = {
+            "owner": lambda blocker: blocker.__setitem__("owner", "target_project"),
+            "status": lambda blocker: blocker.__setitem__("status", "retrying"),
+            "incident_id": lambda blocker: blocker.__setitem__(
+                "incident_id", "different-incident"
+            ),
+            "task_id": lambda blocker: blocker.__setitem__(
+                "task_id", "different-recovery"
+            ),
+            "source_task_id": lambda blocker: blocker.__setitem__(
+                "source_task_id", "different-source"
+            ),
+            "mismatch": lambda blocker: blocker[
+                "execution_recovery_borrowed_worktree"
+            ]["altered_paths"].append("owner.py"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "project"
+                case = self._legacy_selector_resume_case(root)
+                blocker = case["state"].active_blocker
+                mutate(blocker)
+                before_owner = dict(
+                    case["state"].resume_context[
+                        "retained_worktree_ownership"
+                    ][case["source"].task_id]
+                )
+                with patch.object(
+                    case["orchestrator"],
+                    "_run_task_review",
+                    side_effect=AssertionError("unbound blocker must not review"),
+                ):
+                    resumed = case[
+                        "orchestrator"
+                    ]._resume_reclassified_current_selector_incident(
+                        case["state"],
+                        case["incident"],
+                        dict(blocker),
+                    )
+                self.assertFalse(resumed)
+                self.assertEqual(case["recovery"].status, "blocked")
+                self.assertEqual(case["incident"].status, "recovering")
+                self.assertEqual(
+                    case["state"].resume_context[
+                        "retained_worktree_ownership"
+                    ][case["source"].task_id],
+                    before_owner,
+                )
+                self.assertTrue(case["state"].active_blocker)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            case = self._legacy_selector_resume_case(root)
+            case["state"].task_review_cache[case["recovery"].task_id][
+                "prompt_policy_hash"
+            ] = case["orchestrator"]._review_prompt_policy_hash()
+            with patch.object(
+                case["orchestrator"],
+                "_run_task_review",
+                side_effect=AssertionError("a synthesized hash is not an attestation"),
+            ):
+                resumed = case[
+                    "orchestrator"
+                ]._resume_reclassified_current_selector_incident(
+                    case["state"],
+                    case["incident"],
+                    dict(case["state"].active_blocker),
+                )
+            self.assertFalse(resumed)
+            self.assertEqual(case["recovery"].status, "blocked")
+
+    def test_current_selector_recovery_reconciles_verified_borrowed_path_delta_restart_and_resolution_provenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            case = self._legacy_selector_resume_case(root)
+            orchestrator = case["orchestrator"]
+            with (
+                patch.object(
+                    orchestrator,
+                    "_run_task_review",
+                    return_value={"ok": True, "review": "fresh review"},
+                ),
+                patch.object(
+                    orchestrator,
+                    "_resolve_execution_incident_for_task",
+                    side_effect=RuntimeError("crash after done plan"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "crash after done plan"),
+            ):
+                orchestrator._resume_reclassified_current_selector_incident(
+                    case["state"],
+                    case["incident"],
+                    dict(case["state"].active_blocker),
+                )
+            self.assertEqual(
+                next(
+                    task
+                    for task in orchestrator._load_tasks_from_plan()
+                    if task.task_origin == "stage_recovery"
+                ).status,
+                "done",
+            )
+
+            resumed_orchestrator = Orchestrator(root)
+            resumed_state = load_run_state(root)
+            resumed_incident = ExecutionIncidentStore(
+                root, resumed_state.run_id
+            ).active(resumed_state)
+            with (
+                patch.object(
+                    resumed_orchestrator,
+                    "_run_task_review",
+                    side_effect=AssertionError("fresh review is already durable"),
+                ),
+                patch.object(
+                    resumed_orchestrator,
+                    "_run_persisted_selector_probe",
+                    side_effect=AssertionError("owner provenance is already durable"),
+                ),
+            ):
+                self.assertTrue(
+                    resumed_orchestrator._resume_reclassified_current_selector_incident(
+                        resumed_state,
+                        resumed_incident,
+                        dict(resumed_state.active_blocker),
+                    )
+                )
+            saved = ExecutionIncidentStore(root, resumed_state.run_id).load(
+                resumed_incident.incident_id
+            )
+            self.assertEqual(saved.status, "repair_attempt_completed")
+            self.assertEqual(
+                [event.get("event") for event in saved.history].count(
+                    "selector_delta_reconciled"
+                ),
+                1,
+            )
+            self.assertEqual(
+                [event.get("event") for event in saved.history].count(
+                    "repair_attempt_completed"
+                ),
+                1,
+            )
+
+            tasks = resumed_orchestrator._load_tasks_from_plan()
+            source = next(task for task in tasks if task.task_origin != "stage_recovery")
+            source.status = "done"
+            resumed_state.tasks = tasks
+            malformed = (
+                "source_not_done",
+                "missing_embedded_provenance",
+                "non_recomputable_digest",
+                "stale_round",
+                "mismatched_transfer",
+            )
+            for label in malformed:
+                with self.subTest(label=label):
+                    source.status = "in_progress" if label == "source_not_done" else "done"
+                    candidate = ExecutionIncident.from_dict(saved.to_dict())
+                    event = next(
+                        item
+                        for item in candidate.history
+                        if item.get("event") == "selector_delta_reconciled"
+                    )
+                    if label == "missing_embedded_provenance":
+                        event.pop("provenance")
+                    elif label == "non_recomputable_digest":
+                        event["provenance"]["postimage_path_fingerprint"] = "0" * 64
+                    elif label == "stale_round":
+                        event["round"] = candidate.recovery_round + 1
+                    elif label == "mismatched_transfer":
+                        event["transfer_id"] = "sha256:" + "0" * 64
+                    ExecutionIncidentStore(root, resumed_state.run_id).save(
+                        candidate, resumed_state
+                    )
+                    resumed_orchestrator._resolve_inline_task_incident(
+                        resumed_state, source
+                    )
+                    unresolved = ExecutionIncidentStore(
+                        root, resumed_state.run_id
+                    ).load(candidate.incident_id)
+                    self.assertEqual(unresolved.status, "repair_attempt_completed")
+                    resumed_state.active_execution_incident_id = candidate.incident_id
+
+            source.status = "in_progress"
+            ExecutionIncidentStore(root, resumed_state.run_id).save(
+                saved, resumed_state
+            )
+            with (
+                patch.object(
+                    resumed_orchestrator,
+                    "_route_frontend_design_contract_prerequisite",
+                    return_value=None,
+                ),
+                patch.object(
+                    resumed_orchestrator,
+                    "_ensure_evidence_preflight",
+                    return_value={},
+                ),
+                patch.object(
+                    resumed_orchestrator,
+                    "_execute_task_with_retries",
+                    return_value={
+                        "ok": True,
+                        "review": "source verification passed",
+                        "verify_current_failure_ids": [],
+                    },
+                ),
+                patch.object(
+                    resumed_orchestrator,
+                    "_warm_clean_head_verify_baseline",
+                ),
+            ):
+                self.assertIsNone(
+                    resumed_orchestrator._execute_task_in_main_worktree(
+                        resumed_state,
+                        tasks,
+                        source,
+                    )
+                )
+            self.assertEqual(source.status, "done")
+            resolved = ExecutionIncidentStore(root, resumed_state.run_id).load(
+                saved.incident_id
+            )
+            self.assertEqual(resolved.status, "resolved")
+            self.assertEqual(resumed_state.execution_incident_budget_epoch, 1)
+            resumed_orchestrator._resolve_inline_task_incident(
+                resumed_state, source
+            )
+            resolved_again = ExecutionIncidentStore(
+                root, resumed_state.run_id
+            ).load(saved.incident_id)
+            self.assertEqual(
+                [event.get("event") for event in resolved_again.history].count(
+                    "resolved"
+                ),
+                1,
+            )
+            self.assertEqual(resumed_state.execution_incident_budget_epoch, 1)
 
     def test_prebaseline_recovery_preempts_stale_repair_ownership_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

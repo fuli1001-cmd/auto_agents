@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import json
 import subprocess
 import sys
 import tempfile
@@ -396,6 +398,505 @@ class GateCurrentSelectorRoutingTests(unittest.TestCase):
             )
             self.assertEqual(worktree_fingerprint(root), original_full_worktree)
             self.assertEqual(retained.read_bytes(), original_bytes)
+
+    def _current_selector_overlap_case(self, root: Path) -> dict:
+        case = self._persisted_selector_case(root)
+        incident = copy.deepcopy(case["incident"])
+        incident.kind = CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+        incident.baseline = False
+        incident.status = "recovering"
+        incident.recovery_round = 1
+        incident.command = case["malformed_command"]
+        incident.origin_command = case["malformed_command"]
+        incident.process_snapshot = {
+            CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY: {
+                "status": "target_not_found",
+                "contract": "exact_pytest_target",
+                "repair_scope": "verification_contract",
+            }
+        }
+        case["state"].status = "pending"
+        case["state"].active_blocker = {}
+        case["state"].last_error = ""
+        case["incident"] = incident
+        return case
+
+    @staticmethod
+    def _set_overlap_command(case: dict, command: str) -> None:
+        case["incident"].command = command
+        case["incident"].origin_command = command
+        case["source_task"].verification_refs = [f"cmd:{command}"]
+        case["state"].tasks = [case["source_task"]]
+        case["orchestrator"]._persist_tasks(case["state"].tasks)
+
+    def _assert_overlap_authority_blocked(
+        self,
+        root: Path,
+        *,
+        recovery_expected: bool,
+    ) -> None:
+        payload = load_task_plan(root)
+        recovery_tasks = [
+            task
+            for task in payload["tasks"]
+            if task["task_origin"] == "stage_recovery"
+        ]
+        self.assertEqual(bool(recovery_tasks), recovery_expected)
+        if recovery_tasks:
+            recovery = recovery_tasks[0]
+            marker = recovery["recovery_history"][0]
+            self.assertEqual(recovery["status"], "blocked")
+            self.assertEqual(recovery["mutable_artifacts"], [])
+            self.assertNotIn("selector_owner_transfer", marker)
+            self.assertNotIn("mutable_paths", marker)
+        state = load_run_state(root)
+        self.assertEqual(state.status, "blocked")
+        self.assertEqual(
+            state.active_blocker["category"],
+            "execution_recovery_selector_overlap_authority",
+        )
+
+    def _check_current_selector_overlap_persists_narrow_source_owner_transfer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            orchestrator = case["orchestrator"]
+            state = case["state"]
+            source = case["source_task"]
+            selector_path = case["test_path"].relative_to(root).as_posix()
+            original = self._target_snapshot(root, case["retained_paths"])
+
+            # Equivalent spellings must converge on the Git-canonical path.
+            alias = "././tests//./test_recovery_contract.py::test_public_recovery_projection"
+            alias_command = case["malformed_command"].replace(
+                case["malformed_command"].split()[-1],
+                alias,
+            )
+            self._set_overlap_command(case, alias_command)
+            orchestrator._schedule_prebaseline_recovery_task(
+                state,
+                case["incident"],
+            )
+
+            recovery = next(
+                task
+                for task in state.tasks
+                if task.task_origin == "stage_recovery"
+            )
+            marker = orchestrator._execution_recovery_marker(recovery)
+            transfer = marker["selector_owner_transfer"]
+            self.assertEqual(transfer["selector_path"], selector_path)
+            self.assertEqual(
+                transfer["canonical_selector"],
+                f"{selector_path}::test_public_recovery_projection",
+            )
+            self.assertEqual(transfer["source_task_id"], source.task_id)
+            self.assertEqual(transfer["recovery_task_id"], recovery.task_id)
+            self.assertEqual(
+                transfer["evidence_fingerprint"],
+                case["incident"].evidence_fingerprint,
+            )
+            self.assertEqual(transfer["recovery_round"], 1)
+            self.assertEqual(transfer["handoff_version"], 2)
+            self.assertEqual(
+                transfer["selector_transition"],
+                {"from": "target_not_found", "to": "resolved_pass"},
+            )
+            self.assertEqual(recovery.mutable_artifacts, [selector_path])
+            self.assertEqual(marker["mutable_paths"], [selector_path])
+            self.assertEqual(
+                orchestrator._execution_recovery_selector_transfer_paths(
+                    recovery,
+                    tasks=state.tasks,
+                    ownership_records=(
+                        orchestrator._retained_worktree_ownership_records(state)
+                    ),
+                    state=state,
+                ),
+                [selector_path],
+            )
+            owner = state.resume_context["retained_worktree_ownership"][source.task_id]
+            self.assertEqual(
+                set(owner["index_fingerprints"]),
+                set(owner["changed_paths"]),
+            )
+            orchestrator._set_implementation_ready_marker(state, recovery, True)
+            recovery_owner = state.resume_context[
+                "retained_worktree_ownership"
+            ][recovery.task_id]
+            self.assertNotIn(selector_path, recovery_owner["changed_paths"])
+            self.assertIn(selector_path, owner["changed_paths"])
+            self.assertEqual(
+                self._target_snapshot(root, case["retained_paths"]),
+                original,
+            )
+
+        # A ready source without a stored owner record is captured before use.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            source_id = case["source_task"].task_id
+            case["state"].resume_context[
+                "retained_worktree_ownership"
+            ].pop(source_id)
+            case["orchestrator"]._schedule_prebaseline_recovery_task(
+                case["state"],
+                case["incident"],
+            )
+            recovery = next(
+                task
+                for task in case["state"].tasks
+                if task.task_origin == "stage_recovery"
+            )
+            self.assertIn(
+                "selector_owner_transfer",
+                case["orchestrator"]._execution_recovery_marker(recovery),
+            )
+            self.assertIn(
+                source_id,
+                case["state"].resume_context["retained_worktree_ownership"],
+            )
+
+        # A genuinely missing, non-overlapping file retains ordinary recovery.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            missing = "tests/test_not_created.py::test_missing_contract"
+            command = case["malformed_command"].replace(
+                case["malformed_command"].split()[-1],
+                missing,
+            )
+            self._set_overlap_command(case, command)
+            case["orchestrator"]._schedule_prebaseline_recovery_task(
+                case["state"],
+                case["incident"],
+            )
+            recovery = next(
+                task
+                for task in case["state"].tasks
+                if task.task_origin == "stage_recovery"
+            )
+            self.assertEqual(recovery.status, "pending")
+            self.assertEqual(recovery.mutable_artifacts, [])
+            self.assertNotIn(
+                "selector_owner_transfer",
+                case["orchestrator"]._execution_recovery_marker(recovery),
+            )
+
+        # Unrelated execution recovery retains ordinary inherited ownership.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            owner = TaskSpec(
+                task_id="ordinary-owner",
+                title="Update the public contract",
+                description="Keep the public contract current.",
+                acceptance=["The focused proof passes."],
+                status="done",
+                mutable_artifacts=["contract.md"],
+                verification_refs=["tests/test_contract.py::test_contract"],
+            )
+            recovery = TaskSpec(
+                task_id="ordinary-execution-recovery",
+                title="Repair a verification failure",
+                description="contract.md failed tests/test_contract.py.",
+                acceptance=["The focused proof passes."],
+                status="blocked",
+                task_origin="stage_recovery",
+                verification_refs=[
+                    "cmd:python -m pytest -q tests/test_contract.py"
+                ],
+                recovery_history=[
+                    {
+                        "kind": "execution_incident",
+                        "execution_incident_id": "ordinary-incident",
+                        "verification_command": (
+                            "python -m pytest -q tests/test_contract.py"
+                        ),
+                        "result": "scheduled",
+                    }
+                ],
+            )
+
+            repaired = orchestrator._backfill_mutable_artifact_ownership(
+                [owner, recovery]
+            )
+
+            self.assertEqual(recovery.mutable_artifacts, ["contract.md"])
+            self.assertIn(recovery.task_id, repaired)
+
+    def _check_current_selector_overlap_authority_fails_closed(self) -> None:
+        # Missing readiness means no v2 handoff: do not create a recovery task.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            markers = case["state"].resume_context["implementation_ready_tasks"]
+            markers.pop(case["source_task"].task_id)
+            before = self._target_snapshot(root, case["retained_paths"])
+            case["orchestrator"]._schedule_prebaseline_recovery_task(
+                case["state"], case["incident"]
+            )
+            self._assert_overlap_authority_blocked(
+                root,
+                recovery_expected=False,
+            )
+            self.assertEqual(
+                self._target_snapshot(root, case["retained_paths"]), before
+            )
+
+        # Unsafe and multiple-target commands cannot acquire overlap authority.
+        for label, suffix in (("shell", " && true"), ("multiple", " tests/test_recovery_contract.py")):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "project"
+                Orchestrator.init_project(root, "project", "mock")
+                case = self._current_selector_overlap_case(root)
+                self._set_overlap_command(
+                    case,
+                    case["malformed_command"] + suffix,
+                )
+                case["orchestrator"]._schedule_prebaseline_recovery_task(
+                    case["state"], case["incident"]
+                )
+                self._assert_overlap_authority_blocked(
+                    root,
+                    recovery_expected=False,
+                )
+
+        # Lexically traversing an internal directory symlink is never canonical.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            alias = root / "tests_alias"
+            alias.symlink_to("tests", target_is_directory=True)
+            command = case["malformed_command"].replace(
+                "tests/test_recovery_contract.py",
+                "tests_alias/test_recovery_contract.py",
+            )
+            self._set_overlap_command(case, command)
+            before = self._target_snapshot(root, case["retained_paths"])
+
+            case["orchestrator"]._schedule_prebaseline_recovery_task(
+                case["state"], case["incident"]
+            )
+
+            self._assert_overlap_authority_blocked(
+                root,
+                recovery_expected=False,
+            )
+            self.assertEqual(
+                self._target_snapshot(root, case["retained_paths"]),
+                before,
+            )
+
+        # An overlap never accepts a legacy handoff without index bindings.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            orchestrator = case["orchestrator"]
+            original_capture = orchestrator._capture_execution_recovery_worktree_handoff
+
+            def legacy_handoff(*args: object, **kwargs: object) -> dict:
+                handoff = original_capture(*args, **kwargs)
+                handoff["version"] = 1
+                handoff.pop("index_fingerprints", None)
+                return handoff
+
+            with patch.object(
+                orchestrator,
+                "_capture_execution_recovery_worktree_handoff",
+                side_effect=legacy_handoff,
+            ):
+                orchestrator._schedule_prebaseline_recovery_task(
+                    case["state"], case["incident"]
+                )
+            self._assert_overlap_authority_blocked(
+                root,
+                recovery_expected=False,
+            )
+
+        # A second ready claim remains ambiguous even when its checkpoint is stale.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            state = case["state"]
+            second = copy.deepcopy(case["source_task"])
+            second.task_id = "second-ready-owner"
+            state.tasks = [case["source_task"], second]
+            state.resume_context["implementation_ready_tasks"][second.task_id] = True
+            records = state.resume_context["retained_worktree_ownership"]
+            records[second.task_id] = copy.deepcopy(
+                records[case["source_task"].task_id]
+            )
+            records[second.task_id]["owner_task_id"] = second.task_id
+            records[second.task_id]["head_ref"] = "0" * 40
+            case["orchestrator"]._persist_tasks(state.tasks)
+            case["orchestrator"]._schedule_prebaseline_recovery_task(
+                state, case["incident"]
+            )
+            self._assert_overlap_authority_blocked(
+                root,
+                recovery_expected=False,
+            )
+
+        # An existing task loses stale authority and becomes non-runnable.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            orchestrator = case["orchestrator"]
+            state = case["state"]
+            orchestrator._schedule_prebaseline_recovery_task(state, case["incident"])
+            recovery = next(
+                task for task in state.tasks if task.task_origin == "stage_recovery"
+            )
+            second = copy.deepcopy(case["source_task"])
+            second.task_id = "late-ambiguous-owner"
+            state.tasks.append(second)
+            state.resume_context["implementation_ready_tasks"][second.task_id] = True
+            records = state.resume_context["retained_worktree_ownership"]
+            records[second.task_id] = copy.deepcopy(
+                records[case["source_task"].task_id]
+            )
+            records[second.task_id]["owner_task_id"] = second.task_id
+            records[second.task_id]["worktree_fingerprint"] = "f" * 64
+            orchestrator._persist_tasks(state.tasks)
+            orchestrator._schedule_prebaseline_recovery_task(state, case["incident"])
+            self._assert_overlap_authority_blocked(
+                root,
+                recovery_expected=True,
+            )
+            persisted = next(
+                task
+                for task in load_task_plan(root)["tasks"]
+                if task["task_id"] == recovery.task_id
+            )
+            self.assertFalse(
+                load_run_state(root).resume_context[
+                    "implementation_ready_tasks"
+                ].get(recovery.task_id, False)
+            )
+            self.assertEqual(persisted["status"], "blocked")
+
+        # Recomputed digests cannot disguise identity, preimage, index, or HEAD drift.
+        for field, value in (
+            ("source_task_id", "wrong-owner"),
+            ("recovery_task_id", "wrong-recovery"),
+            ("evidence_fingerprint", "wrong-evidence"),
+            ("preimage_head_ref", "f" * 40),
+            ("preimage_worktree_fingerprint", "f" * 64),
+            ("preimage_path_fingerprints", None),
+            ("preimage_index_fingerprints", None),
+        ):
+            with self.subTest(envelope_field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "project"
+                Orchestrator.init_project(root, "project", "mock")
+                case = self._current_selector_overlap_case(root)
+                orchestrator = case["orchestrator"]
+                state = case["state"]
+                orchestrator._schedule_prebaseline_recovery_task(
+                    state, case["incident"]
+                )
+                recovery = next(
+                    task for task in state.tasks if task.task_origin == "stage_recovery"
+                )
+                transfer = orchestrator._execution_recovery_marker(recovery)[
+                    "selector_owner_transfer"
+                ]
+                if value is None:
+                    altered = dict(transfer[field])
+                    first_path = next(iter(altered))
+                    altered[first_path] = "0" * 64
+                    transfer[field] = altered
+                else:
+                    transfer[field] = value
+                material = {
+                    key: item
+                    for key, item in transfer.items()
+                    if key != "transfer_id"
+                }
+                transfer["transfer_id"] = "sha256:" + hashlib.sha256(
+                    json.dumps(
+                        material,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                self.assertEqual(
+                    orchestrator._execution_recovery_selector_transfer_paths(
+                        recovery,
+                        tasks=state.tasks,
+                        ownership_records=(
+                            orchestrator._retained_worktree_ownership_records(state)
+                        ),
+                        state=state,
+                    ),
+                    [],
+                )
+
+        # Recomputing every mirror cannot rebind authority to another borrowed path.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            case = self._current_selector_overlap_case(root)
+            orchestrator = case["orchestrator"]
+            state = case["state"]
+            orchestrator._schedule_prebaseline_recovery_task(
+                state, case["incident"]
+            )
+            recovery = next(
+                task for task in state.tasks if task.task_origin == "stage_recovery"
+            )
+            marker = orchestrator._execution_recovery_marker(recovery)
+            transfer = marker["selector_owner_transfer"]
+            rebound_path = "retained.tsbuildinfo"
+            test_name = str(transfer["test_name"])
+            transfer["selector_path"] = rebound_path
+            transfer["canonical_selector"] = f"{rebound_path}::{test_name}"
+            transfer["retained_class_selector"] = (
+                f"{rebound_path}::ProjectApiTests::{test_name}"
+            )
+            marker["mutable_paths"] = [rebound_path]
+            recovery.mutable_artifacts = [rebound_path]
+            handoff = marker["worktree_handoff"]
+            handoff["immutable_borrowed_paths"] = sorted(
+                set(handoff["borrowed_paths"]) - {rebound_path}
+            )
+            material = {
+                key: item
+                for key, item in transfer.items()
+                if key != "transfer_id"
+            }
+            transfer["transfer_id"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    material,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+
+            self.assertEqual(
+                orchestrator._execution_recovery_selector_transfer_paths(
+                    recovery,
+                    tasks=state.tasks,
+                    ownership_records=(
+                        orchestrator._retained_worktree_ownership_records(state)
+                    ),
+                    state=state,
+                ),
+                [],
+            )
 
     def test_baseline_only_missing_pytest_target_remains_not_applicable(
         self,
@@ -1616,6 +2117,14 @@ class GateCurrentSelectorRoutingTests(unittest.TestCase):
 
 def test_current_and_baseline_missing_pytest_target_routes_target_recovery() -> None:
     GateCurrentSelectorRoutingTests()._check_current_and_baseline_missing_routes_target_recovery()
+
+
+def test_current_selector_overlap_persists_narrow_source_owner_transfer() -> None:
+    GateCurrentSelectorRoutingTests()._check_current_selector_overlap_persists_narrow_source_owner_transfer()
+
+
+def test_current_selector_overlap_authority_fails_closed() -> None:
+    GateCurrentSelectorRoutingTests()._check_current_selector_overlap_authority_fails_closed()
 
 
 def test_persisted_missing_selector_reclassifies_without_losing_task_worktree() -> None:

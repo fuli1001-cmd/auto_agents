@@ -2893,7 +2893,10 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     ),
                     diagnosis=Diagnosis(),
                 )
-                result = runner.run()
+                # This test exercises feedback/selection, not the proof oracle.
+                # A pending dummy run and `test -f` are not recovery proof.
+                with patch.object(runner, "_replay_candidate", return_value=_VerificationResult(True, "recovery replay passed")), patch.object(runner, "_diagnosis_differential", return_value=_VerificationResult(True, "behavioral differential passed")):
+                    result = runner.run()
 
             self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
             self.assertEqual(orchestrator.repair_calls, 2)
@@ -3263,7 +3266,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(review["blocking_issues"], [])
             self.assertEqual(len(review["nonblocking_issues"]), 1)
 
-    def test_design_review_rejection_loop_is_bounded(self):
+    def test_design_review_rejections_restart_strategy_without_stopping(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -3313,6 +3316,8 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
                 def _call_with_failover(self, request):
                     self.calls += 1
+                    if self.calls > 3:
+                        raise KeyboardInterrupt("operator stopped the continued search")
                     contract = json.loads(
                         request.prompt.split("FROZEN_CONTRACT:\n", 1)[1].split(
                             "\nROOT_CAUSE:", 1
@@ -3375,14 +3380,12 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     decision=SelfRepairDecision(True, category="design-loop"),
                     diagnosis=Diagnosis(),
                 )
-                result = runner.run()
-                repeated = runner.run()
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run()
 
-            self.assertFalse(result.ok)
-            self.assertEqual(result.status, "design_review_exhausted")
-            self.assertEqual(repeated.status, "design_review_exhausted")
-            self.assertEqual(orchestrator.calls, 3)
-            self.assertIn("3 consecutive attempts", result.reason)
+            self.assertEqual(orchestrator.calls, 4)
+            self.assertEqual(runner._experiment.status, "active")
+            self.assertTrue(any(event.get("event") == "design_search_restart" for event in runner._experiment.design_history))
 
     def test_candidate_review_defers_downstream_component_finding(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3694,7 +3697,8 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     "_full_suite_differential",
                     side_effect=full_suite,
                 ):
-                    result = runner.run()
+                    with patch.object(runner, "_replay_candidate", return_value=_VerificationResult(True, "recovery replay passed")), patch.object(runner, "_diagnosis_differential", return_value=_VerificationResult(True, "behavioral differential passed")):
+                        result = runner.run()
 
             self.assertTrue(result.ok, result.reason)
             self.assertEqual(orchestrator.generated_groups, ["first", "second"])
@@ -4455,7 +4459,8 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     ),
                     diagnosis=diagnosis,
                 )
-                result = runner.run()
+                with patch.object(runner, "_replay_candidate", return_value=_VerificationResult(True, "recovery replay passed")), patch.object(runner, "_diagnosis_differential", return_value=_VerificationResult(True, "behavioral differential passed")):
+                    result = runner.run()
                 promoted = runner.promote_after_live_boundary(result)
                 runner.cleanup_runtime(result)
 
@@ -4739,7 +4744,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     seen_fingerprints=set(),
                 )
 
-            self.assertEqual(result.status, "candidate_group_completed")
+            self.assertEqual(result.status, "candidate_group_completed", result.reason)
             self.assertEqual(len(orchestrator.requests), 2)
             correction = orchestrator.requests[1]
             self.assertEqual(correction.resume_session_id, "session-1")

@@ -61,6 +61,7 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/health-watch-control.lock",
     "state/checkpoint_blobs/",
     "state/root_cause_certificates/",
+    "state/session-restorations/",
     "state/sessions/*/prompts/",
     "state/sessions/*/outputs/",
     "state/sessions/*/health/",

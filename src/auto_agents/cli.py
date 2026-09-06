@@ -7,6 +7,7 @@ import getpass
 import http.server
 import json
 import os
+import re
 import signal
 import subprocess
 import shlex
@@ -781,7 +782,10 @@ def _run_signal_scope():
 
 def _try_load_run_state(project_root: Path):
     try:
-        return load_run_state(project_root)
+        from .models import RunState
+        from .io_utils import read_json
+        payload = read_json(project_root / ".auto-agents/state/run_state.json", default={})
+        return RunState.from_dict(payload) if payload.get("run_id") else None
     except Exception:
         return None
 
@@ -1113,6 +1117,37 @@ def _session_id_for_self_repair_resume(args) -> str:
     return state.session_id
 
 
+def _prepare_explicit_session(project_root: Path, session_id: str, mode: str):
+    """Validate/recover the requested workflow before loading an ambient run."""
+    from .config import load_session_state, session_state_path
+    from .session_recovery import (
+        SessionRecoveryError, apply_session_recovery, plan_session_recovery,
+    )
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}", session_id):
+        raise SessionRecoveryError("invalid session identifier")
+    receipt_path = project_root / ".auto-agents/state/session-restorations" / session_id / "manifest.json"
+    if receipt_path.is_file():
+        receipt = json.loads(receipt_path.read_bytes())
+        if receipt.get("status") == "applying":
+            apply_session_recovery(project_root, plan_session_recovery(project_root, session_id, mode))
+    if session_state_path(project_root, session_id).is_file():
+        state = load_session_state(project_root, session_id)
+        if state.mode != mode:
+            raise SessionRecoveryError(f"session {session_id} is {state.mode}, not {mode}")
+        workflow_path = project_root / ".auto-agents/state/workflows" / state.workflow_id / "workflow.json"
+        if not state.workflow_id or workflow_path.is_file():
+            return state
+    try:
+        plan = plan_session_recovery(project_root, session_id, mode)
+        receipt = apply_session_recovery(project_root, plan)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise SessionRecoveryError(f"Cannot restore requested {mode} session {session_id}: {error}") from error
+    notice("session.restored", f"Restored {mode} session {session_id}; receipt={receipt}",
+           mode=mode, session_id=session_id, receipt=str(receipt))
+    return load_session_state(project_root, session_id)
+
+
 def _run_self_repair_resume_process(
     command: list[str],
     *,
@@ -1234,6 +1269,11 @@ def _auto_repair_auto_agents_and_resume(
     diagnosis=None,
     repair_case: Optional[RepairCase] = None,
 ) -> int:
+    invocation = dict(getattr(orchestrator, "_invocation_context", {}) or {})
+    if invocation.get("session_id") and not invocation.get("run_id"):
+        return _auto_repair_session_and_resume(
+            project_root, orchestrator, error, decision, args, run_lock, diagnosis,
+        )
     existing_state = load_run_state(project_root)
     authorization_policy = authorization_policy_for_state(
         auto_approve=bool(getattr(args, "auto_approve", False)),
@@ -1585,6 +1625,55 @@ def _auto_repair_auto_agents_and_resume(
     return exit_code
 
 
+def _auto_repair_session_and_resume(project_root, orchestrator, error, decision, args, run_lock, diagnosis) -> int:
+    """Repair a session without mutating an unrelated run's control state."""
+    from .config import load_session_state, save_session_state
+    from .execution_recovery import redact_incident_text
+
+    state = load_session_state(project_root, args.session)
+    runner = AutoAgentsSelfRepairRunner(
+        orchestrator, target_project_root=project_root, error=error,
+        decision=decision, diagnosis=diagnosis,
+        print_agent_output=bool(getattr(args, "print_agent_output", False)),
+    )
+    health_runtime = getattr(orchestrator, "_workflow_health_runtime", None)
+    if health_runtime is not None:
+        health_runtime.set_phase("self_repair")
+        health_runtime.set_active_operation("self_repair", decision.category or "session self-repair")
+    try:
+        result = runner.run()
+    finally:
+        if health_runtime is not None:
+            health_runtime.set_active_operation()
+    if not result.ok or (not result.candidate_commit and result.status != "already_repaired"):
+        ACTIVE_PROCESSES.terminate_all()
+        state.status = "failed"
+        state.resolution = redact_incident_text(result.reason)
+        state.execution_log.append({
+            "action": "engine_self_repair", "result": result.status,
+            "experiment_id": result.experiment_id, "reason": state.resolution,
+        })
+        save_session_state(project_root, state)
+        print(json.dumps({"ok": False, "session_id": args.session, "error": state.resolution,
+                          "experiment_id": result.experiment_id}, ensure_ascii=False))
+        return 3
+    runtime_root = Path(result.runtime_root) if result.runtime_root else auto_agents_repo_root()
+    command = _run_command_for_self_repair_resume(args, repo_root=runtime_root)
+    if health_runtime is not None:
+        health_runtime.set_phase("handoff")
+    try:
+        exit_code = _run_self_repair_resume_process(
+            command, cwd=runtime_root,
+            env=run_lock.inherited_environment(append_self_repair_history(decision)),
+            pass_fd=run_lock.fileno,
+        )
+        if exit_code == 0 and result.candidate_commit:
+            runner.promote_after_live_boundary(result)
+        return exit_code
+    finally:
+        runner.cleanup_runtime(result)
+
+
 def _try_deterministic_self_repair_playbook(
     project_root: Path,
     orchestrator: Orchestrator,
@@ -1807,6 +1896,20 @@ def _triage_terminal_run_error(
     error: object,
 ) -> SelfRepairTriageResult:
     state = _try_load_run_state(project_root)
+    invocation = dict(getattr(orchestrator, "_invocation_context", {}) or {})
+    if invocation.get("session_id"):
+        # Only a durable child run of this workflow may supply run evidence.
+        workflow_id = str(invocation.get("workflow_id", ""))
+        from .io_utils import read_json
+        workflow = read_json(project_root / ".auto-agents/state/workflows" / workflow_id / "workflow.json", default={})
+        frame = workflow.get("active_frame", {})
+        bound = bool(state is not None and workflow_id
+                     and state.resume_context.get("workflow_id") == workflow_id
+                     and frame == {"kind": "run", "native_id": state.run_id})
+        invocation["run_id"] = state.run_id if bound else ""
+        orchestrator._invocation_context = invocation
+        if not bound:
+            state = None
     if orchestrator is None:
         fallback = classify_auto_agents_error(error, state=state)
         return SelfRepairTriageResult(
@@ -3637,7 +3740,19 @@ def _dispatch(args) -> int:
             from .workflow_runtime import WorkflowCoordinator
 
             project_root = Path(args.project)
+            requested_state = None
+            if args.session:
+                requested_state = _prepare_explicit_session(
+                    project_root, args.session, _session_mode_for_command(args.command),
+                )
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            orchestrator._invocation_context = {
+                "command": args.command,
+                "session_id": args.session or "",
+                "workflow_id": requested_state.workflow_id if requested_state else "",
+                "provider": getattr(args, "provider", "") or "",
+                "auto_approve": bool(getattr(args, "auto_approve", False)),
+            }
             orchestrator._run_token = workflow_lock.health_lease_token
             health_config = getattr(
                 getattr(getattr(orchestrator, "config", None), "execution", None),
@@ -3721,6 +3836,12 @@ def _dispatch(args) -> int:
             return 1 if state.status == "failed" else 3
         except (RuntimeError, FileNotFoundError, ValueError) as error:
             project_root = Path(args.project)
+            from .session_recovery import SessionRecoveryError
+            if isinstance(error, SessionRecoveryError):
+                print(json.dumps({"ok": False, "error": str(error), "command": args.command,
+                                  "session_id": args.session, "category": "session_recovery_unavailable"},
+                                 ensure_ascii=False), file=sys.stderr)
+                return 3
             if health_runtime is not None:
                 health_runtime.set_phase("triage")
             triage = (
