@@ -2150,6 +2150,10 @@ class SessionState:
         }
 
 
+class ProviderCleanupIncompleteError(RuntimeError):
+    """Automatic execution must stop until the preceding process is cleaned up."""
+
+
 @dataclass
 class AgentRequest:
     stage: str
@@ -2179,6 +2183,8 @@ class AgentRequest:
     # Observation never selects the subprocess transport or renews a lease.
     diagnostic_output: Optional[Callable[[str, str], None]] = None
     stream_transport: bool = False
+    logical_call_id: str = ""
+    usage_context: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         from .prompting import PromptBlock
@@ -2257,6 +2263,7 @@ class AgentResult:
     supervision_report_path: str = ""
     prompt_metadata: Dict[str, object] = field(default_factory=dict)
     cleanup_incomplete: bool = False
+    usage_attempts: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass

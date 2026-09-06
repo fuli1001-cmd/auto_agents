@@ -474,7 +474,7 @@ Run the real Codex provider demo:
 
 ## Prompt policies
 
-Prompt policy v2 separates real stage duties from effort routing, renders a small
+Prompt policy v3 separates real stage duties from effort routing, renders a small
 model-specific supplement after provider selection, and keeps required machine
 output complete even when the human summary is short. Native model configuration
 remains authoritative. Unknown models use the generic policy.
@@ -485,6 +485,11 @@ retaining task progress; incompatible native conversations are rebuilt.
 See [prompt policies and evaluation](docs/prompting.md) for native configuration
 resolution, rule-file synchronization, attempt diagnostics and the explicit CLI
 comparison command.
+
+Compatible native sessions receive only new context; provider switches rebuild
+the complete task contract and carry observable progress. See
+[token optimization and accounting](docs/token-optimization.md) for continuation
+conditions, observation mode, and physical-call usage reports.
 
 ## Provider model
 

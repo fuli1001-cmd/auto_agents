@@ -5854,13 +5854,17 @@ class Orchestrator:
                     attempt_id=f"operator-input-{request.request_id}",
                     sandbox_mode="read-only",
                     timeout_seconds=120,
+                    logical_call_id=uuid.uuid4().hex,
+                    usage_context={"project_root": str(self.project_root), "workflow_kind": "run",
+                                   "subject_id": load_run_state(self.project_root).run_id},
                 )
                 provider = self.config.active_provider
                 with log_timing(
                     self.logger,
                     f"agent:operator-input provider={provider}",
                 ):
-                    result = self.adapter.run(agent_request)
+                    from .provider_usage import invoke_provider
+                    result = invoke_provider(self.adapter, agent_request, provider)
                 if not result.ok:
                     self.logger.warning(
                         "[user-input] provider=%s could not interpret the answer: %s",
@@ -36116,6 +36120,9 @@ class Orchestrator:
             remaining_chars = max_diff_chars
             for path in untracked_paths[:10]:
                 file_path = self.project_root / path
+                if file_path.is_symlink():
+                    lines.append(f"# {path}: symlink to {os.readlink(file_path)} (target content not included)")
+                    continue
                 if not file_path.is_file():
                     lines.append(f"# {path}: [file missing or not a regular file; inspect directly]")
                     continue
@@ -40057,6 +40064,7 @@ class Orchestrator:
         last_error = f"{stage_key} failed"
         cumulative_usage: Optional[AgentUsage] = None
         usage_available = False
+        stage_usage_complete = True
         restore_workspace = None
         restore_root: Optional[Path] = None
         durable_restore_root: Optional[Path] = None
@@ -40133,6 +40141,8 @@ class Orchestrator:
                     resume_prompt_hash=str(selected_continuation.get("prompt_hash", "")),
                     prompt_is_continuation=bool(retry_continuation),
                     prompt_continuation=protocol_feedback if retry_continuation else "",
+                    usage_context={"project_root": str(self.project_root), "workflow_kind": "run", "subject_id": active_run_id},
+                    prompt_metadata={"stage_attempt": attempt},
                 )
                 if request.prompt_spec is not None and state is not None:
                     policy = state.resume_context.get("authorization_policy", {})
@@ -40143,6 +40153,12 @@ class Orchestrator:
                         )))
                 with log_timing(self.logger, f"agent:{artifact_stage} attempt={attempt}"):
                     result = self._call_with_failover(request)
+                if result.cleanup_incomplete:
+                    from .models import ProviderCleanupIncompleteError
+                    raise ProviderCleanupIncompleteError("Provider cleanup incomplete; automatic execution stopped.")
+                stage_usage_complete = bool(stage_usage_complete and result.usage is not None
+                                            and result.prompt_metadata.get("usage_complete", True))
+                result = replace(result, prompt_metadata={**result.prompt_metadata, "stage_usage_complete": stage_usage_complete})
                 if result.usage is not None:
                     cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
                     usage_available = True
@@ -40393,6 +40409,8 @@ class Orchestrator:
                 f"input={usage.input_tokens} cached_input={usage.cached_input_tokens} "
                 f"output={usage.output_tokens} total={usage.total_tokens}"
             )
+            if result.prompt_metadata.get("stage_usage_complete", result.prompt_metadata.get("usage_complete")) is False:
+                usage_text += " (known subtotal; some calls did not report usage)"
         repo_map_text = ""
         rm = self._last_repo_map_result
         if rm is not None:
@@ -41174,10 +41192,11 @@ class Orchestrator:
                     cwd=root,
                     output_path=root / "provider-probe.md",
                     attempt_id=f"provider-probe-{provider}",
+                    logical_call_id=request.logical_call_id,
+                    usage_context=dict(request.usage_context),
                 )
-                result = self._build_probe_adapter_for_provider(provider).run(
-                    probe_request
-                )
+                from .provider_usage import invoke_provider
+                result = invoke_provider(self._build_probe_adapter_for_provider(provider), probe_request, provider)
                 response = (
                     result.summary
                     or result.stdout
@@ -41235,6 +41254,15 @@ class Orchestrator:
         return ShellAdapter(prov, self.config.execution.smart_timeout)
 
     def _call_with_failover(self, request: AgentRequest) -> AgentResult:
+        from .provider_usage import with_attempt_usage
+        from .models import ProviderCleanupIncompleteError
+        if getattr(self, "_provider_cleanup_blocked", False):
+            raise ProviderCleanupIncompleteError("Provider cleanup incomplete; this workflow cannot start another provider call.")
+        context = request.usage_context
+        if not context and hasattr(self, "project_root"):
+            state = load_run_state(self.project_root)
+            context = {"project_root": str(self.project_root), "workflow_kind": "run", "subject_id": state.run_id}
+        request = replace(request, logical_call_id=request.logical_call_id or uuid.uuid4().hex, usage_context=context)
         # Build provider order: [last_successful or active] + untried + previously_failed
         base_order = self._failover_provider_order()
         interrupted_provider = self._interrupted_provider_for_request(request, base_order)
@@ -41267,6 +41295,7 @@ class Orchestrator:
         last_result: Optional[AgentResult] = None
         from .prompting.core import fresh_request
         handoffs: List[str] = []
+        usage_attempts: List[Dict[str, object]] = []
         for kind in order:
             adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
             available_fn = getattr(adapter, "available", None)
@@ -41291,11 +41320,14 @@ class Orchestrator:
                 provider_request,
                 kind,
             )
+            usage_attempts.extend(result.usage_attempts)
+            result = with_attempt_usage(result, usage_attempts)
             last_result = result
             tried.append(kind)
 
             if result.cleanup_incomplete:
-                return replace(result, ok=False, stderr="Provider process cleanup incomplete; failover stopped. " + result.stderr)
+                self._provider_cleanup_blocked = True
+                raise ProviderCleanupIncompleteError("Provider process cleanup incomplete; automatic execution stopped. " + result.stderr)
             if result.ok:
                 self._last_successful_provider = kind
                 self._clear_provider_failure(kind)
@@ -41432,7 +41464,7 @@ class Orchestrator:
             spec = replace(spec, contexts=(*spec.contexts, ContextBlock(handoff, "Recovery progress")))
         return replace(
             request, prompt=handoff if session_id else f"{request.prompt}\n\n{handoff}",
-            prompt_spec=spec, prompt_metadata={},
+            prompt_spec=spec, prompt_metadata={"stage_attempt": request.prompt_metadata.get("stage_attempt", 1)},
             resume_session_id=session_id,
             resume_prompt_hash=str(request.prompt_metadata.get("compatibility_hash", "")),
             prompt_is_continuation=bool(session_id),
@@ -41445,8 +41477,15 @@ class Orchestrator:
         request: AgentRequest,
         provider: str,
     ) -> AgentResult:
+        from .provider_usage import invoke_provider, with_attempt_usage
+        if getattr(self, "_provider_cleanup_blocked", False):
+            from .models import ProviderCleanupIncompleteError
+            raise ProviderCleanupIncompleteError("Provider cleanup incomplete; automatic execution stopped.")
+        request = replace(request, logical_call_id=request.logical_call_id or uuid.uuid4().hex)
+        usage_attempts: List[Dict[str, object]] = []
         request = self._prepare_prompt_request(adapter, request)
         resume_count = 0
+        missing_session_rebuilt = False
         provider_request = self._provider_request_for_attempt(
             request,
             provider=provider,
@@ -41459,20 +41498,49 @@ class Orchestrator:
         while True:
             provider_request = self._prepare_prompt_request(adapter, provider_request)
             self._write_prompt_attempt(provider_request)
+            resume_workspace = None
+            if provider_request.resume_session_id and provider_request.prompt_spec is not None:
+                try:
+                    resume_workspace = self._native_resume_workspace_identity(provider_request)
+                except (OSError, RuntimeError):
+                    pass
             call_started = time.monotonic()
-            result = adapter.run(provider_request)
+            result = invoke_provider(adapter, provider_request, provider)
+            usage_attempts.extend(result.usage_attempts)
+            result = with_attempt_usage(result, usage_attempts)
             if provider_request.prompt_metadata:
                 if not result.prompt_metadata:
                     result = replace(result, prompt_metadata=dict(provider_request.prompt_metadata))
                 metadata = {**result.prompt_metadata, "ok": result.ok,
                             "duration_seconds": time.monotonic() - call_started}
-                if result.usage is not None:
-                    metadata["usage"] = asdict(result.usage)
+                metadata["usage"] = result.usage_attempts[-1]["usage"]
+                metadata["cumulative_usage"] = asdict(result.usage) if result.usage is not None else None
                 if provider_request.progress_report_path:
                     write_json(provider_request.progress_report_path.with_suffix(".prompt.json"), metadata)
 
             if result.cleanup_incomplete:
+                self._provider_cleanup_blocked = True
                 return replace(result, ok=False)
+            missing_session = re.search(
+                r"(?im)^(?:error:\s*)?(?:no (?:saved )?(?:session|conversation|thread) found\b|"
+                r"(?:session|conversation|thread)[^\n]{0,180}(?:not found|does not exist|has expired)\b)",
+                result.stderr,
+            )
+            if (not result.ok and missing_session and resume_workspace is not None
+                    and not missing_session_rebuilt and result.termination is None):
+                try:
+                    unchanged = resume_workspace == self._native_resume_workspace_identity(provider_request)
+                except (OSError, RuntimeError):
+                    unchanged = False
+                if unchanged:
+                    from .prompting.core import fresh_request
+                    missing_session_rebuilt = True
+                    resume_count += 1
+                    provider_request = self._provider_request_for_attempt(
+                        fresh_request(provider_request, "native-session-unavailable"),
+                        provider=provider, resume_index=resume_count, allow_interrupted_resume=False,
+                    )
+                    continue
             reason = result.termination.reason if result.termination is not None else ""
             if reason == "health_quiesce":
                 triage = self._process_health_action()
@@ -41574,6 +41642,23 @@ class Orchestrator:
             if result.ok and request.record_execution_incidents:
                 self._resolve_active_provider_incident()
             return result
+
+    @staticmethod
+    def _native_resume_workspace_identity(request: AgentRequest):
+        # These exact files are transport artifacts, not product mutations.
+        # Never exclude their whole parent directory or similarly named files.
+        artifacts = [request.output_path]
+        if request.progress_report_path is not None:
+            artifacts.extend((request.progress_report_path,
+                              request.progress_report_path.with_suffix(".prompt.json"),
+                              request.progress_report_path.with_suffix(".prompt.txt")))
+        excluded = []
+        for path in artifacts:
+            try:
+                excluded.append(path.absolute().relative_to(request.cwd.absolute()).as_posix())
+            except ValueError:
+                pass
+        return head_ref(request.cwd), worktree_fingerprint(request.cwd, ignored_paths=excluded)
 
     def _record_provider_execution_incident(
         self,

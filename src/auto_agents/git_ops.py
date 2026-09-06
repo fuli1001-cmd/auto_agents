@@ -395,9 +395,12 @@ def changed_line_count(project_root: Path, paths: Iterable[str]) -> int | None:
     return total
 
 
-def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/")) -> str:
+def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/"), *, ignored_paths: Iterable[str] = ()) -> str:
     hasher = hashlib.sha256()
+    excluded = set(ignored_paths)
     for path in changed_paths(project_root, ignored_prefixes=ignored_prefixes):
+        if path in excluded:
+            continue
         hasher.update(path.encode("utf-8"))
         hasher.update(b"\0")
         file_path = project_root / path

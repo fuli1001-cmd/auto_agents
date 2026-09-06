@@ -396,6 +396,10 @@ def run_subprocess_with_optional_streaming(
     elif supervisor is not None:
         supervisor.finalize("completed")
 
+    if cleanup_incomplete and supervisor is not None:
+        # Keep the PID/start identity discoverable on a later workflow resume.
+        supervisor.finalize("running", reason="cleanup_incomplete")
+
     ACTIVE_PROCESSES.unregister(
         process.pid,
         preserve_if_alive=cleanup_incomplete,

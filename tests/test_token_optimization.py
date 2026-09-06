@@ -81,11 +81,16 @@ def test_delta_failover_transfers_contract_and_partial_work(tmp_path):
 
 
 def test_live_process_prevents_failover(tmp_path):
+    from auto_agents.models import ProviderCleanupIncompleteError
     first = RuntimeAdapter("codex", [replace(_make_result(False, stderr="rate limit"), cleanup_incomplete=True)])
     second = RuntimeAdapter("claude-code", [_make_result()])
     orch = _stub_orchestrator({"codex": {}, "claude-code": {}}, "codex", {"codex": first, "claude-code": second})
-    assert not orch._call_with_failover(request(tmp_path)).ok
+    with pytest.raises(ProviderCleanupIncompleteError):
+        orch._call_with_failover(request(tmp_path))
     assert not second.requests
+    with pytest.raises(ProviderCleanupIncompleteError):
+        orch._call_with_failover(request(tmp_path))
+    assert len(first.requests) == 1
 
 
 def test_native_effort_edit_changes_runtime_identity(tmp_path):
@@ -225,3 +230,76 @@ def test_review_only_resumes_explicit_protocol_corrections(session_case, case):
         rebuilt = prepare_request(fresh_request(captured[1], "provider-switch"), runtime)
         assert "Review all owned acceptance." in rebuilt.prompt
         assert "Looks correct." in rebuilt.prompt
+
+
+
+
+@pytest.mark.parametrize("mutates", [False, True])
+def test_missing_native_session_rebuilds_once_only_without_mutations(session_case, monkeypatch, mutates):
+    session, _, _ = session_case
+    orch = session.orch
+    root = session.project_root
+    adapter = RuntimeAdapter("codex", [_make_result(False, stderr="Error: session old-native not found"), _make_result()])
+    if mutates:
+        adapter.mutate = lambda req: (root / "unexpected.py").write_text("changed = True\n")
+    initial = prepare_request(request(root), adapter.describe_runtime(None))
+    continued = Orchestrator._prompt_handoff(initial, "Continue the owned patch.", "old-native")
+    monkeypatch.setattr(orch, "_record_provider_execution_incident", lambda *args: None)
+    result = orch._run_provider_with_smart_recovery(adapter, continued, "codex")
+    assert len(adapter.requests) == (1 if mutates else 2)
+    if not mutates:
+        assert result.ok
+        assert not adapter.requests[1].resume_session_id
+        assert "Preserve every existing database row." in adapter.requests[1].prompt
+
+
+def test_switch_back_to_previous_provider_gets_latest_complete_context(tmp_path):
+    first = RuntimeAdapter("codex", [_make_result(False, stderr="rate limit"), _make_result()])
+    second = RuntimeAdapter("claude-code", [_make_result(provider_session_id="native-b"),
+                                             _make_result(False, stderr="rate limit", summary="Partial change preserved")])
+    orch = _stub_orchestrator({"codex": {}, "claude-code": {}}, "codex", {"codex": first, "claude-code": second})
+    initial = request(tmp_path)
+    assert orch._call_with_failover(initial).ok
+    updated = replace(initial, prompt_spec=replace(initial.prompt_spec, contexts=(
+        *initial.prompt_spec.contexts, ContextBlock("New constraint: keep the public API.", "user", "message:1"),
+    )))
+    prepared = prepare_request(updated, second.describe_runtime(None))
+    continued = replace(Orchestrator._prompt_handoff(prepared, "Apply the new constraint.", "native-b"), resume_provider="claude-code")
+    assert orch._call_with_failover(continued).ok
+    returned = first.requests[-1]
+    assert not returned.resume_session_id
+    assert "Preserve every existing database row." in returned.prompt
+    assert "New constraint: keep the public API." in returned.prompt
+    assert "Partial change preserved" in returned.prompt
+
+
+def test_outer_session_does_not_retry_cleanup_failure(session_case):
+    from auto_agents.models import ProviderCleanupIncompleteError
+    session, state, _ = session_case
+    calls = []
+    def fail(req):
+        calls.append(req)
+        raise ProviderCleanupIncompleteError("Old process still alive")
+    session.orch._call_with_failover = fail
+    with pytest.raises(ProviderCleanupIncompleteError):
+        session._phase_converse(state)
+    assert len(calls) == 1
+
+
+def test_stage_retry_marks_partial_usage_as_a_known_subtotal(session_case):
+    from auto_agents.models import AgentUsage
+    session, _, _ = session_case
+    orch = session.orch
+    calls = []
+    def call(req):
+        calls.append(req)
+        return AgentResult(True, [], req.output_path,
+                           summary="DECISION: pass" if len(calls) == 2 else "Missing decision",
+                           usage=AgentUsage(100, 20, 10) if len(calls) == 2 else None)
+    orch._call_with_failover = call
+    result = orch._run_agent_with_retries(
+        None, "review", "review-usage-test", compose_prompt(["Review acceptance."], purpose="review"),
+        validation_feedback=orch._review_validation_feedback,
+    )
+    assert result.ok
+    assert result.prompt_metadata["stage_usage_complete"] is False

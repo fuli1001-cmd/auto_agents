@@ -4,6 +4,10 @@ auto_agents uses a shared stage contract and a small, versioned model-specific
 supplement. New calls, including calls in resumed workflows, use the current
 policy. Existing task progress and completed work are retained.
 
+Policy v3 keeps stable instructions before dynamic path/state fields, deduplicates
+identical rule text, and records rule aliases in prompt metadata. It does not
+summarize acceptance contracts or discard rules whose applicability is unknown.
+
 ```json
 {
   "prompting": {
@@ -85,8 +89,23 @@ instead of silently overwriting the author's file.
 Failover renders each provider attempt from the unrendered specification. A
 native session is reused only when existing workspace/session checks and the
 prompt compatibility identity match. Missing legacy metadata or changed stage,
-model policy, CLI version or project instructions causes a fresh native session
+model policy, effort, native settings, workspace, CLI version or project instructions causes a fresh native session
 with the saved task and progress. A completed task is not restarted.
+
+Session checkpoint v4 records sent input identities and immutable history-prefix
+hashes. Compatible calls send new messages and changed context values; the native
+model's own preceding answer is not appended again as a new input. Failed calls
+invalidate the checkpoint. Older checkpoints load normally but require a full
+new native session. Review protocol correction can reuse a compatible session
+only for a missing/invalid `DECISION` marker; semantic failures and rollback do
+not use this optimization.
+
+The saved `PromptSpec` always retains the complete task. Switching providers
+clears all native continuation state, re-renders for the destination provider,
+and includes observable progress plus references to preceding outputs. Prior
+model claims are not verification evidence. Returning to a previous provider
+also starts from the latest complete task, rather than its stale native history.
+Incomplete process cleanup blocks both failover and automatic continuation.
 
 Model review caches include prompt-policy identity. Deterministic test
 certificates keep their existing code/dependency/contract validity checks.
@@ -98,6 +117,13 @@ instruction fingerprint, bytes, prompt hash, elapsed time and available usage.
 Session performance spans also include prompt metadata. These are diagnostics,
 not proof that task acceptance passed. Progress narration does not replace the
 supervisor's semantic-progress checks.
+
+Metadata also records full versus sent prompt bytes, full/delta/handoff mode,
+fallback reasons, and observed delta size in observation mode. Physical call
+records include failures, internal continuations and recovery probes. Their
+usage is deduplicated independently of logical workflow spans. Missing usage is
+unknown, not a zero-cost call. See [token optimization](token-optimization.md)
+for report fields and rollout controls.
 
 ## Explicit evaluation
 

@@ -63,6 +63,7 @@ from .models import (
     SESSION_STALL_THRESHOLD,
     GateResult,
     SessionState,
+    ProviderCleanupIncompleteError,
 )
 from .persistence import (
     PersistenceContractError,
@@ -617,6 +618,8 @@ class Session:
             prompt = self._build_converse_prompt(state)
             try:
                 reply = self._call_agent(state, f"converse-{rounds}", prompt)
+            except ProviderCleanupIncompleteError:
+                raise
             except RuntimeError as exc:
                 err_msg = str(exc)
                 state.execution_log.append({
@@ -1971,6 +1974,9 @@ class Session:
             self._capture_collab_restore_point(restore_root, before_snapshot)
             try:
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
+            except ProviderCleanupIncompleteError:
+                restore_guard.cleanup()
+                raise
             except RuntimeError as exc:
                 restore_guard.cleanup()
                 err_msg = str(exc)
@@ -2309,6 +2315,8 @@ class Session:
                         )
                     if durable_restore is not None:
                         shutil.rmtree(durable_restore, ignore_errors=True)
+                    raise
+                except ProviderCleanupIncompleteError:
                     raise
                 except RuntimeError as exc:
                     offending = self._restore_collab_mutations(
@@ -2670,6 +2678,8 @@ class Session:
                         f"provider-resolve-{state.current_attempt}",
                         prompt,
                     )
+                except ProviderCleanupIncompleteError:
+                    raise
                 except RuntimeError as exc:
                     self._restore_provider_artifacts(restore_root)
                     violation = self.orch._stage_mutation_scope_violation(
@@ -2787,6 +2797,8 @@ class Session:
                     self._save(state)
                     try:
                         resumed = self.orch.resume_saved_run()
+                    except ProviderCleanupIncompleteError:
+                        raise
                     except RuntimeError:
                         state.status = "failed"
                         state.resolution = "clarify_handoff_failed"
@@ -2897,6 +2909,8 @@ class Session:
                 self._print("Provider references and full preflight now pass. Resuming run...")
                 try:
                     resumed = self.orch.resume_saved_run()
+                except ProviderCleanupIncompleteError:
+                    raise
                 except RuntimeError as exc:
                     err_msg = str(exc)
                     state.execution_log.append({
@@ -3594,6 +3608,8 @@ class Session:
                 else None
             ),
             stream_transport=self.mode in ("collab", "fix", "provider_resolve"),
+            usage_context={"project_root": str(self.project_root), "workflow_kind": self.mode,
+                           "subject_id": state.session_id, "workflow_id": state.workflow_id},
         )
         if request.prompt_spec is not None and state.authorization_policy:
             request = replace(request, prompt_spec=replace(request.prompt_spec, blocks=(
@@ -3614,7 +3630,7 @@ class Session:
                     "delta_candidate_bytes": len(delta.encode("utf-8")) if not reason else None,
                     "delta_fallback_reason": reason,
                 })
-                if reason and continuation.get("input_checkpoint") is not None:
+                if reason:
                     request = fresh_request(request, reason)
                 elif not reason and resume_session_id:
                     request = replace(request, prompt_is_continuation=True, prompt_continuation=delta)
@@ -3624,6 +3640,8 @@ class Session:
             publish_operation("provider", label)
         try:
             result: AgentResult = self.orch._call_with_failover(request)
+            if result.cleanup_incomplete:
+                raise ProviderCleanupIncompleteError("Provider cleanup incomplete; automatic execution stopped.")
         except BaseException:
             state.provider_continuations.pop(continuation_key, None)
             self._save(state)
@@ -3643,6 +3661,7 @@ class Session:
             duration_seconds=time.monotonic() - started,
             metadata={
                 "prompt": dict(result.prompt_metadata),
+                "logical_call_id": result.prompt_metadata.get("logical_call_id", ""),
                 "provider_session_resumed": bool(resume_session_id) and bool(result.prompt_metadata.get("resumed", True)),
                 "provider_session_id": result.provider_session_id,
                 "provider": self.orch._current_provider,
