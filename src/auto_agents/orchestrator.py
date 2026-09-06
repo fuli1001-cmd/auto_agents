@@ -36069,7 +36069,8 @@ class Orchestrator:
         proof_evidence: Optional[Dict[str, object]] = None,
         max_diff_chars: int = 20000,
     ) -> str:
-        entries = changed_entries(self.project_root)
+        ignored = self._task_worktree_ignored_prefixes()
+        entries = changed_entries(self.project_root, ignored_prefixes=ignored)
         lines = [
             "Review the current task by prioritizing the diff context below before exploring unrelated files.",
         ]
@@ -36084,36 +36085,61 @@ class Orchestrator:
             if len(entries) > 40:
                 lines.append(f"- ... {len(entries) - 40} more files")
 
-        diff_stat = self._git_text("diff", "--stat", "--", ".", ":(exclude).auto-agents")
+        base = head_ref(self.project_root)
+        pathspecs = [".", *[f":(exclude,literal){path.rstrip('/')}" for path in ignored]]
+
+        def tracked_diff(*options: str) -> str:
+            result = subprocess.run(
+                ["git", "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
+                 *options, "HEAD", "--", *pathspecs],
+                cwd=self.project_root, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            if result.returncode:
+                return "[diff unavailable; inspect Git status and the full changed files before deciding]"
+            return result.stdout.strip()
+
+        diff_stat = tracked_diff("--stat") if base else ""
         if diff_stat:
             lines.extend(["Diff stat:", diff_stat])
 
-        diff_excerpt = self._git_text("diff", "--no-ext-diff", "--unified=3", "--", ".", ":(exclude).auto-agents")
+        diff_excerpt = tracked_diff("--unified=3") if base else ""
         if diff_excerpt:
             if len(diff_excerpt) > max_diff_chars:
-                diff_excerpt = diff_excerpt[:max_diff_chars].rstrip() + "\n... [diff truncated]"
+                diff_excerpt = diff_excerpt[:max_diff_chars].rstrip() + "\n... [diff truncated]; inspect git diff HEAD and full files for omitted content"
             lines.extend(["Diff excerpt:", diff_excerpt])
 
-        untracked_paths = [path for status, path in entries if status == "??"]
+        if not base:
+            lines.append("No HEAD commit: current staged and untracked files are additions; excerpts below are not complete files.")
+        untracked_paths = [path for status, path in entries if status == "??" or not base]
         if untracked_paths:
             lines.append("Untracked file excerpts:")
             remaining_chars = max_diff_chars
             for path in untracked_paths[:10]:
                 file_path = self.project_root / path
                 if not file_path.is_file():
+                    lines.append(f"# {path}: [file missing or not a regular file; inspect directly]")
                     continue
                 try:
-                    snippet = file_path.read_text(encoding="utf-8")[: min(800, remaining_chars)]
-                except UnicodeDecodeError:
-                    lines.append(f"```text\n# {path}\n[binary or non-utf8 file omitted]\n```")
+                    limit = min(800, remaining_chars)
+                    with file_path.open(encoding="utf-8") as handle:
+                        content = handle.read(limit + 1)
+                    if "\0" in content:
+                        raise UnicodeError("binary content")
+                    snippet = content[:limit]
+                except (OSError, UnicodeError):
+                    lines.append(f"```text\n# {path}\n[binary, non-utf8 or unreadable file omitted; inspect directly]\n```")
                     continue
                 if not snippet.strip():
                     continue
                 lines.append(f"```text\n# {path}\n{snippet.rstrip()}\n```")
+                if len(content) > limit:
+                    lines.append(f"[excerpt truncated: read the complete file at {path}]")
                 remaining_chars -= len(snippet)
                 if remaining_chars <= 0:
                     lines.append("[untracked excerpts truncated]")
                     break
+            if len(untracked_paths) > 10:
+                lines.append(f"[{len(untracked_paths) - 10} additional file excerpts omitted; inspect the changed-file list and full files]")
         return "\n".join(lines)
 
     def _quick_verify_failure_details(

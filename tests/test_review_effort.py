@@ -155,3 +155,56 @@ def test_other_escalation_conditions_remain_effective(review, condition):
     else:
         orchestrator.config.efforts["review"] = "max"
     assert orchestrator._review_effort_for_task(task) == ("max" if condition == "explicit_max" else "deep")
+
+
+@pytest.mark.parametrize("staging", ["unstaged", "staged", "mixed"])
+def test_review_context_includes_final_diff_against_head(review, staging):
+    orchestrator, _ = review
+    root = orchestrator.project_root
+    (root / "app.py").write_text(lines(1000).replace("value_0 = 0", "value_0 = 42"))
+    if staging != "unstaged":
+        git(root, "add", "app.py")
+    if staging == "mixed":
+        (root / "app.py").write_text(lines(1000).replace("value_0 = 0", "value_0 = 43"))
+    context = orchestrator._build_review_context()
+    assert "-value_0 = 0" in context
+    assert ("+value_0 = 43" if staging == "mixed" else "+value_0 = 42") in context
+    if staging == "mixed":
+        assert "-value_0 = 42" not in context
+
+
+def test_review_context_marks_missing_excerpts_and_keeps_proof(review):
+    orchestrator, _ = review
+    root = orchestrator.project_root
+    (root / "new.py").write_text(lines(1000))
+    context = orchestrator._build_review_context("Authoritative verification passed.", max_diff_chars=50)
+    assert "Authoritative verification passed." in context
+    assert "[diff truncated]" in context
+    assert "excerpt truncated: read the complete file at new.py" in context
+
+
+def test_review_context_in_unborn_repository_includes_staged_additions(tmp_path):
+    git(tmp_path, "init", "-q")
+    (tmp_path / "new.py").write_text("important_value = 42\n")
+    git(tmp_path, "add", "new.py")
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.project_root = tmp_path
+    context = orchestrator._build_review_context()
+    assert "No HEAD commit" in context
+    assert "important_value = 42" in context
+
+
+@pytest.mark.parametrize("kind", ["deleted", "renamed", "binary"])
+def test_review_context_describes_nonstandard_changes(review, kind):
+    orchestrator, _ = review
+    root = orchestrator.project_root
+    if kind == "deleted":
+        (root / "app.py").unlink()
+        expected = "deleted file mode"
+    elif kind == "renamed":
+        git(root, "mv", "app.py", "renamed.py")
+        expected = "rename to renamed.py"
+    else:
+        (root / "app.py").write_bytes(b"binary\0data")
+        expected = "Binary files"
+    assert expected in orchestrator._build_review_context()
