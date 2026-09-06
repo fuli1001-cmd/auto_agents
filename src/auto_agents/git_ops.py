@@ -343,6 +343,58 @@ def changed_paths(project_root: Path, ignored_prefixes: tuple[str, ...] = (".aut
     return [path for _, path in changed_entries(project_root, ignored_prefixes=ignored_prefixes)]
 
 
+def changed_line_count(project_root: Path, paths: Iterable[str]) -> int | None:
+    """Count final additions and deletions; None means binary or unreadable changes.
+
+    Compare HEAD directly with the worktree to avoid counting staged changes
+    twice. Parse the whole diff so rename sources remain visible to Git, then
+    filter by destination. Untracked files (and unborn repositories) are additions.
+    """
+    selected = set(paths)
+    if not selected:
+        return 0
+    total = 0
+    try:
+        if head_ref(project_root):
+            diff = _git_bytes(
+                project_root, "diff", "--numstat", "-z", "--no-ext-diff",
+                "--no-textconv", "--find-renames", "HEAD", "--",
+            )
+            if diff.returncode:
+                return None
+            records = iter(diff.stdout.split(b"\0"))
+            for record in records:
+                if not record:
+                    continue
+                added, deleted, path = record.split(b"\t", 2)
+                if not path:  # -z rename records have separate source/destination fields.
+                    next(records)
+                    path = next(records)
+                if os.fsdecode(path) not in selected:
+                    continue
+                if added == b"-" or deleted == b"-":
+                    return None
+                total += int(added) + int(deleted)
+            untracked = _git_bytes(project_root, "ls-files", "--others", "--exclude-standard", "-z")
+            if untracked.returncode:
+                return None
+            additions = selected.intersection(os.fsdecode(p) for p in untracked.stdout.split(b"\0") if p)
+        else:
+            additions = selected
+        for path in additions:
+            file_path = project_root / path
+            content = (
+                os.fsencode(os.readlink(file_path))
+                if file_path.is_symlink() else file_path.read_bytes()
+            )
+            if b"\0" in content:
+                return None
+            total += content.count(b"\n") + int(bool(content) and not content.endswith(b"\n"))
+    except (OSError, ValueError, StopIteration):
+        return None
+    return total
+
+
 def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/")) -> str:
     hasher = hashlib.sha256()
     for path in changed_paths(project_root, ignored_prefixes=ignored_prefixes):

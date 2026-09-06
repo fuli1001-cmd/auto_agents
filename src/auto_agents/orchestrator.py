@@ -178,6 +178,7 @@ from .git_ops import (
     begin_checkpoint_application,
     changed_entries,
     changed_files,
+    changed_line_count,
     changed_paths,
     checkpoint_application_state,
     checkpoint_repository_fingerprints,
@@ -35986,18 +35987,9 @@ class Orchestrator:
         if any(self._is_high_risk_review_path(path) for path in non_test_paths):
             return "deep"
 
-        estimated_lines = 0
-        for path in non_test_paths:
-            file_path = self.project_root / path
-            if not file_path.is_file():
-                continue
-            try:
-                with file_path.open("r", encoding="utf-8") as handle:
-                    estimated_lines += sum(1 for _ in handle)
-            except UnicodeDecodeError:
-                return "deep"
-            if estimated_lines > 240:
-                return "deep"
+        changed_lines = changed_line_count(self.project_root, non_test_paths)
+        if changed_lines is None or changed_lines > 240:
+            return "deep"
         return "balanced"
 
     @staticmethod
