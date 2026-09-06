@@ -211,6 +211,7 @@ class CodexAdapter(AgentAdapter):
             streamed_stderr=streamed_stderr,
             provider_session_id=getattr(process_result, "provider_session_id", ""),
             termination=getattr(process_result, "termination", None),
+            cleanup_incomplete=getattr(process_result, "cleanup_incomplete", False),
             supervision_report_path=(
                 str(request.progress_report_path) if request.progress_report_path else ""
             ),

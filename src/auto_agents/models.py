@@ -2256,6 +2256,7 @@ class AgentResult:
     termination: Optional[AgentTermination] = None
     supervision_report_path: str = ""
     prompt_metadata: Dict[str, object] = field(default_factory=dict)
+    cleanup_incomplete: bool = False
 
 
 @dataclass

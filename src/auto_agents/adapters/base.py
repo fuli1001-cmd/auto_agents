@@ -64,6 +64,7 @@ class SubprocessRunResult:
     streamed_stderr: bool
     provider_session_id: str = ""
     termination: Optional[AgentTermination] = None
+    cleanup_incomplete: bool = False
 
     def __iter__(self) -> Iterator[object]:
         # Preserve the historical five-value destructuring contract.
@@ -191,6 +192,7 @@ def run_subprocess_with_optional_streaming(
                 -1,
                 False,
                 False,
+                cleanup_incomplete=termination_result.cleanup_incomplete,
             )
         except BaseException as error:
             termination_result = _kill_process_group(process)
@@ -410,4 +412,5 @@ def run_subprocess_with_optional_streaming(
         streamed["stderr"],
         provider_session_id=supervisor.session_id if supervisor is not None else "",
         termination=termination,
+        cleanup_incomplete=cleanup_incomplete,
     )

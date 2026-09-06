@@ -6,6 +6,7 @@ layers fail to generic, rather than making the agent run under a guessed policy.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -218,6 +219,52 @@ def _claude(config, request, env):
     return model, resolved, "cli" if explicit else "native-settings"
 
 
+def _settings_fingerprint(config, request, env) -> str:
+    """Hash native settings and selection inputs without persisting raw values."""
+    args = list(config.extra_args)
+    profile = last_option(args, "--profile", "-p") or config.profile_map.get(request.effort, "")
+    roots = _root_chain(request.cwd)
+    paths = []
+    if config.kind == "codex":
+        home = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+        paths = [Path("/etc/codex/config.toml"), home / "config.toml"]
+        if profile:
+            paths.append(home / (profile + ".config.toml"))
+        paths.extend(root / ".codex/config.toml" for root in roots)
+    elif config.kind == "claude-code":
+        home = Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        paths = [home / "settings.json", Path("/etc/claude-code/managed-settings.json")]
+        for root in roots:
+            paths.extend((root / ".claude/settings.json", root / ".claude/settings.local.json"))
+        extra = last_option(args, "--settings")
+        if extra and not extra.lstrip().startswith("{"):
+            paths.append(Path(extra) if Path(extra).is_absolute() else request.cwd / extra)
+    elif config.kind == "copilot-cli":
+        home = Path(env.get("COPILOT_HOME") or Path.home() / ".copilot")
+        directory = last_option(args, "--config-dir")
+        selected = Path(directory) if directory else (Path(profile) if Path(profile).is_absolute() else home / "profiles" / profile)
+        if not directory and not profile:
+            selected = home
+        selected = selected.expanduser()
+        if not selected.is_absolute():
+            selected = request.cwd / selected
+        paths = [selected / "config.json", selected / "settings.json"]
+    elif config.kind == "antigravity":
+        paths = [Path.home() / ".gemini/antigravity-cli/settings.json"]
+    values = []
+    for path in paths:
+        try:
+            content = path.read_bytes()
+        except FileNotFoundError:
+            content = b"missing"
+        values.append((str(path), hashlib.sha256(content).hexdigest()))
+    selected_env = {key: value for key, value in env.items() if key.startswith(
+        ("CODEX_", "CLAUDE_", "ANTHROPIC_", "COPILOT_", "GEMINI_", "OPENAI_")
+    ) and key not in {"CODEX_THREAD_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"}}
+    return digest(json.dumps({"files": values, "args": args, "profile": profile,
+                              "effort": request.effort, "env": selected_env}, sort_keys=True))
+
+
 def resolve_runtime(config, request, *, env: Mapping[str, str] | None = None,
                     probe: bool = True) -> ProviderRuntime:
     env = dict(os.environ if env is None else env)
@@ -259,8 +306,12 @@ def resolve_runtime(config, request, *, env: Mapping[str, str] | None = None,
             model, resolved, source = "", "", "custom-provider"
     except (ValueError, OSError, TypeError, AttributeError):
         model, resolved, source = "", "", "unreadable-or-unsupported-config"
+    try:
+        settings = _settings_fingerprint(config, request, env)
+    except (ValueError, OSError, TypeError, AttributeError):
+        settings, source = "", "unreadable-or-unsupported-config"
     return ProviderRuntime(provider, version, model, resolved, source, capabilities,
-                           binary_identity(config.binary) if probe else "")
+                           binary_identity(config.binary) if probe else "", settings)
 
 
 def observed_model_metadata(request, stdout: str) -> dict:

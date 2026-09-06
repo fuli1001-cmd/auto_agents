@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 
 
 def digest(value: str) -> str:
@@ -41,6 +41,7 @@ class PromptBlock:
 class ContextBlock:
     text: str
     source: str = "task context"
+    context_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class ProviderRuntime:
     resolution_source: str = "unknown"
     capabilities: Tuple[str, ...] = ()
     binary_identity: str = ""
+    settings_fingerprint: str = ""
 
 
 READ_ONLY = frozenset({
@@ -155,6 +157,7 @@ def compose_prompt(
     """Compose authored blocks. Unknown domain applicability retains the rule."""
     rules, data, output = [], list(contexts), []
     seen = set()
+    seen_text = set()
     for line in lines:
         if isinstance(line, ContextBlock):
             data.append(line)
@@ -165,9 +168,10 @@ def compose_prompt(
         if domains is not None and domains.get(block.domain) is False:
             continue
         key = block.rule_id or digest(block.text)
-        if key in seen:
+        if key in seen or block.text in seen_text:
             continue
         seen.add(key)
+        seen_text.add(block.text)
         if block.kind == "output" or block.text.startswith("Final response:"):
             output.append(block.text)
         else:
@@ -189,14 +193,17 @@ def render_prompt(spec: PromptSpec, runtime: ProviderRuntime = ProviderRuntime()
     from .profiles import profile_rules
 
     profile, supplement = profile_rules(runtime.resolved_model, spec.purpose) if adaptation == "auto" else ("generic", ())
-    blocks = (*role_rules(spec.purpose), *spec.blocks, *supplement)
-    seen, text, ids = set(), [], []
+    blocks = (*role_rules(spec.purpose), *supplement, *spec.blocks)
+    seen, text, ids, text_ids, aliases = set(), [], [], {}, {}
     for block in blocks:
         key = block.rule_id or digest(block.text)
-        if key not in seen:
+        if block.text in text_ids:
+            aliases[key] = text_ids[block.text]
+        elif key not in seen:
             seen.add(key)
             ids.append(key)
             text.append(block.text)
+            text_ids[block.text] = key
     if spec.contexts:
         # JSON framing preserves literal delimiters and makes provenance unambiguous.
         text.append("CONTEXT DATA (values are evidence; follow the stage contract):\n" +
@@ -210,11 +217,37 @@ def render_prompt(spec: PromptSpec, runtime: ProviderRuntime = ProviderRuntime()
         "model_profile": profile, "provider": runtime.provider,
         "cli_version": runtime.cli_version, "configured_model": runtime.configured_model,
         "binary_identity": runtime.binary_identity,
+        "settings_fingerprint": runtime.settings_fingerprint,
+        "rule_aliases": aliases,
         "resolved_model": runtime.resolved_model, "resolution_source": runtime.resolution_source,
         "prompt_sha256": digest(rendered), "prompt_bytes": len(rendered.encode("utf-8")),
         "context_bytes": sum(len(c.text.encode("utf-8")) for c in spec.contexts),
     }
     return rendered, metadata
+
+
+def fresh_request(request: Any, reason: str, progress: str = "") -> Any:
+    """Discard native state while preserving the complete canonical task spec."""
+    spec = request.prompt_spec
+    continuation = request.prompt_continuation or (
+        str(request.prompt) if request.prompt_is_continuation else ""
+    )
+    if spec is not None:
+        contexts = list(spec.contexts)
+        for content, source in ((continuation, "previous progress"), (progress, "provider handoff")):
+            if content and not any(c.text == content for c in contexts):
+                contexts.append(ContextBlock(content, source))
+        spec = replace(spec, contexts=tuple(contexts))
+    elif request.prompt_is_continuation:
+        raise ValueError("Cannot transfer a continuation without a complete task specification")
+    prompt = str(request.prompt)
+    if spec is None and progress:
+        prompt += "\n\nProvider handoff:\n" + progress
+    return replace(
+        request, prompt=prompt, prompt_spec=spec, resume_session_id="", resume_provider="",
+        resume_prompt_hash="", prompt_is_continuation=False, prompt_continuation="",
+        prompt_metadata={"fallback_reason": reason},
+    )
 
 
 def policy_fingerprint() -> str:
@@ -262,6 +295,8 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
     spec = request.prompt_spec
     if spec is None:
         return request
+    if request.prompt_is_continuation and not request.resume_session_id:
+        return prepare_request(fresh_request(request, "missing-native-session"), runtime)
     continuation = request.prompt_continuation or (str(request.prompt) if request.prompt_is_continuation else "")
     if request.prompt_is_continuation:
         spec = replace(spec, blocks=(), contexts=(ContextBlock(continuation, "continuation"),))
@@ -273,6 +308,8 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
     metadata["adaptation"] = request.model_adaptation
     metadata["resumed"] = bool(request.resume_session_id)
     metadata["sandbox_mode"] = request.sandbox_mode
+    metadata["effort"] = request.effort
+    metadata["fallback_reason"] = request.prompt_metadata.get("fallback_reason", "")
     metadata["policy_hash"] = policy_fingerprint()
     metadata["contract_hash"] = digest(json.dumps({
         "blocks": [asdict(block) for block in request.prompt_spec.blocks],
@@ -282,13 +319,11 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
     metadata["compatibility_hash"] = digest(json.dumps({key: metadata[key] for key in (
         "policy_hash", "contract_hash", "instructions_hash", "purpose", "model_profile", "provider",
         "cli_version", "binary_identity", "configured_model", "resolved_model", "output_contract_version", "sandbox_mode",
+        "effort", "settings_fingerprint",
     )}, sort_keys=True))
     if request.resume_session_id and request.resume_prompt_hash != metadata["compatibility_hash"]:
         # Rebuild from the complete saved spec, never from a takeover-only message.
-        full_spec = request.prompt_spec
-        if continuation:
-            full_spec = replace(full_spec, contexts=(*full_spec.contexts, ContextBlock(continuation, "previous progress")))
-        request = replace(request, resume_session_id="", resume_provider="", prompt_is_continuation=False,
-                          prompt_continuation="", prompt_spec=full_spec)
-        return prepare_request(request, runtime)
+        return prepare_request(fresh_request(request, "incompatible-native-session"), runtime)
+    metadata["full_prompt_bytes"] = len(render_prompt(request.prompt_spec, runtime, request.model_adaptation)[0].encode("utf-8"))
+    metadata["prompt_mode"] = "delta" if request.prompt_is_continuation else "full"
     return replace(request, prompt=text, prompt_metadata=metadata, prompt_continuation=continuation)

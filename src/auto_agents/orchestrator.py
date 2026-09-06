@@ -41213,6 +41213,8 @@ class Orchestrator:
         tried: List[str] = []
         last_error = ""
         last_result: Optional[AgentResult] = None
+        from .prompting.core import fresh_request
+        handoffs: List[str] = []
         for kind in order:
             adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
             available_fn = getattr(adapter, "available", None)
@@ -41227,14 +41229,10 @@ class Orchestrator:
                 continue
 
             self._current_provider = kind
+            switching = bool(handoffs) or bool(request.resume_provider and kind != request.resume_provider)
             provider_request = (
-                request
-                if not request.resume_provider or kind == request.resume_provider
-                else replace(
-                    request,
-                    resume_session_id="",
-                    resume_provider="",
-                )
+                fresh_request(request, "provider-switch", "\n\n".join(handoffs))
+                if switching else request
             )
             result = self._run_provider_with_smart_recovery(
                 adapter,
@@ -41244,6 +41242,8 @@ class Orchestrator:
             last_result = result
             tried.append(kind)
 
+            if result.cleanup_incomplete:
+                return replace(result, ok=False, stderr="Provider process cleanup incomplete; failover stopped. " + result.stderr)
             if result.ok:
                 self._last_successful_provider = kind
                 self._clear_provider_failure(kind)
@@ -41253,6 +41253,8 @@ class Orchestrator:
 
             if not self._is_failover_error(result):
                 return result
+
+            handoffs.append(self._provider_failover_handoff(provider_request, kind, result))
 
             health_state = self._record_provider_failure(kind, result)
             snippet = (result.stderr or "")[:120]
@@ -41287,6 +41289,33 @@ class Orchestrator:
         raise RuntimeError(
             f"All providers exhausted. Tried: {tried}. Last error: {last_error}"
         )
+
+    def _provider_failover_handoff(self, request: AgentRequest, provider: str, result: AgentResult) -> str:
+        """Transfer observable progress, never a previous model's hidden state."""
+        observations: Dict[str, object] = {
+            "provider": provider,
+            "previous_output_path": str(request.output_path),
+            "progress_report_path": str(request.progress_report_path or result.supervision_report_path or ""),
+            "previous_claims_unverified": (result.summary or result.stdout)[-4000:],
+            "failure": (result.stderr or "provider unavailable")[-2000:],
+            "instruction": (
+                "Continue the owned task from the current files. Preserve completed changes. "
+                "Inspect the referenced verification evidence before treating prior claims as verified. "
+                "An interrupted external operation has unknown outcome: inspect its durable result "
+                "or use the existing recovery route; do not blindly repeat it."
+            ),
+        }
+        if result.termination is not None:
+            observations["termination"] = asdict(result.termination)
+        if hasattr(self, "project_root"):
+            try:
+                observations["head"] = head_ref(request.cwd)
+                observations["workspace_fingerprint"] = worktree_fingerprint(request.cwd)
+                observations["changed_files"] = changed_paths(request.cwd)
+                observations["evidence_root"] = str(request.cwd / ".auto-agents")
+            except (OSError, RuntimeError) as error:
+                observations["workspace_observation_error"] = type(error).__name__
+        return json.dumps(observations, ensure_ascii=False, indent=2)
 
     def _interrupted_provider_for_request(
         self,
@@ -41390,6 +41419,8 @@ class Orchestrator:
                 if provider_request.progress_report_path:
                     write_json(provider_request.progress_report_path.with_suffix(".prompt.json"), metadata)
 
+            if result.cleanup_incomplete:
+                return replace(result, ok=False)
             reason = result.termination.reason if result.termination is not None else ""
             if reason == "health_quiesce":
                 triage = self._process_health_action()
