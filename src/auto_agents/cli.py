@@ -1148,6 +1148,26 @@ def _prepare_explicit_session(project_root: Path, session_id: str, mode: str):
     return load_session_state(project_root, session_id)
 
 
+def _reconcile_session_interruption(coordinator, payload, requested_state) -> None:
+    """An old process receipt must not retarget an explicit session resume."""
+    if requested_state is None or not requested_state.workflow_id:
+        coordinator.reconcile_interruption(payload)
+        return
+    snapshot = coordinator.store.load(requested_state.workflow_id)
+    expected = {requested_state.session_id, snapshot.root.native_id}
+    if snapshot.active_frame is not None:
+        expected.add(snapshot.active_frame.native_id)
+    subjects = {
+        str(record.get("subject_id", ""))
+        for record in (payload.get("owner", {}), payload.get("health", {}))
+        if isinstance(record, dict)
+    }
+    if not (subjects - {""}) & expected:
+        return
+    coordinator.store.activate(requested_state.workflow_id)
+    coordinator.reconcile_interruption(payload)
+
+
 def _run_self_repair_resume_process(
     command: list[str],
     *,
@@ -3810,7 +3830,7 @@ def _dispatch(args) -> int:
             session._coordinator = coordinator
             session._coordinator_managed = True
             if workflow_lock.interrupted_snapshot:
-                coordinator.reconcile_interruption(workflow_lock.interrupted_snapshot)
+                _reconcile_session_interruption(coordinator, workflow_lock.interrupted_snapshot, requested_state)
             if args.session:
                 state = session.resume(args.session)
             else:

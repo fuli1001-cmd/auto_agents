@@ -142,3 +142,22 @@ def test_recovery_can_use_committed_history_without_checkpoint_blobs(tmp_path):
     recovered = plan_session_recovery(tmp_path, "session-1", "collab")
     assert recovered.files == initial.files
     assert all(source.startswith("git:") for source in recovered.sources.values())
+
+
+def test_old_interruption_cannot_retarget_explicit_session(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from auto_agents.cli import _reconcile_session_interruption
+    session, _ = _fixture(tmp_path)
+    apply_session_recovery(tmp_path, plan_session_recovery(tmp_path, "session-1", "collab"))
+    store = WorkflowStore(tmp_path)
+    store.create_root(WorkflowRef("run", "other-run"), workflow_id="wf-other")
+    coordinator = SimpleNamespace(store=store, reconcile_interruption=Mock())
+    state = SessionState.from_dict(session)
+    _reconcile_session_interruption(coordinator, {"owner": {"subject_id": "other-run"}}, state)
+    coordinator.reconcile_interruption.assert_not_called()
+    assert store.active().workflow_id == "wf-other"
+    payload = {"owner": {"subject_id": "session-1"}}
+    _reconcile_session_interruption(coordinator, payload, state)
+    coordinator.reconcile_interruption.assert_called_once_with(payload)
+    assert store.active().workflow_id == "wf-1"
