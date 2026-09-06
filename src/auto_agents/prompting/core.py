@@ -310,10 +310,16 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
     metadata["sandbox_mode"] = request.sandbox_mode
     metadata["effort"] = request.effort
     metadata["fallback_reason"] = request.prompt_metadata.get("fallback_reason", "")
+    for key in ("delta_candidate_bytes", "delta_fallback_reason"):
+        if key in request.prompt_metadata:
+            metadata[key] = request.prompt_metadata[key]
     metadata["policy_hash"] = policy_fingerprint()
     metadata["contract_hash"] = digest(json.dumps({
         "blocks": [asdict(block) for block in request.prompt_spec.blocks],
         "output": request.prompt_spec.output_contract,
+        "task_contracts": [asdict(c) for c in request.prompt_spec.contexts if c.source in {
+            "Task JSON", "Bound requirements", "Plan migration contract", "Task status migration contract",
+        }],
     }, sort_keys=True, ensure_ascii=False))
     metadata["instructions_hash"] = instruction_fingerprint(request.cwd, runtime.provider)
     metadata["compatibility_hash"] = digest(json.dumps({key: metadata[key] for key in (
@@ -321,7 +327,8 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
         "cli_version", "binary_identity", "configured_model", "resolved_model", "output_contract_version", "sandbox_mode",
         "effort", "settings_fingerprint",
     )}, sort_keys=True))
-    if request.resume_session_id and request.resume_prompt_hash != metadata["compatibility_hash"]:
+    if request.resume_session_id and (request.resume_prompt_hash != metadata["compatibility_hash"]
+                                      or runtime.resolution_source == "unreadable-or-unsupported-config"):
         # Rebuild from the complete saved spec, never from a takeover-only message.
         return prepare_request(fresh_request(request, "incompatible-native-session"), runtime)
     metadata["full_prompt_bytes"] = len(render_prompt(request.prompt_spec, runtime, request.model_adaptation)[0].encode("utf-8"))

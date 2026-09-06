@@ -98,3 +98,130 @@ def test_native_effort_edit_changes_runtime_identity(tmp_path):
     second = resolve_runtime(config, request(tmp_path), env={"CODEX_HOME": str(home)}, probe=False)
     assert first.resolved_model == second.resolved_model == "gpt-6-astra"
     assert first.settings_fingerprint != second.settings_fingerprint
+
+
+@pytest.fixture
+def session_case(tmp_path):
+    from auto_agents.session import Session
+    from auto_agents.models import SessionState
+    Orchestrator.init_project(tmp_path, "token-test", "mock")
+    orch = Orchestrator(tmp_path)
+    session = Session(orch, mode="collab")
+    goal = "Preserve all existing behavior. " * 100
+    state = SessionState(session_id="token-test", mode="collab", status="executing", goal=goal,
+                         conversation=[{"role": "user", "content": goal}])
+    requests = []
+    runtime = ProviderRuntime("mock", resolved_model="fixed-test-model")
+
+    def call(req):
+        prepared = prepare_request(req, runtime)
+        requests.append(prepared)
+        return AgentResult(True, [], req.output_path, summary="Recorded the requirement.",
+                           provider_session_id="native-session", prompt_metadata=prepared.prompt_metadata)
+
+    orch._call_with_failover = call
+    return session, state, requests
+
+
+def session_turn(session, state, label):
+    return session._call_agent(state, label, session._build_collab_prompt(state, ""))
+
+
+def test_session_sends_only_new_context_and_skips_own_answer(session_case):
+    from auto_agents.models import SessionState
+    session, state, requests = session_case
+    reply = session_turn(session, state, "collab-1")
+    state.conversation.extend([{"role": "agent", "content": reply},
+                               {"role": "user", "content": "Keep fractional totals exactly."}])
+    # Exercise the durable JSON round-trip, not only an in-memory checkpoint.
+    state = SessionState.from_dict(state.to_dict())
+    session_turn(session, state, "collab-2")
+    sent = requests[-1]
+    assert sent.prompt_is_continuation and sent.resume_session_id
+    assert "Keep fractional totals exactly." in sent.prompt
+    assert "Preserve all existing behavior." not in sent.prompt
+    assert reply not in sent.prompt
+    assert len(sent.prompt) < len(requests[0].prompt)
+    assert any("Preserve all existing behavior." in c.text for c in sent.prompt_spec.contexts)
+    assert state.provider_continuations["collab"]["policy_version"] == 4
+
+
+@pytest.mark.parametrize("change", ["history", "execution", "workspace", "legacy", "no_session"])
+def test_session_falls_back_when_sync_cannot_be_proven(session_case, change):
+    session, state, requests = session_case
+    session_turn(session, state, "collab-1")
+    if change == "history":
+        state.conversation[0]["content"] = "Changed historical request."
+    elif change == "execution":
+        state.provider_continuations["collab"]["input_checkpoint"]["execution_count"] = 99
+    elif change == "workspace":
+        (session.project_root / "external.py").write_text("changed = True\n")
+    elif change == "legacy":
+        state.provider_continuations["collab"]["policy_version"] = 3
+    else:
+        state.provider_continuations["collab"]["provider_session_id"] = ""
+    session_turn(session, state, "collab-2")
+    assert not requests[-1].resume_session_id
+    assert not requests[-1].prompt_is_continuation
+    assert "Preserve all existing behavior." in requests[-1].prompt
+
+
+@pytest.mark.parametrize("mode", ["off", "observe"])
+def test_acceleration_observation_does_not_send_delta(session_case, mode):
+    session, state, requests = session_case
+    session_turn(session, state, "collab-1")
+    session.config.execution.acceleration.mode = mode
+    state.conversation.append({"role": "user", "content": "Preserve the public API."})
+    session_turn(session, state, "collab-2")
+    assert not requests[-1].resume_session_id
+    assert not requests[-1].prompt_is_continuation
+    assert "Preserve all existing behavior." in requests[-1].prompt
+    if mode == "observe":
+        assert requests[-1].prompt_metadata["delta_candidate_bytes"] > 0
+
+
+def test_failed_call_does_not_leave_a_reusable_cursor(session_case):
+    session, state, requests = session_case
+    session_turn(session, state, "collab-1")
+    def fail(req):
+        raise RuntimeError("All providers exhausted")
+    session.orch._call_with_failover = fail
+    with pytest.raises(RuntimeError):
+        session_turn(session, state, "collab-2")
+    assert "collab" not in state.provider_continuations
+
+
+@pytest.mark.parametrize("case", ["protocol", "semantic", "disabled"])
+def test_review_only_resumes_explicit_protocol_corrections(session_case, case):
+    session, state, requests = session_case
+    orch = session.orch
+    captured = []
+    runtime = ProviderRuntime("mock", resolved_model="fixed-test-model")
+    if case == "disabled":
+        orch.config.execution.acceleration.session_continuation_enabled = False
+
+    def call(req):
+        prepared = prepare_request(req, runtime)
+        captured.append(prepared)
+        summary = "Looks correct." if case != "semantic" else "DECISION: fail\n.auto-agents/state/task_plan.json status in_progress"
+        if len(captured) > 1:
+            summary = "DECISION: pass\nBehavior verified."
+        return AgentResult(True, [], req.output_path, summary=summary, provider_session_id="review-native",
+                           prompt_metadata=prepared.prompt_metadata)
+
+    orch._call_with_failover = call
+    result = orch._run_agent_with_retries(
+        None, "review", "review-protocol-test",
+        compose_prompt(["Review all owned acceptance.", PromptBlock("Return DECISION: pass or DECISION: fail.", kind="output")], purpose="review"),
+        validation_feedback=orch._review_validation_feedback,
+        protocol_retry_eligible=lambda r: not orch._has_explicit_review_decision(r.summary),
+    )
+    assert result.ok and len(captured) == 2
+    assert bool(captured[1].resume_session_id) == (case == "protocol")
+    assert captured[1].prompt_is_continuation == (case == "protocol")
+    assert "DECISION" in captured[1].prompt
+    if case == "protocol":
+        assert "Looks correct." not in captured[1].prompt
+        rebuilt = prepare_request(fresh_request(captured[1], "provider-switch"), runtime)
+        assert "Review all owned acceptance." in rebuilt.prompt
+        assert "Looks correct." in rebuilt.prompt

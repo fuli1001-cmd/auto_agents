@@ -34569,6 +34569,7 @@ class Orchestrator:
             stage_key=f"review-{task.task_id}",
             prompt=review_prompt,
             validation_feedback=self._review_validation_feedback,
+            protocol_retry_eligible=lambda result: not self._has_explicit_review_decision(result.summary),
             run_id=run_id,
             effort=review_effort,
         )
@@ -40017,6 +40018,7 @@ class Orchestrator:
         task_origin: str = "",
         mutable_artifacts: Iterable[str] = (),
         continuation: Optional[Mapping[str, object]] = None,
+        protocol_retry_eligible: Optional[Callable[[AgentResult], bool]] = None,
     ) -> AgentResult:
         # Complete engine-owned migrations before the mutation snapshot. A
         # provider or health observer can then never be blamed for this write.
@@ -40033,6 +40035,8 @@ class Orchestrator:
         restore_root: Optional[Path] = None
         durable_restore_root: Optional[Path] = None
         completed = False
+        protocol_continuation = None
+        protocol_feedback = ""
         restorable_clarify_conversation = (
             stage == "clarify" and stage_key.startswith("clarify-conv-")
         )
@@ -40079,6 +40083,13 @@ class Orchestrator:
                 artifact_stage = stage_key if attempt == 1 else f"{stage_key}-attempt-{attempt}"
                 output_path = self._stage_output_path(active_run_id, artifact_stage)
                 write_run_prompt(self.project_root, active_run_id, artifact_stage, attempt_prompt)
+                retry_continuation = None
+                if protocol_continuation is not None:
+                    identity = (head_ref(self.project_root), self._worktree_fingerprint_excluding_agent_instructions())
+                    if identity == protocol_continuation["workspace"]:
+                        retry_continuation = protocol_continuation
+                selected_continuation = (continuation if attempt == 1 else retry_continuation) or {}
+                protocol_continuation = None
                 request = AgentRequest(
                     stage=stage,
                     purpose=("clarify_converse" if restorable_clarify_conversation else stage),
@@ -40091,9 +40102,11 @@ class Orchestrator:
                     progress_managed_timeout=(
                         stage == "prototype" and stage_key.startswith("prototype-generate-")
                     ),
-                    resume_session_id=str((continuation or {}).get("session_id", "")) if attempt == 1 else "",
-                    resume_provider=str((continuation or {}).get("provider", "")) if attempt == 1 else "",
-                    resume_prompt_hash=str((continuation or {}).get("prompt_hash", "")) if attempt == 1 else "",
+                    resume_session_id=str(selected_continuation.get("session_id", "")),
+                    resume_provider=str(selected_continuation.get("provider", "")),
+                    resume_prompt_hash=str(selected_continuation.get("prompt_hash", "")),
+                    prompt_is_continuation=bool(retry_continuation),
+                    prompt_continuation=protocol_feedback if retry_continuation else "",
                 )
                 if request.prompt_spec is not None and state is not None:
                     policy = state.resume_context.get("authorization_policy", {})
@@ -40231,6 +40244,19 @@ class Orchestrator:
                         # retry exhaustion.
                         last_error = issue
                         feedback = issue
+                        acceleration = self.config.execution.acceleration
+                        if (protocol_retry_eligible is not None and protocol_retry_eligible(result)
+                                and acceleration.enabled and acceleration.session_continuation_enabled
+                                and result.provider_session_id and result.prompt_metadata.get("compatibility_hash")
+                                and not result.cleanup_incomplete):
+                            protocol_continuation = {
+                                "session_id": result.provider_session_id,
+                                "provider": self._current_provider,
+                                "prompt_hash": result.prompt_metadata["compatibility_hash"],
+                                "workspace": (head_ref(self.project_root), self._worktree_fingerprint_excluding_agent_instructions()),
+                            }
+                            protocol_feedback = issue
+                            feedback += "\nPrevious output (not yet accepted):\n" + result.summary
                         continue
 
                 self._emit_agent_metrics(
