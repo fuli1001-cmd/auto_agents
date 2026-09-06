@@ -437,6 +437,18 @@ def test_auto_result_cache_reuses_when_only_unobserved_source_changes(
     assert second.ok and second.cached
     assert second.backend == "result-cache-observed-inputs"
 
+    # Reuse must stop as soon as an actually observed source changes.
+    (project / "input.txt").write_text("two\n", encoding="utf-8")
+    with LocalGatePlanExecutor(
+        project, config, metadata, environment_fingerprint="env-auto-1",
+    ) as executor:
+        third = executor.run(
+            command, timeout_seconds=60, adaptive_timeout_enabled=False,
+            idle_timeout_seconds=60,
+        )
+    assert not third.cached
+    assert not third.ok
+
 
 def test_serial_lane_preserves_ignored_producer_artifact(tmp_path: Path) -> None:
     project = _project(tmp_path)

@@ -263,7 +263,7 @@ class GateTests(unittest.TestCase):
                         if pgid > 0 and process_group_exists(pgid):
                             os.killpg(pgid, signal.SIGKILL)
 
-    def test_run_commands_enforces_hard_timeout_and_preserves_output(self) -> None:
+    def test_run_commands_enforces_hard_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             started = time.monotonic()
             result = run_commands(
@@ -280,7 +280,9 @@ class GateTests(unittest.TestCase):
             command = result.commands[0]
             self.assertEqual(command.termination_reason, "timeout")
             self.assertEqual(command.timeout_seconds, 0.2)
-            self.assertEqual(command.stdout, "started")
+            # The hard budget includes shell/interpreter startup. Under load,
+            # Python need not reach print within 200ms. Output retention is
+            # tested separately with a synchronized child and deadline.
             self.assertIn("timed out after 0.2s", result.summary)
 
     def test_collect_all_stops_after_timeout(self) -> None:

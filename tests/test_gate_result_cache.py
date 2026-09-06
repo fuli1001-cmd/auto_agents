@@ -196,6 +196,11 @@ def test_observed_input_cache_invalidates_when_a_symlink_is_retargeted(tmp_path:
     'chdir("subdirectory") = 0',
     'fchdir(3) = 0',
     'openat(3, "input.txt", O_RDONLY) = 4',
+    'openat(3</tmp>, "input.txt", O_RDONLY) = 4',
+    'newfstatat(3, "", {st_mode=S_IFREG}, AT_EMPTY_PATH) = 0',
+    'newfstatat(3</tmp>, "input.txt", {st_mode=S_IFREG}, 0) = 0',
+    'newfstatat(3</tmp/input.txt (deleted)>, "", {st_mode=S_IFREG}, AT_EMPTY_PATH) = 0',
+    'newfstatat(3<socket:[123]>, "", {st_mode=S_IFSOCK}, AT_EMPTY_PATH) = 0',
 ])
 def test_unresolved_working_directory_or_dirfd_cannot_certify_inputs(tmp_path, operation):
     (tmp_path / "input.txt").write_text("root input\n", encoding="utf-8")
@@ -209,3 +214,37 @@ def test_unresolved_working_directory_or_dirfd_cannot_certify_inputs(tmp_path, o
 
     assert manifest == {}
     assert not network
+
+
+@pytest.mark.parametrize("syscall,arguments", [
+    ("newfstatat", "{st_mode=S_IFREG}, AT_EMPTY_PATH"),
+    ("fstatat64", "{st_mode=S_IFREG}, AT_EMPTY_PATH"),
+    ("statx", "AT_EMPTY_PATH, STATX_BASIC_STATS, {stx_mode=S_IFREG}"),
+])
+def test_descriptor_stat_records_decoded_target_without_prior_open(tmp_path, syscall, arguments):
+    source = tmp_path / "input.txt"
+    source.write_text("one\n", encoding="utf-8")
+    trace = tmp_path / "trace.log"
+    # An inherited fd has no open in this trace: its decoded target is still
+    # required in the certificate. Pipe metadata is not a source dependency.
+    trace.write_text(
+        f'42 {syscall}(3<{source}>, "", {arguments}) = 0\n'
+        '42 newfstatat(1<pipe:[123]>, "", {st_mode=S_IFIFO}, AT_EMPTY_PATH) = 0\n',
+        encoding="utf-8",
+    )
+    manifest, network = _observed_input_manifest(trace, tmp_path, {})
+    assert set(manifest) == {"input.txt"}
+    assert manifest["input.txt"].startswith("file:")
+    assert not network
+
+
+def test_descriptor_stat_does_not_certify_symlink_dependencies(tmp_path):
+    (tmp_path / "input.txt").write_text("one\n", encoding="utf-8")
+    (tmp_path / "link.txt").symlink_to("input.txt")
+    trace = tmp_path / "trace.log"
+    trace.write_text(
+        'openat(AT_FDCWD, "link.txt", O_RDONLY) = 3\n'
+        f'newfstatat(3<{tmp_path / "input.txt"}>, "", {{st_mode=S_IFREG}}, AT_EMPTY_PATH) = 0\n',
+        encoding="utf-8",
+    )
+    assert _observed_input_manifest(trace, tmp_path, {}) == ({}, False)

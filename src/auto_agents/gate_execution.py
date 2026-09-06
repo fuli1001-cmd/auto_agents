@@ -490,10 +490,35 @@ def _observed_input_manifest(
     except OSError:
         return {}, False
     network_observed = "connect(" in text or "sendto(" in text
+    descriptor_paths: list[str] = []
+
+    def resolved_descriptor_stat(match: re.Match[str]) -> str:
+        # AT_EMPTY_PATH stats the descriptor itself, not a path relative to a
+        # directory fd. strace -y supplies its target, including inherited fds.
+        # Keep rejecting undecoded fds instead of silently omitting an input.
+        target = match.group("target")
+        if (
+            "AT_EMPTY_PATH" not in match.group("arguments")
+            or "\\" in target
+            or target.endswith(" (deleted)")
+        ):
+            return match.group(0)
+        if target.startswith("/"):
+            descriptor_paths.append(target)
+        elif not re.fullmatch(r"pipe:\[\d+\]", target):
+            return match.group(0)
+        return ""
+
+    guard_text = re.sub(
+        r'\b(?:newfstatat|fstatat64|statx)\(\d+<(?P<target>[^>\n]+)>,\s*"",'
+        r'(?P<arguments>[^\n]*)',
+        resolved_descriptor_stat,
+        text,
+    )
     if re.search(
         r"\b(?:chdir|fchdir)\("
         r"|\b(?:openat2?|newfstatat|fstatat64|faccessat2?|readlinkat|statx)\(\s*(?!\s|AT_FDCWD\b)",
-        text,
+        guard_text,
     ):
         # This tracer does not track per-process cwd or directory descriptors.
         # Such traces cannot certify inputs for reuse on another source tree.
@@ -506,11 +531,15 @@ def _observed_input_manifest(
         *dependency_links.keys(),
     }
     manifest: dict[str, str] = {}
+    observed_paths = list(descriptor_paths)
     for match in re.finditer(r'"(?:[^"\\]|\\.)*"', text):
         try:
             raw = json.loads(match.group(0))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
+        if isinstance(raw, str):
+            observed_paths.append(raw)
+    for raw in observed_paths:
         if not isinstance(raw, str) or not raw or raw.startswith(
             ("/dev/", "/proc/", "/sys/")
         ):
@@ -758,9 +787,9 @@ def _sha256(path: Path) -> str:
 
 def isolated_command(command: str) -> str:
     """Disable runner caches that write through shared dependency links."""
-    if "vitest" in command and "--no-cache" not in command and "--cache" not in command:
-        return f"{command} --no-cache"
-    return command
+    from .execution_binding import disable_vitest_cache
+
+    return disable_vitest_cache(command)
 
 
 def gate_environment(
@@ -1291,7 +1320,7 @@ class LocalGatePlanExecutor:
             ):
                 trace_path = runtime_root / "input-trace.log"
                 traced_command = (
-                    "strace -f -qq -e trace=%file,%network,fchdir -o "
+                    "strace -f -qq -y -e trace=%file,%network,fchdir -o "
                     f"{shlex.quote(str(trace_path))} "
                     f"sh -lc {shlex.quote(traced_command)}"
                 )

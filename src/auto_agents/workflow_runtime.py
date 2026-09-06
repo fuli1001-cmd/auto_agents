@@ -685,8 +685,8 @@ class WorkflowCoordinator:
                         f"chore(workflow): finalize {snapshot.workflow_id}",
                         workflow_paths,
                     )
-            elif root and state.status == "failed":
-                snapshot.status = "failed"
+            elif root and state.status in {"failed", "blocked"}:
+                snapshot.status = state.status
                 self.store.save(snapshot)
             elif state.status == "paused" and state.resolution == "interrupted_by_user":
                 snapshot.status = "paused"
@@ -709,6 +709,17 @@ class WorkflowCoordinator:
     def _drive_handoff(self, parent_session: object, parent_state: object, snapshot: WorkflowSnapshot):
         handoff = self.store.load_handoff(parent_state.active_handoff_id)
         if handoff.returned_at:
+            return self._apply_child_result(parent_state, handoff)
+        binding_payload = handoff.payload
+        if handoff.target == "resume":
+            original = self.store.load_handoff(str(handoff.payload.get("resume_handoff_id", "")))
+            binding_payload = original.payload
+        blocked = self._execution_binding_result(binding_payload)
+        if blocked:
+            # Reject legacy/restored foreign handoffs before checkpoints,
+            # rollback, ambient run recovery, or a new provider call.
+            self.store.record_result(snapshot, handoff, status="blocked", result=blocked)
+            self.store.consume_result(snapshot, handoff, operation_id=f"binding-{handoff.handoff_id}")
             return self._apply_child_result(parent_state, handoff)
         self._ensure_handoff_checkpoint(snapshot, handoff)
 
@@ -886,6 +897,10 @@ class WorkflowCoordinator:
     def _drive_fix_child(self, handoff: WorkflowHandoff, snapshot: WorkflowSnapshot) -> Dict[str, object]:
         from .session import Session
 
+        blocked = self._execution_binding_result(handoff.payload)
+        if blocked:
+            return blocked
+
         current = load_run_state(self.project_root)
         if self.orch._prepare_installed_self_repair_resume(current):
             save_run_state(self.project_root, current)
@@ -927,8 +942,21 @@ class WorkflowCoordinator:
         state = self.start_seeded_session(session, snapshot=snapshot, handoff=handoff)
         return self._session_result(state, handoff)
 
-    def prepare_run_route(self) -> tuple[bool, str]:
+    def _execution_binding_result(self, payload: Dict[str, object]) -> Dict[str, object]:
+        from .execution_binding import repository_binding_error
+
+        error = repository_binding_error(self.project_root, payload)
+        return ({
+            "status": "blocked", "resolution": "execution_binding_mismatch",
+            "summary": error, "retry_fix": False, "changed_paths": [],
+        } if error else {})
+
+    def prepare_run_route(self, payload: Optional[Dict[str, object]] = None) -> tuple[bool, str]:
         """Clear a verified engine blocker before a run handoff is created."""
+
+        blocked = self._execution_binding_result(payload or {})
+        if blocked:
+            return False, str(blocked["summary"])
 
         current = load_run_state(self.project_root)
         if current.status == "completed":
@@ -981,6 +1009,9 @@ class WorkflowCoordinator:
         )
 
     def _drive_run_child(self, handoff: WorkflowHandoff, snapshot: WorkflowSnapshot) -> Dict[str, object]:
+        blocked = self._execution_binding_result(handoff.payload)
+        if blocked:
+            return blocked
         self.auto_approve = bool(
             self.auto_approve or handoff.payload.get("auto_approve", False)
         )
@@ -1241,6 +1272,9 @@ class WorkflowCoordinator:
         parent_state.active_handoff_id = ""
         parent_state.return_phase = "after_child"
         parent_state.status = "executing"
+        if result.get("resolution") in {"execution_binding_mismatch", "verification_execution_binding"}:
+            parent_state.status = "blocked"
+            parent_state.resolution = str(result["resolution"])
         parent_state.attempt_epoch += 1
         parent_state.attempts_since_progress = 0
         parent_state.consecutive_agent_errors = 0

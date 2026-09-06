@@ -767,6 +767,10 @@ class Session:
                             )
                             self._save(state)
                             continue
+                    from .execution_binding import repository_binding_error
+                    binding_error = repository_binding_error(self.project_root, disposition)
+                    if binding_error:
+                        return self._block_execution_binding(state, binding_error)
                     issue_ref = self._materialize_fix_issue(state, disposition)
                     if decision == "fix":
                         verify_command = str(
@@ -1370,6 +1374,7 @@ class Session:
                     "evidence_refs",
                     "affected_contracts",
                     "verification_command",
+                    "target_repository",
                 )
                 if key in disposition
             }
@@ -1432,7 +1437,7 @@ class Session:
                         or disposition.get("summary")
                         or "product iteration"
                     ),
-                    payload={"spec_seed": dict(spec_seed)},
+                    payload={"spec_seed": dict(spec_seed), "target_repository": disposition.get("target_repository", "")},
                 ),
                 "",
             )
@@ -1546,6 +1551,9 @@ class Session:
                     "spec_seed JSON object."
                 )
             payload = {"spec_seed": dict(raw_spec_seed)}
+
+        if "target_repository" in route:
+            payload["target_repository"] = route["target_repository"]
 
         return (
             self._prepare_workflow_handoff(
@@ -1861,6 +1869,11 @@ class Session:
         payload: Dict[str, object],
     ) -> SessionState:
         from .workflow_chain import WorkflowRef, WorkflowStore
+        from .execution_binding import repository_binding_error
+
+        binding_error = repository_binding_error(self.project_root, payload)
+        if binding_error:
+            return self._block_execution_binding(state, binding_error)
 
         if not state.workflow_id:
             store = WorkflowStore(self.project_root)
@@ -1874,7 +1887,7 @@ class Session:
             )
             snapshot = store.load(state.workflow_id)
         if target == "run" and self._coordinator is not None:
-            route_ready, route_detail = self._coordinator.prepare_run_route()
+            route_ready, route_detail = self._coordinator.prepare_run_route(payload)
             state.execution_log.append(
                 {
                     "attempt": state.current_attempt,
@@ -1946,8 +1959,26 @@ class Session:
 
     # ── Phase 2a: Fix mode execution ─────────────────────────────
 
+    def _block_execution_binding(self, state: SessionState, error: str,
+                                 kind: str = "execution_binding_mismatch") -> SessionState:
+        state.status = "blocked"
+        state.resolution = kind
+        state.execution_log.append({
+            "action": "execution_preflight_blocked", "result": error,
+            "failure_kind": kind, "retry_fix": False, "timestamp": self._now(),
+        })
+        self._save(state)
+        self._print(error)
+        return state
+
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
         self._current_state = state
+        from .execution_binding import ExecutionBindingError
+
+        try:
+            self._fix_verify_command_for_execution(state.fix_verify_command)
+        except ExecutionBindingError as error:
+            return self._block_execution_binding(state, str(error), "verification_execution_binding")
         self.orch._apply_generated_verification_config()
         self._ensure_baseline(state)
         feedback = ""
@@ -2123,6 +2154,11 @@ class Session:
 
             self._print(f"Verification failed: {verify_reason}")
             if verify.get("retry_fix") is False:
+                if verify.get("failure_kind") == "verification_execution_binding":
+                    state.status = "blocked"
+                    state.resolution = "verification_execution_binding"
+                    self._save(state)
+                    return state
                 state.resolution = "verification_inconclusive"
                 self._print(
                     "Verification could not establish a comparable regression; "
@@ -3951,8 +3987,8 @@ class Session:
 
         # Layer 1: targeted bug verification
         if self.mode == "fix" and state.fix_verify_command:
-            verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
             try:
+                verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
                 with self.orch._gate_executor_context(
                     {verify_command: plan.metadata.get(verify_command, {})}
                 ) as gate_executor:
@@ -3968,6 +4004,10 @@ class Session:
                         gate_executor=gate_executor,
                     )
             except Exception as exc:
+                from .execution_binding import ExecutionBindingError
+                if isinstance(exc, ExecutionBindingError):
+                    return outcome(False, str(exc), retry_fix=False,
+                                   failure_kind="verification_execution_binding")
                 return outcome(False, f"fix_verify_command error: {exc}")
             record_gate(targeted_gate)
             self.orch._classify_reported_infrastructure_failures(targeted_gate)
@@ -3987,6 +4027,9 @@ class Session:
                     or targeted_gate.summary
                     or "non-zero exit"
                 ).strip()
+                if "EnvironmentLocationNotFound" in detail or "Not a conda environment:" in detail:
+                    return outcome(False, f"fix_verify_command environment error: {detail[:500]}",
+                                   retry_fix=False, failure_kind="verification_execution_binding")
                 return outcome(False, f"fix_verify_command failed: {detail[:500]}")
 
         # Layer 2: baseline-diff gate check
@@ -4186,9 +4229,12 @@ class Session:
         return outcome(True, gate.summary)
 
     def _fix_verify_command_for_execution(self, command: str) -> str:
+        from .execution_binding import validate_verification_binding
+
         stripped = command.strip()
         if not stripped:
             return stripped
+        validate_verification_binding(stripped, self.project_root)
         conda_meta = self.project_root / ".conda" / "conda-meta"
         if not conda_meta.exists():
             return stripped

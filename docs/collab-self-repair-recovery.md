@@ -60,3 +60,29 @@ It records the reconstructed graph and checks that the live project did not
 change. The probe stops before making a model call; reaching that boundary proves
 session resumption, not completion of the user's business goal. Its JSON report
 and subprocess output are retained in a uniquely named directory under `/tmp`.
+
+## Deterministic verification and repository-binding failures
+
+An explicit `target_repository` in a route, issue seed, or iteration seed is
+checked before ambient run recovery, baseline creation, or child execution.
+The in-process coordinator owns one repository: its provider write scope,
+verification environment, checkpoint and rollback scope cannot be switched by
+an issue description or a shell `cd`. A foreign target without an explicitly
+bound execution channel now returns `execution_binding_mismatch` and blocks the
+parent. Historical/resumed handoffs receive the same check. This is a bounded
+stop, not a claim that cross-repository execution has succeeded; engine repair
+must use the engine-owned repair path or an authorized engine workspace.
+
+Fix verification preflight rejects missing Conda prefixes/interpreters and
+foreign execution directories/test sources before another fix model call.
+These failures propagate as `verification_execution_binding`, so a parent does
+not repeatedly create replacement fix children for the same invalid command.
+No environment is fabricated and no unrelated pending run is reset or resumed.
+
+Vitest cache isolation identifies executable tokens in individual shell
+commands, not the substring `vitest`. For example, a pytest file named
+`test_workbench_vitest_launcher.py` does not receive `--no-cache`; in a mixed
+`vitest ... && pytest ...` command the flag is attached only to Vitest. Quoting,
+separators, comments, and existing cache flags are preserved. Nested shell
+programs that cannot be safely rewritten are left unchanged, not reparsed as
+top-level commands; use an explicit verification script for those cases.
