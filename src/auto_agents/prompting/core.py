@@ -102,6 +102,14 @@ IMPLEMENT = frozenset({"implement", "fix", "self_repair"})
 DOCUMENT = frozenset({"clarify", "design", "plan", "prototype", "readme",
                       "provider_research", "provider_resolve"})
 
+# These authored fields locate evidence; their values are not stage instructions.
+CONTEXT_FIELDS = (
+    "Project root:", "Project brief:", "Architecture:", "Requirements trace:",
+    "Input spec:", "Immutable run input spec:", "Provider references lock:",
+    "Provider references directory:", "Current run error:", "Last run error:",
+    "Candidate attempt:",
+)
+
 
 def task_context(task: Any) -> dict:
     """The owned task contract; execution/review history is supplied separately."""
@@ -157,21 +165,24 @@ def compose_prompt(
     """Compose authored blocks. Unknown domain applicability retains the rule."""
     rules, data, output = [], list(contexts), []
     seen = set()
-    seen_text = set()
     for line in lines:
         if isinstance(line, ContextBlock):
             data.append(line)
             continue
         block = line if isinstance(line, PromptBlock) else PromptBlock(str(line))
+        if not isinstance(line, PromptBlock):
+            field = next((prefix for prefix in CONTEXT_FIELDS if block.text.startswith(prefix)), "")
+            if field:
+                data.append(ContextBlock(block.text, field.rstrip(":"), "field:" + field.rstrip(":")))
+                continue
         if not block.text.strip():
             continue
         if domains is not None and domains.get(block.domain) is False:
             continue
         key = block.rule_id or digest(block.text)
-        if key in seen or block.text in seen_text:
+        if key in seen:
             continue
         seen.add(key)
-        seen_text.add(block.text)
         if block.kind == "output" or block.text.startswith("Final response:"):
             output.append(block.text)
         else:
@@ -246,7 +257,9 @@ def fresh_request(request: Any, reason: str, progress: str = "") -> Any:
     return replace(
         request, prompt=prompt, prompt_spec=spec, resume_session_id="", resume_provider="",
         resume_prompt_hash="", prompt_is_continuation=False, prompt_continuation="",
-        prompt_metadata={"fallback_reason": reason},
+        prompt_metadata={**{key: value for key, value in request.prompt_metadata.items()
+                            if key in {"stage_attempt", "delta_candidate_bytes", "delta_fallback_reason"}},
+                         "fallback_reason": reason},
     )
 
 
@@ -308,9 +321,10 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
     metadata["adaptation"] = request.model_adaptation
     metadata["resumed"] = bool(request.resume_session_id)
     metadata["sandbox_mode"] = request.sandbox_mode
+    metadata["cwd"] = str(request.cwd.resolve())
     metadata["effort"] = request.effort
     metadata["fallback_reason"] = request.prompt_metadata.get("fallback_reason", "")
-    for key in ("delta_candidate_bytes", "delta_fallback_reason"):
+    for key in ("delta_candidate_bytes", "delta_fallback_reason", "stage_attempt"):
         if key in request.prompt_metadata:
             metadata[key] = request.prompt_metadata[key]
     metadata["policy_hash"] = policy_fingerprint()
@@ -325,12 +339,18 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
     metadata["compatibility_hash"] = digest(json.dumps({key: metadata[key] for key in (
         "policy_hash", "contract_hash", "instructions_hash", "purpose", "model_profile", "provider",
         "cli_version", "binary_identity", "configured_model", "resolved_model", "output_contract_version", "sandbox_mode",
-        "effort", "settings_fingerprint",
+        "effort", "settings_fingerprint", "cwd",
     )}, sort_keys=True))
     if request.resume_session_id and (request.resume_prompt_hash != metadata["compatibility_hash"]
                                       or runtime.resolution_source == "unreadable-or-unsupported-config"):
         # Rebuild from the complete saved spec, never from a takeover-only message.
         return prepare_request(fresh_request(request, "incompatible-native-session"), runtime)
-    metadata["full_prompt_bytes"] = len(render_prompt(request.prompt_spec, runtime, request.model_adaptation)[0].encode("utf-8"))
-    metadata["prompt_mode"] = "delta" if request.prompt_is_continuation else "full"
+    full_spec = request.prompt_spec
+    if request.attachments and runtime.provider == "claude-code":
+        full_spec = replace(full_spec, contexts=(*full_spec.contexts, ContextBlock(
+            "Inspect these attached images using the Read tool:\n" +
+            "\n".join(str(path) for path in request.attachments), "attachments")))
+    metadata["full_prompt_bytes"] = len(render_prompt(full_spec, runtime, request.model_adaptation)[0].encode("utf-8"))
+    metadata["prompt_mode"] = ("delta" if request.prompt_is_continuation else
+                               "handoff" if metadata["fallback_reason"] == "provider-switch" else "full")
     return replace(request, prompt=text, prompt_metadata=metadata, prompt_continuation=continuation)
