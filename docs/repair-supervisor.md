@@ -11,6 +11,19 @@ store. The project lock remains held across quiescence and process replacement.
 The resumed CLI loads a verified SHA in a fresh interpreter, retaining the
 original command, workflow/session, provider and approval arguments.
 
+Verification and replay subprocesses use the installed Codex CLI's local sandbox
+command (no model/API call). The permission profile makes the live target and
+other filesystem paths read-only, allowing writes only to the verification
+workspace and a private temporary directory. A private Linux network namespace
+contains loopback test services; verification receives a credential-free
+environment, private HOME and private `/tmp`. Nested sandbox checks retain the
+outer isolation and use Landlock to narrow their own write roots. Linux/WSL
+hosts need `unshare`, `mount`, `ip`, and Landlock ABI 3 or newer in addition to
+the local Codex sandbox command. The sandbox is probed before generation; an unavailable or
+incompatible host fails closed. This follows the official
+[Codex permissions](https://learn.chatgpt.com/docs/permissions) model; it is
+independent of which provider generates the repair.
+
 ## Operator configuration and commands
 
 The first registration pins the engine installation's explicitly tracked Git
@@ -62,8 +75,10 @@ in-process path for compatibility and isolated tests.
 Failures with the same fingerprint, contract, base and environment share one
 local job, including its blocked state. Changing a child ID does not reset the
 job. Each subscribing project still needs its own boundary check. There is one
-repair/validation/publication worker at a time per supervisor; healthy business
-processes continue independently on their own versions.
+code-repair/validation/integration worker at a time per supervisor; a separate
+lightweight Git publication lane prevents an unrelated long repair from delaying
+an already-verified fast-forward push. Healthy business processes continue
+independently on their own versions.
 
 The supervisor records worker and resumed-process identities and adopts live
 processes after restart. A foreground relay can transfer its still-held lock

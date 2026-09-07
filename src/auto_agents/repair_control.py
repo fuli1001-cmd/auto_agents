@@ -92,6 +92,16 @@ def operator_root():
                 str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "auto-agents/repair-control")).expanduser().resolve()
 
 
+def publication_policy(config):
+    path = Path(config["root"]) / "operator.json" if config.get("root") else None
+    current = json.loads(path.read_text()) if path and path.exists() else config
+    if any(current.get(key) != config.get(key) for key in ("remote", "ref", "identity")):
+        raise PermissionError("operator repository identity changed; use a separate control namespace")
+    if not current.get("publish", False):
+        raise PermissionError("automatic publication is not authorized by the operator")
+    return current
+
+
 def configure(source_root):
     """Pin the installation's trusted upstream, never a model-supplied target."""
     source = Path(source_root).resolve()
@@ -188,6 +198,7 @@ class Store:
                 receipt = {**json.loads(existing["result"]), "ok": False,
                            "error": "the same failure recurred in the verified runtime without a new contract", "recurrence": True}
                 db.execute("UPDATE jobs SET state='blocked',result=?,generation=generation+1 WHERE id=?", (json.dumps(receipt), identity))
+                db.execute("UPDATE outbox SET state='invalidated' WHERE job=? AND state!='published'", (identity,))
                 db.execute("UPDATE subscribers SET state='blocked' WHERE id=?", (subscriber,))
                 return identity
             if not existing:
@@ -244,8 +255,15 @@ class Store:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM outbox WHERE state='pending' AND due<=?", (time.time(),))]
 
+    def enqueue_publish(self, job):
+        with self.connect() as db:
+            db.execute("INSERT OR IGNORE INTO outbox(job,state,due) VALUES(?,'pending',?)", (job, time.time()))
+
     def publish_later(self, job, *, permission=False, detail=""):
         with self.connect() as db:
+            current = db.execute("SELECT state FROM jobs WHERE id=?", (job,)).fetchone()
+            if not current or current["state"] == "cancelled":
+                return
             previous = db.execute("SELECT attempts FROM outbox WHERE job=?", (job,)).fetchone()
             attempt = previous["attempts"] if previous else 0
             delay = PUBLISH_DELAYS[min(attempt, len(PUBLISH_DELAYS) - 1)]
@@ -307,6 +325,7 @@ class Repository:
             git(self.cache, "config", "user.email", "self-repair@localhost")
 
     def push(self, revision):
+        publication_policy(self.config)
         with self.locked():
             result = git(self.cache, "push", self.config["remote"], revision + ":" + self.config["ref"], check=False)
         if result.returncode:
@@ -316,7 +335,7 @@ class Repository:
 
 
 def socket_path(config):
-    directory = private_directory(Path("/tmp") / f"auto-agents-control-{os.getuid()}")
+    directory = private_directory(config.get("socket_dir") or Path("/tmp") / f"auto-agents-control-{os.getuid()}")
     namespace = digest([config["identity"], str(Path(config["root"]).resolve())])[:24]
     return directory / (namespace + ".sock")
 
@@ -361,7 +380,7 @@ def ensure_supervisor(config):
             raise RuntimeError("repair controller must be installed from a committed implementation")
         config["implementation_root"] = str(implementation)
         atomic_json(root / "operator.json", config)
-    source = Path(__file__).read_bytes()
+    source = (Path(config["implementation_root"]) / "src/auto_agents/repair_control.py").read_bytes()
     bootstrap = root / ("bootstrap-" + hashlib.sha256(source).hexdigest()[:20] + ".py")
     if not bootstrap.exists():
         bootstrap.write_bytes(source)
@@ -407,6 +426,7 @@ class Supervisor:
         self.relays = []
         self.halt = False
         self.stopping = {}
+        self.publisher = None
         for path in sorted(self.store.root.glob("jobs/*/*-lease.json"), key=lambda item: item.stat().st_mtime, reverse=True):
             lease = json.loads(path.read_text())
             if lease.get("kind") == "resume":
@@ -423,7 +443,7 @@ class Supervisor:
     def register(self, request, fds):
         payload = request["payload"]
         project = str(Path(payload["project"]).resolve())
-        expected = Path("/tmp/auto-agents-run-locks") / (hashlib.sha256(project.encode()).hexdigest() + ".lock")
+        expected = Path(self.config.get("lock_dir", "/tmp/auto-agents-run-locks")) / (hashlib.sha256(project.encode()).hexdigest() + ".lock")
         if not fds:
             raise RuntimeError("registration requires the held project lock")
         left, right = os.fstat(fds[0]), expected.stat()
@@ -517,7 +537,7 @@ class Supervisor:
             if passed and job["state"] != "completed":
                 self.store.event(job["id"], "live_boundary_passed", {"subscriber": row["id"], "commit": job["result"]["commit"]})
                 if job["result"].get("status") == "repaired":
-                    self.store.publish_later(job["id"])
+                    self.store.enqueue_publish(job["id"])
                 self.store.transition(job["id"], "completed")
             return {"ok": True, "accepted": passed}
         if op == "consume-route":
@@ -534,7 +554,7 @@ class Supervisor:
                 self.store.event(job["id"], "engine_route_consumed", {"subscriber": row["id"]})
                 if job["state"] != "completed":
                     if job["result"].get("status") == "repaired":
-                        self.store.publish_later(job["id"])
+                        self.store.enqueue_publish(job["id"])
                     self.store.transition(job["id"], "completed")
             return {"ok": True, "accepted": passed}
         if op == "finish":
@@ -552,7 +572,7 @@ class Supervisor:
                     if subscriber["state"] == "cancelled" or subscriber["id"] in self.registrations:
                         continue
                     project = subscriber["project"]
-                    path = Path("/tmp/auto-agents-run-locks") / (hashlib.sha256(project.encode()).hexdigest() + ".lock")
+                    path = Path(self.config.get("lock_dir", "/tmp/auto-agents-run-locks")) / (hashlib.sha256(project.encode()).hexdigest() + ".lock")
                     fd = os.open(path, os.O_RDWR)
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -606,11 +626,11 @@ class Supervisor:
                 continue
             self.drain_worker_children(identity)
             del self.workers[identity]
-            result_path = self.store.root / "jobs" / identity / (operation + "-result.json")
+            result_path = self.store.root / "jobs" / identity / (operation + f"-g{generation}-result.json")
             result = json.loads(result_path.read_text()) if result_path.exists() else {"ok": False, "error": "repair worker exited without a receipt"}
             if result.get("generation", generation) != generation:
                 result = {"ok": False, "error": "stale worker receipt"}
-            if job["state"] == "cancelled":
+            if job["state"] == "cancelled" or job["generation"] != generation:
                 continue
             if operation.startswith("validate-"):
                 subscriber_id = operation[len("validate-"):]
@@ -626,6 +646,10 @@ class Supervisor:
                     self.store.publish_later(identity, permission=result.get("permission", False), detail=result.get("error", "publication failed"))
             else:
                 self.store.transition(identity, "ready" if result.get("ok") else "blocked", result, generation=generation)
+                if not result.get("ok"):
+                    with self.store.connect() as db:
+                        db.execute("UPDATE subscribers SET state='blocked',updated=? WHERE job=? AND state IN ('waiting','validating','verified')",
+                                   (time.time(), identity))
         for row in self.store.subscriptions():
             identity = row["id"]
             process = self.resumes.get(identity)
@@ -649,7 +673,7 @@ class Supervisor:
                     if job["state"] != "completed":
                         self.store.transition(job["id"], "completed")
                         if job["result"].get("status") == "repaired":
-                            self.store.publish_later(job["id"])
+                            self.store.enqueue_publish(job["id"])
                 del self.resumes[identity]
             if row["state"] == "verified" and identity not in self.resumes:
                 self.launch_resume(row)
@@ -664,6 +688,13 @@ class Supervisor:
                 active = db.execute("SELECT 1 FROM subscribers WHERE job=? AND state IN ('waiting','validating','verified','resuming')", (item["id"],)).fetchone()
                 if not active:
                     db.execute("UPDATE jobs SET state='blocked' WHERE id=?", (item["id"],))
+        # Network-only publication must not wait behind another model repair.
+        # Integration/review still shares the single code-worker slot.
+        if self.publisher is None or not self.publisher.is_alive():
+            due = [item for item in self.store.due_publish() if item["job"] not in self.workers]
+            if due:
+                self.publisher = threading.Thread(target=self.fast_publish, args=(due[0]["job"],), daemon=True)
+                self.publisher.start()
         if not self.workers:
             for row in self.store.subscriptions():
                 if row["state"] == "waiting" and row["job"] and self.store.job(row["job"])["state"] in {"ready", "completed"}:
@@ -672,28 +703,64 @@ class Supervisor:
                     self.launch_worker(row["job"], "validate-" + row["id"])
                     return
             with self.store.connect() as db:
+                integration = db.execute("SELECT job FROM outbox WHERE state='integration_pending' AND due<=? ORDER BY due LIMIT 1", (time.time(),)).fetchone()
+            if integration:
+                self.launch_worker(integration["job"], "publish")
+                return
+            with self.store.connect() as db:
                 row = db.execute("SELECT id FROM jobs WHERE state='queued' ORDER BY updated LIMIT 1").fetchone()
             if row:
                 self.launch_worker(row["id"], "repair")
-            else:
-                due = self.store.due_publish()
-                if due:
-                    self.launch_worker(due[0]["job"], "publish")
+
+    def fast_publish(self, identity):
+        job = self.store.job(identity)
+        if job["state"] != "completed" or not job["result"].get("ok"):
+            return
+        try:
+            config = publication_policy(self.config)
+            repository = Repository(config)
+            revision, fresh = repository.fetch()
+            if not fresh:
+                raise RuntimeError("publication requires a successful upstream refresh")
+            current = self.store.job(identity)
+            if current["state"] == "cancelled" or current["generation"] != job["generation"]:
+                return
+            candidate = job["result"]["commit"]
+            contained = git(repository.cache, "merge-base", "--is-ancestor", candidate, revision, check=False).returncode == 0
+            if not contained and revision != job["result"]["base"]:
+                with self.store.connect() as db:
+                    db.execute("UPDATE outbox SET state='integration_pending',due=? WHERE job=? AND state='pending'", (time.time(), identity))
+                return
+            if not contained:
+                repository.push(candidate)
+            with self.store.connect() as db:
+                db.execute("UPDATE outbox SET state='published',detail=? WHERE job=? AND state!='cancelled'", (revision if contained else candidate, identity))
+            self.store.event(identity, "published", {"commit": revision if contained else candidate})
+        except PermissionError as error:
+            if self.store.job(identity)["generation"] == job["generation"]:
+                self.store.publish_later(identity, permission=True, detail=str(error))
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            if self.store.job(identity)["generation"] == job["generation"]:
+                self.store.publish_later(identity, detail=str(error))
 
     def launch_worker(self, identity, operation):
         job = self.store.job(identity)
         subscribers = self.store.subscriptions(identity)
         registration = next((self.registrations[item["id"]] for item in subscribers if item["id"] in self.registrations and item["state"] != "cancelled"), None)
         if operation != "publish" and registration is None:
-            self.store.transition(identity, "blocked", {"ok": False, "error": "workflow registration must be restored before repair"})
+            if job["state"] != "completed":
+                self.store.transition(identity, "blocked", {**job["result"], "ok": bool(job["result"].get("ok")),
+                    "control_error": "workflow registration must be restored before repair"})
+            with self.store.connect() as db:
+                db.execute("UPDATE subscribers SET state='blocked' WHERE job=? AND state IN ('waiting','validating','verified')", (identity,))
             return
         root = self.store.root / "jobs" / identity
         root.mkdir(parents=True, exist_ok=True)
         request = {"job": job, "config": self.config, "operation": operation}
         if operation.startswith("validate-"):
             request["subscriber"] = next(item for item in subscribers if item["id"] == operation[len("validate-"):])
-        request_path = root / (operation + "-request.json")
-        result_path = root / (operation + "-result.json")
+        request_path = root / (operation + f"-g{job['generation']}-request.json")
+        result_path = root / (operation + f"-g{job['generation']}-result.json")
         if result_path.exists():
             result_path.unlink()
         atomic_json(request_path, request)
@@ -716,7 +783,7 @@ class Supervisor:
         if operation == "repair":
             self.store.transition(identity, "repairing")
         self.store.event(identity, operation + "_worker", {"pid": process.pid, "ticks": start_ticks(process.pid)})
-        atomic_json(root / (operation + "-lease.json"), {"kind": "worker", "job": identity,
+        atomic_json(root / (operation + f"-g{job['generation']}-lease.json"), {"kind": "worker", "job": identity,
             "pid": process.pid, "ticks": start_ticks(process.pid), "generation": job["generation"], "operation": operation})
 
     def launch_resume(self, row):

@@ -14,7 +14,26 @@ import re
 # Direct script execution deliberately avoids auto_agents.cli initialization.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from auto_agents.repair_control import Repository, Store, atomic_json, digest, git
+from auto_agents.repair_control import Repository, Store, atomic_json, digest, git, publication_policy
+
+
+def execute_selected_worker(request, runtime, python):
+    """Keep control stable while loading repair logic from the selected engine."""
+    runtime = Path(runtime).resolve()
+    if Path(__file__).resolve().parents[2] == runtime:
+        return
+    request_path = request.get("_request_path")
+    if not request_path:
+        return  # Direct unit-level calls do not own a worker process.
+    entry = runtime / "src/auto_agents/repair_worker.py"
+    if not entry.is_file():
+        raise RuntimeError("selected engine does not implement the repair worker protocol")
+    atomic_json(Path(request_path), request)
+    lock_fd = os.environ.get("AUTO_AGENTS_REPAIR_LOCK_FD")
+    if lock_fd:
+        os.set_inheritable(int(lock_fd), True)
+    environment = {**os.environ, "PYTHONPATH": str(runtime / "src")}
+    os.execve(python, [python, str(entry), request_path], environment)
 
 
 def engine_environment(config, checkout):
@@ -58,6 +77,8 @@ def make_runner(payload, checkout, evidence, python):
     runner.repo_root = checkout
     runner._verification_python_cache = python
     runner._engine_source_root = Path(payload.get("engine_root") or checkout)
+    runner._replay_original_base = payload.get("base", "")
+    runner._real_project_root = Path(payload["project"])
     config_path = os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_CONFIG")
     job_id = os.environ.get("AUTO_AGENTS_REPAIR_JOB")
     if config_path and job_id:
@@ -128,10 +149,15 @@ def repair(request):
     payload = job["payload"]
     store = Store(config["root"])
     repository = Repository(config)
-    revision, fresh = repository.fetch()
+    prepared = request.get("prepared_runtime")
+    revision, fresh = (prepared["revision"], prepared["fresh"]) if prepared else repository.fetch()
     store.event(job["id"], "remote_checked", {"revision": revision, "fresh": fresh})
     checkout = repository.worktree(revision, job["id"] + "-base-" + revision[:12])
-    python, environment = engine_environment(config, checkout)
+    python, environment = ((prepared["python"], prepared["environment"]) if prepared else engine_environment(config, checkout))
+    request["prepared_runtime"] = {"revision": revision, "fresh": fresh, "python": python, "environment": environment}
+    execute_selected_worker(request, checkout, python)
+    from auto_agents.verification_sandbox import check_verification_sandbox
+    check_verification_sandbox(checkout, python, Path(payload["project"]))
     directory = Path(config["root"]) / "jobs" / job["id"]
     evidence = directory / "evidence"
     if not evidence.exists():
@@ -155,7 +181,9 @@ def repair(request):
     if payload.get("autonomy") != "max":
         return {"ok": False, "error": "latest revision did not prove recovery; guarded mode will not generate code", "proof": proof}
     runner = make_runner(payload, checkout, working, python)
+    runner._latest_remote_check = proof
     runner._continuous_workspace = directory / "continuous"
+    carry_continuous_work(runner, revision)
     result = runner.run()
     if not result.ok:
         return {"ok": False, "error": result.reason, "result": result.to_dict()}
@@ -168,12 +196,39 @@ def repair(request):
             "proof": result.verification, "fresh": fresh, "result": result.to_dict()}
 
 
+def carry_continuous_work(runner, revision):
+    """Retain edits while bringing a restarted repair onto a newer upstream."""
+    directory = Path(runner._continuous_workspace)
+    receipt = directory / "base.json"
+    previous = json.loads(receipt.read_text()).get("revision") if receipt.exists() else revision
+    retained = directory / "repair"
+    if retained.exists() and previous != revision:
+        if git(retained, "status", "--porcelain"):
+            git(retained, "add", "-A")
+            git(retained, "commit", "-m", "chore: checkpoint retained repair before upstream integration")
+        merged = git(retained, "merge", "--no-commit", "--no-ff", revision, check=False)
+        if merged.returncode:
+            paths = git(retained, "diff", "--name-only", "--diff-filter=U").splitlines()
+            if not paths:
+                raise RuntimeError("could not integrate upstream into retained repair")
+            from auto_agents.self_repair import _SelfRepairGitConflict, _SelfRepairRemote
+            original_root = runner.repo_root
+            try:
+                runner.repo_root = retained
+                runner._resolve_remote_conflicts(_SelfRepairRemote("trusted", "master"),
+                    _SelfRepairGitConflict("upstream changed while the repair was interrupted", paths))
+            finally:
+                runner.repo_root = original_root
+    atomic_json(receipt, {"revision": revision})
+
+
 def publish(request):
     config, job = request["config"], request["job"]
-    if not config.get("publish", False):
-        raise PermissionError("automatic publication is not authorized by the operator")
+    config = publication_policy(config)
     repository = Repository(config)
     approved = job["result"]
+    if approved.get("runtime"):
+        execute_selected_worker(request, approved["runtime"], approved["python"])
     revision, fresh = repository.fetch()
     if not fresh:
         raise RuntimeError("publication requires a successful upstream refresh")
@@ -182,13 +237,14 @@ def publish(request):
         return {"ok": True, "commit": revision, "status": "already_published"}
     if revision != approved["base"]:
         directory = Path(config["root"]) / "jobs" / job["id"]
-        receipt = directory / ("integrated-" + revision + ".json")
+        receipt_key = digest([revision, approved["commit"], approved.get("environment", "")])
+        receipt = directory / ("integrated-" + receipt_key + ".json")
         if receipt.exists():
             recorded = json.loads(receipt.read_text())
             candidate = recorded["commit"]
             repository.push(candidate)
             return {"ok": True, "commit": candidate, "status": "published"}
-        name = job["id"] + "-publish-" + revision[:12]
+        name = job["id"] + "-publish-" + revision[:12] + "-" + approved["commit"][:12]
         root = Path(config["root"]) / "runtimes" / name
         if not root.exists():
             root = repository.worktree(revision, name)
@@ -232,6 +288,7 @@ def validate_subscriber(request):
     from auto_agents.root_cause import RootCauseCoordinator
     config, job, subscriber = request["config"], request["job"], request["subscriber"]
     payload = subscriber["payload"]["repair"]
+    execute_selected_worker(request, job["result"]["runtime"], job["result"]["python"])
     directory = Path(config["root"]) / "jobs" / job["id"] / ("subscriber-" + subscriber["id"])
     evidence = directory / "evidence"
     if not evidence.exists():
@@ -245,8 +302,12 @@ def validate_subscriber(request):
 
 
 def main():
+    # Only verification children may inherit this marker. Project environment
+    # input must never disable creation of the worker's network isolation.
+    os.environ.pop("AUTO_AGENTS_VERIFICATION_SANDBOX", None)
     request_path = Path(sys.argv[1])
     request = json.loads(request_path.read_text())
+    request["_request_path"] = str(request_path)
     operation = request["operation"]
     from auto_agents.process_supervision import ACTIVE_PROCESSES
     ACTIVE_PROCESSES.configure(request_path.parent, request["job"]["id"], request_path.parent / "processes.json")
@@ -265,7 +326,7 @@ def main():
     finally:
         ACTIVE_PROCESSES.terminate_all()
     result["generation"] = request["job"]["generation"]
-    atomic_json(request_path.parent / (operation + "-result.json"), result)
+    atomic_json(request_path.with_name(request_path.name.replace("-request.json", "-result.json")), result)
     return 0 if result.get("ok") else 3
 
 

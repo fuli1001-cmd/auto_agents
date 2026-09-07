@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +24,8 @@ from auto_agents.run_lock import ProjectRunLock, RunAlreadyActiveError
 def configuration(tmp_path):
     root = private_directory(tmp_path / "control")
     return {"root": str(root), "identity": digest(str(tmp_path))[:24],
+            "socket_dir": str(Path(tempfile.gettempdir()) / ("aas-" + digest(str(tmp_path))[:10])),
+            "lock_dir": str(Path(tempfile.gettempdir()) / "auto-agents-run-locks"),
             "source_root": str(tmp_path / "engine"), "remote": str(tmp_path / "remote.git"),
             "ref": "refs/heads/master", "python": sys.executable, "publish": True}
 
@@ -255,6 +258,8 @@ def test_custom_state_roots_do_not_connect_to_another_supervisor(tmp_path):
 def fake_worker_install(config, *, delay=0):
     directory = Path(config["source_root"]) / "src/auto_agents"
     directory.mkdir(parents=True)
+    from auto_agents import repair_control
+    (directory / "repair_control.py").write_text(Path(repair_control.__file__).read_text())
     (directory / "repair_worker.py").write_text(
         "import json, os, sys, time\nfrom pathlib import Path\n"
         "p=Path(sys.argv[1]); r=json.loads(p.read_text()); op=r['operation']\n"
@@ -262,7 +267,7 @@ def fake_worker_install(config, *, delay=0):
         "with (p.parent / 'calls.log').open('a') as out: out.write(op+'\\n')\n"
         "result={'ok':True,'generation':r['job']['generation'],'status':'already_repaired',"
         "'commit':'verified','base':'base','runtime':r['config']['source_root'],'python':sys.executable,'proof':'transport fixture'}\n"
-        "(p.parent/(op+'-result.json')).write_text(json.dumps(result))\n"
+        "p.with_name(p.name.replace('-request.json','-result.json')).write_text(json.dumps(result))\n"
     )
     (directory / "repair_launch.py").write_text(
         "import json, os, sys\nfrom pathlib import Path\n"
@@ -556,3 +561,129 @@ def test_engine_checks_bind_conda_wrappers_to_candidate_python(tmp_path):
     result = subprocess.run(compiled, shell=True, cwd=candidate, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
+
+
+def test_failed_worker_releases_project_lock_without_losing_job(tmp_path):
+    config = configuration(tmp_path)
+    supervisor = Supervisor(config)
+    project = tmp_path / "project"
+    project.mkdir()
+    lock = ProjectRunLock(project, environ={}).acquire()
+    subscriber = supervisor.register({"payload": registration(project, lock.run_token)}, [os.dup(lock.fileno)])["subscriber"]
+    job = supervisor.store.submit(subscriber, failure(project))
+    supervisor.store.transition(job, "repairing")
+    atomic_json(Path(config["root"]) / "jobs" / job / "repair-g1-result.json", {"ok": False, "error": "environment unavailable", "generation": 1})
+    supervisor.workers[job] = (RecoveredProcess({"pid": -1, "ticks": 1}), 1, "repair")
+    supervisor.tick()
+    assert supervisor.store.job(job)["state"] == "blocked"
+    assert supervisor.store.subscriptions(job)[0]["state"] == "blocked"
+    assert subscriber not in supervisor.registrations
+    lock.release()
+    with ProjectRunLock(project, environ={}):
+        pass
+
+
+def test_registration_loss_preserves_an_approved_runtime(tmp_path):
+    config = configuration(tmp_path)
+    supervisor = Supervisor(config)
+    subscriber = supervisor.store.register(registration(tmp_path))
+    job = supervisor.store.submit(subscriber, failure(tmp_path))
+    supervisor.store.transition(job, "ready", {"ok": True, "commit": "keep-candidate", "runtime": "keep-runtime"})
+    supervisor.launch_worker(job, "validate-" + subscriber)
+    assert supervisor.store.job(job)["state"] == "blocked"
+    assert supervisor.store.job(job)["result"]["commit"] == "keep-candidate"
+    assert supervisor.store.job(job)["result"]["ok"]
+
+
+def test_late_worker_failure_cannot_block_a_new_generation(tmp_path):
+    config = configuration(tmp_path)
+    supervisor = Supervisor(config)
+    subscriber = supervisor.store.register(registration(tmp_path))
+    job = supervisor.store.submit(subscriber, failure(tmp_path))
+    atomic_json(Path(config["root"]) / "jobs" / job / "repair-g1-result.json", {"ok": False, "generation": 1})
+    with supervisor.store.connect() as db:
+        db.execute("UPDATE jobs SET generation=2 WHERE id=?", (job,))
+    supervisor.workers[job] = (RecoveredProcess({"pid": -1, "ticks": 1}), 1, "repair")
+    with patch.object(supervisor, "launch_worker"):
+        supervisor.tick()
+    assert supervisor.store.job(job)["state"] == "queued"
+    assert supervisor.store.subscriptions(job)[0]["state"] == "waiting"
+
+
+def test_retained_repair_integrates_new_upstream_without_losing_edits(tmp_path):
+    from auto_agents.repair_worker import carry_continuous_work
+    from auto_agents.git_ops import add_worktree
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    repository = Repository(config)
+    base, _ = repository.fetch()
+    checkout = repository.worktree(base, "base")
+    continuous = Path(config["root"]) / "continuous"
+    continuous.mkdir()
+    retained = continuous / "repair"
+    add_worktree(checkout, retained, ref=base)
+    atomic_json(continuous / "base.json", {"revision": base})
+    (retained / "bug.py").write_text("partial repair retained\n")
+    (engine / "upstream.txt").write_text("new remote work\n")
+    git(engine, "add", "upstream.txt")
+    git(engine, "commit", "-m", "upstream advanced")
+    git(engine, "push", config["remote"], "HEAD:master")
+    new_base, _ = repository.fetch()
+    runner = SimpleNamespace(_continuous_workspace=continuous, repo_root=checkout)
+    carry_continuous_work(runner, new_base)
+    assert (retained / "bug.py").read_text() == "partial repair retained\n"
+    assert (retained / "upstream.txt").read_text() == "new remote work\n"
+    assert git(retained, "diff", "--name-only", new_base) == "bug.py"
+
+
+def test_selected_worker_reexecs_latest_logic_without_changing_process_identity(tmp_path, monkeypatch):
+    from auto_agents.repair_worker import execute_selected_worker
+    runtime = tmp_path / "selected"
+    entry = runtime / "src/auto_agents/repair_worker.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("# selected implementation\n")
+    request = {"_request_path": str(tmp_path / "repair-g1-request.json"), "prepared_runtime": {"revision": "selected"}}
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_LOCK_FD", raising=False)
+    with patch("auto_agents.repair_worker.os.execve", side_effect=RuntimeError("exec boundary")) as execute:
+        with pytest.raises(RuntimeError, match="exec boundary"):
+            execute_selected_worker(request, runtime, sys.executable)
+    assert execute.call_args.args[1] == [sys.executable, str(entry), request["_request_path"]]
+    assert execute.call_args.args[2]["PYTHONPATH"] == str(runtime / "src")
+    assert json.loads(Path(request["_request_path"]).read_text())["prepared_runtime"]["revision"] == "selected"
+
+
+def test_verified_fast_publication_does_not_wait_for_another_repair(tmp_path):
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    repository = Repository(config)
+    base, _ = repository.fetch()
+    root = repository.worktree(base, "candidate")
+    (root / "bug.py").write_text("fixed\n")
+    git(root, "add", "bug.py")
+    git(root, "commit", "-m", "verified repair")
+    commit = git(root, "rev-parse", "HEAD")
+    supervisor = Supervisor(config)
+    first = supervisor.store.register(registration(tmp_path / "a"))
+    job = supervisor.store.submit(first, failure(tmp_path))
+    supervisor.store.transition(job, "completed", {"ok": True, "commit": commit, "base": base})
+    supervisor.store.enqueue_publish(job)
+    second = supervisor.store.register(registration(tmp_path / "b"))
+    busy = supervisor.store.submit(second, {**failure(tmp_path), "fingerprint": "other"})
+    supervisor.store.transition(busy, "repairing")
+    supervisor.workers[busy] = (RecoveredProcess({"pid": os.getpid(), "ticks": start_ticks(os.getpid())}), 1, "repair")
+    supervisor.tick()
+    assert supervisor.publisher is not None
+    supervisor.publisher.join(5)
+    assert not supervisor.publisher.is_alive()
+    assert busy in supervisor.workers
+    assert git(Path(config["remote"]), "rev-parse", "master") == commit
+
+
+def test_operator_can_revoke_publication_without_restarting_daemon(tmp_path):
+    config = configuration(tmp_path)
+    make_remote(config)
+    repository = Repository(config)
+    base, _ = repository.fetch()
+    atomic_json(Path(config["root"]) / "operator.json", {**config, "publish": False})
+    with pytest.raises(PermissionError, match="not authorized"):
+        repository.push(base)

@@ -3967,6 +3967,16 @@ class AutoAgentsSelfRepairRunner:
         root = getattr(self, "_continuous_workspace", None)
         return bool(root and not (Path(root) / "fallback.json").exists())
 
+    @contextmanager
+    def _verification_argv(self, argv, cwd):
+        target = getattr(self, "_real_project_root", None)
+        if target is None:
+            yield argv
+            return
+        from .verification_sandbox import verification_argv
+        with verification_argv(argv, cwd, target) as command:
+            yield command
+
     def _provider_continuation_context(self) -> str:
         experiment = getattr(self, "_experiment", None)
         return _search_stable_hash(
@@ -4237,6 +4247,9 @@ class AutoAgentsSelfRepairRunner:
                     )
                 summary = (result.summary or result.stdout).strip()
                 changed = changed_paths(repair_root)
+                if not changed and self._continuous_mode():
+                    changed = subprocess.run(["git", "diff", "--name-only", self._experiment.base_commit, "HEAD"],
+                        cwd=repair_root, capture_output=True, text=True, check=True).stdout.splitlines()
                 if not changed:
                     return SelfRepairResult(
                         ok=False,
@@ -4326,6 +4339,11 @@ class AutoAgentsSelfRepairRunner:
                 fingerprint = worktree_fingerprint(
                     repair_root, ignored_prefixes=()
                 )
+                if self._continuous_mode():
+                    subprocess.run(["git", "add", "-A"], cwd=repair_root, check=True, capture_output=True)
+                    tree = subprocess.run(["git", "write-tree"], cwd=repair_root, check=True,
+                                          capture_output=True, text=True).stdout.strip()
+                    fingerprint = _search_stable_hash(self._experiment.base_commit, tree, self._verification_python())
                 diff_snapshot = subprocess.run(
                     ["git", "diff", "--binary", base_head, "--"],
                     cwd=str(repair_root),
@@ -4391,10 +4409,8 @@ class AutoAgentsSelfRepairRunner:
                         fatal_candidate=True,
                         diff_line_count=diff_line_count,
                     )
-                candidate_commit = commit_all(
-                    repair_root,
-                    self._commit_message(summary),
-                )
+                candidate_commit = (head_ref(repair_root) if self._continuous_mode() and not changed_paths(repair_root)
+                                    else commit_all(repair_root, self._commit_message(summary)))
                 candidate_ref = (
                     "refs/auto-agents/self-repair/candidates/"
                     f"{self._safe_repair_category()}/{experiment_id}/{candidate_id}"
@@ -6259,8 +6275,9 @@ class AutoAgentsSelfRepairRunner:
             python_executable=self._verification_python(),
         )
         try:
-            collected = subprocess.run(
-                collect_command,
+            with self._verification_argv(["/bin/sh", "-c", collect_command], verification_root) as arguments:
+                collected = subprocess.run(
+                collect_command if getattr(self, "_real_project_root", None) is None else shlex.join(arguments),
                 cwd=str(verification_root),
                 shell=True,
                 text=True,
@@ -7006,6 +7023,7 @@ class AutoAgentsSelfRepairRunner:
                 encoding="utf-8",
                 capture_output=True,
                 timeout=15,
+                **({"cwd": str(python.parent)} if getattr(self, "_real_project_root", None) is not None else {}),
             )
             if probe.returncode == 0:
                 environment_version = probe.stdout.strip()
@@ -7094,8 +7112,9 @@ class AutoAgentsSelfRepairRunner:
                 "'blocker':state.active_blocker,"
                 "'blocked_tasks':[t.task_id for t in state.tasks if t.status in {'blocked','failed'}]},sort_keys=True))"
             )
-            process = subprocess.run(
-                [sys.executable, "-c", runner, str(replay_root), candidate_commit],
+            with self._verification_argv([self._verification_python(), "-c", runner, str(replay_root), candidate_commit], replay_root) as replay_command:
+                process = subprocess.run(
+                replay_command,
                 cwd=str(replay_root),
                 text=True,
                 encoding="utf-8",
@@ -7147,9 +7166,11 @@ class AutoAgentsSelfRepairRunner:
                 receipt = Path(temporary) / "engine-route.json"
                 write_json(receipt, {"route_digest": digest(context["engine_route"])})
                 environment["AUTO_AGENTS_REPAIR_ROUTE_PROBE"] = str(receipt)
-            process = subprocess.run(
-                [self._verification_python(), str(Path(__file__).with_name("session_replay.py")),
-                 str(engine), str(target), str(context["session_id"]), str(context["command"]).replace("provider-resolve", "fix")],
+            arguments = [self._verification_python(), str(Path(__file__).with_name("session_replay.py")),
+                         str(engine), str(target), str(context["session_id"]), str(context["command"]).replace("provider-resolve", "fix")]
+            with self._verification_argv(arguments, target) as replay_command:
+                process = subprocess.run(
+                replay_command,
                 cwd=target, capture_output=True, text=True, env=environment,
                 timeout=max(60, int(self._autonomy_config().replay_timeout_seconds)),
             )
@@ -7170,7 +7191,7 @@ class AutoAgentsSelfRepairRunner:
         if baseline is None:
             with tempfile.TemporaryDirectory(prefix="auto-agents-session-base-") as temporary:
                 base_root = Path(temporary) / "base"
-                add_worktree(self.repo_root, base_root, ref=self._experiment.base_commit)
+                add_worktree(self.repo_root, base_root, ref=getattr(self, "_replay_original_base", "") or self._experiment.base_commit)
                 try:
                     baseline = self._session_probe(base_root)
                 finally:
@@ -7255,8 +7276,9 @@ class AutoAgentsSelfRepairRunner:
             "print(json.dumps([item.to_dict() for item in items],sort_keys=True))"
         )
         try:
-            process = subprocess.run(
-                [self._verification_python(), "-c", runner],
+            with self._verification_argv([self._verification_python(), "-c", runner], source_root) as arguments:
+                process = subprocess.run(
+                arguments,
                 input=payload,
                 cwd=str(source_root),
                 text=True,
@@ -7757,6 +7779,11 @@ class AutoAgentsSelfRepairRunner:
             )
         lines = [
             f"auto_agents repository root: {repair_root or self.repo_root}",
+            *([
+                f"Engine verification interpreter: {self._verification_python()}",
+                "Use this engine interpreter for focused checks; the target project's .conda is not the engine environment. Dependency preparation and broad verification belong to the supervisor.",
+                "Latest upstream preflight evidence:\n" + redact_incident_text(str(getattr(self, "_latest_remote_check", "")))[-4000:],
+            ] if getattr(self, "_engine_source_root", None) is not None else []),
             "Additional diagnostic output, when present: "
             f"{target_evidence_root or self.target_project_root}/.auto-agents/diagnostic-evidence/index.json",
             (
@@ -8036,8 +8063,10 @@ class AutoAgentsSelfRepairRunner:
             diagnostic_progress.reporter = reporter
             diagnostic_progress.context = "self_repair"
             diagnostic_progress.stage = "self_repair_validation"
-            gate = run_commands(
-                [verification_command],
+            with self._verification_argv(["/bin/sh", "-c", verification_command], verification_root) as arguments:
+                executed_command = verification_command if getattr(self, "_real_project_root", None) is None else shlex.join(arguments)
+                gate = run_commands(
+                [executed_command],
                 verification_root,
                 command_timeout_seconds=max(60, int(command_timeout_seconds)),
                 adaptive_timeout_enabled=adaptive_timeout_enabled,
