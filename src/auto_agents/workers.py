@@ -591,6 +591,56 @@ class WorkerSlotLease:
         self._handle_slots: dict[int, int] = {}
 
     def __enter__(self) -> "WorkerSlotLease":
+        from .repair_control import start_ticks
+        directory = self.root / "slots" / self.worker_id / "queue"
+        directory.mkdir(parents=True, exist_ok=True)
+        ticket = directory / (self.lease_id + ".json")
+        _write_json_atomic(ticket, {"pid": os.getpid(), "ticks": start_ticks(os.getpid()),
+            "created": time.time(), "required": self.required,
+            "memory_mb": self.memory_mb, "memory_reserve_mb": self.memory_reserve_mb, "memory_guard": self.memory_guard,
+            "priority": int(self.owner_metadata.get("priority", 1)),
+            "project": str(self.owner_metadata.get("fairness_key", self.owner_metadata.get("project_root", "")))})
+        try:
+            return self._acquire()
+        finally:
+            ticket.unlink(missing_ok=True)
+
+    def _queue_turn(self, slot_root):
+        """Called with the allocation lock; ready work bypasses blocked work."""
+        from .repair_control import alive
+        now = time.time()
+        state = _read_json(slot_root / "scheduler.json")
+        served = state.get("served", {})
+        waiting = []
+        for path in (slot_root / "queue").glob("*.json"):
+            item = _read_json(path)
+            if not item or not alive(item.get("pid", 0), item.get("ticks", 0)):
+                path.unlink(missing_ok=True)
+                continue
+            item["id"] = path.stem
+            age = max(0.0, now - item["created"])
+            item["effective_priority"] = item["priority"] - int(age // 60)
+            waiting.append(item)
+        if not waiting:
+            return True
+        waiting.sort(key=lambda item: (item["effective_priority"], served.get(item["project"], 0), item["created"], item["id"]))
+        snapshot = worker_slot_snapshot(self.root, self.worker_id, self.slots)
+        available = snapshot["available"]
+        holders = {item.get("holder", {}).get("lease_id"): item.get("holder", {})
+                   for item in snapshot["slots"] if not item["available"]}
+        reserved = sum(int(item.get("memory_mb", 0)) for item in holders.values()) * 1024**2
+        memory = _memory_available_bytes()
+        def fits(item):
+            threshold = (item.get("memory_mb", 0) + item.get("memory_reserve_mb", 0)) * 1024**2
+            return item["required"] <= available and (item.get("memory_guard") != "required"
+                    or memory <= 0 or memory >= reserved + threshold)
+        first = waiting[0]
+        if not fits(first) and now - first["created"] >= 60:
+            return False  # Drain for an aged large/exclusive request.
+        ready = next((item for item in waiting if fits(item)), None)
+        return ready is not None and ready["id"] == self.lease_id
+
+    def _acquire(self) -> "WorkerSlotLease":
         slot_root = self.root / "slots" / self.worker_id
         slot_root.mkdir(parents=True, exist_ok=True)
         if self.required > self.slots:
@@ -650,7 +700,7 @@ class WorkerSlotLease:
                 except BlockingIOError:
                     pass
                 else:
-                    for index in range(self.slots):
+                    for index in (range(self.slots) if self._queue_turn(slot_root) else ()):
                         if len(self.handles) >= self.required:
                             break
                         path = slot_root / f"{index}.lock"
@@ -667,6 +717,12 @@ class WorkerSlotLease:
                         self._handle_slots[id(handle)] = index
                         self._write_owner(slot_root, index)
                     if len(self.handles) >= self.required:
+                        state = _read_json(slot_root / "scheduler.json")
+                        served = state.setdefault("served", {})
+                        project = str(self.owner_metadata.get("fairness_key", self.owner_metadata.get("project_root", "")))
+                        served[project] = time.time()
+                        state["served"] = dict(sorted(served.items(), key=lambda item: item[1], reverse=True)[:1000])
+                        _write_json_atomic(slot_root / "scheduler.json", state)
                         return self
                     self._release()
             finally:
@@ -734,6 +790,7 @@ class WorkerSlotLease:
             "slot": index,
             "pid": os.getpid(),
             "acquired_at": time.time(),
+            "memory_mb": self.memory_mb,
         }
         try:
             _write_json_atomic(slot_root / f"{index}.owner.json", payload)
@@ -807,7 +864,7 @@ def _snapshot_ref(snapshot_sha: str) -> str:
     return f"refs/auto-agents/snapshots/{_safe_id(snapshot_sha, 'snapshot sha')}"
 
 
-def worker_probe(environment_id: str = "") -> dict[str, object]:
+def worker_probe(environment_id: str = "", *, required_capabilities=None) -> dict[str, object]:
     config = load_local_worker_config()
     try:
         config.managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -914,6 +971,8 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
         "ffprobe": ("ffprobe",),
         "chrome": ("google-chrome", "chromium", "chromium-browser"),
     }.items():
+        if required_capabilities is not None and capability not in required_capabilities:
+            continue
         if any(shutil.which(program) for program in programs):
             capabilities.add(capability)
     runtimes: dict[str, str] = {}
@@ -946,6 +1005,8 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
     }
     runtime_probes: dict[str, object] = {}
     for name, command in runtime_commands.items():
+        if required_capabilities is not None and name not in required_capabilities:
+            continue
         if not command[0]:
             runtime_probes[name] = {
                 "state": "missing",

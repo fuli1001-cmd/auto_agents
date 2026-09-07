@@ -69,6 +69,7 @@ class DistributedGatePlanExecutor:
         result_context_fingerprint: str = "",
         environment_overrides: Optional[Mapping[str, str]] = None,
         proof_audit_sample_rate: float = 0.0,
+        input_reuse_mode: str = "on",
     ) -> None:
         self.project_root = project_root.resolve()
         self.run_id = str(run_id)
@@ -85,6 +86,7 @@ class DistributedGatePlanExecutor:
             result_context_fingerprint=result_context_fingerprint,
             environment_overrides=self.environment_overrides,
             proof_audit_sample_rate=proof_audit_sample_rate,
+            input_reuse_mode=input_reuse_mode,
         )
         self.key = project_key(self.project_root)
         self.environment_manifest = build_environment_manifest(self.project_root)
@@ -105,7 +107,25 @@ class DistributedGatePlanExecutor:
         self.local.__enter__()
         distributed = self.gate_config.distributed
         local_config = load_local_worker_config()
-        local_probe = enrich_worker_probe(worker_probe(""))
+        from .execution_binding import command_spans, executable_tokens
+        required_capabilities = {value for item in self.metadata.values() for value in getattr(item, "requires", [])}
+        for command in self.metadata:
+            try:
+                for start, end in command_spans(command):
+                    tokens = executable_tokens(command[start:end])
+                    if not tokens:
+                        continue
+                    executable = Path(tokens[0]).name
+                    if executable.startswith("python") or executable == "pytest":
+                        required_capabilities.add("python")
+                    elif executable in {"node", "npm", "npx", "vitest"}:
+                        required_capabilities.add("node")
+                    elif executable in {"ffmpeg", "ffprobe", "docker"}:
+                        required_capabilities.add(executable)
+            except ValueError:
+                required_capabilities = None
+                break
+        local_probe = enrich_worker_probe(worker_probe("", required_capabilities=required_capabilities))
         local_slots = local_config.max_slots
         maximum = self.gate_config.max_auto_workers
         if isinstance(maximum, int):
@@ -141,7 +161,7 @@ class DistributedGatePlanExecutor:
         if distributed.mode != "off" and cluster is not None:
             try:
                 discovered = discover_workers(
-                    distributed.discovery_timeout_seconds
+                    distributed.discovery_timeout_seconds, use_cache=distributed.mode != "required",
                 )
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
                 if distributed.mode == "required":
@@ -868,10 +888,10 @@ class DistributedGatePlanExecutor:
         memory_mb, memory_reserve_mb, memory_guard = self._memory_policy(command)
         if endpoint.transport == "local":
             local_config = load_local_worker_config()
-            with WorkerSlotLease(
+            with exclusive_resource_lease(self._metadata_list(command, "exclusive_resources"), worker_id=endpoint.worker_id), WorkerSlotLease(
                 local_config.managed_root,
                 endpoint.worker_id,
-                endpoint.max_slots,
+                local_config.max_slots,
                 required,
                 memory_mb=memory_mb,
                 memory_reserve_mb=memory_reserve_mb,
@@ -899,6 +919,8 @@ class DistributedGatePlanExecutor:
                     )
                 result = self.local.run(
                     command,
+                    lease_held=True,
+                    named_lease_held=True,
                     lane=lane,
                     timeout_seconds=timeout_seconds,
                     adaptive_timeout_enabled=adaptive_timeout_enabled,

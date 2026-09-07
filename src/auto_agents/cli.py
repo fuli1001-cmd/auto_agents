@@ -2301,7 +2301,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--project", required=True, help="Target project directory.")
     verify_parser.add_argument(
         "--level",
-        choices=("affected", "release"),
+        choices=("focused", "affected", "release"),
         default="affected",
     )
     verify_parser.add_argument(
@@ -2313,6 +2313,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Bypass existing proof certificates.",
     )
+    verify_parser.add_argument("--test", action="append", default=[], help="Repository-local test target; repeat for multiple targets.")
+    verify_parser.add_argument("--engine", action="store_true", help="Use the engine verification profile and interpreter.")
+    verify_parser.add_argument("--explain", action="store_true", help="Explain selection without executing or changing project state.")
+    verify_parser.add_argument("--verification-context", default="", help=argparse.SUPPRESS)
 
     release_worker_parser = subparsers.add_parser(
         "release-worker",
@@ -2673,6 +2677,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "verify" and args.explain:
+        from .managed_verification import explain
+        try:
+            print(json.dumps(explain(args.project, engine=args.engine, level=args.level,
+                tests=args.test, changed_from=args.changed_from), ensure_ascii=False, indent=2))
+            return 0
+        except (OSError, RuntimeError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}))
+            return 1
     if hasattr(args, "log_mode"):
         with reporting_command(args) as reporting:
             code = _dispatch(args)
@@ -3497,6 +3510,8 @@ def _dispatch(args) -> int:
                 workflow_id=str(state.resume_context.get("workflow_id", "")),
             )
         payload = trace.summary()
+        from .verification_ledger import verification_summary
+        payload["verification"] = verification_summary()
         payload["trace_path"] = str(trace.path)
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
@@ -3508,6 +3523,11 @@ def _dispatch(args) -> int:
 
     if args.command == "verify":
         try:
+            if args.engine or args.verification_context:
+                from .managed_verification import request_from_cli
+                result = request_from_cli(args)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0 if result.get("ok") else 1
             project_root = Path(args.project).expanduser().resolve()
             changed_path_set = None
             if args.changed_from:
@@ -3523,6 +3543,11 @@ def _dispatch(args) -> int:
                     line.strip() for line in process.stdout.splitlines() if line.strip()
                 ]
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            if args.level == "focused":
+                from .managed_verification import project_focused
+                result = project_focused(orchestrator, args.test, fresh=args.fresh)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0 if result.get("ok") else 1
             if args.level == "release":
                 begin_release_verification(project_root)
             result = orchestrator.run_verification(

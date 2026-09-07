@@ -20834,6 +20834,7 @@ class Orchestrator:
                 result_context_fingerprint=result_context_fingerprint,
                 environment_overrides=operator_environment,
                 proof_audit_sample_rate=proof_audit_sample_rate,
+                input_reuse_mode=acceleration.verification_input_mode,
             )
         return LocalGatePlanExecutor(
             self.project_root,
@@ -20849,6 +20850,7 @@ class Orchestrator:
             preempt_requested=self._gate_preempt_probe,
             environment_overrides=operator_environment,
             proof_audit_sample_rate=proof_audit_sample_rate,
+            input_reuse_mode=acceleration.verification_input_mode,
         )
 
     def _operator_gate_environment(self) -> Dict[str, str]:
@@ -43686,6 +43688,8 @@ class Orchestrator:
         return ShellAdapter(prov, self.config.execution.smart_timeout)
 
     def _call_with_failover(self, request: AgentRequest) -> AgentResult:
+        from .managed_verification import attach_context
+        request = attach_context(self, request)
         from .provider_usage import with_attempt_usage
         from .models import ProviderCleanupIncompleteError
         if getattr(self, "_provider_cleanup_blocked", False):

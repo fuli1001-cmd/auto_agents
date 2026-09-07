@@ -209,8 +209,8 @@ def test_no_change_reuse_needs_real_acceptance_tests_and_boundary(tmp_path, beha
     assert check_revision(runner, engine, git(engine, "rev-parse", "HEAD"))[0] is expected
 
 
-@pytest.mark.parametrize("satisfied", [True, False])
-def test_worker_fetches_then_plans_then_checks_before_candidate_generation(tmp_path, satisfied):
+@pytest.mark.parametrize("satisfied,full_pass", [(True, True), (False, True), (True, False)])
+def test_worker_fetches_then_plans_then_checks_before_candidate_generation(tmp_path, satisfied, full_pass):
     from auto_agents.repair_worker import repair
     config = configuration(tmp_path)
     engine = make_remote(config)
@@ -228,6 +228,9 @@ def test_worker_fetches_then_plans_then_checks_before_candidate_generation(tmp_p
         events.append("plan")
         return EngineRequestContract.from_dict(contract_data(request, revision), request)
     class Oracle:
+        def _full_suite_differential(self, *args):
+            events.append("full")
+            return SimpleNamespace(ok=full_pass, recoverable=False, summary="full proof")
         def run(self):
             events.append("generate")
             return SimpleNamespace(ok=False, reason="candidate not yet proven", to_dict=lambda: {})
@@ -244,9 +247,9 @@ def test_worker_fetches_then_plans_then_checks_before_candidate_generation(tmp_p
          patch("auto_agents.repair_worker.make_runner", return_value=Oracle()), \
          patch("auto_agents.repair_worker.check_revision", side_effect=checked):
         result = repair({"config": config, "job": {"id": "request", "payload": payload}})
-    assert events == (["plan", "check"] if satisfied else ["plan", "check", "generate"])
-    assert result["ok"] is satisfied
-    if satisfied:
+    assert events == (["plan", "check", "full"] if satisfied else ["plan", "check", "generate"])
+    assert result["ok"] is (satisfied and full_pass)
+    if satisfied and full_pass:
         assert result["status"] == "already_repaired"
         assert result["request_contract"]["route_digest"] == digest(request)
     assert (project / "input.txt").read_text() == "preserve me"

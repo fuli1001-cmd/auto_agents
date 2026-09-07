@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -13,9 +14,26 @@ from .config import gate_baseline_cache_path
 from .models import CommandResult
 
 
-RESULT_CACHE_VERSION = 5
+RESULT_CACHE_VERSION = 6
 MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 MAX_ROWS = 20_000
+_POLICY_CACHE = (None, "")
+
+
+def execution_policy_fingerprint() -> str:
+    global _POLICY_CACHE
+    paths = [Path(__file__).with_name(name) for name in (
+        "gate_execution.py", "gate_result_cache.py", "gates.py", "workers.py",
+        "verification_sandbox.py", "verification_inputs.py", "verification_pytest.py", "verification_trace.py")]
+    identity = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in paths if path.exists())
+    if _POLICY_CACHE[0] != identity:
+        _POLICY_CACHE = (identity, _stable_hash([(path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+                                                for path in paths if path.exists()]))
+    return _POLICY_CACHE[1]
+
+
+def re_full_digest(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
 def _stable_hash(payload: object) -> str:
@@ -35,6 +53,7 @@ def _identity(
             "environment": str(environment_fingerprint),
             "metadata": str(metadata_signature),
             "version": RESULT_CACHE_VERSION,
+            "executor_policy": execution_policy_fingerprint(),
         }
     )
 
@@ -148,6 +167,11 @@ class GateResultCache:
                     (key, now - self.max_age_seconds),
                 ).fetchone()
                 if certificate is not None:
+                    recorded = json.loads(certificate[0])
+                    if recorded.get("observed_inputs") and not self._manifest_matches(recorded["observed_inputs"]):
+                        return None, "observed_inputs_changed"
+                    if not self._restore_artifacts(recorded.get("artifacts", {}), recorded.get("artifact_modes", {})):
+                        return None, "artifact_missing_or_conflicting"
                     return self._certificate_result(command, certificate[0]), "hit"
                 row = connection.execute(
                     """
@@ -157,18 +181,17 @@ class GateResultCache:
                     """,
                     (key, now - self.max_age_seconds),
                 ).fetchone()
-                if row is not None:
-                    return self._cached_result(command, "result-cache-candidate"), "hit"
+                # A success index without its certificate is not evidence.
                 if result_cache_scope not in {"observed_inputs", "auto"}:
                     return None, "candidate_key_miss"
                 rows = connection.execute(
                     """
-                    SELECT observed_inputs
-                    FROM gate_result_successes
-                    WHERE identity_key = ? AND context_fingerprint = ''
+                    SELECT s.observed_inputs, p.result_payload
+                    FROM gate_result_successes s JOIN gate_proof_certificates p ON p.cache_key=s.cache_key
+                    WHERE s.identity_key = ? AND s.context_fingerprint = ''
                       AND trace_complete = 1 AND network_observed = 0
-                      AND updated_at >= ?
-                    ORDER BY updated_at DESC
+                      AND s.updated_at >= ?
+                    ORDER BY s.updated_at DESC
                     LIMIT 20
                     """,
                     (identity, now - self.max_age_seconds),
@@ -176,13 +199,12 @@ class GateResultCache:
                 for candidate in rows:
                     manifest = json.loads(candidate[0] or "{}")
                     if self._manifest_matches(manifest):
-                        return (
-                            self._cached_result(
-                                command,
-                                "result-cache-observed-inputs",
-                            ),
-                            "hit",
-                        )
+                        record = json.loads(candidate[1])
+                        if not self._restore_artifacts(record.get("artifacts", {}), record.get("artifact_modes", {})):
+                            continue
+                        result = self._certificate_result(command, candidate[1])
+                        result.backend = "result-cache-observed-inputs"
+                        return result, "hit"
                 if rows:
                     return None, "observed_inputs_changed"
         except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
@@ -207,10 +229,11 @@ class GateResultCache:
             or result.cleanup_incomplete
             or result.infrastructure_error
             or result.mutation_paths
-            or result.artifacts
             or result.cached
             or not result.ok
         ):
+            return
+        if not self._store_artifacts(result.artifacts):
             return
         identity = _identity(
             command,
@@ -254,6 +277,12 @@ class GateResultCache:
                                 "stdout": result.stdout[-200_000:],
                                 "stderr": result.stderr[-200_000:],
                                 "comparable_failures": bool(result.comparable_failures),
+                                "executed_tests": result.executed_tests,
+                                "phase_seconds": result.phase_seconds,
+                                "artifacts": result.artifacts,
+                                "artifact_modes": {name: (self.project_root / name).stat().st_mode & 0o777 for name in result.artifacts},
+                                "input_trace_complete": result.input_trace_complete,
+                                "observed_inputs": result.observed_inputs,
                             },
                             ensure_ascii=False,
                             sort_keys=True,
@@ -319,22 +348,109 @@ class GateResultCache:
             return False
         for raw_path, expected in manifest.items():
             relative = str(raw_path).replace("\\", "/").strip()
+            denied = relative.startswith("?")
+            if denied:
+                relative = relative[1:]
             missing = relative.startswith("!")
             if missing:
                 relative = relative[1:]
+            external = relative.startswith("@/")
             if (
                 not relative
                 or relative.startswith("/")
                 or ".." in Path(relative).parts
             ):
                 return False
+            path = Path(relative[1:]) if external else self.project_root / relative
+            if denied:
+                try:
+                    path.stat()
+                    return False  # Host visibility differs; do not read content.
+                except PermissionError as error:
+                    if str(error.errno) == str(expected):
+                        continue
+                    return False
+                except OSError:
+                    return False
             if missing:
-                if (self.project_root / relative).exists():
+                if path.exists():
                     return False
                 continue
-            if _path_digest(self.project_root / relative) != str(expected):
+            if _path_digest(path) != str(expected):
                 return False
         return True
+
+    def _store_artifacts(self, artifacts):
+        if not artifacts:
+            return True
+        try:
+            directory = self.cache_path.parent / "artifact-objects"
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for relative, expected in artifacts.items():
+                path = self.project_root / relative
+                if (Path(relative).is_absolute() or ".." in Path(relative).parts
+                        or not path.resolve().is_relative_to(self.project_root) or path.is_symlink()):
+                    return False
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != expected:
+                    return False
+                destination = directory / expected
+                try:
+                    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                except FileExistsError:
+                    if destination.is_symlink() or hashlib.sha256(destination.read_bytes()).hexdigest() != expected:
+                        return False
+                else:
+                    with os.fdopen(fd, "wb") as output:
+                        output.write(data)
+                        output.flush()
+                        os.fsync(output.fileno())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _restore_artifacts(self, artifacts, modes=None):
+        """Restore only missing outputs, never overwrite a concurrent edit."""
+        try:
+            for relative, expected in artifacts.items():
+                mode = int((modes or {}).get(relative, 0o600)) & 0o777
+                parts = Path(relative).parts
+                if not parts or Path(relative).is_absolute() or ".." in parts:
+                    return False
+                blob = self.cache_path.parent / "artifact-objects" / str(expected)
+                if not re_full_digest(str(expected)) or blob.is_symlink():
+                    return False
+                data = blob.read_bytes()
+                if hashlib.sha256(data).hexdigest() != expected:
+                    return False
+                parent = os.open(self.project_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    for part in parts[:-1]:
+                        try:
+                            os.mkdir(part, mode=0o755, dir_fd=parent)
+                        except FileExistsError:
+                            pass
+                        next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                        os.close(parent)
+                        parent = next_fd
+                    try:
+                        fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+                    except FileExistsError:
+                        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+                        with os.fdopen(fd, "rb") as existing:
+                            if hashlib.sha256(existing.read()).hexdigest() != expected or os.fstat(existing.fileno()).st_mode & 0o777 != mode:
+                                return False
+                    else:
+                        with os.fdopen(fd, "wb") as output:
+                            os.fchmod(output.fileno(), mode)
+                            output.write(data)
+                            output.flush()
+                            os.fsync(output.fileno())
+                finally:
+                    os.close(parent)
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
 
     @staticmethod
     def _cached_result(command: str, backend: str) -> CommandResult:
@@ -357,6 +473,11 @@ class GateResultCache:
             stdout=str(payload.get("stdout", "")),
             stderr=str(payload.get("stderr", "")),
             comparable_failures=bool(payload.get("comparable_failures", False)),
+            executed_tests=list(payload.get("executed_tests", [])),
+            phase_seconds=dict(payload.get("phase_seconds", {})),
+            artifacts=dict(payload.get("artifacts", {})),
+            input_trace_complete=bool(payload.get("input_trace_complete", False)),
+            observed_inputs=dict(payload.get("observed_inputs", {})),
             duration_seconds=0.0,
             backend="proof-certificate-candidate",
             cached=True,

@@ -325,6 +325,7 @@ DEFAULT_CONFIG = {
             "collab_read_only_enabled": True,
             "release_prewarm_enabled": True,
             "proof_audit_sample_rate": 0.05,
+            "verification_input_mode": "observe",
         },
         "parallel_tasks": {
             "enabled": True,

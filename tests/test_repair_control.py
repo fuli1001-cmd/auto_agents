@@ -414,6 +414,8 @@ def test_remote_reuse_runs_actual_behavior_without_a_repair_model(tmp_path):
             return SimpleNamespace(ok=not behavior(engine) and behavior(candidate), summary="actual old failure/new pass")
         def _replay_candidate(self, candidate, *args):
             return SimpleNamespace(ok=behavior(candidate), summary="actual boundary")
+        def _full_suite_differential(self, old, candidate):
+            return SimpleNamespace(ok=behavior(candidate), recoverable=False, summary="full fixture proof")
         def run(self):
             raise AssertionError("remote reuse must not generate a candidate")
     payload = {**failure(project), "base": base, "invocation": {}, "autonomy": "max"}
@@ -449,7 +451,7 @@ def test_publication_integrates_upstream_and_reuses_proof_after_network_failure(
         _diagnosis_differential=lambda old, root: SimpleNamespace(ok="fixed" in (root / "bug.py").read_text(), summary="specific behavior"),
         _replay_candidate=lambda *args: SimpleNamespace(ok=True, summary="boundary"),
         _candidate_test_weakening_reason=lambda *args: "",
-        _run_verification_commands=lambda commands, root: (suite_calls.append(root) or SimpleNamespace(ok=True, summary="suite passed")))
+        _run_full_suite_shards=lambda root: (suite_calls.append(root) or SimpleNamespace(ok=True, summary="suite passed")))
     with patch("auto_agents.repair_worker.make_runner", return_value=oracle), patch.object(Repository, "push", side_effect=RuntimeError("network")):
         with pytest.raises(RuntimeError, match="network"):
             publish(request)

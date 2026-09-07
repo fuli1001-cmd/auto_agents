@@ -2666,7 +2666,8 @@ class AutoAgentsSelfRepairRunner:
 
     def _start_base_full_suite_prewarm(self, base_ref: str) -> None:
         if (
-            not base_ref
+            self._acceleration_enabled()
+            or not base_ref
             or not (self.repo_root / "tests").is_dir()
             or self._base_full_verification.get(base_ref) is not None
         ):
@@ -3974,7 +3975,9 @@ class AutoAgentsSelfRepairRunner:
             yield argv
             return
         from .verification_sandbox import verification_argv
-        with verification_argv(argv, cwd, target, read_roots=read_roots) as command:
+        inputs = [Path(value) for value in [*read_roots, *getattr(self, "_verification_read_roots", [])]
+                  if Path(value).resolve() != Path(cwd).resolve()]
+        with verification_argv(argv, cwd, target, read_roots=inputs) as command:
             yield command
 
     def _provider_continuation_context(self) -> str:
@@ -4411,6 +4414,15 @@ class AutoAgentsSelfRepairRunner:
                     )
                 candidate_commit = (head_ref(repair_root) if self._continuous_mode() and not changed_paths(repair_root)
                                     else commit_all(repair_root, self._commit_message(summary)))
+                frozen_for_validation = bool(getattr(self, "_real_project_root", None) is not None
+                                             and getattr(self, "_candidate_is_final_group", True))
+                if frozen_for_validation:
+                    candidate_commit = self._squash_candidate_commit(repair_root, self._experiment.base_commit,
+                                                                      self._commit_message(summary))
+                    # Same tree, isolated detached worktree. Fix the delivered
+                    # commit before testing instead of manufacturing another
+                    # commit after its immutable proof has been sealed.
+                    subprocess.run(["git", "reset", "--soft", candidate_commit], cwd=repair_root, check=True, capture_output=True)
                 candidate_ref = (
                     "refs/auto-agents/self-repair/candidates/"
                     f"{self._safe_repair_category()}/{experiment_id}/{candidate_id}"
@@ -4468,6 +4480,17 @@ class AutoAgentsSelfRepairRunner:
                         summary=summary, verification=replay.summary + "\n" + differential.summary,
                         experiment_id=experiment_id, candidate_id=candidate_id,
                         base_commit=base_head, candidate_commit=candidate_commit, candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint, strategy_fingerprint=strategy_fingerprint,
+                        diff_line_count=diff_line_count,
+                    )
+                if (final_group and self.diagnosis is not None and self._acceleration_enabled()
+                        and (not replay.ok or not differential.ok)):
+                    return SelfRepairResult(
+                        ok=False, status="candidate_replay_failed", category=self.decision.category,
+                        reason="candidate failed its required boundary before semantic review",
+                        summary=summary, verification=replay.summary + "\n" + differential.summary,
+                        experiment_id=experiment_id, candidate_id=candidate_id, base_commit=base_head,
+                        candidate_commit=candidate_commit, candidate_ref=candidate_ref,
                         patch_fingerprint=fingerprint, strategy_fingerprint=strategy_fingerprint,
                         diff_line_count=diff_line_count,
                     )
@@ -5033,7 +5056,7 @@ class AutoAgentsSelfRepairRunner:
                             "validation:proof_seal",
                         ],
                     )
-                approved_commit = self._squash_candidate_commit(
+                approved_commit = candidate_commit if frozen_for_validation else self._squash_candidate_commit(
                     repair_root,
                     self._experiment.base_commit,
                     self._commit_message(summary),
@@ -5904,6 +5927,52 @@ class AutoAgentsSelfRepairRunner:
         )
         if execution is None or not (candidate_root / "tests").is_dir():
             return _VerificationResult(True, "full-suite differential=not-applicable")
+        if self._acceleration_enabled():
+            candidate = self._run_full_suite_shards(candidate_root)
+            if candidate.ok or candidate.recoverable:
+                # Full candidate success needs no old full-suite execution.
+                # An unfinished candidate cannot be approved by baseline data.
+                return _VerificationResult(
+                    candidate.ok and not candidate.recoverable,
+                    "=== candidate full suite ===\n" + candidate.summary
+                    + ("\ninconclusive=full-suite progress checkpoint remains resumable" if candidate.recoverable else ""),
+                    commands=candidate.commands, returncodes=candidate.returncodes,
+                    termination_reasons=candidate.termination_reasons, recoverable=candidate.recoverable,
+                    duration_seconds=candidate.duration_seconds, payload=candidate.payload,
+                )
+            commands = self._failed_source_commands(candidate)
+            if commands and self._is_behavioral_failure(candidate):
+                cache = getattr(self, "_base_failed_verification", {})
+                key = (base_head, tuple(commands))
+                if key not in cache:
+                    cache[key] = self._run_verification_at_ref(commands, base_head)
+                self._base_failed_verification = cache
+                baseline = cache[key]
+                if not baseline.recoverable and (baseline.ok or self._is_behavioral_failure(baseline)):
+                    same = (not baseline.ok and self._verification_failure_signature(baseline.summary)
+                            == self._verification_failure_signature(candidate.summary))
+                    return _VerificationResult(
+                        same, "=== lazy baseline failed batches ===\n" + baseline.summary
+                        + "\n=== candidate full suite ===\n" + candidate.summary,
+                        commands=candidate.commands, returncodes=candidate.returncodes,
+                        termination_reasons=candidate.termination_reasons, payload=candidate.payload,
+                    )
+            # Unknown failure/selection: preserve the conservative old full
+            # baseline comparison, without rerunning the candidate.
+            base = self._base_full_verification.get(base_head)
+            if base is None:
+                base = self._run_full_suite_at_ref(base_head)
+                self._base_full_verification[base_head] = base
+            same = (not base.ok and not base.recoverable and self._is_behavioral_failure(base)
+                    and self._is_behavioral_failure(candidate)
+                    and self._verification_failure_signature(base.summary)
+                    == self._verification_failure_signature(candidate.summary))
+            return _VerificationResult(
+                same, "=== fallback baseline ===\n" + base.summary + "\n" + candidate.summary,
+                commands=candidate.commands, returncodes=candidate.returncodes,
+                termination_reasons=candidate.termination_reasons,
+                recoverable=base.recoverable, payload=candidate.payload,
+            )
         base = self._base_full_verification.get(base_head)
         overlap = self._acceleration_enabled()
         if overlap:
@@ -6032,8 +6101,9 @@ class AutoAgentsSelfRepairRunner:
             cached = completed.get(shard.shard_id)
             if isinstance(cached, Mapping):
                 shard_result = _VerificationResult.from_dict(cached)
-                results.append((shard.shard_id, shard_result, True))
-                continue
+                if shard_result.ok and not shard_result.recoverable and not shard_result.timed_out:
+                    results.append((shard.shard_id, shard_result, True))
+                    continue
             proof = self._full_suite_proof_cache_lookup(
                 verification_root,
                 shard,
@@ -6065,7 +6135,10 @@ class AutoAgentsSelfRepairRunner:
                 results.append((shard.shard_id, shard_result, False))
                 if interrupted:
                     return False
-                completed[shard.shard_id] = shard_result.to_dict()
+                if shard_result.ok:
+                    completed[shard.shard_id] = shard_result.to_dict()
+                else:
+                    completed.pop(shard.shard_id, None)
                 if checkpoint_path is not None:
                     write_json(
                         checkpoint_path,
@@ -6304,8 +6377,8 @@ class AutoAgentsSelfRepairRunner:
             estimated_seconds = self._full_suite_timing_estimate(test_file)
             split_nodes = bool(
                 nodes
-                and estimated_seconds
-                >= SELF_REPAIR_FULL_SUITE_NODE_BATCH_THRESHOLD_SECONDS
+                and (estimated_seconds >= SELF_REPAIR_FULL_SUITE_NODE_BATCH_THRESHOLD_SECONDS
+                     or (getattr(self, "_real_project_root", None) is not None and len(nodes) >= 80))
             )
             batches = (
                 [
@@ -6317,7 +6390,7 @@ class AutoAgentsSelfRepairRunner:
                     )
                 ]
                 if split_nodes
-                else [nodes or [test_file]]
+                else [[test_file]]
             )
             priority = self._full_suite_shard_priority(
                 test_file,
@@ -6391,6 +6464,10 @@ class AutoAgentsSelfRepairRunner:
         verification_root: Path,
         test_files: list[str],
     ) -> str:
+        if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
+            from .verification_ledger import source_identity
+            return _search_stable_hash("managed-collection-v1", source_identity(verification_root), test_files,
+                self._full_suite_environment_fingerprint(), SELF_REPAIR_FULL_SUITE_NODE_BATCH_SIZE)
         tree = subprocess.run(
             ["git", "rev-parse", "HEAD^{tree}"],
             cwd=str(verification_root),
@@ -6409,6 +6486,15 @@ class AutoAgentsSelfRepairRunner:
         )
 
     def _full_suite_shard_plan_path(self, plan_key: str) -> Optional[Path]:
+        if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
+            from .verification_ledger import VerificationLedger, repository_identity
+            try:
+                ledger = VerificationLedger(self.repo_root,
+                    repository=repository_identity(getattr(self, "_engine_source_root", self.repo_root)), scope="engine",
+                    environment=_search_stable_hash(self._full_suite_environment_fingerprint()))
+                return ledger.root / "collection-plans" / (plan_key + ".json")
+            except (OSError, RuntimeError):
+                return None
         store = getattr(self, "_experiment_store", None)
         if not isinstance(store, SelfRepairExperimentStore):
             return None
@@ -6562,9 +6648,20 @@ class AutoAgentsSelfRepairRunner:
                 break
             selected.extend(additions)
             selected_names.update(node.name for node in additions)
-        batch_source = "\n".join(
-            ast.get_source_segment(source, node) or "" for node in selected
-        )
+        # ast.get_source_segment splits the entire source on every call. Large
+        # fixture modules selected in many node batches made that quadratic.
+        # AST column offsets are UTF-8 byte offsets, not Python string indexes.
+        lines = source.encode("utf-8").splitlines(keepends=True)
+        def segment(node):
+            if node.end_lineno is None or node.end_col_offset is None:
+                return source
+            start, end = node.lineno - 1, node.end_lineno - 1
+            if start == end:
+                value = lines[start][node.col_offset:node.end_col_offset]
+            else:
+                value = b"".join([lines[start][node.col_offset:], *lines[start + 1:end], lines[end][:node.end_col_offset]])
+            return value.decode("utf-8")
+        batch_source = "\n".join(segment(node) for node in selected)
         if not batch_source.strip():
             batch_source = source
         lowered = batch_source.lower()
@@ -6615,6 +6712,8 @@ class AutoAgentsSelfRepairRunner:
         verification_root: Path,
         shard: _FullSuiteShard,
     ) -> Optional["_VerificationResult"]:
+        if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
+            return None  # Managed runs use the process-shared ledger.
         proof_key = self._full_suite_proof_key(verification_root, shard)
         path = self._full_suite_proof_cache_path(proof_key)
         if path is None:
@@ -6640,6 +6739,8 @@ class AutoAgentsSelfRepairRunner:
         shard: _FullSuiteShard,
         result: "_VerificationResult",
     ) -> None:
+        if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
+            return
         if not result.ok or result.recoverable:
             return
         proof_key = self._full_suite_proof_key(verification_root, shard)
@@ -6832,12 +6933,31 @@ class AutoAgentsSelfRepairRunner:
         return store.root / "full-suite-proof-cache" / f"{proof_key}.json"
 
     def _full_suite_timing_path(self) -> Optional[Path]:
+        if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
+            plan = self._full_suite_shard_plan_path("timing")
+            return plan.parent.parent / "timings.json" if plan else None
         store = getattr(self, "_experiment_store", None)
         if not isinstance(store, SelfRepairExperimentStore):
             return None
         return store.root / "full-suite-timings.json"
 
+    def _managed_timing_store(self):
+        cached = getattr(self, "_engine_timing_store", None)
+        if cached is not None:
+            return cached
+        from .gate_timing import GateTimingStore
+        plan = self._full_suite_shard_plan_path("timing")
+        if plan is None:
+            return None
+        self._engine_timing_store = GateTimingStore(self.repo_root,
+            cache_path=plan.parent.parent / "proofs.sqlite3",
+            environment_fingerprint=_search_stable_hash(self._full_suite_environment_fingerprint()))
+        return self._engine_timing_store
+
     def _full_suite_timing_estimate(self, test_file: str) -> float:
+        if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
+            store = self._managed_timing_store()
+            return float(store.estimate("engine-suite:" + test_file) or 0) if store else 0.0
         path = self._full_suite_timing_path()
         if path is None:
             return 0.0
@@ -6849,6 +6969,9 @@ class AutoAgentsSelfRepairRunner:
             if not isinstance(sample_map, Mapping):
                 return 0.0
             samples = sample_map.get(test_file, [])
+            if not samples:
+                batches = [values for key, values in sample_map.items() if key.startswith(test_file + "#batch-")]
+                return sum(float(median(values)) for values in batches if values)
             durations = [
                 float(item)
                 for item in samples
@@ -6863,7 +6986,15 @@ class AutoAgentsSelfRepairRunner:
         shard: _FullSuiteShard,
         result: "_VerificationResult",
     ) -> None:
-        if result.duration_seconds <= 0 or "#batch-" in shard.shard_id:
+        if result.duration_seconds <= 0:
+            return
+        if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
+            from .models import CommandResult
+            store = self._managed_timing_store()
+            if store:
+                store.record("engine-suite:" + shard.test_file, CommandResult(
+                    command=shard.test_file, ok=result.ok, returncode=0 if result.ok else 1,
+                    duration_seconds=result.duration_seconds))
             return
         path = self._full_suite_timing_path()
         if path is None:
@@ -6880,11 +7011,11 @@ class AutoAgentsSelfRepairRunner:
         )
         history = [
             float(item)
-            for item in samples.get(shard.test_file, [])
+            for item in samples.get(shard.shard_id, [])
             if isinstance(item, (int, float)) and float(item) >= 0
         ]
         history.append(float(result.duration_seconds))
-        samples[shard.test_file] = history[-7:]
+        samples[shard.shard_id] = history[-7:]
         write_json(
             path,
             {
@@ -6989,6 +7120,10 @@ class AutoAgentsSelfRepairRunner:
         verification_root: Path,
         shards: list[str],
     ) -> str:
+        if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
+            from .verification_ledger import source_identity
+            return _search_stable_hash("managed-suite-v1", source_identity(verification_root), shards,
+                                      self._full_suite_environment_fingerprint())
         tree = subprocess.run(
             ["git", "rev-parse", "HEAD^{tree}"],
             cwd=str(verification_root),
@@ -7015,8 +7150,9 @@ class AutoAgentsSelfRepairRunner:
                     str(python),
                     "-c",
                     (
-                        "import pytest,sys; "
-                        "print(sys.version); print(pytest.__version__)"
+                        "import pytest,sys,json,importlib.metadata as m; "
+                        "print(sys.version); print(pytest.__version__); "
+                        "print(json.dumps(sorted((d.metadata.get('Name',''),d.version) for d in m.distributions())))"
                     ),
                 ],
                 text=True,
@@ -8054,7 +8190,19 @@ class AutoAgentsSelfRepairRunner:
         termination_reasons: list[str] = []
         nonfatal_source_commands: list[str] = []
         duration_seconds = 0.0
+        proof_refs = []
+        executed_tests = []
+        certificate_hits = 0
         for command in commands:
+            managed = getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled()
+            if managed:
+                from .verification_ledger import engine_command
+                command = engine_command(command)
+                # The sandbox exposes these protected directories even when
+                # absent in Git. Materialize that same directory view before
+                # validating observed directory-listing certificates.
+                for name in (".auto-agents-gate-runtime", ".agents", ".codex"):
+                    (verification_root / name).mkdir(exist_ok=True)
             if getattr(self, "_engine_source_root", None) is not None:
                 from .execution_binding import engine_verification_command
                 verification_command = engine_verification_command(command, verification_root,
@@ -8069,20 +8217,72 @@ class AutoAgentsSelfRepairRunner:
             diagnostic_progress.reporter = reporter
             diagnostic_progress.context = "self_repair"
             diagnostic_progress.stage = "self_repair_validation"
-            with self._verification_argv(["/bin/sh", "-c", verification_command], verification_root) as arguments:
-                executed_command = verification_command if getattr(self, "_real_project_root", None) is None else shlex.join(arguments)
-                gate = run_commands(
-                [executed_command],
-                verification_root,
-                command_timeout_seconds=max(60, int(command_timeout_seconds)),
-                adaptive_timeout_enabled=adaptive_timeout_enabled,
-                command_idle_timeout_seconds=max(
-                    60, int(command_idle_timeout_seconds)
-                ),
-                **({"progress": diagnostic_progress} if reporter is not None else {}),
-            )
-            process = gate.commands[0]
+            def execute():
+                from contextlib import nullcontext
+                from .verification_runtime import verification_resources
+                runtime = verification_root / ".auto-agents-gate-runtime"
+                resources = set()
+                if managed:
+                    by_file = {}
+                    for target in shlex.split(command):
+                        test_file = target.split("::", 1)[0]
+                        if test_file.startswith("tests/") and (verification_root / test_file).is_file():
+                            by_file.setdefault(test_file, []).append(target)
+                    for test_file, targets in by_file.items():
+                        resources.update(self._full_suite_shard_resources(verification_root, test_file, tuple(targets))[0])
+                    runtime.mkdir(exist_ok=True)
+                with (verification_resources(self._real_project_root, resources=resources) if managed else nullcontext(0.0)) as queued:
+                    with (tempfile.TemporaryDirectory(dir=runtime, prefix="proof-") if managed else nullcontext(None)) as temporary:
+                        args = shlex.split(command)
+                        receipt = Path(temporary) / "pytest.json" if temporary else None
+                        profiled = managed and args[:3] == ["python", "-m", "pytest"]
+                        actual_command = (shlex.join([self._verification_python(),
+                            str(Path(__file__).with_name("verification_pytest.py")), str(verification_root), str(receipt), *args[3:]])
+                            if profiled else verification_command)
+                        with self._verification_argv(["/bin/sh", "-c", actual_command], verification_root) as arguments:
+                            executed_command = actual_command if getattr(self, "_real_project_root", None) is None else shlex.join(arguments)
+                            gate = run_commands(
+                                [executed_command], verification_root,
+                                command_timeout_seconds=max(60, int(command_timeout_seconds)),
+                                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                                command_idle_timeout_seconds=max(60, int(command_idle_timeout_seconds)),
+                                **({"progress": diagnostic_progress} if reporter is not None else {}))
+                        process = gate.commands[0]
+                        process.queue_seconds = queued
+                        if profiled and receipt.exists():
+                            recorded = read_json(receipt, default={})
+                            process.executed_tests = list(recorded.get("passed", []))
+                            process.phase_seconds = dict(recorded.get("phases", {}))
+                            process.test_timings = list(recorded.get("slowest", []))
+                            observed = recorded.get("inputs", {})
+                            process.input_trace_complete = bool(observed.get("complete"))
+                            process.input_trace_reason = ",".join(observed.get("reasons", []))
+                            process.observed_inputs = dict(observed.get("manifest", {}))
+                            if not recorded.get("collected") and process.ok and not allow_pytest_no_tests:
+                                process.ok, process.returncode = False, 5
+                        elif profiled and process.ok:
+                            process.ok, process.returncode = False, 125
+                            process.stderr += "\ntrusted pytest receipt missing"
+                        return process
+            ledger = None
+            if managed:
+                from .verification_ledger import VerificationLedger, repository_identity
+                try:
+                    ledger = VerificationLedger(verification_root,
+                        repository=repository_identity(getattr(self, "_engine_source_root", self.repo_root)),
+                        scope="engine", environment=_search_stable_hash(self._full_suite_environment_fingerprint()))
+                except (OSError, RuntimeError):
+                    pass  # Unavailable acceleration never supplies a proof.
+            process = (ledger.execute(command, execute, metadata="engine-pytest-v1",
+                                      fresh=bool(getattr(self, "_verification_fresh", False)),
+                                      result_cache_scope="observed_inputs",
+                                      input_mode=getattr(getattr(self.target_orchestrator.config.execution, "acceleration", None), "verification_input_mode", "observe"))
+                       if ledger is not None else execute())
             duration_seconds += float(process.duration_seconds)
+            if getattr(process, "proof_ref", ""):
+                proof_refs.append(process.proof_ref)
+            executed_tests.extend(getattr(process, "executed_tests", []))
+            certificate_hits += int(getattr(process, "cached", False))
             rendered_commands.append(verification_command)
             returncodes.append(int(process.returncode))
             termination_reasons.append(
@@ -8125,6 +8325,7 @@ class AutoAgentsSelfRepairRunner:
                     payload={
                         "source_commands": list(commands[: len(returncodes)]),
                         "nonfatal_source_commands": nonfatal_source_commands,
+                        "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
                     },
                 )
         return _VerificationResult(
@@ -8137,6 +8338,7 @@ class AutoAgentsSelfRepairRunner:
             payload={
                 "source_commands": list(commands[: len(returncodes)]),
                 "nonfatal_source_commands": nonfatal_source_commands,
+                "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
             },
         )
 

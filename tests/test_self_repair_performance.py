@@ -100,7 +100,7 @@ def test_full_suite_dispatches_ready_work_past_resource_waiters(tmp_path):
     assert overlapped == [True]
 
 
-def test_full_suite_differential_overlaps_base_and_candidate(tmp_path):
+def test_successful_candidate_needs_no_baseline_full_suite(tmp_path):
     (tmp_path / "tests").mkdir()
     runner = _runner(tmp_path)
     candidate_started = threading.Event()
@@ -119,7 +119,7 @@ def test_full_suite_differential_overlaps_base_and_candidate(tmp_path):
         result = runner._full_suite_differential("base", tmp_path)
 
     assert result.ok
-    assert overlapped == [True]
+    assert overlapped == []
 
 
 def test_overlapping_full_suites_share_exclusive_resources_and_capacity(tmp_path):

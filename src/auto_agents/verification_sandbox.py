@@ -79,7 +79,7 @@ def namespace_exec(payload):
 
 
 @contextmanager
-def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=()):
+def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=()):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     if root == target or root in target.parents or target in root.parents:
         raise RuntimeError("verification workspace overlaps the live target project")
@@ -99,6 +99,14 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=()):
         entries = {":root": "read", "/tmp": "write", "/run": "deny",
                    str(root): "write", str(scratch): "write", str(target): "read"}
         preserve = [str(root), str(scratch), str(target), str(Path(__file__).resolve().parents[2])]
+        writable = [str(root), str(scratch)]
+        for value in write_roots:
+            extra = Path(value).resolve()
+            if extra == target or extra in target.parents or target in extra.parents or extra == Path("/"):
+                raise RuntimeError("verification write root overlaps the live project")
+            entries[str(extra)] = "write"
+            preserve.append(str(extra))
+            writable.append(str(extra))
         for value in read_roots:
             readonly = Path(value).resolve()
             if readonly == root or readonly in root.parents:
@@ -126,10 +134,11 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=()):
         clean_environment = ["env", "-i", "PATH=" + os.environ.get("PATH", os.defpath),
                              "HOME=" + str(home), "CODEX_HOME=" + str(codex_home),
                              "TMPDIR=" + temporary, "LANG=C.UTF-8", "PYTHONPATH=" + str(root / "src"),
+                             "PYTHONDONTWRITEBYTECODE=1",
                              "AUTO_AGENTS_TEST=True", "TESTING=True", "AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1",
                              "AUTO_AGENTS_VERIFICATION_SANDBOX=1"]
         if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
-            yield [sys.executable, str(Path(__file__).resolve()), "--landlock", json.dumps([str(root), str(scratch)]), *clean_environment, *argv]
+            yield [sys.executable, str(Path(__file__).resolve()), "--landlock", json.dumps(writable), *clean_environment, *argv]
             return
         sandbox = [executable, "sandbox", "-c", "features.network_proxy=false",
                    "-c", "permissions.autoagents_verify=" + profile,

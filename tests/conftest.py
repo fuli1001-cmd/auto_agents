@@ -8,3 +8,11 @@ def isolate_repair_control(monkeypatch):
     Control-plane tests explicitly opt in with private state and local remotes.
     """
     monkeypatch.setenv("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", "1")
+
+
+@pytest.fixture(autouse=True)
+def isolate_verification_state(tmp_path, monkeypatch):
+    """Tests never publish certificates or consume slots in operator state."""
+    monkeypatch.setenv("AUTO_AGENTS_VERIFICATION_ROOT", str(tmp_path / "verification-state"))
+    monkeypatch.setenv("AUTO_AGENTS_WORKER_ROOT", str(tmp_path / "worker-state"))
+    monkeypatch.setenv("AUTO_AGENTS_CLUSTER_HOME", str(tmp_path / "cluster-state"))

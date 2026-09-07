@@ -1014,9 +1014,13 @@ class AccelerationConfig:
     collab_read_only_enabled: bool = True
     release_prewarm_enabled: bool = True
     proof_audit_sample_rate: float = 0.05
+    verification_input_mode: str = "observe"
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "AccelerationConfig":
+        input_mode = str(data.get("verification_input_mode", "observe")).strip()
+        if input_mode not in {"off", "observe", "on"}:
+            raise ValueError("execution.acceleration.verification_input_mode must be off, observe, or on")
         return cls(
             mode=str(data.get("mode", "on")).strip() or "on",
             diagnosis_cache_enabled=bool(
@@ -1038,6 +1042,7 @@ class AccelerationConfig:
             proof_audit_sample_rate=float(
                 data.get("proof_audit_sample_rate", 0.05) or 0.0
             ),
+            verification_input_mode=input_mode,
         )
 
     @property
@@ -2296,7 +2301,13 @@ class CommandResult:
     cache_miss_reason: str = ""
     observed_inputs: Dict[str, str] = field(default_factory=dict)
     input_trace_complete: bool = False
+    input_trace_reason: str = ""
     network_observed: bool = False
+    proof_ref: str = ""
+    executed_tests: List[str] = field(default_factory=list)
+    queue_seconds: float = 0.0
+    phase_seconds: Dict[str, float] = field(default_factory=dict)
+    test_timings: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass

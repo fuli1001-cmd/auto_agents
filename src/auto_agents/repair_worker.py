@@ -193,9 +193,14 @@ def repair(request):
     verifier = make_runner(payload, original, working, python)
     fixed, proof = check_revision(verifier, checkout, base)
     if fixed:
+        full = verifier._full_suite_differential(base, checkout)
+        if not full.ok or full.recoverable:
+            return {"ok": False, "error": "upstream behavior passed but full engine proof is incomplete or failed",
+                    "proof": proof + "\n" + full.summary}
         return {"ok": True, "status": "already_repaired", "commit": revision,
                 "base": revision, "runtime": str(checkout), "python": python,
-                "environment": environment, "proof": proof, "fresh": fresh, "request_contract": request_contract}
+                "environment": environment, "proof": proof + "\n" + full.summary, "fresh": fresh, "request_contract": request_contract,
+                "engine_full_proof": {"policy": 1, "commit": revision, "environment": environment, "ok": True}}
     if payload.get("autonomy") != "max":
         return {"ok": False, "error": "latest revision did not prove recovery; guarded mode will not generate code", "proof": proof}
     runner = make_runner(payload, checkout, working, python)
@@ -211,7 +216,8 @@ def repair(request):
     runtime = repository.worktree(candidate, job["id"] + "-approved-" + candidate[:12])
     return {"ok": True, "status": "repaired", "commit": candidate, "base": revision,
             "runtime": str(runtime), "python": python, "environment": environment,
-            "proof": result.verification, "fresh": fresh, "result": result.to_dict(), "request_contract": request_contract}
+            "proof": result.verification, "fresh": fresh, "result": result.to_dict(), "request_contract": request_contract,
+            "engine_full_proof": {"policy": 1, "commit": candidate, "environment": environment, "ok": True}}
 
 
 def carry_continuous_work(runner, revision):
@@ -293,7 +299,7 @@ def publish(request):
         if weakening:
             raise RuntimeError("integrated publication weakened proof: " + weakening)
         passed, proof = check_revision(runner, root, job["payload"]["base"])
-        suite = runner._run_verification_commands(["python -m pytest -q -p no:cacheprovider"], root)
+        suite = runner._run_full_suite_shards(root)
         if not passed or not suite.ok:
             raise RuntimeError("integrated publication failed verification; retain local recovery version")
         atomic_json(receipt, {"commit": candidate, "upstream": revision, "proof": proof, "suite": suite.summary})
@@ -318,8 +324,14 @@ def validate_subscriber(request):
     repository.import_commit(config["source_root"], payload["base"])
     original = repository.worktree(payload["base"], "base-" + payload["base"][:20])
     runner = make_runner(payload, original, evidence, job["result"]["python"])
+    receipt = job["result"].get("engine_full_proof", {})
+    expected = {"policy": 1, "commit": job["result"]["commit"], "environment": job["result"]["environment"], "ok": True}
+    if receipt != expected:
+        full = runner._full_suite_differential(payload["base"], Path(job["result"]["runtime"]))
+        if not full.ok or full.recoverable:
+            return {"ok": False, "proof": full.summary}
     passed, proof = check_revision(runner, Path(job["result"]["runtime"]), payload["base"])
-    return {"ok": passed, "proof": proof}
+    return {"ok": passed, "proof": proof, "engine_full_proof": expected}
 
 
 def main():

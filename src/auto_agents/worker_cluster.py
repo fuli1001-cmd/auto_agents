@@ -512,10 +512,22 @@ class DiscoveryResponder:
             self.thread.join(timeout=2)
 
 
-def discover_workers(timeout_seconds: float = 1.5) -> list[DiscoveredWorker]:
+def discover_workers(timeout_seconds: float = 1.5, *, use_cache: bool = False) -> list[DiscoveredWorker]:
     state = load_cluster_state()
     if state is None:
         return []
+    identity = hashlib.sha256(canonical_json({"cluster": state.cluster_id, "node": state.node_id,
+        "secret": hashlib.sha256(state.secret.encode()).hexdigest(),
+        "peers": {key: {name: value for name, value in peer.items() if name != "last_seen"}
+                  for key, peer in state.peers.items()}})).hexdigest()
+    cache_path = cluster_root() / "discovery-cache.json"
+    if use_cache:
+        try:
+            cached = json.loads(cache_path.read_text())
+            if cached.get("identity") == identity and 0 <= time.time() - cached["created"] < 30:
+                return [DiscoveredWorker.from_dict(item) for item in cached["workers"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     query: dict[str, object] = {
         "type": "discover",
         "cluster_id": state.cluster_id,
@@ -586,4 +598,9 @@ def discover_workers(timeout_seconds: float = 1.5) -> list[DiscoveredWorker]:
             "last_seen": now,
         }
     save_cluster_state(state)
+    if use_cache:
+        # Discovery is advisory; a cached address still needs authentication
+        # and a fresh capability probe before receiving any test work.
+        _write_json_atomic(cache_path, {"identity": identity, "created": time.time(),
+                                      "workers": [worker.to_dict() for worker in found.values()]})
     return list(found.values())

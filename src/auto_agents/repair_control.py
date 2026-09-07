@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -153,6 +154,11 @@ class Store:
                 CREATE TABLE IF NOT EXISTS outbox (
                   job TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                   due REAL NOT NULL, detail TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS verification_contexts (
+                  id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS verifications (
+                  id TEXT PRIMARY KEY, context TEXT NOT NULL, state TEXT NOT NULL,
+                  payload TEXT NOT NULL, created REAL NOT NULL);
             """)
         os.chmod(self.path, 0o600)
 
@@ -330,7 +336,8 @@ class Repository:
             result = git(self.cache, "push", self.config["remote"], revision + ":" + self.config["ref"], check=False)
         if result.returncode:
             text = result.stderr.lower()
-            permission = any(word in text for word in ("permission denied", "authentication failed", "403", "protected branch", "not allowed"))
+            permission = (any(word in text for word in ("permission denied", "authentication failed", "protected branch", "not allowed"))
+                          or bool(re.search(r"\b(?:http(?:/[0-9.]+)?(?:\s+error)?|status(?:\s+code)?|returned\s+error)\s*[:=]?\s+403\b|\b403\s+forbidden\b", text)))
             raise PermissionError("remote publication not authorized") if permission else RuntimeError("remote publication failed; fetch and revalidate before retry")
 
 
@@ -365,15 +372,63 @@ def rpc(config, request, fds=()):
 
 
 def ensure_supervisor(config):
+    root = private_directory(config["root"])
+    with (root / "supervisor-start.lock").open("a+") as ownership:
+        fcntl.flock(ownership, fcntl.LOCK_EX)
+        return _ensure_supervisor(config)
+
+
+def retire_idle_legacy_supervisor(config, response):
+    """Freeze submissions before replacing an idle old protocol generation.
+
+    A SQLite write transaction fences even old clients that do not know about
+    the startup lock. Never stop a controller with live owners, workers or work.
+    """
+    store = Store(config["root"])
+    pid, ticks = response.get("pid", 0), response.get("ticks", 0)
+    if not alive(pid, ticks) or pid == os.getpid():
+        return False
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT 1 FROM jobs WHERE state NOT IN ('completed','blocked','cancelled') LIMIT 1").fetchone():
+            return False
+        if db.execute("SELECT 1 FROM outbox WHERE state IN ('pending','integration_pending','publishing') LIMIT 1").fetchone():
+            return False
+        if db.execute("SELECT 1 FROM verifications WHERE state IN ('queued','running') LIMIT 1").fetchone():
+            return False
+        for row in db.execute("SELECT payload FROM subscribers WHERE state NOT IN ('finished','blocked','cancelled')"):
+            owner = json.loads(row[0])
+            if alive(owner.get("pid", 0), owner.get("ticks", 0)):
+                return False
+        for path in store.root.glob("jobs/*/*-lease.json"):
+            lease = json.loads(path.read_text())
+            if alive(lease.get("pid", 0), lease.get("ticks", 0)):
+                return False
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 3
+        while alive(pid, ticks) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return not alive(pid, ticks)
+
+
+def _ensure_supervisor(config):
     try:
-        rpc(config, {"op": "ping"})
-        return
+        response = rpc(config, {"op": "ping"})
+        supports = "managed-verification-v1" in response.get("capabilities", [])
+        committed_support = git(config["source_root"], "cat-file", "-e", "HEAD:src/auto_agents/verification_worker.py", check=False).returncode == 0
+        if supports or not committed_support or not retire_idle_legacy_supervisor(config, response):
+            return
     except (OSError, RuntimeError):
         pass
     root = Path(config["root"])
+    revision = git(config["source_root"], "rev-parse", "HEAD")
+    pinned = config.get("implementation_root")
+    if pinned:
+        old = git(pinned, "rev-parse", "HEAD", check=False)
+        if old.returncode or old.stdout.strip() != revision:
+            config.pop("implementation_root", None)
     if not config.get("implementation_root"):
         repository = Repository(config)
-        revision = git(config["source_root"], "rev-parse", "HEAD")
         repository.import_commit(config["source_root"], revision)
         implementation = repository.worktree(revision, "controller-" + revision[:20])
         if not (implementation / "src/auto_agents/repair_worker.py").is_file():
@@ -427,6 +482,11 @@ class Supervisor:
         self.halt = False
         self.stopping = {}
         self.publisher = None
+        self.verification_processes = {}
+        for lease_path in self.store.root.glob("verifications/*/lease.json"):
+            lease = json.loads(lease_path.read_text())
+            if alive(lease["pid"], lease["ticks"]):
+                self.verification_processes[lease_path.parent.name] = RecoveredProcess(lease)
         for path in sorted(self.store.root.glob("jobs/*/*-lease.json"), key=lambda item: item.stat().st_mtime, reverse=True):
             lease = json.loads(path.read_text())
             if lease.get("kind") == "resume":
@@ -473,7 +533,10 @@ class Supervisor:
             raise RuntimeError("incompatible repair control protocol")
         op = request["op"]
         if op == "ping":
-            return {"ok": True, "version": VERSION, "pid": os.getpid(), "ticks": start_ticks(os.getpid())}
+            return {"ok": True, "version": VERSION, "pid": os.getpid(), "ticks": start_ticks(os.getpid()),
+                    "capabilities": ["managed-verification-v1"]}
+        if op.startswith("verify-"):
+            return self.verification_dispatch(request)
         if op == "register":
             return self.register(request, fds)
         if op == "submit":
@@ -611,6 +674,7 @@ class Supervisor:
                 self.stop_process(RecoveredProcess({"pid": pid, "ticks": ticks}))
 
     def tick(self):
+        self.tick_verifications()
         for identity, process in list(self.relays):
             row = next((item for item in self.store.subscriptions() if item["id"] == identity), None)
             if row and row["state"] == "cancelled":
@@ -635,6 +699,10 @@ class Supervisor:
             if operation.startswith("validate-"):
                 subscriber_id = operation[len("validate-"):]
                 with self.store.connect() as db:
+                    if result.get("ok") and result.get("engine_full_proof"):
+                        updated = {**job["result"], "engine_full_proof": result["engine_full_proof"]}
+                        db.execute("UPDATE jobs SET result=? WHERE id=? AND generation=?",
+                                   (json.dumps(updated), identity, generation))
                     db.execute("UPDATE subscribers SET state=?,updated=? WHERE id=? AND state='validating'",
                                ("verified" if result.get("ok") else "blocked", time.time(), subscriber_id))
                 self.store.event(identity, "subscriber_validated", {"subscriber": subscriber_id, "ok": bool(result.get("ok"))})
@@ -817,6 +885,158 @@ class Supervisor:
         self.store.event(job["id"], "workflow_started", {"subscriber": row["id"], "pid": process.pid, "ticks": start_ticks(process.pid)})
         atomic_json(root / ("resume-" + row["id"] + "-lease.json"), {"kind": "resume", "job": job["id"],
             "subscriber": row["id"], "pid": process.pid, "ticks": start_ticks(process.pid)})
+
+    def verification_context(self, identity):
+        with self.store.connect() as db:
+            row = db.execute("SELECT payload FROM verification_contexts WHERE id=?", (identity,)).fetchone()
+        if not row:
+            raise RuntimeError("unknown verification context")
+        context = json.loads(row[0])
+        if context.get("job"):
+            job = self.store.job(context["job"])
+            if job["generation"] != context["generation"] or job["state"] not in {"repairing", "ready", "validating"}:
+                raise RuntimeError("verification context belongs to an obsolete repair generation")
+        else:
+            registration = self.registrations.get(context["subscriber"])
+            if not registration or registration["payload"]["token"] != context["run_token"]:
+                raise RuntimeError("verification workflow owner is no longer registered")
+            row = next((r for r in self.store.subscriptions() if r["id"] == context["subscriber"]), None)
+            if not row or row["state"] in {"finished", "cancelled", "blocked"}:
+                raise RuntimeError("verification workflow is no longer active")
+        if not alive(context["pid"], context["ticks"]):
+            raise RuntimeError("verification owner exited")
+        workspace = Path(context["workspace"])
+        info = workspace.stat()
+        if workspace.resolve() != workspace or [info.st_dev, info.st_ino] != context["inode"]:
+            raise RuntimeError("verification workspace identity changed")
+        return context
+
+    def verification_dispatch(self, request):
+        op = request["op"]
+        if op == "verify-context":
+            workspace = Path(request["workspace"]).resolve()
+            peer = request.get("_peer_pid")
+            job_id = request.get("job", "")
+            if job_id:
+                worker = self.workers.get(job_id)
+                job = self.store.job(job_id)
+                if not worker or worker[0].pid != peer or job["state"] != "repairing":
+                    raise RuntimeError("only the active repair worker can bind engine verification")
+                if not workspace.is_relative_to(self.store.root / "jobs" / job_id):
+                    common = git(workspace, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                    if Path(common).resolve() != (self.store.root / "engine.git").resolve():
+                        raise RuntimeError("engine verification workspace is outside the repair repository")
+                source = job["payload"]["project"]
+                generation = job["generation"]
+                run_token = ""
+            else:
+                registration = self.registrations.get(request.get("subscriber", ""))
+                if not registration or registration["payload"]["pid"] != peer:
+                    raise RuntimeError("only the registered workflow can bind project verification")
+                if request.get("engine"):
+                    raise RuntimeError("project verification cannot grant engine write scope")
+                source = registration["payload"]["project"]
+                common = lambda path: git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                if common(workspace) != common(source):
+                    raise RuntimeError("verification workspace belongs to a different repository")
+                generation, run_token = 0, registration["payload"]["token"]
+            runtime = Path(request["runtime"]).resolve()
+            if not (runtime == Path(self.config["source_root"]).resolve()
+                    or runtime.is_relative_to(self.store.root / "runtimes")):
+                raise RuntimeError("verification executor is not a trusted engine runtime")
+            revision = git(runtime, "rev-parse", "HEAD")
+            if runtime == Path(self.config["source_root"]).resolve():
+                repository = Repository(self.config)
+                repository.import_commit(runtime, revision)
+                runtime = repository.worktree(revision, "verification-controller-" + revision[:20])
+            if not (runtime / "src/auto_agents/verification_worker.py").is_file():
+                raise RuntimeError("runtime has no managed verification executor")
+            if git(runtime, "diff", "--quiet", "HEAD", "--", "src/auto_agents", check=False).returncode:
+                raise RuntimeError("trusted verification runtime was modified")
+            identity = uuid4().hex
+            info = workspace.stat()
+            context = {"workspace": str(workspace), "inode": [info.st_dev, info.st_ino],
+                       "source": source, "runtime": str(runtime), "engine": bool(job_id),
+                       "job": job_id, "generation": generation, "run_token": run_token,
+                       "subscriber": request.get("subscriber", ""), "pid": peer, "ticks": start_ticks(peer),
+                       "repository": self.config["source_root"] if job_id else source,
+                       "python": request.get("python") or self.config["python"], "runtime_commit": revision,
+                       "resource_environment": {key: str(value) for key, value in request.get("resource_environment", {}).items()
+                           if key in {"AUTO_AGENTS_CLUSTER_HOME", "AUTO_AGENTS_WORKER_ROOT", "AUTO_AGENTS_WORKER_SLOTS", "AUTO_AGENTS_WORKER_CONFIG", "AUTO_AGENTS_VERIFICATION_ROOT"}}}
+            with self.store.connect() as db:
+                db.execute("INSERT INTO verification_contexts VALUES(?,?)", (identity, json.dumps(context)))
+            return {"ok": True, "context": identity}
+        context = self.verification_context(request["context"])
+        if op == "verify-submit":
+            if request.get("level") != "focused" or not isinstance(request.get("tests"), list) or not request["tests"]:
+                raise RuntimeError("model verification requires explicit focused test targets")
+            identity = uuid4().hex
+            payload = {**context, "tests": request["tests"], "level": "focused", "fresh": bool(request.get("fresh"))}
+            with self.store.connect() as db:
+                db.execute("INSERT INTO verifications VALUES(?,?,'queued',?,?)",
+                           (identity, request["context"], json.dumps(payload), time.time()))
+            return {"ok": True, "verification": identity}
+        with self.store.connect() as db:
+            row = db.execute("SELECT * FROM verifications WHERE id=? AND context=?",
+                             (request.get("verification"), request["context"])).fetchone()
+        if not row:
+            raise RuntimeError("verification does not belong to this context")
+        if op == "verify-status":
+            path = self.store.root / "verifications" / row["id"] / "result.json"
+            result = json.loads(path.read_text()) if path.exists() else {}
+            return {"ok": True, "state": row["state"], "result": result}
+        raise RuntimeError("unknown managed verification operation")
+
+    def tick_verifications(self):
+        with self.store.connect() as db:
+            rows = db.execute("SELECT * FROM verifications WHERE state IN ('queued','running') ORDER BY created").fetchall()
+        for row in rows:
+            root = self.store.root / "verifications" / row["id"]
+            process = self.verification_processes.get(row["id"])
+            try:
+                context = self.verification_context(row["context"])
+            except (OSError, RuntimeError, ValueError):
+                if process and process.poll() is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGTERM)
+                    # Repeated ticks escalate only this tracked process group.
+                    since = self.stopping.setdefault("verify:" + row["id"], time.monotonic())
+                    if time.monotonic() - since > 10:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(process.pid, signal.SIGKILL)
+                    continue
+                state = "cancelled"
+            else:
+                if process and process.poll() is None:
+                    continue
+                if row["state"] == "queued":
+                    if len(self.verification_processes) >= 4:
+                        continue
+                    root.mkdir(parents=True, exist_ok=True)
+                    payload = json.loads(row["payload"])
+                    atomic_json(root / "request.json", payload)
+                    environment = {key: value for key, value in os.environ.items()
+                                   if key in {"PATH", "HOME", "LANG", "CODEX_HOME", "XDG_STATE_HOME", "AUTO_AGENTS_WORKER_ROOT", "AUTO_AGENTS_VERIFICATION_ROOT", "AUTO_AGENTS_VERIFICATION_SANDBOX"}}
+                    environment["AUTO_AGENTS_REPAIR_CONTROL_CONFIG"] = str(self.store.root / "operator.json")
+                    if context["job"]:
+                        environment["AUTO_AGENTS_REPAIR_JOB"] = context["job"]
+                    environment["PYTHONPATH"] = str(Path(context["runtime"]) / "src")
+                    environment.update(context.get("resource_environment", {}))
+                    with (root / "worker.log").open("ab") as output:
+                        process = subprocess.Popen([context["python"], str(Path(context["runtime"]) / "src/auto_agents/verification_worker.py"), str(root / "request.json")],
+                            stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=environment,
+                            start_new_session=True)
+                    self.verification_processes[row["id"]] = process
+                    atomic_json(root / "lease.json", {"pid": process.pid, "ticks": start_ticks(process.pid)})
+                    state = "running"
+                else:
+                    path = root / "result.json"
+                    result = json.loads(path.read_text()) if path.exists() else {}
+                    state = "completed" if result.get("ok") else "failed"
+            with self.store.connect() as db:
+                db.execute("UPDATE verifications SET state=? WHERE id=?", (state, row["id"]))
+            if state != "running":
+                self.verification_processes.pop(row["id"], None)
 
     def serve(self):
         with (self.store.root / "supervisor.lock").open("a+") as ownership:

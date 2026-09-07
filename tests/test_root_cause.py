@@ -1698,7 +1698,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(runner._experiment.consecutive_non_improvements, 0)
             self.assertEqual(runner._experiment.status, "approved")
 
-    def test_full_suite_uses_symmetric_progress_managed_results(self):
+    def test_successful_full_suite_preserves_candidate_proof_without_running_base(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -1756,7 +1756,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 )
 
             self.assertTrue(result.ok, result.summary)
-            base_verify.assert_called_once_with("base")
+            base_verify.assert_not_called()
             candidate_verify.assert_called_once_with(candidate_root)
             self.assertIn("candidate full suite", result.summary)
 
@@ -1780,7 +1780,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertIn("Do not run the broad auto_agents suite", prompt)
             self.assertIn("orchestrator owns authoritative full-suite", prompt)
 
-    def test_base_full_suite_prewarm_is_reused_by_differential(self):
+    def test_legacy_mode_base_full_suite_prewarm_is_reused_by_differential(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -1809,6 +1809,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             runner.repo_root = auto_root
             passed = _VerificationResult(True, "passed")
             with (
+                patch.object(runner, "_acceleration_enabled", return_value=False),
                 patch.object(
                     runner,
                     "_run_full_suite_at_ref",
@@ -1960,7 +1961,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             with patch.object(
                 runner,
                 "_run_verification_commands",
-                side_effect=[passed, timeout],
+                side_effect=lambda commands, *_args, **_kwargs: passed if "test_a.py" in commands[0] else timeout,
             ) as first_verify:
                 first = runner._run_full_suite_shards(candidate_root)
 
