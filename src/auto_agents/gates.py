@@ -32,6 +32,7 @@ from .models import (
     VerificationStep,
 )
 from .process_supervision import run_supervised_shell_command
+from .repair_client import gate_boundary
 
 
 _PYTEST_SHORT_SUMMARY = re.compile(
@@ -1493,6 +1494,7 @@ def run_commands_collect_all(
     return GateResult(ok=ok, commands=results, summary=summary)
 
 
+@gate_boundary
 def run_gate_plan(
     commands: Iterable[str],
     parallel_groups: Sequence[GateParallelGroup],

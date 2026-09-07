@@ -247,6 +247,8 @@ class ProjectRunLock:
     def release(self) -> None:
         if self._fd is None:
             return
+        from .repair_client import release as release_repair_control
+        release_repair_control(self)
         fd, self._fd = self._fd, None
         self._acquired_pid = 0
         _unregister_project_lock(self)
@@ -449,6 +451,16 @@ def stop_project_run(
     grace_seconds: float = 10.0,
     kill_grace_seconds: float = 5.0,
 ) -> tuple[dict[str, object], int]:
+    from .repair_client import enabled
+    if enabled():
+        from .repair_control import operator_root, rpc
+        for config_path in operator_root().glob("*/operator.json"):
+            try:
+                rpc(json.loads(config_path.read_text()), {"op": "cancel", "project": str(project_root.resolve())})
+            except (OSError, RuntimeError, ValueError):
+                # Persist cancellation even while the supervisor is down.
+                from .repair_control import Store
+                Store(config_path.parent).cancel(project=str(project_root.resolve()))
     lock = ProjectRunLock(project_root, environ={})
     project = str(lock.project_root)
     owner = lock.owner_payload()

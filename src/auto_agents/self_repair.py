@@ -1729,6 +1729,9 @@ class AutoAgentsSelfRepairRunner:
     @contextmanager
     def _phase_timer(self, phase: str) -> Iterator[None]:
         started = time.perf_counter()
+        callback = getattr(self, "_control_phase_callback", None)
+        if callback:
+            callback("phase_started", {"phase": phase})
         raised = False
         try:
             yield
@@ -1737,6 +1740,8 @@ class AutoAgentsSelfRepairRunner:
             raise
         finally:
             duration = time.perf_counter() - started
+            if callback:
+                callback("phase_finished", {"phase": phase, "duration_seconds": duration, "raised": raised})
             store = getattr(self, "_experiment_store", None)
             if isinstance(store, SelfRepairExperimentStore):
                 try:
@@ -3065,7 +3070,7 @@ class AutoAgentsSelfRepairRunner:
             and experiment.finding_groups
         ):
             return True
-        if self.diagnosis is None or not hasattr(self.diagnosis, "to_dict"):
+        if self.diagnosis is None or not hasattr(self.diagnosis, "to_dict") or self._continuous_mode():
             # Legacy direct API repairs do not carry a causal contract. Keep
             # their historical one-candidate behavior.
             experiment.repair_design = {
@@ -3085,7 +3090,8 @@ class AutoAgentsSelfRepairRunner:
                         "depends_on": [],
                         "touched_paths": [],
                         "implementation_steps": ["repair the reported failure"],
-                        "focused_tests": ["git diff --check"],
+                        "focused_tests": (list(self.diagnosis.final.verification_commands)
+                                          if self._continuous_mode() and self.diagnosis else ["git diff --check"]),
                         "status": "pending",
                     }
                 ],
@@ -3761,7 +3767,7 @@ class AutoAgentsSelfRepairRunner:
                     f"progress={candidate.progress_kind} status={candidate.status}"
                 ),
             )
-            if semantic_repeat or health.get("anomaly") == "strategy_oscillation":
+            if (semantic_repeat or health.get("anomaly") == "strategy_oscillation") and not self._continuous_mode():
                 experiment.apply_automatic_correction(
                     reason=(
                         "semantic search state repeated"
@@ -3802,6 +3808,11 @@ class AutoAgentsSelfRepairRunner:
                 store.save(experiment)
                 return candidate
             if experiment.patience_exhausted:
+                if self._continuous_mode():
+                    write_json(Path(self._continuous_workspace) / "fallback.json", {
+                        "reason": "three non-improving continuous attempts; deepen diagnosis without discarding evidence",
+                        "candidate": candidate.candidate_id,
+                    })
                 contract_amended = self._automatic_contract_reanalysis(
                     experiment,
                     candidate,
@@ -3932,6 +3943,12 @@ class AutoAgentsSelfRepairRunner:
 
     @contextmanager
     def _candidate_workspace(self):
+        if self._continuous_mode():
+            root = Path(self._continuous_workspace)
+            root.mkdir(parents=True, exist_ok=True)
+            self._candidate_keep_workspace = True
+            yield root
+            return
         temporary = Path(tempfile.mkdtemp(prefix="auto-agents-self-repair-worktree-"))
         self._candidate_keep_workspace = False
         try:
@@ -3939,6 +3956,10 @@ class AutoAgentsSelfRepairRunner:
         finally:
             if not self._candidate_keep_workspace:
                 shutil.rmtree(temporary, ignore_errors=True)
+
+    def _continuous_mode(self) -> bool:
+        root = getattr(self, "_continuous_workspace", None)
+        return bool(root and not (Path(root) / "fallback.json").exists())
 
     def _provider_continuation_context(self) -> str:
         experiment = getattr(self, "_experiment", None)
@@ -3949,6 +3970,10 @@ class AutoAgentsSelfRepairRunner:
         )
 
     def _provider_continuation(self) -> dict[str, str]:
+        if self._continuous_mode():
+            receipt = read_json(Path(self._continuous_workspace) / "provider.json", default={})
+            if receipt.get("context") == self._provider_continuation_context():
+                return dict(receipt.get("continuation", {}))
         if not self._acceleration_enabled():
             return {}
         acceleration = getattr(getattr(getattr(self.target_orchestrator, "config", None), "execution", None), "acceleration", None)
@@ -4063,6 +4088,10 @@ class AutoAgentsSelfRepairRunner:
             if isinstance(experiment, SelfRepairExperiment)
             else ""
         ) or head_ref(self.repo_root)
+        if self._continuous_mode():
+            retained = Path(self._continuous_workspace) / "repair"
+            if retained.exists():
+                base_head = head_ref(retained)
         self._candidate_base_ref = base_head
         target_before = capture_repository_guard(
             self.target_project_root,
@@ -4079,17 +4108,15 @@ class AutoAgentsSelfRepairRunner:
             repair_root = Path(tmp) / "repair"
             created = False
             try:
-                add_worktree(self.repo_root, repair_root, ref=base_head or "HEAD")
+                if not (self._continuous_mode() and repair_root.exists()):
+                    add_worktree(self.repo_root, repair_root, ref=base_head or "HEAD")
                 created = True
-                self._candidate_resumed_from = self._resume_interrupted_candidate(
-                    repair_root,
-                    base_head=base_head,
-                )
+                self._candidate_resumed_from = ("continuous-workspace" if self._continuous_mode() else
+                    self._resume_interrupted_candidate(repair_root, base_head=base_head))
                 target_snapshot = Path(tmp) / "target-evidence"
-                RootCauseCoordinator._copy_diagnostic_tree(
-                    getattr(self, "_frozen_target_root", self.target_project_root),
-                    target_snapshot,
-                )
+                if not target_snapshot.exists():
+                    RootCauseCoordinator._copy_diagnostic_tree(
+                        getattr(self, "_frozen_target_root", self.target_project_root), target_snapshot)
                 from .diagnostic_output import diagnostic_attachments, copy_diagnostic_attachments
                 copy_diagnostic_attachments(
                     diagnostic_attachments(self.target_project_root, str(
@@ -4168,6 +4195,13 @@ class AutoAgentsSelfRepairRunner:
                     self._candidate_keep_workspace = True
                     raise RuntimeError(f"could not save candidate; worktree retained at {repair_root}")
                 self._candidate_provider_result = result
+                if self._continuous_mode() and result.provider_session_id:
+                    write_json(Path(self._continuous_workspace) / "provider.json", {
+                        "context": self._provider_continuation_context(),
+                        "continuation": {"resume_session_id": result.provider_session_id,
+                            "resume_provider": str(getattr(self.target_orchestrator, "_current_provider", "")),
+                            "resume_prompt_hash": result.prompt_metadata.get("compatibility_hash", "")},
+                    })
                 if hasattr(self.target_orchestrator, "_emit_agent_output"):
                     self.target_orchestrator._emit_agent_output(
                         f"self-repair-{candidate_id}",
@@ -5017,7 +5051,7 @@ class AutoAgentsSelfRepairRunner:
                         self._report_candidate_phase("checkpoint_failed", f"Candidate worktree retained at {repair_root}; checkpoint could not be saved")
                 raise
             finally:
-                if created and not self._candidate_keep_workspace:
+                if created and not self._candidate_keep_workspace and not self._continuous_mode():
                     try:
                         remove_worktree(self.repo_root, repair_root, force=True)
                     except RuntimeError:
@@ -5127,7 +5161,7 @@ class AutoAgentsSelfRepairRunner:
         issues: list[str] = []
         weakening = self._candidate_test_weakening_reason(
             repair_root,
-            base_head,
+            self._experiment.base_commit if self._continuous_mode() else base_head,
         )
         if weakening:
             issues.append(weakening)
@@ -7101,10 +7135,16 @@ class AutoAgentsSelfRepairRunner:
         with tempfile.TemporaryDirectory(prefix="auto-agents-session-replay-") as temporary:
             target = Path(temporary) / "target"
             RootCauseCoordinator._copy_diagnostic_tree(source, target)
+            environment = dict(os.environ)
+            if context.get("engine_route"):
+                from .repair_control import digest
+                receipt = Path(temporary) / "engine-route.json"
+                write_json(receipt, {"route_digest": digest(context["engine_route"])})
+                environment["AUTO_AGENTS_REPAIR_ROUTE_PROBE"] = str(receipt)
             process = subprocess.run(
                 [self._verification_python(), str(Path(__file__).with_name("session_replay.py")),
                  str(engine), str(target), str(context["session_id"]), str(context["command"]).replace("provider-resolve", "fix")],
-                cwd=target, capture_output=True, text=True,
+                cwd=target, capture_output=True, text=True, env=environment,
                 timeout=max(60, int(self._autonomy_config().replay_timeout_seconds)),
             )
             try:
@@ -7113,6 +7153,13 @@ class AutoAgentsSelfRepairRunner:
                 return {"ok": False, "outcome": "invalid", "error": process.stderr[-2000:]}
 
     def _replay_session_candidate(self, candidate_root: Path, candidate_id: str) -> "_VerificationResult":
+        if self._invocation_context.get("engine_route"):
+            # The separate behavior differential proves the requested engine
+            # defect. Replay checks the broker's verified-result return path.
+            candidate = self._session_probe(candidate_root)
+            return _VerificationResult(bool(candidate.get("ok")), str(candidate), payload={
+                "outcome": "passed" if candidate.get("ok") else "failed", "candidate": candidate,
+            })
         baseline = getattr(self, "_session_replay_baseline", None)
         if baseline is None:
             with tempfile.TemporaryDirectory(prefix="auto-agents-session-base-") as temporary:

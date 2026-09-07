@@ -3582,6 +3582,9 @@ class Orchestrator:
                         state,
                         reason=f"stage {stage} completed",
                     )
+                    from .repair_client import boundary_event
+                    boundary_event("run_stage", run_id=state.run_id, completed_stage=stage,
+                                   fingerprint=state.active_blocker.get("fingerprint", ""))
                 save_run_state(self.project_root, state)
                 if state.status == "waiting_user":
                     return state

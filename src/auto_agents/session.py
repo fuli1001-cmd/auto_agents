@@ -1873,6 +1873,14 @@ class Session:
 
         binding_error = repository_binding_error(self.project_root, payload)
         if binding_error:
+            from .repair_client import engine_route
+            if engine_route(self.orch, payload):
+                state.status = "executing"
+                state.resolution = ""
+                state.conversation.append({"role": "orchestrator", "content":
+                    "The engine-owned repair passed verification and was installed. Continue the original goal; this engine route has been consumed."})
+                self._save(state)
+                return state
             return self._block_execution_binding(state, binding_error)
 
         if not state.workflow_id:

@@ -1712,7 +1712,13 @@ do not occupy executor threads that could run independent work. Incomplete proof
 `execution.acceleration.mode=observe|off` retains sequential base/candidate comparison and fresh
 integration reviews; phase timing remains available for comparison.
 
-An approved candidate is not immediately merged. The real workflow first resumes from the approved
+The independent repair supervisor now owns the default update, repair, recovery and
+publication path. It checks the trusted remote before generating code, preserves a
+continuous repair workspace, and validates each subscribing project's recovery.
+Developer checkouts remain untouched. See [repair supervisor](docs/repair-supervisor.md)
+for operator policy, commands, cancellation, concurrency and publication behavior.
+
+For the legacy in-process compatibility path, an approved candidate is not immediately merged. The real workflow first resumes from the approved
 candidate worktree. Only after the original blocker fingerprint disappears is the candidate promoted
 to the local auto_agents branch. A dirty main checkout is preserved byte-for-byte and promotion is
 recorded as pending until it becomes clean. Remote publication happens after local recovery; push or

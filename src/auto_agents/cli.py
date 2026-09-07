@@ -1289,6 +1289,10 @@ def _auto_repair_auto_agents_and_resume(
     diagnosis=None,
     repair_case: Optional[RepairCase] = None,
 ) -> int:
+    from .repair_client import enabled as repair_control_enabled, submit_and_wait
+    if repair_control_enabled():
+        return submit_and_wait(project_root, orchestrator, error, decision, args,
+                               run_lock, diagnosis, repair_case)
     invocation = dict(getattr(orchestrator, "_invocation_context", {}) or {})
     if invocation.get("session_id") and not invocation.get("run_id"):
         return _auto_repair_session_and_resume(
@@ -1649,6 +1653,9 @@ def _auto_repair_session_and_resume(project_root, orchestrator, error, decision,
     """Repair a session without mutating an unrelated run's control state."""
     from .config import load_session_state, save_session_state
     from .execution_recovery import redact_incident_text
+    from .repair_client import enabled as repair_control_enabled, submit_and_wait
+    if repair_control_enabled():
+        return submit_and_wait(project_root, orchestrator, error, decision, args, run_lock, diagnosis)
 
     state = load_session_state(project_root, args.session)
     runner = AutoAgentsSelfRepairRunner(
@@ -2006,6 +2013,10 @@ def _record_blocked_self_repair_triage(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    repair_parser = subparsers.add_parser("repair", help="Inspect and control durable engine repairs")
+    repair_parser.add_argument("repair_action", choices=("status", "resume", "cancel", "retry-publish"))
+    repair_parser.add_argument("--job", default="")
+    repair_parser.add_argument("--project", default="")
     prompt_eval_parser = subparsers.add_parser(
         "prompt-eval", help="Capture prompt baselines or explicitly evaluate configured providers"
     )
@@ -2654,6 +2665,25 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _dispatch(args) -> int:
+    if args.command == "repair":
+        from .repair_control import configure, ensure_supervisor, rpc
+        try:
+            config = configure(auto_agents_repo_root())
+            ensure_supervisor(config)
+            request = {"op": args.repair_action}
+            if args.repair_action == "resume":
+                request["environment"] = dict(os.environ)
+            if args.job:
+                request["job"] = args.job
+            if args.project:
+                request["project"] = str(Path(args.project).resolve())
+            if args.repair_action in {"resume", "retry-publish"} and not args.job:
+                raise ValueError("--job is required")
+            print(json.dumps(rpc(config, request), ensure_ascii=False, indent=2))
+            return 0
+        except (OSError, RuntimeError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}))
+            return 3
     if args.command == "prompt-eval":
         from .prompting.evaluate import main as evaluate_prompts
         _load_cli_dotenv()
@@ -3071,6 +3101,8 @@ def _dispatch(args) -> int:
             spec_file = _apply_saved_run_context(args, project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
             orchestrator._run_token = run_lock.health_lease_token
+            from .repair_client import register as register_repair_control
+            register_repair_control(run_lock, args, orchestrator)
             from .workflow_chain import WorkflowRef, WorkflowStore
 
             workflow_store = WorkflowStore(project_root)
@@ -3591,6 +3623,8 @@ def _dispatch(args) -> int:
             workflow_lock.acquire()
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
             orchestrator._run_token = workflow_lock.health_lease_token
+            from .repair_client import register as register_repair_control
+            register_repair_control(workflow_lock, args, orchestrator)
             store = WorkflowStore(project_root)
             selected = (
                 store.load(str(args.workflow))
@@ -3774,6 +3808,8 @@ def _dispatch(args) -> int:
                 "auto_approve": bool(getattr(args, "auto_approve", False)),
             }
             orchestrator._run_token = workflow_lock.health_lease_token
+            from .repair_client import register as register_repair_control
+            register_repair_control(workflow_lock, args, orchestrator)
             health_config = getattr(
                 getattr(getattr(orchestrator, "config", None), "execution", None),
                 "health_watch",
