@@ -124,3 +124,17 @@ For `tests/test_verification_ledger.py`, the measured sequence was 3.93 seconds,
 not start the tests again. Cross-environment checks still execute when their
 identities differ; in particular, credential-free model project tests are not
 silently substituted for native-environment gates.
+
+Final managed release validation executed all 105 shards with fresh execution:
+2061 tests and 142 subtests passed in 489.76 seconds (8m10s). The earlier
+committed baseline took 779.30 seconds (12m59s), so this local cold comparison
+was about 37% shorter while including the added regressions. This is a measured
+test-workload comparison, not a promise about model or business workflow time.
+
+The full-path check also removed repeated whole-module source splitting during
+AST resource analysis and repeated per-node analysis of the same file. Resource
+classification still follows the same selected functions and fixtures. Dirty
+engine release inputs are committed only inside the private snapshot before
+creating shard worktrees, and the parent's Git metadata remains read-only and
+visible inside their namespaces. Neither operation changes the user index or
+the developer checkout's HEAD.
