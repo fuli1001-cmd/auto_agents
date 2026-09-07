@@ -40,6 +40,8 @@ def execute_selected_worker(request, runtime, python):
 
 
 def engine_environment(config, checkout):
+    from auto_agents.repair_environment_log import EnvironmentSetupLog, sanitize
+    log = EnvironmentSetupLog(config)
     protocol = checkout / "src/auto_agents/repair_control.py"
     if not protocol.is_file() or not (checkout / "src/auto_agents/repair_client.py").is_file():
         raise RuntimeError("trusted runtime lacks the repair control protocol; publish the authorized installation before switching versions")
@@ -62,15 +64,14 @@ def engine_environment(config, checkout):
         package_cache = Path(config["root"]) / "package-cache" / "pip"
         package_cache.mkdir(parents=True, exist_ok=True)
         track(package_cache, "cache", scope="repair:" + config["root"], metadata={"repair_root": config["root"]})
-        subprocess.run([config["python"], "-m", "venv", str(root)], check=True, timeout=60, capture_output=True)
-        subprocess.run([str(python), "-m", "pip", "install", str(checkout), "pytest"],
-                       check=True, timeout=300, capture_output=True,
-                       env={**os.environ, "PIP_CACHE_DIR": str(package_cache)})
-        frozen = subprocess.run([str(python), "-m", "pip", "freeze"], check=True, text=True, capture_output=True, timeout=60).stdout
-        atomic_json(receipt, {"identity": identity, "dependencies": frozen, "fingerprint": digest(frozen)})
+        log.run([config["python"], "-m", "venv", str(root)], timeout=60)
+        log.run([str(python), "-m", "pip", "install", str(checkout), "pytest"],
+                timeout=300, env={**os.environ, "PIP_CACHE_DIR": str(package_cache)})
+        frozen = log.run([str(python), "-m", "pip", "freeze"], text=True, timeout=60).stdout
+        atomic_json(receipt, {"identity": identity, "dependencies": sanitize(frozen), "fingerprint": digest(frozen)})
         if artifact:
             ArtifactStore().promote(artifact, "environment")
-    subprocess.run([str(python), "-c", "import pytest,regex"], check=True, capture_output=True, timeout=60)
+    log.run([str(python), "-c", "import pytest,regex"], timeout=60)
     return str(python), json.loads(receipt.read_text())["fingerprint"]
 
 
@@ -371,9 +372,11 @@ def main():
         result = (publish(request) if operation == "publish" else
                   validate_subscriber(request) if operation.startswith("validate-") else repair(request))
     except PermissionError as error:
-        result = {"ok": False, "permission": True, "error": str(error)}
+        from auto_agents.repair_environment_log import failure_result
+        result = {**failure_result(error), "permission": True}
     except Exception as error:
-        result = {"ok": False, "error": f"{type(error).__name__}: {error}"[:2000]}
+        from auto_agents.repair_environment_log import failure_result
+        result = failure_result(error)
     except KeyboardInterrupt:
         result = {"ok": False, "error": "repair cancelled", "cancelled": True}
     finally:

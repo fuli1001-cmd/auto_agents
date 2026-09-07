@@ -51,6 +51,23 @@ Commands and current retention behavior are documented in
 [Storage maintenance](storage-maintenance.md), with the cross-stage design in
 [Artifact cleanup design](artifact-cleanup-design.md).
 
+Environment preparation saves each command's sanitized `stdout.txt`, `stderr.txt`
+and `command.json` under `jobs/JOB/environment-setup/ATTEMPT/STEP/`. Direct setup
+calls without a job use `environment-setup/ATTEMPT/STEP/` under the controller root.
+This covers venv creation, pip installation, dependency listing and import checks,
+including captured partial output on timeout. A failed worker result includes
+`environment_diagnostics` with these paths, and its error message links to the
+command metadata. If persistence fails, `environment_diagnostics_error` explains
+the logging failure while retaining the original setup failure.
+
+Output is redacted before writing: configured secret values and their URL-encoded
+forms, URL userinfo/query/fragment, secret assignments and authorization headers.
+Environment variables are not dumped. Each stream retains up to approximately
+2 MiB of its head/tail with explicit truncation metadata; files are private to the
+user. Dependency receipts also redact credential-bearing URLs, while retaining
+the dependency fingerprint. These logs live outside the disposable venv so that
+failed-environment cleanup does not remove the diagnostic evidence.
+
 ```
 auto-agents repair status
 auto-agents repair status --job JOB
