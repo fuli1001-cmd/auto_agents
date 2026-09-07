@@ -167,6 +167,41 @@ class _FakeOrchestrator:
 
 
 class RootCauseCoordinatorTests(unittest.TestCase):
+    def test_reviewer_timeout_preserves_investigation_without_repair_or_certificate(self):
+        for parallel in (True, False):
+            with self.subTest(parallel=parallel), tempfile.TemporaryDirectory() as tmp:
+                coordinator, fake, target = self._coordinator(Path(tmp), [])
+                fake.config.execution.acceleration = AccelerationConfig(
+                    parallel_diagnosis_enabled=parallel,
+                )
+
+                def respond(request):
+                    fake.requests.append(request)
+                    self.assertFalse(request.progress_managed_timeout)
+                    self.assertGreater(request.timeout_seconds, 0)
+                    if request.stage == "self_repair_reviewer":
+                        raise RuntimeError("smart timeout: timed out after 600s")
+                    self.assertEqual(request.stage, "self_repair_investigator")
+                    return AgentResult(
+                        ok=True, command=[], output_path=request.output_path,
+                        summary=json.dumps(_report(role="investigator", verdict="ROOT_CAUSE")),
+                    )
+
+                with patch.object(fake, "_call_with_failover", side_effect=respond), patch.object(
+                    coordinator, "_save_certificate",
+                ) as save_certificate:
+                    diagnosis = coordinator.run()
+                self.assertFalse(diagnosis.repair_approved)
+                self.assertEqual(diagnosis.investigator.owner, "auto_agents")
+                self.assertEqual(diagnosis.reviewer.verdict, "UNKNOWN")
+                self.assertIn("independent review is incomplete", diagnosis.reason)
+                self.assertEqual(len(fake.requests), 2)
+                save_certificate.assert_not_called()
+                artifacts = Path(diagnosis.evidence_path).parent
+                self.assertTrue((artifacts / "investigator.json").is_file())
+                self.assertTrue((artifacts / "reviewer-incomplete.json").is_file())
+                self.assertFalse(json.loads((artifacts / "diagnosis.json").read_text())["repair_approved"])
+
     def assert_parseable_utc(self, value: object) -> None:
         timestamp = datetime.fromisoformat(str(value))
         self.assertIsNotNone(timestamp.tzinfo)

@@ -178,6 +178,7 @@ from .git_ops import (
     begin_checkpoint_application,
     changed_entries,
     changed_files,
+    changed_line_count,
     changed_paths,
     checkpoint_application_state,
     checkpoint_repository_fingerprints,
@@ -288,6 +289,7 @@ from .prototype_variants import (
     variant_dir,
     variant_prototype_dir,
 )
+from .prototype_recovery import PrototypeGenerationCheckpoint
 from .supervision import process_start_identity
 from .requirements import (
     AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
@@ -4174,13 +4176,33 @@ class Orchestrator:
         base_variant: Optional[Mapping[str, object]] = None,
         initial: bool = False,
     ) -> Dict[str, object]:
-        variant_id = new_variant_id()
+        checkpoint = PrototypeGenerationCheckpoint(
+            self.project_root,
+            state.run_id,
+            {
+                "spec_sha256": sha256_file(spec_file),
+                "surfaces": surfaces,
+                "prompt": prompt,
+                "name": name,
+                "base_variant": dict(base_variant or {}),
+                "initial": initial,
+                "design_sha256": (
+                    sha256_file(design_md_path(self.project_root))
+                    if design_md_path(self.project_root).is_file() else ""
+                ),
+            },
+        )
+        resumed_variant_id = checkpoint.resumable_variant_id()
+        variant_id = resumed_variant_id or new_variant_id()
         root = variant_dir(self.project_root, variant_id)
         design_docs_root = variant_design_docs_dir(self.project_root, variant_id)
         prototype_root = variant_prototype_dir(self.project_root, variant_id)
-        root.mkdir(parents=True, exist_ok=False)
-        design_docs_root.mkdir(parents=True)
-        prototype_root.mkdir(parents=True)
+        root.mkdir(parents=True, exist_ok=bool(resumed_variant_id))
+        design_docs_root.mkdir(parents=True, exist_ok=bool(resumed_variant_id))
+        prototype_root.mkdir(parents=True, exist_ok=bool(resumed_variant_id))
+        if not resumed_variant_id:
+            checkpoint.payload = {}
+            checkpoint.save(variant_id=variant_id, status="running", phase="design")
         parent_id = str(base_variant.get("id", "")) if isinstance(base_variant, Mapping) else ""
         decision = self._automatic_variant_design_decision(
             prompt,
@@ -4203,7 +4225,11 @@ class Orchestrator:
                 trace,
                 spec_text=read_text(spec_file),
             ) if initial else []
-            if initial and assets:
+            if resumed_variant_id:
+                source = dict(checkpoint.payload["source"])
+                candidate_records = list(checkpoint.payload["candidates"])
+                decision = dict(checkpoint.payload["decision"])
+            elif initial and assets:
                 if design_md_path(self.project_root).is_file():
                     shutil.copy2(
                         design_md_path(self.project_root),
@@ -4332,6 +4358,11 @@ class Orchestrator:
                     "from_cache": snapshot.from_cache,
                 }
 
+            checkpoint.save(
+                status="running", phase="generation", source=source,
+                candidates=candidate_records, decision=decision,
+                design_sha256=sha256_file(variant_design_path(self.project_root, variant_id)),
+            )
             generation_prompt = self._prototype_generation_prompt(
                 spec_file=spec_file,
                 surfaces=surfaces,
@@ -4344,12 +4375,14 @@ class Orchestrator:
                 stage="prototype",
                 stage_key=f"prototype-generate-{variant_id}",
                 prompt=generation_prompt,
+                continuation=checkpoint.continuation() if resumed_variant_id else None,
                 validation_feedback=lambda result: self._prototype_manifest_validation_feedback(
                     result,
                     expected_surfaces=surfaces,
                     prototype_root=prototype_root,
                 ),
             )
+            (root / "interruption.json").unlink(missing_ok=True)
             entry = build_variant_entry(
                 self.project_root,
                 variant_id,
@@ -4378,10 +4411,15 @@ class Orchestrator:
                 max_pages=self.config.frontend_design.max_pages,
             )
             add_variant(self.project_root, registry, entry)
+            checkpoint.save(status="candidate", continuation={})
             return entry
-        except Exception:
-            if root.is_dir():
-                shutil.rmtree(root)
+        except BaseException as error:
+            # Includes host interruption. Drafts are never registry candidates
+            # until generation and manifest validation have both succeeded.
+            try:
+                checkpoint.preserve_interruption(redact_incident_text(str(error))[:2000])
+            except OSError:
+                self.logger.exception("Could not persist prototype interruption: %s", root)
             raise
 
     def generate_prototype_variant(
@@ -5820,13 +5858,17 @@ class Orchestrator:
                     attempt_id=f"operator-input-{request.request_id}",
                     sandbox_mode="read-only",
                     timeout_seconds=120,
+                    logical_call_id=uuid.uuid4().hex,
+                    usage_context={"project_root": str(self.project_root), "workflow_kind": "run",
+                                   "subject_id": load_run_state(self.project_root).run_id},
                 )
                 provider = self.config.active_provider
                 with log_timing(
                     self.logger,
                     f"agent:operator-input provider={provider}",
                 ):
-                    result = self.adapter.run(agent_request)
+                    from .provider_usage import invoke_provider
+                    result = invoke_provider(self.adapter, agent_request, provider)
                 if not result.ok:
                     self.logger.warning(
                         "[user-input] provider=%s could not interpret the answer: %s",
@@ -36963,6 +37005,7 @@ class Orchestrator:
             stage_key=f"review-{task.task_id}",
             prompt=review_prompt,
             validation_feedback=self._review_validation_feedback,
+            protocol_retry_eligible=lambda result: not self._has_explicit_review_decision(result.summary),
             run_id=run_id,
             effort=review_effort,
         )
@@ -38381,18 +38424,9 @@ class Orchestrator:
         if any(self._is_high_risk_review_path(path) for path in non_test_paths):
             return "deep"
 
-        estimated_lines = 0
-        for path in non_test_paths:
-            file_path = self.project_root / path
-            if not file_path.is_file():
-                continue
-            try:
-                with file_path.open("r", encoding="utf-8") as handle:
-                    estimated_lines += sum(1 for _ in handle)
-            except UnicodeDecodeError:
-                return "deep"
-            if estimated_lines > 240:
-                return "deep"
+        changed_lines = changed_line_count(self.project_root, non_test_paths)
+        if changed_lines is None or changed_lines > 240:
+            return "deep"
         return "balanced"
 
     @staticmethod
@@ -38471,7 +38505,8 @@ class Orchestrator:
         proof_evidence: Optional[Dict[str, object]] = None,
         max_diff_chars: int = 20000,
     ) -> str:
-        entries = changed_entries(self.project_root)
+        ignored = self._task_worktree_ignored_prefixes()
+        entries = changed_entries(self.project_root, ignored_prefixes=ignored)
         lines = [
             "Review the current task by prioritizing the diff context below before exploring unrelated files.",
         ]
@@ -38486,36 +38521,64 @@ class Orchestrator:
             if len(entries) > 40:
                 lines.append(f"- ... {len(entries) - 40} more files")
 
-        diff_stat = self._git_text("diff", "--stat", "--", ".", ":(exclude).auto-agents")
+        base = head_ref(self.project_root)
+        pathspecs = [".", *[f":(exclude,literal){path.rstrip('/')}" for path in ignored]]
+
+        def tracked_diff(*options: str) -> str:
+            result = subprocess.run(
+                ["git", "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
+                 *options, "HEAD", "--", *pathspecs],
+                cwd=self.project_root, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            if result.returncode:
+                return "[diff unavailable; inspect Git status and the full changed files before deciding]"
+            return result.stdout.strip()
+
+        diff_stat = tracked_diff("--stat") if base else ""
         if diff_stat:
             lines.extend(["Diff stat:", diff_stat])
 
-        diff_excerpt = self._git_text("diff", "--no-ext-diff", "--unified=3", "--", ".", ":(exclude).auto-agents")
+        diff_excerpt = tracked_diff("--unified=3") if base else ""
         if diff_excerpt:
             if len(diff_excerpt) > max_diff_chars:
-                diff_excerpt = diff_excerpt[:max_diff_chars].rstrip() + "\n... [diff truncated]"
+                diff_excerpt = diff_excerpt[:max_diff_chars].rstrip() + "\n... [diff truncated]; inspect git diff HEAD and full files for omitted content"
             lines.extend(["Diff excerpt:", diff_excerpt])
 
-        untracked_paths = [path for status, path in entries if status == "??"]
+        if not base:
+            lines.append("No HEAD commit: current staged and untracked files are additions; excerpts below are not complete files.")
+        untracked_paths = [path for status, path in entries if status == "??" or not base]
         if untracked_paths:
             lines.append("Untracked file excerpts:")
             remaining_chars = max_diff_chars
             for path in untracked_paths[:10]:
                 file_path = self.project_root / path
+                if file_path.is_symlink():
+                    lines.append(f"# {path}: symlink to {os.readlink(file_path)} (target content not included)")
+                    continue
                 if not file_path.is_file():
+                    lines.append(f"# {path}: [file missing or not a regular file; inspect directly]")
                     continue
                 try:
-                    snippet = file_path.read_text(encoding="utf-8")[: min(800, remaining_chars)]
-                except UnicodeDecodeError:
-                    lines.append(f"```text\n# {path}\n[binary or non-utf8 file omitted]\n```")
+                    limit = min(800, remaining_chars)
+                    with file_path.open(encoding="utf-8") as handle:
+                        content = handle.read(limit + 1)
+                    if "\0" in content:
+                        raise UnicodeError("binary content")
+                    snippet = content[:limit]
+                except (OSError, UnicodeError):
+                    lines.append(f"```text\n# {path}\n[binary, non-utf8 or unreadable file omitted; inspect directly]\n```")
                     continue
                 if not snippet.strip():
                     continue
                 lines.append(f"```text\n# {path}\n{snippet.rstrip()}\n```")
+                if len(content) > limit:
+                    lines.append(f"[excerpt truncated: read the complete file at {path}]")
                 remaining_chars -= len(snippet)
                 if remaining_chars <= 0:
                     lines.append("[untracked excerpts truncated]")
                     break
+            if len(untracked_paths) > 10:
+                lines.append(f"[{len(untracked_paths) - 10} additional file excerpts omitted; inspect the changed-file list and full files]")
         return "\n".join(lines)
 
     def _quick_verify_failure_details(
@@ -42419,6 +42482,8 @@ class Orchestrator:
         effort: Optional[str] = None,
         task_origin: str = "",
         mutable_artifacts: Iterable[str] = (),
+        continuation: Optional[Mapping[str, object]] = None,
+        protocol_retry_eligible: Optional[Callable[[AgentResult], bool]] = None,
     ) -> AgentResult:
         # Complete engine-owned migrations before the mutation snapshot. A
         # provider or health observer can then never be blamed for this write.
@@ -42431,10 +42496,13 @@ class Orchestrator:
         last_error = f"{stage_key} failed"
         cumulative_usage: Optional[AgentUsage] = None
         usage_available = False
+        stage_usage_complete = True
         restore_workspace = None
         restore_root: Optional[Path] = None
         durable_restore_root: Optional[Path] = None
         completed = False
+        protocol_continuation = None
+        protocol_feedback = ""
         restorable_clarify_conversation = (
             stage == "clarify" and stage_key.startswith("clarify-conv-")
         )
@@ -42481,6 +42549,13 @@ class Orchestrator:
                 artifact_stage = stage_key if attempt == 1 else f"{stage_key}-attempt-{attempt}"
                 output_path = self._stage_output_path(active_run_id, artifact_stage)
                 write_run_prompt(self.project_root, active_run_id, artifact_stage, attempt_prompt)
+                retry_continuation = None
+                if protocol_continuation is not None:
+                    identity = (head_ref(self.project_root), self._worktree_fingerprint_excluding_agent_instructions())
+                    if identity == protocol_continuation["workspace"]:
+                        retry_continuation = protocol_continuation
+                selected_continuation = (continuation if attempt == 1 else retry_continuation) or {}
+                protocol_continuation = None
                 request = AgentRequest(
                     stage=stage,
                     purpose=("clarify_converse" if restorable_clarify_conversation else stage),
@@ -42490,6 +42565,16 @@ class Orchestrator:
                     output_path=output_path,
                     stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
                     attempt_id=artifact_stage,
+                    progress_managed_timeout=(
+                        stage == "prototype" and stage_key.startswith("prototype-generate-")
+                    ),
+                    resume_session_id=str(selected_continuation.get("session_id", "")),
+                    resume_provider=str(selected_continuation.get("provider", "")),
+                    resume_prompt_hash=str(selected_continuation.get("prompt_hash", "")),
+                    prompt_is_continuation=bool(retry_continuation),
+                    prompt_continuation=protocol_feedback if retry_continuation else "",
+                    usage_context={"project_root": str(self.project_root), "workflow_kind": "run", "subject_id": active_run_id},
+                    prompt_metadata={"stage_attempt": attempt},
                 )
                 if request.prompt_spec is not None and state is not None:
                     policy = state.resume_context.get("authorization_policy", {})
@@ -42500,6 +42585,12 @@ class Orchestrator:
                         )))
                 with log_timing(self.logger, f"agent:{artifact_stage} attempt={attempt}"):
                     result = self._call_with_failover(request)
+                if result.cleanup_incomplete:
+                    from .models import ProviderCleanupIncompleteError
+                    raise ProviderCleanupIncompleteError("Provider cleanup incomplete; automatic execution stopped.")
+                stage_usage_complete = bool(stage_usage_complete and result.usage is not None
+                                            and result.prompt_metadata.get("usage_complete", True))
+                result = replace(result, prompt_metadata={**result.prompt_metadata, "stage_usage_complete": stage_usage_complete})
                 if result.usage is not None:
                     cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
                     usage_available = True
@@ -42627,6 +42718,19 @@ class Orchestrator:
                         # retry exhaustion.
                         last_error = issue
                         feedback = issue
+                        acceleration = self.config.execution.acceleration
+                        if (protocol_retry_eligible is not None and protocol_retry_eligible(result)
+                                and acceleration.enabled and acceleration.session_continuation_enabled
+                                and result.provider_session_id and result.prompt_metadata.get("compatibility_hash")
+                                and not result.cleanup_incomplete):
+                            protocol_continuation = {
+                                "session_id": result.provider_session_id,
+                                "provider": self._current_provider,
+                                "prompt_hash": result.prompt_metadata["compatibility_hash"],
+                                "workspace": (head_ref(self.project_root), self._worktree_fingerprint_excluding_agent_instructions()),
+                            }
+                            protocol_feedback = issue
+                            feedback += "\nPrevious output (not yet accepted):\n" + result.summary
                         continue
 
                 self._emit_agent_metrics(
@@ -42737,6 +42841,8 @@ class Orchestrator:
                 f"input={usage.input_tokens} cached_input={usage.cached_input_tokens} "
                 f"output={usage.output_tokens} total={usage.total_tokens}"
             )
+            if result.prompt_metadata.get("stage_usage_complete", result.prompt_metadata.get("usage_complete")) is False:
+                usage_text += " (known subtotal; some calls did not report usage)"
         repo_map_text = ""
         rm = self._last_repo_map_result
         if rm is not None:
@@ -43335,6 +43441,8 @@ class Orchestrator:
         termination = result.termination
         if termination is not None:
             reason = termination.reason.lower()
+            if reason == "timed_out":
+                return "timeout"
             if any(token in reason for token in ("timeout", "stall", "idle", "ceiling", "loop")):
                 return "timeout"
             if reason == "provider_error":
@@ -43516,10 +43624,11 @@ class Orchestrator:
                     cwd=root,
                     output_path=root / "provider-probe.md",
                     attempt_id=f"provider-probe-{provider}",
+                    logical_call_id=request.logical_call_id,
+                    usage_context=dict(request.usage_context),
                 )
-                result = self._build_probe_adapter_for_provider(provider).run(
-                    probe_request
-                )
+                from .provider_usage import invoke_provider
+                result = invoke_provider(self._build_probe_adapter_for_provider(provider), probe_request, provider)
                 response = (
                     result.summary
                     or result.stdout
@@ -43577,6 +43686,15 @@ class Orchestrator:
         return ShellAdapter(prov, self.config.execution.smart_timeout)
 
     def _call_with_failover(self, request: AgentRequest) -> AgentResult:
+        from .provider_usage import with_attempt_usage
+        from .models import ProviderCleanupIncompleteError
+        if getattr(self, "_provider_cleanup_blocked", False):
+            raise ProviderCleanupIncompleteError("Provider cleanup incomplete; this workflow cannot start another provider call.")
+        context = request.usage_context
+        if not context and hasattr(self, "project_root"):
+            state = load_run_state(self.project_root)
+            context = {"project_root": str(self.project_root), "workflow_kind": "run", "subject_id": state.run_id}
+        request = replace(request, logical_call_id=request.logical_call_id or uuid.uuid4().hex, usage_context=context)
         # Build provider order: [last_successful or active] + untried + previously_failed
         base_order = self._failover_provider_order()
         interrupted_provider = self._interrupted_provider_for_request(request, base_order)
@@ -43606,6 +43724,10 @@ class Orchestrator:
 
         tried: List[str] = []
         last_error = ""
+        last_result: Optional[AgentResult] = None
+        from .prompting.core import fresh_request
+        handoffs: List[str] = []
+        usage_attempts: List[Dict[str, object]] = []
         for kind in order:
             adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
             available_fn = getattr(adapter, "available", None)
@@ -43620,22 +43742,24 @@ class Orchestrator:
                 continue
 
             self._current_provider = kind
+            switching = bool(handoffs) or bool(request.resume_provider and kind != request.resume_provider)
             provider_request = (
-                request
-                if not request.resume_provider or kind == request.resume_provider
-                else replace(
-                    request,
-                    resume_session_id="",
-                    resume_provider="",
-                )
+                fresh_request(request, "provider-switch", "\n\n".join(handoffs))
+                if switching else request
             )
             result = self._run_provider_with_smart_recovery(
                 adapter,
                 provider_request,
                 kind,
             )
+            usage_attempts.extend(result.usage_attempts)
+            result = with_attempt_usage(result, usage_attempts)
+            last_result = result
             tried.append(kind)
 
+            if result.cleanup_incomplete:
+                self._provider_cleanup_blocked = True
+                raise ProviderCleanupIncompleteError("Provider process cleanup incomplete; automatic execution stopped. " + result.stderr)
             if result.ok:
                 self._last_successful_provider = kind
                 self._clear_provider_failure(kind)
@@ -43645,6 +43769,8 @@ class Orchestrator:
 
             if not self._is_failover_error(result):
                 return result
+
+            handoffs.append(self._provider_failover_handoff(provider_request, kind, result))
 
             health_state = self._record_provider_failure(kind, result)
             snippet = (result.stderr or "")[:120]
@@ -43662,9 +43788,50 @@ class Orchestrator:
                 reporter.emit("provider.recovering")
             last_error = result.stderr or result.summary or "unknown error"
 
+        if (
+            request.stage == "prototype"
+            and request.progress_managed_timeout
+            and last_result is not None
+            and last_result.termination is not None
+            and last_result.termination.reason == "timed_out"
+        ):
+            # Let the bounded stage retry loop handle the preserved draft.
+            # A local deadline is not evidence of provider unavailability.
+            return replace(
+                last_result,
+                stderr="auto_agents execution time budget exhausted during prototype generation. "
+                + (last_result.stderr or last_result.summary),
+            )
         raise RuntimeError(
             f"All providers exhausted. Tried: {tried}. Last error: {last_error}"
         )
+
+    def _provider_failover_handoff(self, request: AgentRequest, provider: str, result: AgentResult) -> str:
+        """Transfer observable progress, never a previous model's hidden state."""
+        observations: Dict[str, object] = {
+            "provider": provider,
+            "previous_output_path": str(request.output_path),
+            "progress_report_path": str(request.progress_report_path or result.supervision_report_path or ""),
+            "previous_claims_unverified": (result.summary or result.stdout)[-4000:],
+            "failure": (result.stderr or "provider unavailable")[-2000:],
+            "instruction": (
+                "Continue the owned task from the current files. Preserve completed changes. "
+                "Inspect the referenced verification evidence before treating prior claims as verified. "
+                "An interrupted external operation has unknown outcome: inspect its durable result "
+                "or use the existing recovery route; do not blindly repeat it."
+            ),
+        }
+        if result.termination is not None:
+            observations["termination"] = asdict(result.termination)
+        if hasattr(self, "project_root"):
+            try:
+                observations["head"] = head_ref(request.cwd)
+                observations["workspace_fingerprint"] = worktree_fingerprint(request.cwd)
+                observations["changed_files"] = changed_paths(request.cwd)
+                observations["evidence_root"] = str(request.cwd / ".auto-agents")
+            except (OSError, RuntimeError) as error:
+                observations["workspace_observation_error"] = type(error).__name__
+        return json.dumps(observations, ensure_ascii=False, indent=2)
 
     def _interrupted_provider_for_request(
         self,
@@ -43729,7 +43896,7 @@ class Orchestrator:
             spec = replace(spec, contexts=(*spec.contexts, ContextBlock(handoff, "Recovery progress")))
         return replace(
             request, prompt=handoff if session_id else f"{request.prompt}\n\n{handoff}",
-            prompt_spec=spec, prompt_metadata={},
+            prompt_spec=spec, prompt_metadata={"stage_attempt": request.prompt_metadata.get("stage_attempt", 1)},
             resume_session_id=session_id,
             resume_prompt_hash=str(request.prompt_metadata.get("compatibility_hash", "")),
             prompt_is_continuation=bool(session_id),
@@ -43742,8 +43909,15 @@ class Orchestrator:
         request: AgentRequest,
         provider: str,
     ) -> AgentResult:
+        from .provider_usage import invoke_provider, with_attempt_usage
+        if getattr(self, "_provider_cleanup_blocked", False):
+            from .models import ProviderCleanupIncompleteError
+            raise ProviderCleanupIncompleteError("Provider cleanup incomplete; automatic execution stopped.")
+        request = replace(request, logical_call_id=request.logical_call_id or uuid.uuid4().hex)
+        usage_attempts: List[Dict[str, object]] = []
         request = self._prepare_prompt_request(adapter, request)
         resume_count = 0
+        missing_session_rebuilt = False
         provider_request = self._provider_request_for_attempt(
             request,
             provider=provider,
@@ -43756,18 +43930,49 @@ class Orchestrator:
         while True:
             provider_request = self._prepare_prompt_request(adapter, provider_request)
             self._write_prompt_attempt(provider_request)
+            resume_workspace = None
+            if provider_request.resume_session_id and provider_request.prompt_spec is not None:
+                try:
+                    resume_workspace = self._native_resume_workspace_identity(provider_request)
+                except (OSError, RuntimeError):
+                    pass
             call_started = time.monotonic()
-            result = adapter.run(provider_request)
+            result = invoke_provider(adapter, provider_request, provider)
+            usage_attempts.extend(result.usage_attempts)
+            result = with_attempt_usage(result, usage_attempts)
             if provider_request.prompt_metadata:
                 if not result.prompt_metadata:
                     result = replace(result, prompt_metadata=dict(provider_request.prompt_metadata))
                 metadata = {**result.prompt_metadata, "ok": result.ok,
                             "duration_seconds": time.monotonic() - call_started}
-                if result.usage is not None:
-                    metadata["usage"] = asdict(result.usage)
+                metadata["usage"] = result.usage_attempts[-1]["usage"]
+                metadata["cumulative_usage"] = asdict(result.usage) if result.usage is not None else None
                 if provider_request.progress_report_path:
                     write_json(provider_request.progress_report_path.with_suffix(".prompt.json"), metadata)
 
+            if result.cleanup_incomplete:
+                self._provider_cleanup_blocked = True
+                return replace(result, ok=False)
+            missing_session = re.search(
+                r"(?im)^(?:error:\s*)?(?:no (?:saved )?(?:session|conversation|thread) found\b|"
+                r"(?:session|conversation|thread)[^\n]{0,180}(?:not found|does not exist|has expired)\b)",
+                result.stderr,
+            )
+            if (not result.ok and missing_session and resume_workspace is not None
+                    and not missing_session_rebuilt and result.termination is None):
+                try:
+                    unchanged = resume_workspace == self._native_resume_workspace_identity(provider_request)
+                except (OSError, RuntimeError):
+                    unchanged = False
+                if unchanged:
+                    from .prompting.core import fresh_request
+                    missing_session_rebuilt = True
+                    resume_count += 1
+                    provider_request = self._provider_request_for_attempt(
+                        fresh_request(provider_request, "native-session-unavailable"),
+                        provider=provider, resume_index=resume_count, allow_interrupted_resume=False,
+                    )
+                    continue
             reason = result.termination.reason if result.termination is not None else ""
             if reason == "health_quiesce":
                 triage = self._process_health_action()
@@ -43811,6 +44016,14 @@ class Orchestrator:
                 "loop_detected",
                 "safety_ceiling",
             }
+            resumable = resumable or (
+                reason == "timed_out"
+                and self.config.execution.smart_timeout.enabled
+                and request.stage == "prototype"
+                and request.progress_managed_timeout
+                and not request.timeout_seconds
+                and bool(result.provider_session_id)
+            )
             resume_limit = (
                 self.config.execution.smart_timeout.fresh_continuation_limit
                 if reason == "safety_ceiling"
@@ -43861,6 +44074,23 @@ class Orchestrator:
             if result.ok and request.record_execution_incidents:
                 self._resolve_active_provider_incident()
             return result
+
+    @staticmethod
+    def _native_resume_workspace_identity(request: AgentRequest):
+        # These exact files are transport artifacts, not product mutations.
+        # Never exclude their whole parent directory or similarly named files.
+        artifacts = [request.output_path]
+        if request.progress_report_path is not None:
+            artifacts.extend((request.progress_report_path,
+                              request.progress_report_path.with_suffix(".prompt.json"),
+                              request.progress_report_path.with_suffix(".prompt.txt")))
+        excluded = []
+        for path in artifacts:
+            try:
+                excluded.append(path.absolute().relative_to(request.cwd.absolute()).as_posix())
+            except ValueError:
+                pass
+        return head_ref(request.cwd), worktree_fingerprint(request.cwd, ignored_paths=excluded)
 
     def _record_provider_execution_incident(
         self,

@@ -474,7 +474,7 @@ Run the real Codex provider demo:
 
 ## Prompt policies
 
-Prompt policy v2 separates real stage duties from effort routing, renders a small
+Prompt policy v3 separates real stage duties from effort routing, renders a small
 model-specific supplement after provider selection, and keeps required machine
 output complete even when the human summary is short. Native model configuration
 remains authoritative. Unknown models use the generic policy.
@@ -485,6 +485,11 @@ retaining task progress; incompatible native conversations are rebuilt.
 See [prompt policies and evaluation](docs/prompting.md) for native configuration
 resolution, rule-file synchronization, attempt diagnostics and the explicit CLI
 comparison command.
+
+Compatible native sessions receive only new context; provider switches rebuild
+the complete task contract and carry observable progress. See
+[token optimization and accounting](docs/token-optimization.md) for continuation
+conditions, observation mode, and physical-call usage reports.
 
 ## Provider model
 
@@ -651,22 +656,36 @@ protocol field, for example:
 without a workspace change are used for loop detection.
 
 Each stage in the `efforts` config block can be set to any of these labels. The default
-configuration balances quality and token usage:
+configuration prioritizes design and planning quality while adjusting review effort
+to the changes. Routine use does not require users to classify project complexity:
 
 | Stage | Default | Effective | Rationale |
 |-------|---------|-----------|-----------|
 | clarify | `deep` | dynamic | Downgraded to `balanced` when spec is already a design doc |
 | prototype | `max` | conditional | Selects a design system and generates approval-quality frontend prototypes |
-| design | `deep` | dynamic | Downgraded to `balanced` when spec is already a design doc |
-| plan | `deep` | `deep` | Task decomposition affects the whole run |
+| design | `max` | `max` | Architecture affects the whole run; the default does not auto-downgrade |
+| plan | `max` | `max` | Task decomposition and verification planning affect the whole run |
+| sync-agent-instructions | `deep` | `deep` | Normalizes project rules into provider instructions |
 | provider_research | `deep` | `deep` | Resolves provider-specific requirement references before implementation |
 | implement | `deep` | `deep` | Stronger reasoning reduces review rejections |
 | review | `balanced` | auto-escalated | Automatically escalated to `deep` for risky diffs |
+| visual_judge | `balanced` | conditional | Evaluates frontend visual evidence |
 | verify | `balanced` | `balanced` | Runs local commands, no LLM reasoning needed |
 | self_repair | `deep` | `deep` | Generates auto_agents repair candidates after eligible orchestrator-owned failures |
 | self_repair_review | `max` | `max` | Performs root-cause judgment and the complete pre-validation semantic review |
+| arbiter | `balanced` | `balanced` | Resolves workflow disagreements |
+| incident_judge | `max` | conditional | Judges infrastructure incidents |
 | evidence_preflight | `balanced` | conditional | Checks high-risk proof feasibility before code changes |
 | readme | `balanced` | `balanced` | Interactive README generation from finalized repo |
+
+For `clarify` and `design`, setting `max` pins that effort. Setting either `deep`
+or `balanced` enables input-based selection: a complete design document uses
+`balanced`, and other spec types use `deep`. Thus the default `design=max` stays
+at `max` even for a complete design document.
+
+[`examples/project-config.json`](examples/project-config.json) demonstrates explicit
+overrides, not a copy of these defaults: it sets `design` and `plan` to `deep`
+and `readme` to `deep`. Omitted stages inherit their defaults.
 
 Review auto-escalation triggers (when configured as `balanced`):
 
@@ -674,8 +693,13 @@ Review auto-escalation triggers (when configured as `balanced`):
 - Code changes without corresponding test changes → `deep`
 - More than 3 non-test files changed → `deep`
 - High-risk files changed (pyproject.toml, Dockerfile, CI configs) → `deep`
-- Large diffs (>240 lines of non-test code) → `deep`
-- Only test files changed in a small diff → stays `balanced`
+- Large diffs (>240 added plus deleted non-test lines relative to `HEAD`) → `deep`
+- Binary changes or an unavailable line count → `deep`
+- Test-only changes stay `balanced` unless an earlier evidence/retry condition escalates them
+
+The line count includes staged and unstaged changes as one final diff, plus
+untracked additions. Deleted lines count; unchanged lines in large files and
+pure renames do not. New repositories count current file contents as additions.
 
 Setting review to `deep` or `max` overrides auto-escalation and uses that effort for every review.
 

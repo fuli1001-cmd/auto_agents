@@ -33,6 +33,14 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def contract_identity(payload):
+    raw = payload["contract"]
+    keys = ("owner", "category", "failure_scope", "expected_postconditions", "verification_commands", "proposed_fix_scope")
+    semantic = {key: raw[key] for key in keys if key in raw} or raw
+    encoded = json.dumps(semantic, sort_keys=True).replace(payload["project"], "<project>")
+    return json.loads(encoded)
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,7 +61,12 @@ def start_ticks(pid):
 
 
 def alive(pid, ticks):
-    return bool(ticks and start_ticks(pid) == ticks)
+    if not ticks or start_ticks(pid) != ticks:
+        return False
+    try:
+        return Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, ValueError, IndexError):
+        return False
 
 
 def git(root, *args, check=True):
@@ -162,14 +175,21 @@ class Store:
         return identity
 
     def submit(self, subscriber, payload):
-        key = digest([payload["fingerprint"], payload["contract"], payload["base"], payload["environment"]])
+        key = digest([payload.get("symptom_key") or payload["fingerprint"], contract_identity(payload), payload["base"], payload["environment"]])
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             subscription = db.execute("SELECT * FROM subscribers WHERE id=?", (subscriber,)).fetchone()
             if not subscription or subscription["state"] == "cancelled":
                 raise RuntimeError("missing or cancelled workflow registration")
-            existing = db.execute("SELECT id FROM jobs WHERE dedup=? AND state!='cancelled' ORDER BY updated DESC LIMIT 1", (key,)).fetchone()
+            existing = db.execute("SELECT id,state,result FROM jobs WHERE dedup=? AND state!='cancelled' ORDER BY updated DESC LIMIT 1", (key,)).fetchone()
             identity = existing["id"] if existing else uuid4().hex[:24]
+            if (existing and existing["state"] == "completed" and subscription["job"] == identity
+                    and subscription["state"] == "resuming"):
+                receipt = {**json.loads(existing["result"]), "ok": False,
+                           "error": "the same failure recurred in the verified runtime without a new contract", "recurrence": True}
+                db.execute("UPDATE jobs SET state='blocked',result=?,generation=generation+1 WHERE id=?", (json.dumps(receipt), identity))
+                db.execute("UPDATE subscribers SET state='blocked' WHERE id=?", (subscriber,))
+                return identity
             if not existing:
                 db.execute("INSERT INTO jobs(id,dedup,state,payload,updated) VALUES(?,?,'queued',?,?)",
                            (identity, key, json.dumps(payload), time.time()))
@@ -383,6 +403,7 @@ class Supervisor:
         self.registrations = {}
         self.workers = {}
         self.resumes = {}
+        self.relays = []
         self.halt = False
         self.stopping = {}
         for path in sorted(self.store.root.glob("jobs/*/*-lease.json"), key=lambda item: item.stat().st_mtime, reverse=True):
@@ -407,6 +428,9 @@ class Supervisor:
         left, right = os.fstat(fds[0]), expected.stat()
         if (left.st_dev, left.st_ino) != (right.st_dev, right.st_ino):
             raise RuntimeError("project lock identity mismatch")
+        # A newly opened descriptor for the same inode is not a transferred
+        # lock capability. Only the held open-file description can reacquire it.
+        fcntl.flock(fds[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
         owner = json.loads(os.pread(fds[0], 8192, 0))
         if (owner.get("run_token") != payload["token"] or not alive(payload["pid"], payload["ticks"])
                 or request.get("_peer_pid", payload["pid"]) != payload["pid"]):
@@ -428,23 +452,47 @@ class Supervisor:
             raise RuntimeError("incompatible repair control protocol")
         op = request["op"]
         if op == "ping":
-            return {"ok": True, "version": VERSION}
+            return {"ok": True, "version": VERSION, "pid": os.getpid(), "ticks": start_ticks(os.getpid())}
         if op == "register":
             return self.register(request, fds)
         if op == "submit":
             identity = request["subscriber"]
             if identity not in self.registrations:
                 raise RuntimeError("workflow must register with the current supervisor")
+            if request.get("_peer_pid") != self.registrations[identity]["payload"]["pid"]:
+                raise RuntimeError("repair request must originate from the registered workflow")
             payload = request["payload"]
             # Code/entrypoint come from the trusted installation, never a route.
             payload["engine_root"] = self.config["source_root"]
             job = self.store.submit(identity, payload)
+            prior = self.resumes.pop(identity, None)
+            if prior is not None:
+                self.relays.append((identity, prior))
             return {"ok": True, "job": job}
         if op == "status":
+            if request.get("subscriber"):
+                row = next((item for item in self.store.subscriptions() if item["id"] == request["subscriber"]), None)
+                if not row or not row["job"]:
+                    raise RuntimeError("subscriber has no repair job")
+                return {"ok": True, "job": self.store.job(row["job"]), "subscribers": [row], "registered": list(self.registrations)}
             if request.get("job"):
                 return {"ok": True, "job": self.store.job(request["job"]), "subscribers": self.store.subscriptions(request["job"]), "registered": list(self.registrations)}
             with self.store.connect() as db:
                 return {"ok": True, "jobs": [dict(row) for row in db.execute("SELECT id,state,updated FROM jobs ORDER BY updated DESC")], "publications": [dict(row) for row in db.execute("SELECT * FROM outbox")]}
+        if op == "lookup-contract":
+            with self.store.connect() as db:
+                rows = db.execute("SELECT payload FROM jobs WHERE state!='cancelled' ORDER BY updated DESC").fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                diagnosis = payload.get("diagnosis") or {}
+                final = diagnosis.get("final") or {}
+                if (payload.get("symptom_key") == request.get("symptom_key")
+                        and payload.get("base") == request.get("base")
+                        and diagnosis.get("repair_approved") and final.get("generic")
+                        and final.get("verification_commands")):
+                    return {"ok": True, "contract": {"project": payload["project"],
+                            "decision": payload["decision"], "diagnosis": diagnosis}}
+            return {"ok": True, "contract": None}
         if op == "cancel":
             return self.store.cancel(project=request.get("project"), job=request.get("job"))
         if op == "boundary":
@@ -542,6 +590,12 @@ class Supervisor:
                 self.stop_process(RecoveredProcess({"pid": pid, "ticks": ticks}))
 
     def tick(self):
+        for identity, process in list(self.relays):
+            row = next((item for item in self.store.subscriptions() if item["id"] == identity), None)
+            if row and row["state"] == "cancelled":
+                self.stop_process(process)
+            if process.poll() is not None:
+                self.relays.remove((identity, process))
         for identity, (process, generation, operation) in list(self.workers.items()):
             job = self.store.job(identity)
             if job["state"] == "cancelled":
@@ -629,7 +683,7 @@ class Supervisor:
         job = self.store.job(identity)
         subscribers = self.store.subscriptions(identity)
         registration = next((self.registrations[item["id"]] for item in subscribers if item["id"] in self.registrations and item["state"] != "cancelled"), None)
-        if operation == "repair" and registration is None:
+        if operation != "publish" and registration is None:
             self.store.transition(identity, "blocked", {"ok": False, "error": "workflow registration must be restored before repair"})
             return
         root = self.store.root / "jobs" / identity
@@ -687,7 +741,8 @@ class Supervisor:
         with (root / ("resume-" + row["id"] + ".log")).open("ab") as output:
             process = subprocess.Popen([job["result"]["python"], str(Path(self.config.get("implementation_root", self.config["source_root"])) / "src/auto_agents/repair_launch.py"), str(path)],
                 stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                env=environment, pass_fds=(fd,), start_new_session=True)
+                env=environment, pass_fds=(fd,), start_new_session=True,
+                cwd=row["payload"].get("cwd", row["project"]))
         self.resumes[row["id"]] = process
         with self.store.connect() as db:
             db.execute("UPDATE subscribers SET state='resuming',updated=? WHERE id=?", (time.time(), row["id"]))

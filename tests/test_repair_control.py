@@ -230,11 +230,20 @@ def test_environment_setup_never_falls_back_to_target_project(tmp_path):
     root = Path(config["source_root"])
     root.mkdir()
     (root / "pyproject.toml").write_text('[project]\nname="example"\n')
+    (root / "src/auto_agents").mkdir(parents=True)
+    (root / "src/auto_agents/repair_control.py").write_text("VERSION = 1\n")
+    (root / "src/auto_agents/repair_client.py").write_text("")
     with patch("auto_agents.repair_worker.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["venv"])) as execute:
         with pytest.raises(subprocess.CalledProcessError):
             engine_environment(config, root)
     assert execute.call_count == 1
     assert execute.call_args.args[0][0] == config["python"]
+
+
+def test_runtime_without_control_protocol_cannot_be_installed(tmp_path):
+    from auto_agents.repair_worker import engine_environment
+    with pytest.raises(RuntimeError, match="lacks the repair control protocol"):
+        engine_environment(configuration(tmp_path), tmp_path)
 
 
 def fake_worker_install(config, *, delay=0):
@@ -366,3 +375,178 @@ def test_publication_disabled_cannot_use_cached_receipt_to_push(tmp_path):
         with pytest.raises(PermissionError):
             publish({"config": {"publish": False}, "job": {}})
         repository.assert_not_called()
+
+
+def test_remote_reuse_runs_actual_behavior_without_a_repair_model(tmp_path):
+    import shutil
+    from auto_agents.repair_worker import repair
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    base = git(engine, "rev-parse", "HEAD")
+    repository = Repository(config)
+    repository.fetch()
+    latest = repository.worktree(base, "upstream-fix")
+    (latest / "bug.py").write_text("value = 'fixed'\n")
+    git(latest, "add", "bug.py")
+    git(latest, "commit", "-m", "fix elsewhere")
+    commit = git(latest, "rev-parse", "HEAD")
+    repository.push(commit)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "input.txt").write_text("unchanged")
+    def behavior(root):
+        return subprocess.run([sys.executable, "-c", "import bug; assert bug.value == 'fixed'"], cwd=root, capture_output=True).returncode == 0
+    class Oracle:
+        def _load_or_create_experiment(self):
+            return None, None
+        def _diagnosis_differential(self, old, candidate):
+            return SimpleNamespace(ok=not behavior(engine) and behavior(candidate), summary="actual old failure/new pass")
+        def _replay_candidate(self, candidate, *args):
+            return SimpleNamespace(ok=behavior(candidate), summary="actual boundary")
+        def run(self):
+            raise AssertionError("remote reuse must not generate a candidate")
+    payload = {**failure(project), "base": base, "invocation": {}, "autonomy": "max"}
+    with patch("auto_agents.repair_worker.engine_environment", return_value=(sys.executable, "env")), \
+         patch("auto_agents.repair_worker.make_runner", return_value=Oracle()), \
+         patch("auto_agents.root_cause.RootCauseCoordinator._copy_diagnostic_tree", side_effect=lambda src, dst: shutil.copytree(src, dst)):
+        result = repair({"config": config, "job": {"id": "reuse", "payload": payload}})
+    assert result["status"] == "already_repaired"
+    assert result["commit"] == commit
+    assert (project / "input.txt").read_text() == "unchanged"
+    assert git(engine, "rev-parse", "HEAD") == base
+
+
+def test_publication_integrates_upstream_and_reuses_proof_after_network_failure(tmp_path):
+    from auto_agents.repair_worker import publish
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    repository = Repository(config)
+    base, _ = repository.fetch()
+    candidate = repository.worktree(base, "candidate")
+    (candidate / "bug.py").write_text("value = 'fixed'\n")
+    git(candidate, "add", "bug.py")
+    git(candidate, "commit", "-m", "our repair")
+    repair_commit = git(candidate, "rev-parse", "HEAD")
+    (engine / "unrelated.txt").write_text("remote work")
+    git(engine, "add", "unrelated.txt")
+    git(engine, "commit", "-m", "parallel remote work")
+    git(engine, "push", config["remote"], "HEAD:master")
+    request = {"config": config, "job": {"id": "publish-job", "payload": {"base": base},
+        "result": {"commit": repair_commit, "base": base, "python": sys.executable}}}
+    suite_calls = []
+    oracle = SimpleNamespace(_load_or_create_experiment=lambda: (None, None),
+        _diagnosis_differential=lambda old, root: SimpleNamespace(ok="fixed" in (root / "bug.py").read_text(), summary="specific behavior"),
+        _replay_candidate=lambda *args: SimpleNamespace(ok=True, summary="boundary"),
+        _candidate_test_weakening_reason=lambda *args: "",
+        _run_verification_commands=lambda commands, root: (suite_calls.append(root) or SimpleNamespace(ok=True, summary="suite passed")))
+    with patch("auto_agents.repair_worker.make_runner", return_value=oracle), patch.object(Repository, "push", side_effect=RuntimeError("network")):
+        with pytest.raises(RuntimeError, match="network"):
+            publish(request)
+    assert len(suite_calls) == 1
+    with patch("auto_agents.repair_worker.make_runner", side_effect=AssertionError("must reuse verified integration")):
+        result = publish(request)
+    assert result["ok"]
+    remote = git(Path(config["remote"]), "rev-parse", "master")
+    assert git(repository.cache, "show", remote + ":unrelated.txt") == "remote work"
+    assert "fixed" in git(repository.cache, "show", remote + ":bug.py")
+
+
+def test_real_daemon_uses_an_immutable_committed_bootstrap(tmp_path):
+    from auto_agents.repair_control import ensure_supervisor, alive
+    import signal
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    fake_worker_install(config)
+    git(engine, "add", "src")
+    git(engine, "commit", "-m", "install worker transport fixture")
+    ensure_supervisor(config)
+    response = rpc(config, {"op": "ping"})
+    pid = response["pid"]
+    try:
+        assert pid != os.getpid()
+        assert alive(pid, response["ticks"])
+        assert rpc(config, {"op": "status"})["jobs"] == []
+        installed = json.loads((Path(config["root"]) / "operator.json").read_text())
+        assert git(installed["implementation_root"], "rev-parse", "HEAD") == git(engine, "rev-parse", "HEAD")
+    finally:
+        if alive(pid, response["ticks"]):
+            os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+
+
+def test_foreground_registration_retains_original_cwd(tmp_path, monkeypatch):
+    from auto_agents import repair_client
+    monkeypatch.chdir(tmp_path)
+    config = configuration(tmp_path)
+    lock = SimpleNamespace(project_root=tmp_path / "project", run_token="token", fileno=10)
+    orchestrator = SimpleNamespace(config=SimpleNamespace(execution=SimpleNamespace(autonomy=SimpleNamespace(mode="max"))))
+    args = SimpleNamespace(command="collab", autonomy=None)
+    with patch.object(repair_client, "enabled", return_value=True), patch.object(repair_client, "configure", return_value=config), \
+         patch.object(repair_client, "ensure_supervisor"), patch.object(repair_client, "rpc", return_value={"subscriber": "sub"}) as call:
+        repair_client.register(lock, args, orchestrator)
+    assert call.call_args.args[1]["payload"]["cwd"] == str(tmp_path)
+
+
+def test_shared_generic_contract_skips_repeated_diagnosis_calls(tmp_path):
+    from auto_agents.cli import _triage_terminal_run_error
+    from auto_agents.self_repair import SelfRepairDecision
+    from test_root_cause import _report
+    report = _report(role="investigator", verdict="ROOT_CAUSE")
+    diagnosis = {"diagnosis_id": "known", "evidence_path": "", "investigator": report,
+                 "reviewer": {**report, "role": "reviewer", "verdict": "AGREE"}, "arbiter": None, "final": report,
+                 "repair_approved": True, "reason": "known generic defect"}
+    cached = {"decision": SelfRepairDecision(True, category="retry_restore_invariant").to_dict(), "diagnosis": diagnosis}
+    with patch("auto_agents.repair_client.cached_contract", return_value=cached), \
+         patch("auto_agents.cli.adjudicate_auto_agents_error", side_effect=AssertionError("redundant model diagnosis")):
+        result = _triage_terminal_run_error(tmp_path, SimpleNamespace(), RuntimeError("known failure"))
+    assert result.source == "shared_repair_contract"
+    assert result.root_cause.repair_approved
+
+
+def test_repair_recurrence_does_not_reuse_a_false_success_forever(tmp_path):
+    store = Store(tmp_path / "state")
+    subscriber = store.register(registration(tmp_path))
+    payload = failure(tmp_path)
+    job = store.submit(subscriber, payload)
+    store.transition(job, "completed", {"ok": True, "commit": "candidate"})
+    with store.connect() as db:
+        db.execute("UPDATE subscribers SET state='resuming' WHERE id=?", (subscriber,))
+    assert store.submit(subscriber, payload) == job
+    assert store.job(job)["state"] == "blocked"
+    assert store.job(job)["result"]["recurrence"]
+
+
+def test_nested_repair_moves_recovered_process_to_waiting_relay(tmp_path):
+    config = configuration(tmp_path)
+    supervisor = Supervisor(config)
+    project = tmp_path / "project"
+    project.mkdir()
+    with ProjectRunLock(project, environ={}) as lock:
+        subscriber = supervisor.register({"payload": registration(project, lock.run_token)}, [os.dup(lock.fileno)])["subscriber"]
+        first = supervisor.store.submit(subscriber, failure(project))
+        process = RecoveredProcess({"pid": os.getpid(), "ticks": start_ticks(os.getpid())})
+        supervisor.resumes[subscriber] = process
+        response = supervisor.dispatch({"version": 1, "op": "submit", "subscriber": subscriber,
+            "_peer_pid": os.getpid(), "payload": {**failure(project), "fingerprint": "different-fault"}}, [])
+        assert response["job"] != first
+        assert subscriber not in supervisor.resumes
+        assert supervisor.relays == [(subscriber, process)]
+        status = supervisor.dispatch({"version": 1, "op": "status", "subscriber": subscriber}, [])
+        assert status["job"]["id"] == response["job"]
+        os.close(supervisor.registrations[subscriber]["fds"][0])
+
+
+def test_engine_checks_bind_conda_wrappers_to_candidate_python(tmp_path):
+    from auto_agents.execution_binding import engine_verification_command
+    source = tmp_path / "developer"
+    candidate = tmp_path / "candidate"
+    source.mkdir()
+    candidate.mkdir()
+    (candidate / "test_example.py").write_text("def test_example():\n    assert True\n")
+    command = "cd " + str(source) + " && conda run -p ./.conda python -m pytest -q " + str(source / "test_example.py")
+    compiled = engine_verification_command(command, candidate, sys.executable, source)
+    assert "conda run" not in compiled
+    assert str(source) not in compiled
+    result = subprocess.run(compiled, shell=True, cwd=candidate, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout

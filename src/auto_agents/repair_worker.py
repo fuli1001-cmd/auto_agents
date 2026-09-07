@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import ast
 import os
 from pathlib import Path
 import subprocess
 import sys
 import signal
 import shutil
+import re
 
 # Direct script execution deliberately avoids auto_agents.cli initialization.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,6 +18,14 @@ from auto_agents.repair_control import Repository, Store, atomic_json, digest, g
 
 
 def engine_environment(config, checkout):
+    protocol = checkout / "src/auto_agents/repair_control.py"
+    if not protocol.is_file() or not (checkout / "src/auto_agents/repair_client.py").is_file():
+        raise RuntimeError("trusted runtime lacks the repair control protocol; publish the authorized installation before switching versions")
+    versions = [node.value.value for node in ast.parse(protocol.read_text()).body
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                and any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets)]
+    if versions != [1]:
+        raise RuntimeError("trusted runtime uses an incompatible repair control protocol")
     metadata = (checkout / "pyproject.toml").read_bytes()
     identity = digest([metadata.hex(), config["python"]])[:24]
     root = Path(config["root"]) / "environments" / identity
@@ -47,6 +57,7 @@ def make_runner(payload, checkout, evidence, python):
         diagnosis=diagnosis, repair_case=RepairCase.from_dict(payload["repair_case"]) if payload.get("repair_case") else None)
     runner.repo_root = checkout
     runner._verification_python_cache = python
+    runner._engine_source_root = Path(payload.get("engine_root") or checkout)
     config_path = os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_CONFIG")
     job_id = os.environ.get("AUTO_AGENTS_REPAIR_JOB")
     if config_path and job_id:
@@ -82,7 +93,30 @@ def check_revision(runner, checkout, base):
     runner._experiment_store, runner._experiment = runner._load_or_create_experiment()
     differential = runner._diagnosis_differential(base, checkout)
     if not differential.ok:
-        return False, differential.summary
+        # An explicit engine-work request may already be satisfied in both
+        # installed and upstream versions. This is a no-change return, not
+        # permission to approve a generated patch without negative proof.
+        context = getattr(runner, "_invocation_context", {})
+        diagnosis = getattr(runner, "diagnosis", None)
+        if not context.get("engine_route") or diagnosis is None:
+            return False, differential.summary
+        from auto_agents.execution_binding import command_spans, executable_tokens
+        commands = list(diagnosis.final.verification_commands)
+        def pytest_command(command):
+            try:
+                args = executable_tokens(command)
+                return len(command_spans(command)) == 1 and bool(args) and (
+                    Path(args[0]).name == "pytest" or
+                    bool(re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(args[0]).name)) and args[1:3] == ["-m", "pytest"])
+            except ValueError:
+                return False
+        if not commands or not all(pytest_command(command) for command in commands):
+            return False, differential.summary
+        positive = runner._run_verification_commands(commands, checkout)
+        if not positive.ok or not positive.returncodes or any(code != 0 for code in positive.returncodes):
+            return False, differential.summary
+        if not re.search(r"\b[1-9][0-9]* passed\b", positive.summary):
+            return False, differential.summary
     replay = runner._replay_candidate(checkout, git(checkout, "rev-parse", "HEAD"), "remote-reuse")
     return replay.ok, differential.summary + "\n" + replay.summary
 

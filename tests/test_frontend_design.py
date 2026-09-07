@@ -41,7 +41,7 @@ from auto_agents.frontend_design import (
     validate_prototype_manifest,
 )
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentRequest, AgentResult, TaskSpec
+from auto_agents.models import AgentRequest, AgentResult, AgentTermination, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.prototype_variants import (
     candidate_variants,
@@ -210,6 +210,149 @@ def frontend_task(*, status: str = "in_progress") -> TaskSpec:
 
 
 class FrontendDesignTests(unittest.TestCase):
+    def test_exhausted_prototype_deadline_reaches_bounded_stage_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            orchestrator.config.retries.per_stage["prototype"] = 2
+            orchestrator.config.providers = {
+                orchestrator.config.active_provider: orchestrator.config.provider,
+            }
+            orchestrator.config.execution.smart_timeout.same_provider_resume_limit = 1
+            state = load_run_state(root)
+            state.run_id = "bounded-prototype-retry"
+            save_run_state(root, state)
+            requests = []
+
+            class TimeoutAdapter(AgentAdapter):
+                def available(self):
+                    return True
+
+                def run(self, request):
+                    requests.append(request)
+                    return AgentResult(
+                        ok=False, command=[], output_path=request.output_path,
+                        stderr="smart timeout: timed out", returncode=-1,
+                        termination=AgentTermination(reason="timed_out"),
+                        provider_session_id="prototype-session",
+                    )
+
+            orchestrator.adapter = TimeoutAdapter()
+            with patch.object(orchestrator, "_probe_active_provider", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "auto_agents execution time budget exhausted"):
+                    orchestrator._run_agent_with_retries(
+                        state, "prototype", "prototype-generate-draft", "generate draft",
+                    )
+            self.assertEqual(len(requests), 4)
+            self.assertTrue(any("attempt-2" in request.attempt_id for request in requests))
+
+    def test_interrupted_prototype_is_preserved_and_resumed_before_becoming_candidate(self):
+        for error_type in (RuntimeError, KeyboardInterrupt):
+            with self.subTest(error_type=error_type), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "demo"
+                Orchestrator.init_project(root, "demo", "mock")
+                write_text(root / "spec.md", "# New frontend\n")
+                write_text(design_md_path(root), "# User design\n")
+                write_frontend_trace(root)
+                state = load_run_state(root)
+                state.run_id = "prototype-recovery"
+                save_run_state(root, state)
+                requests = []
+
+                class InterruptedAdapter(PrototypeAdapter):
+                    interrupted = False
+
+                    def run(self, request):
+                        result = super().run(request)
+                        if request.attempt_id.startswith("prototype-generate"):
+                            requests.append(request)
+                            if not self.interrupted:
+                                self.interrupted = True
+                                write_json(request.progress_report_path, {
+                                    "status": "terminated", "reason": "timed_out",
+                                    "stage": "prototype", "cwd": str(root),
+                                    "session_id": "saved-session", "provider": "mock",
+                                    "prompt_metadata": request.prompt_metadata,
+                                })
+                                raise error_type("interrupted generation")
+                        return result
+
+                orchestrator = Orchestrator(root)
+                adapter = InterruptedAdapter(root)
+                orchestrator.adapter = adapter
+                kwargs = dict(
+                    state=state, spec_file=root / "spec.md",
+                    surfaces=selected_surface_specs(
+                        json.loads(requirements_trace_path(root).read_text()), max_pages=3,
+                    ),
+                    prompt="", name="", initial=True,
+                )
+                with self.assertRaises(error_type):
+                    orchestrator._create_prototype_variant(**kwargs)
+                checkpoints = list((root / ".auto-agents/state/prototype-generations").glob("*.json"))
+                self.assertEqual(len(checkpoints), 1)
+                checkpoint = json.loads(checkpoints[0].read_text())
+                draft = variant_dir(root, checkpoint["variant_id"])
+                self.assertTrue((draft / "frontend_prototype/home.html").is_file())
+                self.assertTrue((draft / "interruption.json").is_file())
+                self.assertEqual(checkpoint["status"], "interrupted")
+                self.assertEqual(checkpoint["continuation"]["session_id"], "saved-session")
+                self.assertEqual(candidate_variants(load_registry(root)), [])
+
+                # Reconstruct the host to exercise durable recovery, not memory.
+                resumed = Orchestrator(root)
+                resumed.adapter = adapter
+                entry = resumed._create_prototype_variant(**kwargs)
+                self.assertEqual(entry["id"], checkpoint["variant_id"])
+                self.assertEqual(requests[-1].resume_session_id, "saved-session")
+                self.assertTrue(all(request.progress_managed_timeout for request in requests))
+                self.assertFalse((draft / "interruption.json").exists())
+                self.assertEqual(len(candidate_variants(load_registry(root))), 1)
+                self.assertEqual(json.loads(checkpoints[0].read_text())["status"], "candidate")
+
+    def test_changed_spec_does_not_reuse_interrupted_prototype(self):
+        from auto_agents.prototype_recovery import PrototypeGenerationCheckpoint
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = PrototypeGenerationCheckpoint(root, "run", {"spec_sha256": "first"})
+            draft = variant_dir(root, "proto-old")
+            write_text(draft / "DESIGN.md", "design")
+            from auto_agents.frontend_design import sha256_file
+            first.save(
+                variant_id="proto-old", status="interrupted", phase="generation",
+                design_sha256=sha256_file(draft / "DESIGN.md"),
+            )
+            self.assertEqual(first.resumable_variant_id(), "proto-old")
+            changed = PrototypeGenerationCheckpoint(root, "run", {"spec_sha256": "second"})
+            self.assertEqual(changed.resumable_variant_id(), "")
+            write_text(draft / "DESIGN.md", "changed design")
+            self.assertEqual(first.resumable_variant_id(), "")
+            self.assertTrue(draft.is_dir())
+
+    def test_only_prototype_generation_uses_progress_managed_stage_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.run_id = "request-timeout-policy"
+            for stage, key, expected in (
+                ("prototype", "prototype-generate-draft", True),
+                ("prototype", "prototype-select-draft", False),
+                ("plan", "plan", False),
+            ):
+                requests = []
+
+                def respond(request):
+                    requests.append(request)
+                    return AgentResult(ok=True, command=[], output_path=request.output_path, summary="ok")
+
+                with patch.object(orchestrator, "_call_with_failover", side_effect=respond):
+                    orchestrator._run_agent_with_retries(state, stage, key, "work")
+                self.assertEqual(requests[0].progress_managed_timeout, expected)
+
     def test_prototype_cli_parses_generate_and_lists_virtual_legacy_without_migration(self) -> None:
         args = build_parser().parse_args(
             ["prototype", "generate", "--project", "/tmp/demo", "--prompt", "calmer"]

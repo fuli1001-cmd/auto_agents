@@ -63,6 +63,7 @@ from .models import (
     SESSION_STALL_THRESHOLD,
     GateResult,
     SessionState,
+    ProviderCleanupIncompleteError,
 )
 from .persistence import (
     PersistenceContractError,
@@ -123,7 +124,7 @@ _ORCHESTRATOR_CONTROL_ASSISTANCE = re.compile(
 )
 # Version 2 makes pre-fix records ineligible after rejected-output and process
 # resume boundaries became explicit continuation invalidation points.
-_PROVIDER_CONTINUATION_POLICY_VERSION = 3
+_PROVIDER_CONTINUATION_POLICY_VERSION = 4
 
 
 class Session:
@@ -617,6 +618,8 @@ class Session:
             prompt = self._build_converse_prompt(state)
             try:
                 reply = self._call_agent(state, f"converse-{rounds}", prompt)
+            except ProviderCleanupIncompleteError:
+                raise
             except RuntimeError as exc:
                 err_msg = str(exc)
                 state.execution_log.append({
@@ -2010,6 +2013,9 @@ class Session:
             self._capture_collab_restore_point(restore_root, before_snapshot)
             try:
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
+            except ProviderCleanupIncompleteError:
+                restore_guard.cleanup()
+                raise
             except RuntimeError as exc:
                 restore_guard.cleanup()
                 err_msg = str(exc)
@@ -2353,6 +2359,8 @@ class Session:
                         )
                     if durable_restore is not None:
                         shutil.rmtree(durable_restore, ignore_errors=True)
+                    raise
+                except ProviderCleanupIncompleteError:
                     raise
                 except RuntimeError as exc:
                     offending = self._restore_collab_mutations(
@@ -2714,6 +2722,8 @@ class Session:
                         f"provider-resolve-{state.current_attempt}",
                         prompt,
                     )
+                except ProviderCleanupIncompleteError:
+                    raise
                 except RuntimeError as exc:
                     self._restore_provider_artifacts(restore_root)
                     violation = self.orch._stage_mutation_scope_violation(
@@ -2831,6 +2841,8 @@ class Session:
                     self._save(state)
                     try:
                         resumed = self.orch.resume_saved_run()
+                    except ProviderCleanupIncompleteError:
+                        raise
                     except RuntimeError:
                         state.status = "failed"
                         state.resolution = "clarify_handoff_failed"
@@ -2941,6 +2953,8 @@ class Session:
                 self._print("Provider references and full preflight now pass. Resuming run...")
                 try:
                     resumed = self.orch.resume_saved_run()
+                except ProviderCleanupIncompleteError:
+                    raise
                 except RuntimeError as exc:
                     err_msg = str(exc)
                     state.execution_log.append({
@@ -3078,10 +3092,10 @@ class Session:
                 "",
                 "--- Conversation History ---",
             ]
-            for msg in state.conversation:
+            for message_index, msg in enumerate(state.conversation):
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
-                lines.append(ContextBlock(content, f"Conversation: {role}"))
+                lines.append(ContextBlock(content, f"Conversation: {role}", f"conversation:{message_index}"))
             lines.extend([
                 "",
                 "Analyze the unresolved provider references and the user's goal.",
@@ -3133,10 +3147,10 @@ class Session:
                     ]
                 )
         lines.extend(["", "--- Conversation History ---"])
-        for msg in state.conversation:
+        for message_index, msg in enumerate(state.conversation):
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            lines.append(ContextBlock(content, f"Conversation: {role}"))
+            lines.append(ContextBlock(content, f"Conversation: {role}", f"conversation:{message_index}"))
 
         if self.mode == "collab" or self._goal_environment_confirmed(state):
             lines.extend(["", *self._goal_environment_prompt_lines(state)])
@@ -3214,7 +3228,7 @@ class Session:
             f"Provider references directory: {refs_dir}",
             "",
             "Recovery goal:",
-            ContextBlock(consolidated, "User goal and corrections"),
+            *self._goal_contexts(state),
             "",
             f"Current run error: {report.get('last_error', '')}",
             "",
@@ -3233,10 +3247,10 @@ class Session:
             "",
             "--- Conversation History ---",
         ])
-        for msg in state.conversation[-20:]:
+        for message_index, msg in [(i, m) for i, m in enumerate(state.conversation) if m.get("role") != "user"][-20:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            lines.append(ContextBlock(content, f"Conversation: {role}"))
+            lines.append(ContextBlock(content, f"Conversation: {role}", f"conversation:{message_index}"))
 
         if state.execution_log:
             lines.extend(["", "--- Execution Log (recent) ---"])
@@ -3294,7 +3308,7 @@ class Session:
             f"Architecture: {architecture}",
             "",
             "Bug description (from conversation):",
-            ContextBlock(consolidated, "User goal and corrections"),
+            *self._goal_contexts(state),
             "",
         ]
         if self._goal_environment_confirmed(state):
@@ -3429,21 +3443,21 @@ class Session:
             f"Architecture: {architecture}",
             "",
             "User's goal:",
-            ContextBlock(consolidated, "User goal and corrections"),
+            *self._goal_contexts(state),
             "",
             *self._goal_environment_prompt_lines(state),
             "",
             "--- Conversation History ---",
         ]
-        for msg in [m for m in state.conversation if m.get("role") != "user"][-20:]:
+        for message_index, msg in [(i, m) for i, m in enumerate(state.conversation) if m.get("role") != "user"][-20:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            lines.append(ContextBlock(content, f"Conversation: {role}"))
+            lines.append(ContextBlock(content, f"Conversation: {role}", f"conversation:{message_index}"))
 
         if state.execution_log:
             lines.extend(["", "--- Execution Log (recent) ---"])
-            for entry in state.execution_log[-10:]:
-                lines.append(ContextBlock(f"Attempt {entry.get('attempt')}: {entry.get('action')} -> {str(entry.get('result', ''))[:200]}", "Recent execution log"))
+            for entry_index, entry in list(enumerate(state.execution_log))[-10:]:
+                lines.append(ContextBlock(f"Attempt {entry.get('attempt')}: {entry.get('action')} -> {str(entry.get('result', ''))[:200]}", "Recent execution log", f"execution:{entry_index}"))
 
         if feedback:
             lines.extend([
@@ -3598,14 +3612,13 @@ class Session:
         continuation = state.provider_continuations.get(continuation_key, {})
         resume_session_id = ""
         resume_provider = ""
-        if (
-            acceleration.enabled
-            and acceleration.session_continuation_enabled
-            and continuation.get("head") == current_head
+        compatible_checkpoint = (
+            continuation.get("head") == current_head
             and continuation.get("workspace_fingerprint") == current_workspace
             and int(continuation.get("policy_version", 0) or 0)
             == _PROVIDER_CONTINUATION_POLICY_VERSION
-        ):
+        )
+        if acceleration.enabled and acceleration.session_continuation_enabled and compatible_checkpoint:
             resume_session_id = str(
                 continuation.get("provider_session_id", "")
             ).strip()
@@ -3639,18 +3652,44 @@ class Session:
                 else None
             ),
             stream_transport=self.mode in ("collab", "fix", "provider_resolve"),
+            usage_context={"project_root": str(self.project_root), "workflow_kind": self.mode,
+                           "subject_id": state.session_id, "workflow_id": state.workflow_id},
         )
         if request.prompt_spec is not None and state.authorization_policy:
             request = replace(request, prompt_spec=replace(request.prompt_spec, blocks=(
                 *request.prompt_spec.blocks,
                 PromptBlock("Workflow policy for new decisions (this invocation already authorizes its stage-permitted task actions): " + json.dumps(state.authorization_policy, sort_keys=True), "stage.authorization"),
             )))
+        from .prompting.continuation import delta_context, input_checkpoint
+        from .prompting.core import digest, fresh_request
+        sent_input = None
+        if request.prompt_spec is not None:
+            sent_input = input_checkpoint(request.prompt_spec, state.conversation, state.execution_log)
+            if (compatible_checkpoint and acceleration.delta_context_enabled
+                    and acceleration.session_continuation_enabled
+                    and (acceleration.enabled or acceleration.observing)):
+                delta, reason = delta_context(request.prompt_spec, continuation.get("input_checkpoint"),
+                                              state.conversation, state.execution_log)
+                request = replace(request, prompt_metadata={
+                    "delta_candidate_bytes": len(delta.encode("utf-8")) if not reason else None,
+                    "delta_fallback_reason": reason,
+                })
+                if reason:
+                    request = fresh_request(request, reason)
+                elif not reason and resume_session_id:
+                    request = replace(request, prompt_is_continuation=True, prompt_continuation=delta)
         started = time.monotonic()
         publish_operation = getattr(self._health_runtime, "set_active_operation", None)
         if callable(publish_operation):
             publish_operation("provider", label)
         try:
             result: AgentResult = self.orch._call_with_failover(request)
+            if result.cleanup_incomplete:
+                raise ProviderCleanupIncompleteError("Provider cleanup incomplete; automatic execution stopped.")
+        except BaseException:
+            state.provider_continuations.pop(continuation_key, None)
+            self._save(state)
+            raise
         finally:
             if callable(publish_operation):
                 publish_operation()
@@ -3666,6 +3705,7 @@ class Session:
             duration_seconds=time.monotonic() - started,
             metadata={
                 "prompt": dict(result.prompt_metadata),
+                "logical_call_id": result.prompt_metadata.get("logical_call_id", ""),
                 "provider_session_resumed": bool(resume_session_id) and bool(result.prompt_metadata.get("resumed", True)),
                 "provider_session_id": result.provider_session_id,
                 "provider": self.orch._current_provider,
@@ -3680,6 +3720,8 @@ class Session:
         )
         self.orch._emit_agent_output(label, result)
         if not result.ok:
+            state.provider_continuations.pop(continuation_key, None)
+            self._save(state)
             parts = []
             if result.stderr:
                 parts.append(f"stderr={result.stderr}")
@@ -3690,6 +3732,8 @@ class Session:
             detail = "; ".join(parts) if parts else "no output"
             raise RuntimeError(f"Agent call failed ({label}): {detail}")
         if result.provider_session_id:
+            if sent_input is not None:
+                sent_input["response_hash"] = digest((result.summary or result.stdout).strip())
             state.provider_continuations[continuation_key] = {
                 "provider_session_id": result.provider_session_id,
                 "provider": self.orch._current_provider,
@@ -3697,8 +3741,12 @@ class Session:
                 "workspace_fingerprint": worktree_fingerprint(self.project_root),
                 "policy_version": _PROVIDER_CONTINUATION_POLICY_VERSION,
                 "prompt_compatibility_hash": result.prompt_metadata.get("compatibility_hash", ""),
+                "input_checkpoint": sent_input,
                 "updated_at": self._now(),
             }
+            self._save(state)
+        else:
+            state.provider_continuations.pop(continuation_key, None)
             self._save(state)
         return (result.summary or result.stdout).strip()
 
@@ -4918,6 +4966,16 @@ class Session:
         if state.goal and state.goal not in messages:
             messages.insert(0, state.goal)
         return "\n\n".join(f"User input {i}:\n{text}" for i, text in enumerate(messages, 1)) or state.goal
+
+    @staticmethod
+    def _goal_contexts(state: SessionState):
+        users = [(i, msg) for i, msg in enumerate(state.conversation) if msg.get("role") == "user"]
+        contexts = []
+        if state.goal and all(msg.get("content") != state.goal for _, msg in users):
+            contexts.append(ContextBlock(state.goal, "Initial user goal", "goal"))
+        contexts.extend(ContextBlock(str(msg.get("content", "")), "Conversation: user", f"conversation:{i}")
+                        for i, msg in users)
+        return contexts
 
     def _save(self, state: SessionState) -> None:
         state.updated_at = self._now()

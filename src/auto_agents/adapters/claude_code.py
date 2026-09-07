@@ -280,6 +280,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             streamed_stderr=streamed_stderr,
             provider_session_id=provider_session_id,
             termination=getattr(process_result, "termination", None),
+            cleanup_incomplete=getattr(process_result, "cleanup_incomplete", False),
             supervision_report_path=(
                 str(request.progress_report_path) if request.progress_report_path else ""
             ),
@@ -471,8 +472,8 @@ class ClaudeCodeAdapter(AgentAdapter):
                     error_messages.append(_claude_result_error_message(event))
                 elif isinstance(result_text, str) and result_text.strip():
                     final_text = result_text.strip()
-                usage_payload = event.get("usage", {})
-                if isinstance(usage_payload, dict):
+                usage_payload = event.get("usage")
+                if isinstance(usage_payload, dict) and all(usage_payload.get(key) is not None for key in ("input_tokens", "output_tokens")):
                     uncached_input_tokens = int(
                         usage_payload.get("input_tokens", 0) or 0
                     )

@@ -1960,6 +1960,17 @@ def _triage_terminal_run_error(
     traceback_text = traceback.format_exc()
     if traceback_text.strip() == "NoneType: None":
         traceback_text = ""
+    from .repair_client import cached_contract
+    prior = cached_contract(orchestrator, project_root, error)
+    if prior:
+        from .root_cause import RootCauseDiagnosis
+        try:
+            diagnosis = RootCauseDiagnosis.from_dict(prior["diagnosis"])
+            return SelfRepairTriageResult(decision=SelfRepairDecision(**prior["decision"]),
+                source="shared_repair_contract", reason="reusing a generic contract; frozen behavior and boundary must be revalidated",
+                root_cause=diagnosis)
+        except (ValueError, TypeError, KeyError):
+            pass  # An obsolete cached schema cannot replace fresh diagnosis.
     result = adjudicate_auto_agents_error(
         orchestrator,
         target_project_root=project_root,

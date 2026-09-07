@@ -3804,7 +3804,7 @@ class SessionContinuationTests(unittest.TestCase):
             self.assertEqual(requests[2].resume_session_id, "")
             self.assertEqual(
                 state.provider_continuations["collab"]["policy_version"],
-                3,
+                4,
             )
             self.assertTrue(
                 all(item.sandbox_mode == "read-only" for item in requests)

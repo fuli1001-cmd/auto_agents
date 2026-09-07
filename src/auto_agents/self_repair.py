@@ -764,6 +764,12 @@ def classify_auto_agents_error(
         return SelfRepairDecision(False, reason="target project preflight failure")
     if "review rejected the task" in lowered:
         return SelfRepairDecision(False, reason="target task review failure")
+    if "auto_agents execution time budget exhausted" in lowered:
+        return SelfRepairDecision(
+            False,
+            category="execution_time_budget",
+            reason="local execution deadline exhausted; inspect timeout policy and recovery evidence",
+        )
     if "all providers exhausted" in lowered:
         return SelfRepairDecision(False, reason="provider availability failure")
 
@@ -8016,12 +8022,14 @@ class AutoAgentsSelfRepairRunner:
         nonfatal_source_commands: list[str] = []
         duration_seconds = 0.0
         for command in commands:
-            verification_command = self_repair_verification_command(
-                command,
-                verification_root,
-                repository_aliases={self.repo_root.name},
-                python_executable=self._verification_python(),
-            )
+            if getattr(self, "_engine_source_root", None) is not None:
+                from .execution_binding import engine_verification_command
+                verification_command = engine_verification_command(command, verification_root,
+                    self._verification_python(), Path(self._engine_source_root))
+            else:
+                verification_command = self_repair_verification_command(
+                    command, verification_root, repository_aliases={self.repo_root.name},
+                    python_executable=self._verification_python())
             reporter = getattr(getattr(self, "target_orchestrator", None), "reporter", None)
             def diagnostic_progress(event, command, elapsed):
                 pass

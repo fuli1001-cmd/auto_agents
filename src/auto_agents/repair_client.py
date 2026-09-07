@@ -47,8 +47,35 @@ def enabled():
     return os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", "").lower() not in {"1", "true"} and not os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_WORKER")
 
 
+def symptom_key(error, project):
+    from .execution_recovery import redact_incident_text
+    return digest(redact_incident_text(str(error)).replace(str(Path(project).resolve()), "<project>"))
+
+
+def cached_contract(orchestrator, project, error):
+    registration = getattr(orchestrator, "_repair_registration", None)
+    if not registration or not enabled() or os.environ.get("AUTO_AGENTS_REPAIR_SUBSCRIBER"):
+        return None
+    from .self_repair import auto_agents_repo_root
+    try:
+        response = rpc(registration["config"], {"op": "lookup-contract",
+            "symptom_key": symptom_key(error, project), "base": git(auto_agents_repo_root(), "rev-parse", "HEAD")})
+        cached = response.get("contract")
+        if cached:
+            # A cached generic contract is a hypothesis, not a new diagnosis of
+            # this project. Both behavior and boundary are re-proved by worker.
+            return json.loads(json.dumps(cached).replace(cached["project"], str(Path(project).resolve())))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
 def register(lock, args, orchestrator):
-    if not enabled() or getattr(args, "autonomy", None) == "off" or orchestrator.config.execution.autonomy.mode == "off":
+    config = getattr(orchestrator, "config", None)
+    execution = getattr(config, "execution", None)
+    autonomy = getattr(execution, "autonomy", None)
+    if (not enabled() or autonomy is None or getattr(args, "autonomy", None) == "off"
+            or autonomy.mode == "off"):
         return None
     from .self_repair import auto_agents_repo_root
     try:
@@ -56,7 +83,8 @@ def register(lock, args, orchestrator):
         config = json.loads(Path(configured).read_text()) if configured else configure(auto_agents_repo_root())
         ensure_supervisor(config)
         payload = {"project": str(lock.project_root), "token": lock.run_token,
-                   "pid": os.getpid(), "ticks": start_ticks(os.getpid()), "command": args.command}
+                   "pid": os.getpid(), "ticks": start_ticks(os.getpid()), "command": args.command,
+                   "cwd": str(Path.cwd().resolve())}
         response = rpc(config, {"op": "register", "payload": payload, "environment": dict(os.environ)}, [lock.fileno])
         registration = {"config": config, "subscriber": response["subscriber"]}
         lock.repair_registration = registration
@@ -135,6 +163,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
         boundary = {"kind": "engine_route", "route_digest": digest(invocation["engine_route"])}
     source = auto_agents_repo_root()
     payload = {"project": str(Path(project).resolve()), "base": git(source, "rev-parse", "HEAD"),
+               "symptom_key": symptom_key(error, project),
                "fingerprint": decision.fingerprint, "error": redact_incident_text(str(error)),
                "contract": diagnosis.final.to_dict() if diagnosis else {},
                "decision": asdict(decision), "diagnosis": diagnosis.to_dict() if diagnosis else None,
@@ -155,7 +184,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     try:
         while True:
             try:
-                response = rpc(registration["config"], {"op": "status", "job": job})
+                response = rpc(registration["config"], {"op": "status", "subscriber": registration["subscriber"]})
             except (OSError, RuntimeError):
                 ensure_supervisor(registration["config"])
                 registration = register(lock, args, orchestrator)
@@ -168,6 +197,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                     raise RuntimeError("cannot restore repair ownership")
                 continue
             status = response["job"]["state"]
+            job = response["job"]["id"]
             subscriber = next(item for item in response["subscribers"] if item["id"] == registration["subscriber"])
             message = status + "/" + subscriber["state"]
             if message != last:

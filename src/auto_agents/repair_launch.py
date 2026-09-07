@@ -3,12 +3,19 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 
 
 def main():
     request = json.loads(Path(sys.argv[1]).read_text())
     subscriber, result = request["subscriber"], request["result"]
     runtime = Path(result["runtime"]).resolve()
+    loaded = subprocess.run(["git", "-C", str(runtime), "rev-parse", "HEAD"],
+                            check=True, capture_output=True, text=True, timeout=60).stdout.strip()
+    changed = subprocess.run(["git", "-C", str(runtime), "diff", "HEAD", "--exit-code"],
+                             capture_output=True, timeout=60)
+    if loaded != result["commit"] or changed.returncode:
+        raise RuntimeError("approved runtime changed before workflow launch")
     sys.path.insert(0, str(runtime / "src"))
     from auto_agents.run_lock import ProjectRunLock
     from auto_agents.config import load_run_state

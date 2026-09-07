@@ -178,3 +178,51 @@ def validate_verification_binding(command: str, project_root: Path) -> None:
                 path = Path(arg.split("::", 1)[0])
                 if path.is_absolute() and path.suffix in {".py", ".js", ".ts", ".tsx"} and root not in path.resolve().parents:
                     raise ExecutionBindingError(f"verification source belongs to a different repository: {path}")
+
+
+def engine_verification_command(command: str, root: Path, python: str, source_root: Path) -> str:
+    """Bind copied engine checks to the candidate and its explicit interpreter."""
+    from .self_repair import self_repair_verification_command
+    root, source_root = root.resolve(), source_root.resolve()
+    def compile_branch(raw):
+        original = shlex.split(raw)
+        if not original:
+            return raw
+        if original[0] == "cd":
+            if len(original) != 2:
+                raise ExecutionBindingError("engine verification needs an explicit cwd")
+            destination = Path(original[1])
+            if destination == source_root or original[1] == source_root.name and not (root / destination).is_dir():
+                return "cd " + shlex.quote(str(root))
+            resolved = (root / destination).resolve()
+            if resolved != root and root not in resolved.parents:
+                raise ExecutionBindingError("engine verification cannot leave its candidate workspace")
+            return raw
+        args = executable_tokens(raw)
+        if not args:
+            return raw
+        executable = Path(args[0]).name
+        if executable != "pytest" and not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+            return raw
+        if any("$" in value or "`" in value for value in original):
+            raise ExecutionBindingError("dynamic engine verification must use an explicit verification script")
+        index = next((i for i in range(len(original)) if original[i:] == args), 0)
+        assignments = [value for value in original[:index] if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", value)]
+        mapped = []
+        for arg in args[1:]:
+            if arg.startswith(str(source_root) + "/"):
+                arg = str(root) + arg[len(str(source_root)):]
+            mapped.append(arg)
+        if executable == "pytest" or mapped[:2] == ["-m", "pytest"]:
+            tests = mapped if executable == "pytest" else mapped[2:]
+            for arg in tests:
+                path = Path(arg.split("::", 1)[0])
+                if path.is_absolute() and root not in path.resolve().parents:
+                    raise ExecutionBindingError("engine pytest selector belongs to another repository")
+            result = self_repair_verification_command(shlex.join(["python", "-m", "pytest", *tests]), root, python_executable=python)
+        else:
+            result = shlex.join([python, *mapped])
+        if assignments:
+            result = "env " + shlex.join([value.replace(str(source_root), str(root)) for value in assignments]) + " " + result
+        return result
+    return rewrite_simple_commands(command, compile_branch)
