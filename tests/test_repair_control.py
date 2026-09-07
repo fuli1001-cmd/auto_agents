@@ -246,6 +246,12 @@ def test_runtime_without_control_protocol_cannot_be_installed(tmp_path):
         engine_environment(configuration(tmp_path), tmp_path)
 
 
+def test_custom_state_roots_do_not_connect_to_another_supervisor(tmp_path):
+    from auto_agents.repair_control import socket_path
+    config = configuration(tmp_path)
+    assert socket_path(config) != socket_path({**config, "root": str(tmp_path / "other-state")})
+
+
 def fake_worker_install(config, *, delay=0):
     directory = Path(config["source_root"]) / "src/auto_agents"
     directory.mkdir(parents=True)

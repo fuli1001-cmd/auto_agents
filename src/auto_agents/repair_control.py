@@ -89,7 +89,7 @@ def private_directory(path):
 
 def operator_root():
     return Path(os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_ROOT") or
-                str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "auto-agents/repair-control"))
+                str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "auto-agents/repair-control")).expanduser().resolve()
 
 
 def configure(source_root):
@@ -317,7 +317,8 @@ class Repository:
 
 def socket_path(config):
     directory = private_directory(Path("/tmp") / f"auto-agents-control-{os.getuid()}")
-    return directory / (config["identity"] + ".sock")
+    namespace = digest([config["identity"], str(Path(config["root"]).resolve())])[:24]
+    return directory / (namespace + ".sock")
 
 
 def rpc(config, request, fds=()):
