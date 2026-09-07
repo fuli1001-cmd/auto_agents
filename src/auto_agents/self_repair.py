@@ -3968,13 +3968,13 @@ class AutoAgentsSelfRepairRunner:
         return bool(root and not (Path(root) / "fallback.json").exists())
 
     @contextmanager
-    def _verification_argv(self, argv, cwd):
+    def _verification_argv(self, argv, cwd, *, read_roots=()):
         target = getattr(self, "_real_project_root", None)
         if target is None:
             yield argv
             return
         from .verification_sandbox import verification_argv
-        with verification_argv(argv, cwd, target) as command:
+        with verification_argv(argv, cwd, target, read_roots=read_roots) as command:
             yield command
 
     def _provider_continuation_context(self) -> str:
@@ -7163,12 +7163,18 @@ class AutoAgentsSelfRepairRunner:
             environment = dict(os.environ)
             if context.get("engine_route"):
                 from .repair_control import digest
-                receipt = Path(temporary) / "engine-route.json"
+                receipt = target / ".auto-agents/engine-route-probe.json"
                 write_json(receipt, {"route_digest": digest(context["engine_route"])})
-                environment["AUTO_AGENTS_REPAIR_ROUTE_PROBE"] = str(receipt)
             arguments = [self._verification_python(), str(Path(__file__).with_name("session_replay.py")),
                          str(engine), str(target), str(context["session_id"]), str(context["command"]).replace("provider-resolve", "fix")]
-            with self._verification_argv(arguments, target) as replay_command:
+            if context.get("engine_route"):
+                # The sandbox clears inherited environment and mounts private
+                # /tmp. Pass only this explicit probe, inside the copied target,
+                # after that clearing boundary; never mutate worker os.environ.
+                arguments = ["env", "AUTO_AGENTS_REPAIR_ROUTE_PROBE=" + str(receipt), *arguments]
+            # A diagnostic shared clone may refer to the frozen source's Git
+            # objects. Keep that one input read-only in the private namespace.
+            with self._verification_argv(arguments, target, read_roots=[source]) as replay_command:
                 process = subprocess.run(
                 replay_command,
                 cwd=target, capture_output=True, text=True, env=environment,

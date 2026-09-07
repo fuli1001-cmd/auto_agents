@@ -1922,6 +1922,12 @@ def _triage_terminal_run_error(
     orchestrator: Optional[Orchestrator],
     error: object,
 ) -> SelfRepairTriageResult:
+    from .repair_client import triage_engine_request
+    request = triage_engine_request(orchestrator, project_root, error)
+    if request is not None:
+        notice("repair.request_accepted" if request.decision.eligible else "repair.request_rejected",
+               request.reason)
+        return request
     state = _try_load_run_state(project_root)
     invocation = dict(getattr(orchestrator, "_invocation_context", {}) or {})
     if invocation.get("session_id"):
@@ -3643,6 +3649,10 @@ def _dispatch(args) -> int:
                 else store.active()
             )
             if selected is not None:
+                orchestrator._invocation_context = {
+                    "command": selected.root.kind, "workflow_id": selected.workflow_id,
+                    "session_id": selected.root.native_id if selected.root.kind in {"fix", "collab"} else "",
+                }
                 health_config = orchestrator.config.execution.health_watch
                 if bool(args.no_health_watch):
                     health_config.enabled = False
@@ -3682,6 +3692,13 @@ def _dispatch(args) -> int:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 2
         except (OSError, RuntimeError, FileNotFoundError, ValueError) as error:
+            from .repair_client import EngineRepairRequired
+            if isinstance(error, EngineRepairRequired) and "orchestrator" in locals():
+                triage = _triage_terminal_run_error(project_root, orchestrator, error)
+                if triage.decision.eligible:
+                    foreground.release()
+                    return _auto_repair_auto_agents_and_resume(
+                        project_root, orchestrator, error, triage.decision, args, workflow_lock)
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
         finally:

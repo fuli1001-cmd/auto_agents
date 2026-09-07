@@ -20,6 +20,9 @@ from auto_agents.repair_control import Repository, Store, atomic_json, digest, g
 def execute_selected_worker(request, runtime, python):
     """Keep control stable while loading repair logic from the selected engine."""
     runtime = Path(runtime).resolve()
+    payload = request.get("job", {}).get("payload", {})
+    if payload.get("invocation", {}).get("engine_route") and not (runtime / "src/auto_agents/repair_contract.py").is_file():
+        raise RuntimeError("selected engine lacks explicit-request acceptance proof; refusing legacy repair fallback")
     if Path(__file__).resolve().parents[2] == runtime:
         return
     request_path = request.get("_request_path")
@@ -70,7 +73,11 @@ def make_runner(payload, checkout, evidence, python):
     orchestrator._autonomy_mode = payload.get("autonomy", "max")
     if payload.get("provider"):
         orchestrator._set_active_provider(payload["provider"])
-    diagnosis = RootCauseDiagnosis.from_dict(payload["diagnosis"]) if payload.get("diagnosis") else None
+    if payload.get("invocation", {}).get("engine_route"):
+        from auto_agents.repair_contract import EngineRequestContract
+        diagnosis = EngineRequestContract.from_dict(payload.get("request_contract", {}), payload["invocation"]["engine_route"])
+    else:
+        diagnosis = RootCauseDiagnosis.from_dict(payload["diagnosis"]) if payload.get("diagnosis") else None
     runner = AutoAgentsSelfRepairRunner(orchestrator, target_project_root=evidence,
         error=RuntimeError(payload["error"]), decision=SelfRepairDecision(**payload["decision"]),
         diagnosis=diagnosis, repair_case=RepairCase.from_dict(payload["repair_case"]) if payload.get("repair_case") else None)
@@ -113,13 +120,13 @@ def check_revision(runner, checkout, base):
     """Both behavior-specific differential AND original boundary are required."""
     runner._experiment_store, runner._experiment = runner._load_or_create_experiment()
     differential = runner._diagnosis_differential(base, checkout)
-    if not differential.ok:
+    context = getattr(runner, "_invocation_context", {})
+    if context.get("engine_route"):
         # An explicit engine-work request may already be satisfied in both
         # installed and upstream versions. This is a no-change return, not
         # permission to approve a generated patch without negative proof.
-        context = getattr(runner, "_invocation_context", {})
         diagnosis = getattr(runner, "diagnosis", None)
-        if not context.get("engine_route") or diagnosis is None:
+        if diagnosis is None:
             return False, differential.summary
         from auto_agents.execution_binding import command_spans, executable_tokens
         commands = list(diagnosis.final.verification_commands)
@@ -138,6 +145,10 @@ def check_revision(runner, checkout, base):
             return False, differential.summary
         if not re.search(r"\b[1-9][0-9]* passed\b", positive.summary):
             return False, differential.summary
+        if re.search(r"\b[1-9][0-9]* (?:skipped|xfailed|xpassed|deselected)\b", positive.summary):
+            return False, "engine request acceptance checks were not all exercised\n" + positive.summary
+    elif not differential.ok:
+        return False, differential.summary
     replay = runner._replay_candidate(checkout, git(checkout, "rev-parse", "HEAD"), "remote-reuse")
     return replay.ok, differential.summary + "\n" + replay.summary
 
@@ -168,6 +179,13 @@ def repair(request):
     working = directory / "working-evidence"
     if not working.exists():
         RootCauseCoordinator._copy_diagnostic_tree(evidence, working)
+    request_contract = {}
+    if payload.get("invocation", {}).get("engine_route"):
+        from auto_agents.repair_contract import prepare_contract
+        store.event(job["id"], "request_contract_planning", {"revision": revision})
+        request_contract = prepare_contract(payload, revision, checkout, working, directory).to_dict()
+        payload = {**payload, "request_contract": request_contract}
+        store.event(job["id"], "request_contract_ready", {"revision": revision})
     import_legacy_experiment(payload, working, repository, directory)
     base = payload["base"]
     repository.import_commit(config["source_root"], base)
@@ -177,7 +195,7 @@ def repair(request):
     if fixed:
         return {"ok": True, "status": "already_repaired", "commit": revision,
                 "base": revision, "runtime": str(checkout), "python": python,
-                "environment": environment, "proof": proof, "fresh": fresh}
+                "environment": environment, "proof": proof, "fresh": fresh, "request_contract": request_contract}
     if payload.get("autonomy") != "max":
         return {"ok": False, "error": "latest revision did not prove recovery; guarded mode will not generate code", "proof": proof}
     runner = make_runner(payload, checkout, working, python)
@@ -193,7 +211,7 @@ def repair(request):
     runtime = repository.worktree(candidate, job["id"] + "-approved-" + candidate[:12])
     return {"ok": True, "status": "repaired", "commit": candidate, "base": revision,
             "runtime": str(runtime), "python": python, "environment": environment,
-            "proof": result.verification, "fresh": fresh, "result": result.to_dict()}
+            "proof": result.verification, "fresh": fresh, "result": result.to_dict(), "request_contract": request_contract}
 
 
 def carry_continuous_work(runner, revision):
@@ -251,7 +269,8 @@ def publish(request):
         if git(root, "merge-base", "--is-ancestor", revision, "HEAD", check=False).returncode:
             raise RuntimeError("publication worktree does not descend from its recorded upstream")
         working = Path(config["root"]) / "jobs" / job["id"] / "working-evidence"
-        runner = make_runner(job["payload"], root, working, approved["python"])
+        from auto_agents.repair_contract import with_request_contract
+        runner = make_runner(with_request_contract(job["payload"], approved), root, working, approved["python"])
         # A different machine may already have published an equivalent fix.
         if git(root, "rev-parse", "HEAD") == revision and not git(root, "status", "--porcelain"):
             fixed, proof = check_revision(runner, root, job["payload"]["base"])
@@ -288,6 +307,8 @@ def validate_subscriber(request):
     from auto_agents.root_cause import RootCauseCoordinator
     config, job, subscriber = request["config"], request["job"], request["subscriber"]
     payload = subscriber["payload"]["repair"]
+    from auto_agents.repair_contract import with_request_contract
+    payload = with_request_contract(payload, job["result"])
     execute_selected_worker(request, job["result"]["runtime"], job["result"]["python"])
     directory = Path(config["root"]) / "jobs" / job["id"] / ("subscriber-" + subscriber["id"])
     evidence = directory / "evidence"

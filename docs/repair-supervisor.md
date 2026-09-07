@@ -72,6 +72,29 @@ in-process path for compatibility and isolated tests.
 6. Publish only after recovery confirmation. Source developer files, index and
    unrelated local commits are not promoted or pushed by this path.
 
+Explicit engine routes use a separate admission path: `EngineRepairRequired`
+is an internal work request, not an exception that a model must first prove is
+an engine defect. The CLI checks the registered repository and invocation/saved
+workflow authorization, then submits directly, including when resuming a saved
+collab handoff or using `resume --workflow`. Ordinary exceptions retain their
+root-cause adjudication.
+
+After fetching upstream, the worker makes one read-only acceptance-planning
+request (180-second timeout) and caches its result by route and upstream SHA.
+Every requested behavior must map to named engine tests; missing coverage must
+be supplied by a candidate, not treated as success. This unverified contract is
+not a diagnosis or an approval. Already-satisfied work requires successful tests
+without skipped checks and an isolated replay that consumes the exact original
+engine route before the next execution boundary. Candidate changes still require
+the existing differential, review and full-suite proofs. The same frozen contract
+is carried into subscriber validation and publication integration. Older cached
+workers reject the request marker rather than invoking the legacy no-diagnosis
+repair path.
+
+The replay receipt lives only in the copied target and is explicitly passed
+through the verification sandbox's credential-free environment. Reaching an
+unrelated provider boundary without consuming the original route is not recovery.
+
 Failures with the same fingerprint, contract, base and environment share one
 local job, including its blocked state. Changing a child ID does not reset the
 job. Each subscribing project still needs its own boundary check. There is one

@@ -42,10 +42,12 @@ def restrict_nested_writes(roots):
     if fd < 0:
         raise OSError(ctypes.get_errno(), "could not create verification ruleset")
     try:
-        for root in roots:
+        # Git opens /dev/null read-write even for read-only repository probes.
+        # Permit writes to that sink only, not arbitrary device files.
+        for root, access in [*( (root, allowed) for root in roots), ("/dev/null", 1 << 1)]:
             path_fd = os.open(root, os.O_PATH | os.O_CLOEXEC)
             try:
-                rule = PathRule(allowed, path_fd)
+                rule = PathRule(access, path_fd)
                 if libc.syscall(445, fd, 1, ctypes.byref(rule), 0) != 0:
                     raise OSError(ctypes.get_errno(), "could not bind verification write root")
             finally:
@@ -77,7 +79,7 @@ def namespace_exec(payload):
 
 
 @contextmanager
-def verification_argv(argv, cwd: Path, real_project: Path):
+def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=()):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     if root == target or root in target.parents or target in root.parents:
         raise RuntimeError("verification workspace overlaps the live target project")
@@ -97,6 +99,12 @@ def verification_argv(argv, cwd: Path, real_project: Path):
         entries = {":root": "read", "/tmp": "write", "/run": "deny",
                    str(root): "write", str(scratch): "write", str(target): "read"}
         preserve = [str(root), str(scratch), str(target), str(Path(__file__).resolve().parents[2])]
+        for value in read_roots:
+            readonly = Path(value).resolve()
+            if readonly == root or readonly in root.parents:
+                raise RuntimeError("read-only verification input overlaps the writable workspace")
+            entries[str(readonly)] = "read"
+            preserve.append(str(readonly))
         for name in (".ssh", ".gnupg", ".codex"):
             sensitive = Path.home() / name
             if sensitive.exists():
@@ -120,8 +128,6 @@ def verification_argv(argv, cwd: Path, real_project: Path):
                              "TMPDIR=" + temporary, "LANG=C.UTF-8", "PYTHONPATH=" + str(root / "src"),
                              "AUTO_AGENTS_TEST=True", "TESTING=True", "AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1",
                              "AUTO_AGENTS_VERIFICATION_SANDBOX=1"]
-        if os.environ.get("AUTO_AGENTS_REPAIR_ROUTE_PROBE"):
-            clean_environment.append("AUTO_AGENTS_REPAIR_ROUTE_PROBE=" + os.environ["AUTO_AGENTS_REPAIR_ROUTE_PROBE"])
         if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
             yield [sys.executable, str(Path(__file__).resolve()), "--landlock", json.dumps([str(root), str(scratch)]), *clean_environment, *argv]
             return

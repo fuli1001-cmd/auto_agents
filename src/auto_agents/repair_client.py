@@ -26,6 +26,7 @@ def engine_route(orchestrator, payload):
     if probe:
         approved = json.loads(Path(probe).read_text())
         if digest(payload) == approved.get("route_digest"):
+            orchestrator._repair_route_probe_consumed = approved["route_digest"]
             return True
     if not registration or not enabled():
         return False
@@ -45,6 +46,44 @@ def engine_route(orchestrator, payload):
 
 def enabled():
     return os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", "").lower() not in {"1", "true"} and not os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_WORKER")
+
+
+def triage_engine_request(orchestrator, project, error):
+    """Admission is not a root-cause verdict or permission to accept a patch."""
+    if not isinstance(error, EngineRepairRequired):
+        return None
+    from .authorization import authorization_policy_for_state
+    from .config import load_session_state
+    from .execution_binding import repository_binding_error
+    from .self_repair import SelfRepairDecision, SelfRepairTriageResult
+    registration = getattr(orchestrator, "_repair_registration", None)
+    invocation = getattr(orchestrator, "_invocation_context", {}) or {}
+    reason = ""
+    target = error.route_payload.get("target_repository", "")
+    for key in ("issue_seed", "spec_seed"):
+        seed = error.route_payload.get(key, {})
+        if isinstance(seed, dict):
+            target = seed.get("target_repository", target)
+    if not enabled() or not registration:
+        reason = "independent repair control is unavailable"
+    elif (not target or Path(target).resolve() != Path(registration["config"]["source_root"]).resolve()
+          or repository_binding_error(Path(registration["config"]["source_root"]), error.route_payload)):
+        reason = "engine request does not target the registered engine repository"
+    # Authorization comes from the invocation/saved session, never the model's
+    # route payload. Receiving a control signal does not grant new authority.
+    policy_payload = {}
+    if invocation.get("session_id"):
+        state = load_session_state(project, invocation["session_id"])
+        policy_payload = state.authorization_policy
+    policy = authorization_policy_for_state(
+        auto_approve=bool(invocation.get("auto_approve")), payload=policy_payload)
+    if policy.decide("engine_self_repair") != "AUTO_EXECUTE":
+        reason = reason or "engine self-repair requires workflow authorization"
+    return SelfRepairTriageResult(
+        decision=SelfRepairDecision(not reason, category="explicit_engine_request",
+            reason=reason or "authorized engine work request; upstream behavior and recovery still require proof",
+            fingerprint=digest(error.route_payload)),
+        source="engine_request", reason=reason or "submit to supervisor without terminal-error adjudication")
 
 
 def symptom_key(error, project):
@@ -165,14 +204,20 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     payload = {"project": str(Path(project).resolve()), "base": git(source, "rev-parse", "HEAD"),
                "symptom_key": symptom_key(error, project),
                "fingerprint": decision.fingerprint, "error": redact_incident_text(str(error)),
-               "contract": diagnosis.final.to_dict() if diagnosis else {},
-               "decision": asdict(decision), "diagnosis": diagnosis.to_dict() if diagnosis else None,
+               "contract": (diagnosis.final.to_dict() if diagnosis else
+                            {"engine_request": invocation["engine_route"]} if invocation.get("engine_route") else {}),
+               "decision": asdict(decision), "diagnosis": (diagnosis.to_dict() if diagnosis else
+                   {"kind": "engine_request_contract_required", "repair_approved": False}
+                   if invocation.get("engine_route") else None),
                "repair_case": repair_case.to_dict() if repair_case else None,
                "invocation": invocation, "boundary": boundary,
                "environment": digest([sys.version, sys.executable, orchestrator.config.execution.autonomy.to_dict()]),
                "provider": getattr(args, "provider", None),
                "autonomy": getattr(args, "autonomy", None) or orchestrator.config.execution.autonomy.mode,
                "resume_argv": argv}
+    # The request marker deliberately is not a valid RootCauseDiagnosis. An
+    # old immutable worker that cannot fetch a newer runtime must fail closed,
+    # rather than treating diagnosis=None as permission for legacy repair.
     response = rpc(registration["config"], {"op": "submit", "subscriber": registration["subscriber"], "payload": payload})
     job = response["job"]
     last = ""
@@ -206,6 +251,9 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
             if subscriber["state"] == "finished":
                 return 0
             if status in {"blocked", "cancelled"} or subscriber["state"] in {"blocked", "cancelled"}:
+                detail = response["job"].get("result", {}).get("error", "")
+                if detail:
+                    print(f"Self-repair stopped: {detail}", file=sys.stderr)
                 return 3
             time.sleep(1)
     except BaseException:

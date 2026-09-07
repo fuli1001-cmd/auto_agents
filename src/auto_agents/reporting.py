@@ -90,6 +90,8 @@ _MESSAGES = {
     "verify.failed": ("最终验收未通过；下一步：{route}", "Final verification did not pass; next: {route}"),
     "repair.eligible": ("诊断已完成，将启动 auto_agents 自动修复", "Diagnosis completed; automatic auto_agents repair will start"),
     "repair.not_eligible": ("诊断已完成，本次不会启动自动修复；详情已保存", "Diagnosis completed; automatic repair will not start for this issue; details are saved"),
+    "repair.request_accepted": ("引擎修复请求已通过接管检查，将提交独立控制进程", "Engine request admitted; submitting to the independent supervisor"),
+    "repair.request_rejected": ("引擎修复请求未通过归属或授权检查；详情已保存", "Engine request failed ownership or authorization checks; details are saved"),
     "repair.resume_pending": ("修复已通过验证，正在准备恢复原任务", "The repair passed validation; preparing to resume the original task"),
     "diagnosis.unavailable": ("诊断服务暂不可用，详情已保存", "The diagnosis provider is unavailable; details are saved"),
     "diagnosis.review_incomplete": ("根因调查已完成，复核未完成；调查报告已保留，本次不启动自动修复", "Investigation completed; independent review is incomplete. Evidence is preserved; automatic repair will not start"),

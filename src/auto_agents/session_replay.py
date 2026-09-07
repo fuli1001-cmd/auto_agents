@@ -6,6 +6,7 @@ both the base revision and its candidate. No model call is executed by a probe.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -46,6 +47,13 @@ def main() -> None:
         payload = {"ok": True, "status": "next_provider_boundary", "session_id": session_id}
     except Exception as error:
         payload = {"ok": False, "status": "failed", "error": str(error), "error_type": type(error).__name__}
+    probe = os.environ.get("AUTO_AGENTS_REPAIR_ROUTE_PROBE")
+    if probe:
+        expected = json.loads(Path(probe).read_text()).get("route_digest")
+        consumed = getattr(locals().get("orchestrator"), "_repair_route_probe_consumed", None)
+        payload["route_consumed"] = bool(expected and consumed == expected)
+        if not payload["route_consumed"]:
+            payload.update(ok=False, error="original engine request was not consumed before the next boundary")
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
