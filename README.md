@@ -991,8 +991,8 @@ worker is available. A run transfers one immutable Git snapshot per remote worke
 parallel-safe commands with the ordered sequential producer/consumer lane while pinning that lane
 to one worker. Dispatch respects declared CPU slots and the total capacity advertised by all
 workers. Infrastructure failures before acceptance may be retried elsewhere; a job whose remote
-state becomes uncertain after acceptance is never duplicated. Stale terminal records and artifacts
-can be removed with `auto-agents workers cleanup`.
+state becomes uncertain after acceptance is never duplicated. Registered, unreferenced artifacts
+can be maintained with `auto-agents workers cleanup`; job records and unacknowledged evidence are retained.
 
 Tests can explicitly report that they could not exercise the target behavior by emitting
 `AUTO_AGENTS_INFRA_FAILURE id=<stable_id>` on a diagnostic line. Capability-aware checks may append
@@ -1741,6 +1741,13 @@ publication path. It checks the trusted remote before generating code, preserves
 continuous repair workspace, and validates each subscribing project's recovery.
 Developer checkouts remain untouched. See [repair supervisor](docs/repair-supervisor.md)
 for operator policy, commands, cancellation, concurrency and publication behavior.
+
+Generated files use a shared ownership and retention registry. Use `auto-agents storage status`
+to inspect recorded usage, `storage plan --project PATH` to preview a cleanup, and
+`storage apply --plan ID` to execute it with fresh process/reference checks. Idle maintenance runs
+outside the workflow process, with per-scope soft budgets. Active work, recovery evidence, pinned
+versions and unregistered historical files are protected. See [storage maintenance](docs/storage-maintenance.md)
+for retention defaults, quarantine restore, worker acknowledgments and configuration.
 
 For the legacy in-process compatibility path, an approved candidate is not immediately merged. The real workflow first resumes from the approved
 candidate worktree. Only after the original blocker fingerprint disappears is the candidate promoted

@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import ssl
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import threading
 import time
 from typing import Mapping, Optional
@@ -33,6 +33,7 @@ from .workers import (
     command_result_from_dict,
     load_local_worker_config,
     worker_artifacts,
+    worker_ack_artifacts,
     worker_cancel,
     worker_cleanup_plan,
     worker_execute,
@@ -45,7 +46,7 @@ from .workers import (
 
 
 def worker_probe(environment_id: str = "") -> dict[str, object]:
-    return enrich_worker_probe(_worker_probe(environment_id))
+    return {**enrich_worker_probe(_worker_probe(environment_id)), "storage_protocol": 1}
 
 
 MAX_REQUEST_BYTES = 512 * 1024 * 1024
@@ -278,7 +279,14 @@ class WorkerClient:
         )
         return payload
 
+    def acknowledge_artifacts(self, job_id: str, archive_sha256: str) -> dict[str, object]:
+        _, payload, _ = self._request("POST", f"/v1/jobs/{job_id}/artifact-ack",
+                                      body=canonical_json({"sha256": archive_sha256}))
+        return json.loads(payload.decode("utf-8"))
+
     def cleanup_plan(self, project_key: str, plan_id: str) -> dict[str, object]:
+        if self.probe().get("storage_protocol") != 1:
+            return {"ok": False, "reason": "legacy worker retained; storage protocol upgrade required"}
         body = canonical_json({"project_key": project_key, "plan_id": plan_id})
         _status, payload, _headers = self._request(
             "POST",
@@ -289,6 +297,8 @@ class WorkerClient:
         return value if isinstance(value, dict) else {}
 
     def gc(self, max_age_seconds: float) -> dict[str, object]:
+        if self.probe().get("storage_protocol") != 1:
+            return {"ok": False, "reason": "legacy worker retained; storage protocol upgrade required"}
         body = canonical_json({"max_age_seconds": max_age_seconds})
         _status, payload, _headers = self._request("POST", "/v1/gc", body=body)
         value = json.loads(payload.decode("utf-8"))
@@ -541,6 +551,9 @@ class WorkerRequestHandler(BaseHTTPRequestHandler):
                     output = io.BytesIO()
                     worker_artifacts(job_id, output)
                     self._bytes(200, output.getvalue(), "application/gzip")
+                    return
+                if self.command == "POST" and action == "artifact-ack":
+                    self._json(200, worker_ack_artifacts(job_id, str(json.loads(body.decode("utf-8")).get("sha256", ""))))
                     return
             if self.command == "POST" and parsed.path == "/v1/cleanup-plan":
                 request = json.loads(body.decode("utf-8"))

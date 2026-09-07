@@ -284,6 +284,8 @@ class GateTimingStore:
         with closing(sqlite3.connect(str(self.cache_path), timeout=1.0)) as connection:
             with connection:
                 self._initialize_connection(connection)
+                from .artifact_cache import register_database
+                register_database(self.cache_path)
                 yield connection
 
     @staticmethod

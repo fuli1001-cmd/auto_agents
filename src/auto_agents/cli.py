@@ -12,7 +12,7 @@ import signal
 import subprocess
 import shlex
 import sys
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import time
 import traceback
 import uuid
@@ -2655,6 +2655,21 @@ def build_parser() -> argparse.ArgumentParser:
     worker_serve.add_argument("--bind", default="0.0.0.0")
     worker_serve.add_argument("--port", type=int, default=WORKER_API_PORT)
 
+    storage_parser = subparsers.add_parser("storage", help="Inspect and maintain registered generated files.")
+    storage_sub = storage_parser.add_subparsers(dest="storage_action", required=True)
+    for action in ("status", "plan", "maintain"):
+        child = storage_sub.add_parser(action)
+        child.add_argument("--project")
+        child.add_argument("--scope", choices=("user", "worker", "repair"), default="user")
+        child.add_argument("--format", choices=("json",), default="json")
+    child = storage_sub.add_parser("apply")
+    child.add_argument("--plan", required=True)
+    for action in ("pin", "unpin", "restore"):
+        child = storage_sub.add_parser(action)
+        child.add_argument("artifact")
+        if action == "pin":
+            child.add_argument("--reason", required=True)
+
     foreground = {
         "run", "fix", "collab", "provider-resolve", "resume", "answer", "approve", "reject", "verify",
         "provider-research", "audit-requirements", "sync-agent-instructions",
@@ -2686,15 +2701,43 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, RuntimeError, ValueError) as error:
             print(json.dumps({"ok": False, "error": str(error)}))
             return 1
-    if hasattr(args, "log_mode"):
-        with reporting_command(args) as reporting:
-            code = _dispatch(args)
-            reporting.finish(code)
-            return code
-    return _dispatch(args)
+    from .artifact_runtime import command_context
+    managed = args.command in {"run", "fix", "collab", "resume", "verify", "prototype", "provider-research", "provider-resolve", "prompt-eval", "worker"}
+    with command_context(getattr(args, "project", None)) if managed else contextlib.nullcontext():
+        if hasattr(args, "log_mode"):
+            with reporting_command(args) as reporting:
+                code = _dispatch(args)
+                reporting.finish(code)
+                return code
+        return _dispatch(args)
 
 
 def _dispatch(args) -> int:
+    if args.command == "storage":
+        import sqlite3
+        from .artifact_store import ArtifactStore
+        from .artifact_runtime import maintain
+        try:
+            store = ArtifactStore()
+            scope = ("project:" + str(Path(args.project).expanduser().resolve())) if getattr(args, "project", None) else (
+                args.scope + ":" if getattr(args, "scope", "user") != "user" else None)
+            if args.storage_action == "status":
+                payload = store.status(scope)
+            elif args.storage_action == "plan":
+                payload = store.plan(scope)
+            elif args.storage_action == "maintain":
+                payload = maintain(scope)
+            elif args.storage_action == "apply":
+                payload = store.apply(args.plan)
+            elif args.storage_action == "restore":
+                payload = store.restore(args.artifact)
+            else:
+                store.pin(args.artifact, args.reason if args.storage_action == "pin" else "")
+                payload = {"ok": True}
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+            payload = {"ok": False, "error": str(error)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if payload.get("ok") else 1
     if args.command == "repair":
         from .repair_control import configure, ensure_supervisor, rpc
         try:

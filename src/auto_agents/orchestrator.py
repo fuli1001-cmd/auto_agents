@@ -13,7 +13,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -812,16 +812,8 @@ class Orchestrator:
         return self.project_root / ".auto-agents" / "failed-verification-logs"
 
     def _cleanup_failed_verification_logs(self) -> None:
-        log_dir = self._failed_verification_log_dir()
-        if not log_dir.is_dir():
-            return
-        cutoff = time.time() - 7 * 24 * 60 * 60
-        for path in log_dir.glob("*.log"):
-            try:
-                if path.stat().st_mtime < cutoff:
-                    path.unlink()
-            except OSError:
-                continue
+        from .artifact_runtime import schedule
+        schedule()  # Shared retention also protects logs referenced by recovery.
 
     def _persist_failed_verification_log(self, raw_output: str, *, label: str) -> str:
         if not raw_output.strip():
@@ -831,6 +823,8 @@ class Orchestrator:
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-") or "verification"
         path = log_dir / f"{safe_label}-{uuid.uuid4().hex[:8]}.log"
         write_text(path, raw_output.rstrip() + "\n")
+        from .artifact_runtime import track
+        track(path, "log", project=self.project_root)
         capture = self.reporter.capture(kind="verification_summary")
         capture.start(label, {}, source_path=str(path))
         capture("stderr", raw_output.rstrip() + "\n")
@@ -42524,6 +42518,8 @@ class Orchestrator:
             if durable_restore_root.exists():
                 shutil.rmtree(durable_restore_root)
             durable_restore_root.mkdir(parents=True, exist_ok=True)
+            from .artifact_runtime import track
+            track(durable_restore_root, "recovery", project=self.project_root)
             restore_root = durable_restore_root
             self._capture_auto_agents_restore_point(restore_root)
             self._write_attempt_recovery_manifest(

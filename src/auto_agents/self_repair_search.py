@@ -1116,6 +1116,8 @@ class SelfRepairExperimentStore:
                 if not backup.exists():
                     _atomic_json(backup, previous)
         _atomic_json(self.path, experiment.to_dict())
+        from .artifact_runtime import track
+        track(self.root, "recovery", project=self.project_root)
 
     def candidate_root(self, candidate_id: str) -> Path:
         return self.root / safe_repair_root(candidate_id)

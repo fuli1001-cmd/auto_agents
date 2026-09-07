@@ -236,11 +236,6 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                 if not registration:
                     raise RuntimeError("cannot reattach to repair control")
                 continue
-            if registration["subscriber"] not in response.get("registered", []):
-                registration = register(lock, args, orchestrator)
-                if not registration:
-                    raise RuntimeError("cannot restore repair ownership")
-                continue
             status = response["job"]["state"]
             job = response["job"]["id"]
             subscriber = next(item for item in response["subscribers"] if item["id"] == registration["subscriber"])
@@ -255,6 +250,14 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                 if detail:
                     print(f"Self-repair stopped: {detail}", file=sys.stderr)
                 return 3
+            # Terminal subscribers have already released their registration.
+            # Observe their durable result before trying to restore ownership,
+            # otherwise each supervisor tick removes the new registration again.
+            if registration["subscriber"] not in response.get("registered", []):
+                registration = register(lock, args, orchestrator)
+                if not registration:
+                    raise RuntimeError("cannot restore repair ownership")
+                continue
             time.sleep(1)
     except BaseException:
         cancel(lock)

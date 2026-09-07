@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
+from auto_agents import artifact_temp as tempfile
 from pathlib import Path
 from typing import Any
 

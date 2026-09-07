@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import tempfile
+from auto_agents import artifact_temp as tempfile
 from pathlib import Path
 
 from .repository_guard import capture_repository_guard, guard_fingerprint

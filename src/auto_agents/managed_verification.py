@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import shlex
 import sys
-import tempfile
+from auto_agents import artifact_temp as tempfile
 from types import SimpleNamespace
 
 from .repair_control import digest, git, rpc

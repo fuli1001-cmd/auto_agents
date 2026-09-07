@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import time
 from pathlib import Path
 from typing import Mapping, Optional, TextIO

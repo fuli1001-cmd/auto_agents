@@ -585,6 +585,79 @@ def test_failed_worker_releases_project_lock_without_losing_job(tmp_path):
         pass
 
 
+@pytest.mark.parametrize("job_state,subscriber_state,reattach,exit_code", [
+    ("blocked", "blocked", False, 3),
+    ("blocked", "waiting", False, 3),
+    ("cancelled", "cancelled", False, 3),
+    ("ready", "blocked", False, 3),
+    ("repairing", "cancelled", False, 3),
+    ("completed", "finished", False, 0),
+    ("completed", "finished", True, 0),
+])
+def test_foreground_observes_terminal_result_after_registration_cleanup(
+    tmp_path, monkeypatch, capsys, job_state, subscriber_state, reattach, exit_code,
+):
+    import signal
+    from auto_agents import repair_client
+    from auto_agents.self_repair import SelfRepairDecision
+
+    config = configuration(tmp_path)
+    supervisor = Supervisor(config)
+    subscriber = supervisor.store.register(registration(tmp_path))
+    supervisor.registrations[subscriber] = {"payload": registration(tmp_path), "fds": []}
+    attached = {"config": config, "subscriber": subscriber}
+    autonomy = SimpleNamespace(mode="max", to_dict=lambda: {"mode": "max"})
+    orchestrator = SimpleNamespace(
+        _repair_registration=attached,
+        config=SimpleNamespace(execution=SimpleNamespace(autonomy=autonomy)),
+        record_run_blocker=lambda **kwargs: None,
+    )
+    monkeypatch.setattr("auto_agents.cli._run_command_for_self_repair_resume", lambda args: ["run"])
+    monkeypatch.setattr("auto_agents.config.load_run_state", lambda project: SimpleNamespace(run_id="run", current_stage="implement"))
+    monkeypatch.setattr("auto_agents.process_supervision.ACTIVE_PROCESSES.terminate_all", lambda: None)
+    monkeypatch.setattr("auto_agents.process_supervision.ACTIVE_PROCESSES.snapshot", lambda: [])
+    monkeypatch.setattr(repair_client, "git", lambda *args: "base")
+    calls = []
+
+    def control_rpc(config, request):
+        calls.append(request["op"])
+        assert len(calls) <= 3, "foreground did not stop after the terminal result"
+        response = supervisor.dispatch({**request, "version": 1, "_peer_pid": os.getpid()}, [])
+        if request["op"] == "submit":
+            if reattach:
+                supervisor.store.transition(response["job"], "repairing")
+                supervisor.registrations.clear()  # Active work survives controller restart.
+            else:
+                finish(response["job"])
+        return response
+
+    def finish(job):
+        supervisor.store.transition(job, job_state, {"ok": exit_code == 0, "error": "environment unavailable"})
+        with supervisor.store.connect() as db:
+            db.execute("UPDATE subscribers SET state=? WHERE id=?", (subscriber_state, subscriber))
+        supervisor.tick()  # Exercise the actual terminal registration cleanup.
+
+    def restore(lock, args, orch):
+        assert reattach, "terminal result must not trigger re-registration"
+        job = supervisor.store.subscriptions()[0]["job"]
+        supervisor.registrations[subscriber] = {"payload": registration(tmp_path), "fds": []}
+        finish(job)
+        return attached
+
+    monkeypatch.setattr(repair_client, "rpc", control_rpc)
+    monkeypatch.setattr(repair_client, "register", restore)
+    previous_term = signal.getsignal(signal.SIGTERM)
+    result = repair_client.submit_and_wait(
+        tmp_path, orchestrator, RuntimeError("engine failed"),
+        SelfRepairDecision(True, fingerprint="failure"), SimpleNamespace(command="run"), SimpleNamespace(),
+    )
+    assert result == exit_code
+    assert calls == ["submit", "status"] + (["status"] if reattach else [])
+    assert signal.getsignal(signal.SIGTERM) == previous_term
+    if exit_code:
+        assert "Self-repair stopped: environment unavailable" in capsys.readouterr().err
+
+
 def test_registration_loss_preserves_an_approved_runtime(tmp_path):
     config = configuration(tmp_path)
     supervisor = Supervisor(config)

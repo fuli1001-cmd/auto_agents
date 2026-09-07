@@ -13,7 +13,7 @@ import shlex
 import shutil
 import socket
 import subprocess
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import threading
 import time
 import uuid
@@ -63,19 +63,6 @@ def short_job_runtime_root(job_id: str, *, create: bool = True) -> Path:
                 "short_runtime_root_unavailable: no writable temporary root "
                 "satisfies the Unix socket path budget"
             )
-        if create:
-            now = time.time()
-            for candidate in base.glob(f"{prefix}*"):
-                marker = candidate / ".auto-agents-runtime.json"
-                try:
-                    if (
-                        marker.is_file()
-                        and now - candidate.stat().st_mtime
-                        > _SHORT_RUNTIME_STALE_SECONDS
-                    ):
-                        shutil.rmtree(candidate, ignore_errors=True)
-                except OSError:
-                    continue
     if create:
         if root.is_symlink():
             raise RuntimeError("short runtime root must not be a symbolic link")
@@ -86,6 +73,8 @@ def short_job_runtime_root(job_id: str, *, create: bool = True) -> Path:
             json.dumps({"job_id": normalized}, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        from .artifact_runtime import track
+        track(root, "scratch")
     return root
 
 
@@ -1212,6 +1201,8 @@ class LocalGatePlanExecutor:
             str(sandbox),
             self.snapshot.commit_sha,
         )
+        from .artifact_runtime import track
+        track(sandbox, "worktree", project=self.project_root, metadata={"repository": str(self.project_root)})
         install_dependency_links(sandbox, self.dependency_links)
         if lane:
             with self._lock:
@@ -1296,7 +1287,17 @@ class LocalGatePlanExecutor:
                 )
                 shutil.copy2(source, temporary)
                 os.replace(temporary, destination)
+                with destination.open("rb") as durable:
+                    os.fsync(durable.fileno())
+                directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             artifacts[relative] = digest
+        if archive_root.exists():
+            from .artifact_runtime import track
+            track(archive_root, "evidence", project=self.project_root)
         return artifacts
 
     def _publish_diagnostics(self, sandbox: Path, job_id: str) -> None:
@@ -1604,9 +1605,9 @@ class LocalGatePlanExecutor:
                 resource_lease.__exit__(None, None, None)
             if named_lease is not None:
                 named_lease.__exit__(None, None, None)
-            if runtime_root is not None:
+            if runtime_root is not None and not (result and result.cleanup_incomplete):
                 shutil.rmtree(runtime_root, ignore_errors=True)
-            if cleanup and sandbox is not None:
+            if cleanup and sandbox is not None and not (result and result.cleanup_incomplete):
                 try:
                     _run_git(
                         self.project_root,

@@ -7,7 +7,7 @@ import os
 import shutil
 import stat
 import subprocess
-import tempfile
+from auto_agents import artifact_temp as tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Iterable, Mapping
 
@@ -432,6 +432,8 @@ def add_worktree(project_root: Path, worktree_path: Path, ref: str = "HEAD") -> 
     result = _git(project_root, "worktree", "add", "--detach", str(worktree_path), ref)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "git worktree add failed")
+    from .artifact_runtime import track
+    track(worktree_path, "worktree", project=project_root, metadata={"repository": str(project_root.resolve())})
 
 
 def remove_worktree(project_root: Path, worktree_path: Path, force: bool = True) -> None:

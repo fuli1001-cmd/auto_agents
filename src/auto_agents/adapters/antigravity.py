@@ -320,6 +320,8 @@ class AntigravityAdapter(AgentAdapter):
             / f"antigravity-{digest}.txt"
         )
         write_text(prompt_path, request.prompt)
+        from ..artifact_runtime import track
+        track(prompt_path, "log", project=request.cwd)
         return (
             "The complete authoritative task instructions are stored in this UTF-8 file:\n"
             f"{prompt_path}\n"

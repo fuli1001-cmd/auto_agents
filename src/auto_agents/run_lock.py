@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import signal
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import threading
 import time
 import uuid

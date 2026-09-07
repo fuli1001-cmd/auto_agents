@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -4369,6 +4369,10 @@ class Session:
         restore_root: Path,
         before_snapshot: Dict[str, str],
     ) -> None:
+        if restore_root.is_relative_to(self.project_root / ".auto-agents"):
+            restore_root.mkdir(parents=True, exist_ok=True)
+            from .artifact_runtime import track
+            track(restore_root, "recovery", project=self.project_root)
         files_root = restore_root / "files"
         for relative in before_snapshot:
             source = self.project_root / relative

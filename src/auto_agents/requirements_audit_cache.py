@@ -111,6 +111,8 @@ class RequirementsAuditCache:
             connection.close()
             raise
         self._connection = connection
+        from .artifact_cache import register_database
+        register_database(self.path)
         return connection
 
     @staticmethod

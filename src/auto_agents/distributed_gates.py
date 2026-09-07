@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import tarfile
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import threading
 import time
 import uuid
@@ -694,6 +694,8 @@ class DistributedGatePlanExecutor:
             / f"remote-artifacts-{job_id}"
         )
         temporary_root.mkdir(parents=True, exist_ok=True)
+        from .artifact_runtime import track
+        track(temporary_root, "scratch", project=self.project_root)
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
             for member in archive.getmembers():
                 path = PurePosixPath(member.name)
@@ -721,9 +723,16 @@ class DistributedGatePlanExecutor:
                     shutil.copyfileobj(source, output)
         try:
             self.local._publish_diagnostics(temporary_root, job_id)
-            return self.local._publish_artifacts(
+            published = self.local._publish_artifacts(
                 temporary_root, command, job_id
             )
+            client = self.clients[endpoint.worker_id]
+            if hasattr(client, "acknowledge_artifacts"):
+                try:
+                    client.acknowledge_artifacts(job_id, hashlib.sha256(archive_bytes).hexdigest())
+                except (OSError, RuntimeError, ValueError):
+                    pass  # Retain the remote copy until a later acknowledged transfer.
+            return published
         finally:
             shutil.rmtree(temporary_root, ignore_errors=True)
 

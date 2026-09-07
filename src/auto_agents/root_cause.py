@@ -5,7 +5,7 @@ import json
 import re
 import shutil
 import subprocess
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field

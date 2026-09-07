@@ -3,7 +3,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
-import tempfile
+from auto_agents import artifact_temp as tempfile
 from pathlib import Path
 from typing import Optional
 

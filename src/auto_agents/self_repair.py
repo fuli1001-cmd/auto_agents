@@ -9,7 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import threading
 import time
 import uuid

@@ -316,6 +316,14 @@ class Repository:
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 git(self.cache, "worktree", "add", "--detach", str(path), revision)
+        # Optional on old committed runtimes; this module remains stdlib-only.
+        try:
+            from auto_agents.artifact_runtime import track
+        except ImportError:
+            pass
+        else:
+            track(path, "worktree", scope="repair:" + str(self.root),
+                  metadata={"repair_root": str(self.root), "repository": str(self.cache)})
         return path
 
     def import_commit(self, source, revision):
@@ -443,6 +451,7 @@ def _ensure_supervisor(config):
     # The daemon keeps only engine-launch/Git authentication plumbing. Per-job
     # provider credentials arrive in memory, never in the durable job payload.
     names = {"PATH", "HOME", "LANG", "LC_ALL", "SSH_AUTH_SOCK", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "AUTO_AGENTS_REPAIR_CONTROL_ROOT"}
+    names.update({"AUTO_AGENTS_STORAGE_ROOT", "AUTO_AGENTS_STORAGE_DISABLED", "AUTO_AGENTS_STORAGE_MAINTENANCE"})
     environment = {key: value for key, value in os.environ.items() if key in names}
     with (root / "supervisor.log").open("ab") as output:
         subprocess.Popen([config["python"], str(bootstrap), "--serve", str(root / "operator.json")],
@@ -1016,7 +1025,7 @@ class Supervisor:
                     payload = json.loads(row["payload"])
                     atomic_json(root / "request.json", payload)
                     environment = {key: value for key, value in os.environ.items()
-                                   if key in {"PATH", "HOME", "LANG", "CODEX_HOME", "XDG_STATE_HOME", "AUTO_AGENTS_WORKER_ROOT", "AUTO_AGENTS_VERIFICATION_ROOT", "AUTO_AGENTS_VERIFICATION_SANDBOX"}}
+                                   if key in {"PATH", "HOME", "LANG", "CODEX_HOME", "XDG_STATE_HOME", "AUTO_AGENTS_WORKER_ROOT", "AUTO_AGENTS_VERIFICATION_ROOT", "AUTO_AGENTS_VERIFICATION_SANDBOX", "AUTO_AGENTS_STORAGE_ROOT", "AUTO_AGENTS_STORAGE_DISABLED", "AUTO_AGENTS_STORAGE_MAINTENANCE"}}
                     environment["AUTO_AGENTS_REPAIR_CONTROL_CONFIG"] = str(self.store.root / "operator.json")
                     if context["job"]:
                         environment["AUTO_AGENTS_REPAIR_JOB"] = context["job"]
@@ -1094,4 +1103,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--serve", required=True)
     arguments = parser.parse_args()
-    Supervisor(json.loads(Path(arguments.serve).read_text())).serve()
+    configured = json.loads(Path(arguments.serve).read_text())
+    implementation = Path(configured.get("implementation_root", "/__missing_controller_runtime__"))
+    if configured.get("implementation_root") and (implementation / "src/auto_agents/artifact_store.py").is_file():
+        sys.path.insert(0, str(implementation / "src"))
+        from auto_agents.artifact_runtime import activate, schedule, track
+        activate(scope="repair:" + configured["root"])
+        track(implementation, "worktree", scope="repair:" + configured["root"],
+              metadata={"repair_root": configured["root"], "repository": str(Path(configured["root"]) / "engine.git")})
+        track(Path(__file__), "cache", scope="repair:" + configured["root"], metadata={"repair_root": configured["root"]})
+        schedule()
+    Supervisor(configured).serve()

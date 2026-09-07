@@ -95,7 +95,9 @@ def attach_run_file_logger(logger: logging.Logger, path: Path) -> Path:
         if getattr(handler, "_auto_agents_file_path", None):
             logger.removeHandler(handler)
             handler.close()
-    handler = logging.FileHandler(resolved, encoding="utf-8")
+    from logging.handlers import RotatingFileHandler
+    # Human-readable progress only; durable workflow events/proofs are separate.
+    handler = RotatingFileHandler(resolved, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
     handler.setLevel(logging.INFO)
     handler.setFormatter(RunLogFormatter("%(message)s"))
     handler._auto_agents_file_path = str(resolved)  # type: ignore[attr-defined]

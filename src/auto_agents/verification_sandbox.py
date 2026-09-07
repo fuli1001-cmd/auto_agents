@@ -8,7 +8,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import sys
 import ctypes
 

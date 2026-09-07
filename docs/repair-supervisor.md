@@ -35,6 +35,22 @@ with `remote`, `ref`, `python`, and `publish`. These are operator settings, not
 project/model-controlled route fields. Embedded HTTP Git credentials are refused;
 use the configured credential helper or SSH agent.
 
+This directory is persistent state, not a temporary workspace. Dependency venvs
+under `environments/`, Git worktrees under `runtimes/`, the repository cache and
+job evidence survive process exits and restarts. New producer invocations register
+these resources with the storage lifecycle service. Unused registered environments
+can expire, while active runtimes and recovery/publication evidence remain protected;
+unregistered legacy paths are retained. Each venv is created with the configured Python
+and keyed by `pyproject.toml` contents and that interpreter's path. A successful
+`ready.json` receipt allows reuse. Repair dependencies are installed into this
+venv rather than the launching Conda environment so preparing a candidate does
+not replace the running engine or change its dependencies; the venv does not
+inherit the launching environment's site-packages.
+
+Commands and current retention behavior are documented in
+[Storage maintenance](storage-maintenance.md), with the cross-stage design in
+[Artifact cleanup design](artifact-cleanup-design.md).
+
 ```
 auto-agents repair status
 auto-agents repair status --job JOB
@@ -109,6 +125,13 @@ again after a control restart. A late result from an obsolete generation is not
 accepted. A user stop writes cancellation before signaling processes and prevents
 automatic restart. An unexplained business crash without a durable repair request
 is not treated as permission to repeat external side effects.
+
+Terminal subscribers release their controller registration. The foreground
+reads their durable result before attempting to register again: a finished
+subscriber exits with code 0, and a blocked or cancelled repair/subscriber exits
+with code 3. Only ongoing work needs registration recovery. Environment setup
+failure blocks the job; it does not automatically start another repair generation.
+After resolving the blocker, `repair resume --job JOB` can queue another attempt.
 
 ## Publication and evidence
 

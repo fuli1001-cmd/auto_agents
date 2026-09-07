@@ -814,6 +814,9 @@ def run_artifact_paths(project_root: Path, run_id: str, stage: str) -> Tuple[Pat
     output_path = run_root / "outputs" / f"{stage}.md"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    from .artifact_runtime import track
+    for directory in (prompt_path.parent, output_path.parent):
+        track(directory, "evidence", project=project_root)
     return prompt_path, output_path
 
 
@@ -855,6 +858,9 @@ def session_artifact_paths(
     output_path = root / "outputs" / f"{label}.md"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    from .artifact_runtime import track
+    for directory in (prompt_path.parent, output_path.parent):
+        track(directory, "evidence", project=project_root)
     return prompt_path, output_path
 
 
@@ -941,6 +947,8 @@ def delete_session(project_root: Path, session_id: str) -> None:
     target = _validated_session_dir(project_root, session_id)
     if not target.is_dir():
         raise FileNotFoundError(f"Session not found: {session_state_path(project_root, session_id)}")
+    from .artifact_references import assert_session_unreferenced
+    assert_session_unreferenced(project_root, {session_id})
     shutil.rmtree(target)
 
 
@@ -948,6 +956,8 @@ def clear_sessions(project_root: Path) -> int:
     root = sessions_dir(project_root)
     if not root.is_dir():
         return 0
+    from .artifact_references import assert_session_unreferenced
+    assert_session_unreferenced(project_root, {child.name for child in root.iterdir()})
     deleted = 0
     for child in sorted(root.iterdir()):
         if not child.is_dir():

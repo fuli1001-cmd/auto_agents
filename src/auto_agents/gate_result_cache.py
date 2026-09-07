@@ -395,6 +395,10 @@ class GateResultCache:
                 if hashlib.sha256(data).hexdigest() != expected:
                     return False
                 destination = directory / expected
+                from .artifact_runtime import track, enabled
+                if destination.exists() and enabled():
+                    if track(destination, "cache", metadata={"proof_database": str(self.cache_path.absolute()), "blob": expected}) is None:
+                        return False
                 try:
                     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 except FileExistsError:
@@ -405,6 +409,10 @@ class GateResultCache:
                         output.write(data)
                         output.flush()
                         os.fsync(output.fileno())
+                from .artifact_runtime import track
+                owned = track(destination, "cache", metadata={"proof_database": str(self.cache_path.absolute()), "blob": expected})
+                if enabled() and owned is None:
+                    return False
             return True
         except (OSError, ValueError):
             return False
@@ -489,6 +497,8 @@ class GateResultCache:
         with closing(sqlite3.connect(str(self.cache_path), timeout=2.0)) as connection:
             with connection:
                 self._initialize_connection(connection)
+                from .artifact_cache import register_database
+                register_database(self.cache_path)
                 yield connection
 
     @staticmethod

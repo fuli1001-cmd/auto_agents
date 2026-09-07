@@ -17,6 +17,7 @@ from ..process_supervision import (
 )
 from ..supervision import ProgressDecoder, ProgressSupervisor
 from ..reporting import find_reporter
+from ..artifact_runtime import capture_output
 
 
 class AgentAdapter(ABC):
@@ -92,6 +93,7 @@ def _tail_lines(chunks: List[str], n: int) -> str:
     return "\n".join(all_lines[-n:])
 
 
+@capture_output
 def run_subprocess_with_optional_streaming(
     command: List[str],
     request: AgentRequest,

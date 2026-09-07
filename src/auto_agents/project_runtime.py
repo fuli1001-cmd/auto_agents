@@ -7,7 +7,7 @@ import os
 import shutil
 import stat
 import tarfile
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass, field
@@ -292,6 +292,9 @@ class ProjectRuntimeManager:
             os.replace(content_root, tool_root)
             final_executable = tool_root / relative_executable
             final_sha = _sha256(final_executable)
+            from .artifact_runtime import track
+            track(tool_root, "environment", project=self.project_root,
+                  metadata={"tool_id": requirement.tool_id, "version": requirement.version})
             return {
                 "tool_id": requirement.tool_id,
                 "version": requirement.version,

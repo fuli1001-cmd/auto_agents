@@ -16,3 +16,5 @@ def isolate_verification_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTO_AGENTS_VERIFICATION_ROOT", str(tmp_path / "verification-state"))
     monkeypatch.setenv("AUTO_AGENTS_WORKER_ROOT", str(tmp_path / "worker-state"))
     monkeypatch.setenv("AUTO_AGENTS_CLUSTER_HOME", str(tmp_path / "cluster-state"))
+    monkeypatch.setenv("AUTO_AGENTS_STORAGE_ROOT", str(tmp_path / "storage-state"))
+    monkeypatch.setenv("AUTO_AGENTS_STORAGE_MAINTENANCE", "off")

@@ -19,7 +19,7 @@ import socket
 import subprocess
 import sys
 import tarfile
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import threading
 import time
 import uuid
@@ -39,6 +39,7 @@ from .gate_execution import (
 )
 from .models import CommandResult
 from .process_supervision import process_group_exists, run_supervised_shell_command
+from .artifact_runtime import worker_scope
 
 
 WORKER_PROTOCOL_VERSION = 4
@@ -1089,6 +1090,7 @@ def _worker_implementation_fingerprint() -> str:
         return ""
 
 
+@worker_scope
 def worker_stage(
     *,
     key: str,
@@ -1118,6 +1120,8 @@ def worker_stage(
     with temporary.open("wb") as handle:
         shutil.copyfileobj(stream, handle)
     os.chmod(temporary, 0o600)
+    from .artifact_runtime import track
+    track(temporary, "incomplete", scope="worker:" + str(config.managed_root), metadata={"worker_root": str(config.managed_root)})
     target_ref = _snapshot_ref(snapshot_sha)
     try:
         fetch = subprocess.run(
@@ -1189,6 +1193,9 @@ def _worker_sandbox(
     )
     if process.returncode != 0:
         raise RuntimeError(process.stderr.strip() or "remote git worktree add failed")
+    from .artifact_runtime import track
+    track(sandbox, "worktree", scope="worker:" + str(config.managed_root),
+          metadata={"worker_root": str(config.managed_root), "repository": str(mirror), "job": job_id})
     return mirror, sandbox, True
 
 
@@ -1351,6 +1358,12 @@ def _auto_environment_links(
             )
             shutil.rmtree(temporary, ignore_errors=True)
             temporary.mkdir(parents=True, exist_ok=True)
+            from .artifact_runtime import track
+            track(temporary, "incomplete", scope="worker:" + str(config.managed_root),
+                  metadata={"worker_root": str(config.managed_root), "lock_path": str(lock_path)})
+            package_cache = config.managed_root / "package-cache"
+            package_cache.mkdir(parents=True, exist_ok=True)
+            track(package_cache, "cache", scope="worker:" + str(config.managed_root), metadata={"worker_root": str(config.managed_root)})
             try:
                 python_payload = environment.get("python", {})
                 if isinstance(python_payload, dict) and python_payload.get("version"):
@@ -1388,6 +1401,7 @@ def _auto_environment_links(
                             encoding="utf-8",
                             capture_output=True,
                             timeout=1800,
+                            env={**os.environ, "PIP_CACHE_DIR": str(package_cache / "pip")},
                         )
                         if install.returncode != 0:
                             raise RuntimeError(
@@ -1455,6 +1469,9 @@ def _auto_environment_links(
                 raise
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     links: dict[str, Path] = {}
+    from .artifact_runtime import track
+    track(environment_root, "environment", scope="worker:" + str(config.managed_root),
+          metadata={"worker_root": str(config.managed_root), "lock_path": str(lock_path)})
     python_environment = environment_root / ".conda"
     if python_environment.is_dir():
         links[".conda"] = python_environment
@@ -1554,6 +1571,9 @@ def _create_artifact_archive(
             handle.add(path, arcname=relative, recursive=False)
             hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     os.chmod(archive, 0o600)
+    from .artifact_runtime import track
+    track(archive, "evidence", scope="worker:" + str(config.managed_root),
+          metadata={"worker_root": str(config.managed_root), "job": job_id, "disposable": True})
     return archive, hashes
 
 
@@ -1586,6 +1606,9 @@ def worker_execute(
             backend="lan-worker",
             infrastructure_error=True,
         )
+    from .artifact_runtime import activate, deactivate, schedule, release_owned, track
+    storage_context = activate(scope="worker:" + str(config.managed_root))
+    schedule()
     environment_id = str(manifest.get("environment_id", "")).strip()
     forwarded = {
         str(key): str(value)
@@ -1874,7 +1897,8 @@ def worker_execute(
             pass
         return result
     finally:
-        if sandbox is not None and mirror is not None and not keep_sandbox:
+        cleanup_incomplete = bool(locals().get("result") and result.cleanup_incomplete)
+        if sandbox is not None and mirror is not None and not keep_sandbox and not cleanup_incomplete:
             subprocess.run(
                 [
                     "git",
@@ -1889,9 +1913,12 @@ def worker_execute(
                 capture_output=True,
             )
         runtime_path = locals().get("runtime_root")
-        if isinstance(runtime_path, Path):
+        if isinstance(runtime_path, Path) and not cleanup_incomplete:
             shutil.rmtree(runtime_path, ignore_errors=True)
-        shutil.rmtree(config.managed_root / "runtime" / job_id, ignore_errors=True)
+        if not cleanup_incomplete:
+            shutil.rmtree(config.managed_root / "runtime" / job_id, ignore_errors=True)
+        release_owned()
+        deactivate(storage_context)
 
 
 def worker_query(job_id: str) -> dict[str, object]:
@@ -1959,46 +1986,57 @@ def worker_cleanup_plan(key: str, plan_id: str) -> dict[str, object]:
     config = load_local_worker_config()
     key = _safe_id(key, "project key")
     plan_id = _safe_id(plan_id, "plan id")
-    mirror = _mirror_path(config, key)
+    from .artifact_store import ArtifactStore
+    store = ArtifactStore()
     plan_root = config.managed_root / "sandboxes" / key / plan_id
-    if plan_root.exists() and mirror.exists():
+    results = []
+    registered = {r["path"]: r for r in store.rows("worker:" + str(config.managed_root))}
+    if plan_root.exists():
         for sandbox in sorted(plan_root.iterdir()):
-            subprocess.run(
-                [
-                    "git",
-                    f"--git-dir={mirror}",
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(sandbox),
-                ],
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-            )
-        shutil.rmtree(plan_root, ignore_errors=True)
-    return {"ok": True, "plan_id": plan_id}
+            row = registered.get(str(sandbox))
+            if row is None:
+                results.append({"path": str(sandbox), "result": "retained_unknown"})
+                continue
+            try:
+                results.append(store.dispose_worktree(row["id"]))
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                results.append({"path": str(sandbox), "result": "retained", "reason": str(error)})
+        try:
+            plan_root.rmdir()
+        except OSError:
+            pass
+    return {"ok": all(item.get("ok", False) for item in results), "plan_id": plan_id, "results": results}
 
 
 def worker_gc(max_age_seconds: float = 86400.0) -> dict[str, object]:
     config = load_local_worker_config()
-    now = time.time()
-    removed_jobs = 0
-    jobs_root = config.managed_root / "jobs"
-    if jobs_root.exists():
-        for path in jobs_root.glob("*.json"):
-            record = _read_json(path)
-            updated = float(record.get("updated_at", 0.0) or 0.0)
-            pgid = int(record.get("pgid", 0) or 0)
-            if now - updated < max_age_seconds or (
-                pgid > 0 and process_group_exists(pgid)
-            ):
-                continue
-            artifact = Path(str(record.get("artifact_archive", "")))
-            artifact.unlink(missing_ok=True)
-            path.unlink(missing_ok=True)
-            removed_jobs += 1
-    return {"ok": True, "removed_jobs": removed_jobs}
+    from .artifact_store import ArtifactStore
+    store = ArtifactStore()
+    plan = store.plan("worker:" + str(config.managed_root))
+    result = store.apply(plan["id"])
+    return {**result, "removed_jobs": 0,
+            "note": "job records are recovery metadata; only registered, acknowledged artifacts are eligible"}
+
+
+def worker_ack_artifacts(job_id: str, archive_sha256: str) -> dict[str, object]:
+    config = load_local_worker_config()
+    path = config.managed_root / "jobs" / f"{_safe_id(job_id, 'job id')}.json"
+    record = _read_json(path)
+    if record.get("state") != "terminal" or not record.get("artifact_archive"):
+        raise ValueError("job has no terminal artifact archive")
+    archive = config.managed_root / "artifacts" / f"{job_id}.tar.gz"
+    if str(archive) != record["artifact_archive"] or archive.is_symlink():
+        raise ValueError("artifact archive ownership mismatch")
+    digest = hashlib.sha256()
+    with os.fdopen(os.open(archive, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if not archive_sha256 or actual != archive_sha256:
+        raise ValueError("artifact acknowledgment hash mismatch")
+    record["artifact_ack"] = {"sha256": actual, "received_at": time.time(), "job_id": job_id}
+    _write_json_atomic(path, record)
+    return {"ok": True, "job_id": job_id}
 
 
 def command_result_from_dict(payload: Mapping[str, object]) -> CommandResult:

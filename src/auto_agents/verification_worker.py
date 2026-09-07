@@ -5,9 +5,9 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from auto_agents import artifact_temp as tempfile
 from auto_agents.repair_control import atomic_json
 from auto_agents.managed_verification import execute_engine, selected_tests
 
@@ -23,6 +23,10 @@ def execute_project(payload):
 def main():
     path = Path(sys.argv[1])
     payload = json.loads(path.read_text())
+    from auto_agents.artifact_runtime import activate, track
+    activate(project=payload.get("source") if not payload.get("engine") else None,
+             process_control=path.parent / "processes.json")
+    track(path.parent, "evidence")
     from auto_agents.process_supervision import ACTIVE_PROCESSES
     ACTIVE_PROCESSES.configure(path.parent, path.parent.name, path.parent / "processes.json")
     signal.signal(signal.SIGTERM, lambda signum, frame: (_ for _ in ()).throw(KeyboardInterrupt()))

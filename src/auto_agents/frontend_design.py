@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tarfile
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -641,6 +641,8 @@ class AwesomeDesignCatalogClient:
     def _ensure_snapshot(self, sha: str) -> Path:
         target = self.cache_root / sha
         if (target / ".complete").is_file():
+            from .artifact_runtime import track
+            track(target, "cache", project=self.project_root)
             return target
         archive = self._request_bytes(
             f"https://codeload.github.com/{self.repository}/tar.gz/{sha}",
@@ -660,6 +662,8 @@ class AwesomeDesignCatalogClient:
                 raise ValueError("catalog archive is missing README.md or LICENSE")
             extracted.rename(target)
             (target / ".complete").write_text(utc_now_iso() + "\n", encoding="utf-8")
+        from .artifact_runtime import track
+        track(target, "cache", project=self.project_root)
         return target
 
     @staticmethod

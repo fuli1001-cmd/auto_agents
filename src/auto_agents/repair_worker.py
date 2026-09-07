@@ -53,12 +53,23 @@ def engine_environment(config, checkout):
     root = Path(config["root"]) / "environments" / identity
     python = root / "bin/python"
     receipt = root / "ready.json"
+    from auto_agents.artifact_runtime import track
+    from auto_agents.artifact_store import ArtifactStore
+    root.mkdir(parents=True, exist_ok=True)
+    artifact = track(root, "environment" if receipt.exists() else "incomplete",
+                     scope="repair:" + config["root"], metadata={"repair_root": config["root"]})
     if not receipt.exists():
+        package_cache = Path(config["root"]) / "package-cache" / "pip"
+        package_cache.mkdir(parents=True, exist_ok=True)
+        track(package_cache, "cache", scope="repair:" + config["root"], metadata={"repair_root": config["root"]})
         subprocess.run([config["python"], "-m", "venv", str(root)], check=True, timeout=60, capture_output=True)
         subprocess.run([str(python), "-m", "pip", "install", str(checkout), "pytest"],
-                       check=True, timeout=300, capture_output=True)
+                       check=True, timeout=300, capture_output=True,
+                       env={**os.environ, "PIP_CACHE_DIR": str(package_cache)})
         frozen = subprocess.run([str(python), "-m", "pip", "freeze"], check=True, text=True, capture_output=True, timeout=60).stdout
         atomic_json(receipt, {"identity": identity, "dependencies": frozen, "fingerprint": digest(frozen)})
+        if artifact:
+            ArtifactStore().promote(artifact, "environment")
     subprocess.run([str(python), "-c", "import pytest,regex"], check=True, capture_output=True, timeout=60)
     return str(python), json.loads(receipt.read_text())["fingerprint"]
 
@@ -179,6 +190,10 @@ def repair(request):
     working = directory / "working-evidence"
     if not working.exists():
         RootCauseCoordinator._copy_diagnostic_tree(evidence, working)
+    from auto_agents.artifact_runtime import track
+    for snapshot in (evidence, working):
+        track(snapshot, "recovery", scope="repair:" + config["root"],
+              metadata={"repair_root": config["root"], "disposable": True})
     request_contract = {}
     if payload.get("invocation", {}).get("engine_route"):
         from auto_agents.repair_contract import prepare_contract
@@ -340,6 +355,11 @@ def main():
     os.environ.pop("AUTO_AGENTS_VERIFICATION_SANDBOX", None)
     request_path = Path(sys.argv[1])
     request = json.loads(request_path.read_text())
+    from auto_agents.artifact_runtime import activate, schedule, track
+    activate(scope="repair:" + request["config"]["root"], process_control=request_path.parent / "processes.json")
+    schedule()
+    track(request_path.parent / "repair.log", "log", scope="repair:" + request["config"]["root"],
+          metadata={"repair_root": request["config"]["root"]})
     request["_request_path"] = str(request_path)
     operation = request["operation"]
     from auto_agents.process_supervision import ACTIVE_PROCESSES

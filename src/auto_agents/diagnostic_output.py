@@ -80,6 +80,9 @@ class OutputCapture:
         self._finished = not enabled
         self._disabled = not enabled
         self._write_metadata()
+        if enabled and self.root.exists():
+            from .artifact_runtime import track
+            track(self.root, "evidence")
 
     def start(self, command: object, env: Mapping[str, str], **metadata: object) -> None:
         with self._lock:

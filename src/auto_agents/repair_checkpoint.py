@@ -222,6 +222,8 @@ def create_repair_checkpoint(
     }
     manifest = root / "manifest.json"
     _atomic_json(manifest, manifest_payload)
+    from .artifact_runtime import track
+    track(root, "recovery", project=project)
     return manifest
 
 

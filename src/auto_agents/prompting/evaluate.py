@@ -12,7 +12,7 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path

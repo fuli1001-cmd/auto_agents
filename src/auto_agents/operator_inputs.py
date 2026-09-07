@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import re
-import tempfile
+from auto_agents import artifact_temp as tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path

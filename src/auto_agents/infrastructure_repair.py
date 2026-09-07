@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
+from auto_agents import artifact_temp as tempfile
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import urlopen
