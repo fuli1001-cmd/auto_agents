@@ -236,6 +236,8 @@ def test_environment_setup_never_falls_back_to_target_project(tmp_path):
     (root / "src/auto_agents").mkdir(parents=True)
     (root / "src/auto_agents/repair_control.py").write_text("VERSION = 1\n")
     (root / "src/auto_agents/repair_client.py").write_text("")
+    from auto_agents.repair_runtime import RUNTIME_CAPABILITIES
+    (root / "src/auto_agents/repair_runtime.py").write_text("RUNTIME_CAPABILITIES = " + repr(RUNTIME_CAPABILITIES))
     with patch("auto_agents.repair_worker.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["venv"])) as execute:
         with pytest.raises(subprocess.CalledProcessError):
             engine_environment(config, root)
@@ -937,10 +939,12 @@ def test_selected_worker_reexecs_latest_logic_without_changing_process_identity(
     entry.write_text("# selected implementation\n")
     request = {"_request_path": str(tmp_path / "repair-g1-request.json"), "prepared_runtime": {"revision": "selected"}}
     monkeypatch.delenv("AUTO_AGENTS_REPAIR_LOCK_FD", raising=False)
-    with patch("auto_agents.repair_worker.os.execve", side_effect=RuntimeError("exec boundary")) as execute:
+    with patch("auto_agents.repair_worker.verify_runtime", return_value={}) as compatibility, \
+         patch("auto_agents.repair_worker.os.execve", side_effect=RuntimeError("exec boundary")) as execute:
         with pytest.raises(RuntimeError, match="exec boundary"):
             execute_selected_worker(request, runtime, sys.executable)
     assert execute.call_args.args[1] == [sys.executable, str(entry), request["_request_path"]]
+    compatibility.assert_called_once_with(runtime.resolve(), sys.executable)
     assert execute.call_args.args[2]["PYTHONPATH"] == str(runtime / "src")
     assert json.loads(Path(request["_request_path"]).read_text())["prepared_runtime"]["revision"] == "selected"
 

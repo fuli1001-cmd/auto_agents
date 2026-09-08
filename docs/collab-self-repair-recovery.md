@@ -104,3 +104,22 @@ timeout into cancellation. `tests/test_repair_terminal_handoff.py` exercises the
 legacy ordering in real subprocesses and checks subsequent project lock
 acquisition. The current client continues to inspect terminal results before
 attempting re-registration.
+
+## Runtime compatibility before engine replacement
+
+The controller admits replaceable engines using versioned runtime capabilities
+and its own offline behavioral probes. Admission covers initial environment
+setup, worker replacement for repair/validation/publication, and final workflow
+launch. A remote or cached revision, a capability declaration, and a previous
+full-suite receipt do not individually prove compatibility. The probes run from
+the calling controller's checkout in an isolated interpreter, with temporary
+state and no provider credentials or model calls. They exercise mandatory
+progress supervision, acceptance planning, and terminal repair delivery using
+the selected engine's implementation, without depending on its test suite.
+
+Incompatible engines return `runtime_incompatible` before model execution, with
+the selected runtime, required/available capabilities and failed checks retained
+in diagnostics. The workflow stays resumable and reports that engine versions
+must be synchronized. This does not merge divergent histories, force-push, or
+silently replace upstream work with the local checkout. Integrate and verify the
+required changes before publishing a compatible upstream revision and retrying.

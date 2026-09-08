@@ -211,6 +211,7 @@ def _repair_failure_detail(job, subscriber):
         "upstream behavior passed but full engine proof is incomplete or failed": "修复的完整验证未通过",
         "latest revision did not prove recovery; guarded mode will not generate code": "现有版本未通过恢复验证，当前模式不允许生成修复代码",
         "approved repair has no immutable candidate revision": "修复结果缺少可供验证的代码版本",
+        "repair runtime is incompatible; synchronize the engine versions before retrying": "修复运行时版本不兼容，需要同步引擎版本后重试",
     }
     if result.get("environment_diagnostics"):
         return "修复环境准备失败，请查看详细日志中的环境安装记录"

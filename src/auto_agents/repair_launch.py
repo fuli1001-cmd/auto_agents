@@ -5,6 +5,11 @@ from pathlib import Path
 import sys
 import subprocess
 
+if __package__:
+    from .repair_runtime import RuntimeCompatibilityError, verify_runtime
+else:
+    from repair_runtime import RuntimeCompatibilityError, verify_runtime
+
 
 def main():
     request = json.loads(Path(sys.argv[1]).read_text())
@@ -16,6 +21,7 @@ def main():
                              capture_output=True, timeout=60)
     if loaded != result["commit"] or changed.returncode:
         raise RuntimeError("approved runtime changed before workflow launch")
+    verify_runtime(runtime, sys.executable, phase="resume")
     sys.path.insert(0, str(runtime / "src"))
     from auto_agents.run_lock import ProjectRunLock
     from auto_agents.config import load_run_state
@@ -39,13 +45,18 @@ def main():
 
 if __name__ == "__main__":
     path = Path(sys.argv[1])
+    failure = {}
     try:
         code = main()
+    except RuntimeCompatibilityError as error:
+        failure = error.to_result()
+        code = 3
+        print(str(error), file=sys.stderr)
     finally:
         output = path.with_name(path.stem + "-result.json")
         temporary = output.with_suffix(".tmp")
         with temporary.open("w") as handle:
-            json.dump({"exit_code": locals().get("code", 3)}, handle)
+            json.dump({**failure, "exit_code": locals().get("code", 3)}, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, output)

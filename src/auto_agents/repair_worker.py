@@ -15,6 +15,7 @@ import re
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from auto_agents.repair_control import Repository, Store, atomic_json, digest, git, publication_policy
+from auto_agents.repair_runtime import RuntimeCompatibilityError, require_runtime, verify_runtime
 
 
 def execute_selected_worker(request, runtime, python):
@@ -31,6 +32,7 @@ def execute_selected_worker(request, runtime, python):
     entry = runtime / "src/auto_agents/repair_worker.py"
     if not entry.is_file():
         raise RuntimeError("selected engine does not implement the repair worker protocol")
+    request["runtime_compatibility"] = verify_runtime(runtime, python)
     atomic_json(Path(request_path), request)
     lock_fd = os.environ.get("AUTO_AGENTS_REPAIR_LOCK_FD")
     if lock_fd:
@@ -50,6 +52,7 @@ def engine_environment(config, checkout):
                 and any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets)]
     if versions != [1]:
         raise RuntimeError("trusted runtime uses an incompatible repair control protocol")
+    require_runtime(checkout, phase="environment")
     metadata = (checkout / "pyproject.toml").read_bytes()
     identity = digest([metadata.hex(), config["python"]])[:24]
     root = Path(config["root"]) / "environments" / identity
@@ -371,6 +374,9 @@ def main():
     try:
         result = (publish(request) if operation == "publish" else
                   validate_subscriber(request) if operation.startswith("validate-") else repair(request))
+    except RuntimeCompatibilityError as error:
+        result = error.to_result()
+        result["runtime_compatibility"]["controller_revision"] = request["config"].get("implementation_revision", "")
     except PermissionError as error:
         from auto_agents.repair_environment_log import failure_result
         result = {**failure_result(error), "permission": True}
