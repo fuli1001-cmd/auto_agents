@@ -17,10 +17,12 @@ def config(tmp_path):
 
 
 def engine(tmp_path):
+    from auto_agents.repair_runtime import RUNTIME_CAPABILITIES
     root = tmp_path / "engine"
     (root / "src/auto_agents").mkdir(parents=True)
     (root / "src/auto_agents/repair_control.py").write_text("VERSION = 1\n")
     (root / "src/auto_agents/repair_client.py").write_text("")
+    (root / "src/auto_agents/repair_runtime.py").write_text(f"RUNTIME_CAPABILITIES = {RUNTIME_CAPABILITIES!r}\n")
     (root / "pyproject.toml").write_text('[project]\nname="example"\n')
     return root
 

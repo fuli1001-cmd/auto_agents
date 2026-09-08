@@ -1,0 +1,8 @@
+{
+  "name": "auto-agents-verification-tools",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "vitest": "5.0.0"
+  }
+}

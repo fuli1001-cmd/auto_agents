@@ -80,6 +80,31 @@ including captured partial output on timeout. A failed worker result includes
 command metadata. If persistence fails, `environment_diagnostics_error` explains
 the logging failure while retaining the original setup failure.
 
+Engine proof failures caused by an unavailable Vitest runner now enter dependency
+preparation before any new candidate or redesign. The trusted executor installs
+the bundled, pinned npm lockfile under the selected Python environment's private
+`verification-tools/` directory. Installation is bounded, disables lifecycle
+scripts, enforces Node requirements and saves the normal setup diagnostics. The
+candidate cannot supply a package, command, version or installation directory.
+Python-only repairs do not install Node tools unless a proof needs them.
+
+After preparation, the same candidate and required tests run again. A private
+HOME and offline proof execution remain in force; the toolchain is exposed on
+the verifier PATH as a read-only input. Its fingerprint participates in proof
+identity. Each missing capability permits one preparation attempt per runner;
+failed preparation or the same unavailable dependency afterwards preserves the
+candidate and returns an infrastructure blocker instead of consuming code-search
+patience. This path currently provisions Vitest; it is not a general package
+installer driven by test output.
+
+The foreground relays the current candidate, phase and elapsed minutes while
+the top-level job remains `repairing`, including dependency preparation and
+contract/design work. It also retains the previous candidate's failure reason.
+A new generation clears the displayed phase history. Native candidate
+continuations separate stable scope/authorization/design from changing failure
+evidence. Compatible retries send bounded continuation context; a changed
+contract, component, settings or workspace still requires a fresh full prompt.
+
 Output is redacted before writing: configured secret values and their URL-encoded
 forms, URL userinfo/query/fragment, secret assignments and authorization headers.
 Environment variables are not dumped. Each stream retains up to approximately

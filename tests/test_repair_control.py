@@ -50,6 +50,36 @@ def test_job_deduplication_includes_contract_base_and_environment(tmp_path):
     assert store.submit(b, {**failure(tmp_path / "b"), "environment": "other"}) != first
 
 
+def test_status_exposes_phase_elapsed_and_previous_failure_without_stale_generation(tmp_path):
+    from auto_agents.repair_client import _repair_progress_message
+    store = Store(tmp_path / "state")
+    subscriber = store.register(registration(tmp_path / "project"))
+    job = store.submit(subscriber, failure(tmp_path / "project"))
+    store.transition(job, "repairing")
+    store.event(job, "candidate_result", {"candidate": 1, "status": "candidate_verification_failed",
+                                         "reason": "Vitest dependency missing password=do-not-show"})
+    store.event(job, "phase_started", {"phase": "environment_preparation", "candidate": 1})
+    current = store.job(job, include_progress=True)
+    with patch("auto_agents.repair_client.time.time", return_value=current["progress"]["started_at"] + 125):
+        message = _repair_progress_message(current, {"state": "waiting"})
+    assert "第 1 轮：正在准备验证依赖" in message
+    assert "本阶段 2 分钟" in message
+    assert "Vitest dependency missing" in message and "do-not-show" not in message
+    store.transition(job, "blocked")
+    store.transition(job, "repairing")
+    assert "progress" not in store.job(job, include_progress=True)
+
+
+def test_foreground_phase_changes_are_visible_while_top_level_state_stays_repairing():
+    from auto_agents.repair_client import _repair_progress_message
+    messages = [_repair_progress_message({"state": "repairing", "progress": {"phase": phase, "candidate": 2}},
+                                         {"state": "waiting"})
+                for phase in ("candidate_generation", "focused_verification", "contract_reanalysis", "repair_design")]
+    assert len(set(messages)) == 4
+    assert "正在执行针对性验证" in messages[1]
+    assert "重新分析验收要求" in messages[2]
+
+
 def test_cancel_tombstone_rejects_late_worker_and_re_registration(tmp_path):
     store = Store(tmp_path / "state")
     payload = registration(tmp_path / "project")

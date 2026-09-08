@@ -79,7 +79,7 @@ def namespace_exec(payload):
 
 
 @contextmanager
-def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=()):
+def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=(), path_entries=()):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     if root == target or root in target.parents or target in root.parents:
         raise RuntimeError("verification workspace overlaps the live target project")
@@ -131,7 +131,9 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
                 entries[str(root / name)] = "read"
         filesystem = ",".join(json.dumps(key) + "=" + json.dumps(value) for key, value in entries.items())
         profile = '{filesystem={' + filesystem + '},network={enabled=true}}'
-        clean_environment = ["env", "-i", "PATH=" + os.environ.get("PATH", os.defpath),
+        executable_path = os.pathsep.join([*(str(Path(value).resolve()) for value in path_entries),
+                                           os.environ.get("PATH", os.defpath)])
+        clean_environment = ["env", "-i", "PATH=" + executable_path,
                              "HOME=" + str(home), "CODEX_HOME=" + str(codex_home),
                              "TMPDIR=" + temporary, "LANG=C.UTF-8", "PYTHONPATH=" + str(root / "src"),
                              "PYTHONDONTWRITEBYTECODE=1",

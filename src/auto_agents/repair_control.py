@@ -151,6 +151,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS events (
                   sequence INTEGER PRIMARY KEY, job TEXT NOT NULL, kind TEXT NOT NULL,
                   payload TEXT NOT NULL, created REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS events_by_job ON events(job, sequence);
                 CREATE TABLE IF NOT EXISTS outbox (
                   job TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                   due REAL NOT NULL, detail TEXT NOT NULL DEFAULT '');
@@ -218,7 +219,7 @@ class Store:
         self.event(identity, "subscribed", {"subscriber": subscriber})
         return identity
 
-    def job(self, identity):
+    def job(self, identity, *, include_progress=False):
         with self.connect() as db:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (identity,)).fetchone()
         if row is None:
@@ -226,6 +227,21 @@ class Store:
         result = dict(row)
         for key in ("payload", "result"):
             result[key] = json.loads(result[key])
+        if include_progress and result["state"] == "repairing":
+            with self.connect() as db:
+                # A new repair generation starts with a repairing event. Never
+                # display a previous generation's candidate or phase as current.
+                start = db.execute("SELECT MAX(sequence) FROM events WHERE job=? AND kind='repairing'", (identity,)).fetchone()[0] or 0
+                progress = db.execute("SELECT kind,payload,created FROM events WHERE job=? AND sequence>? "
+                    "AND kind IN ('phase_started','candidate_result','request_contract_planning','request_contract_ready') "
+                    "ORDER BY sequence DESC LIMIT 1", (identity, start)).fetchone()
+                previous = db.execute("SELECT payload FROM events WHERE job=? AND sequence>? AND kind='candidate_result' "
+                                      "ORDER BY sequence DESC LIMIT 1", (identity, start)).fetchone()
+            if progress:
+                result["progress"] = {**json.loads(progress["payload"]), "kind": progress["kind"],
+                                      "started_at": progress["created"]}
+                if previous:
+                    result["progress"]["last_result"] = json.loads(previous["payload"])
         return result
 
     def transition(self, identity, state, result=None, *, generation=None):
@@ -601,9 +617,9 @@ class Supervisor:
                     # The response still includes the held registration; tick
                     # releases it after the response has been sent.
                     registration.pop("terminal_status_pending", None)
-                return {"ok": True, "job": self.store.job(row["job"]), "subscribers": [row], "registered": list(self.registrations)}
+                return {"ok": True, "job": self.store.job(row["job"], include_progress=True), "subscribers": [row], "registered": list(self.registrations)}
             if request.get("job"):
-                return {"ok": True, "job": self.store.job(request["job"]), "subscribers": self.store.subscriptions(request["job"]), "registered": list(self.registrations)}
+                return {"ok": True, "job": self.store.job(request["job"], include_progress=True), "subscribers": self.store.subscriptions(request["job"]), "registered": list(self.registrations)}
             with self.store.connect() as db:
                 return {"ok": True, "jobs": [dict(row) for row in db.execute("SELECT id,state,updated FROM jobs ORDER BY updated DESC")], "publications": [dict(row) for row in db.execute("SELECT * FROM outbox")]}
         if op == "lookup-contract":

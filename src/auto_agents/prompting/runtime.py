@@ -260,7 +260,7 @@ def _settings_fingerprint(config, request, env) -> str:
         values.append((str(path), hashlib.sha256(content).hexdigest()))
     selected_env = {key: value for key, value in env.items() if key.startswith(
         ("CODEX_", "CLAUDE_", "ANTHROPIC_", "COPILOT_", "GEMINI_", "OPENAI_")
-    ) and key not in {"CODEX_THREAD_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"}}
+    ) and key not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"}}
     return digest(json.dumps({"files": values, "args": args, "profile": profile,
                               "effort": request.effort, "env": selected_env}, sort_keys=True))
 

@@ -3686,8 +3686,10 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                                 }
                             ),
                         )
+                    evidence = next(context.text for context in request.prompt_spec.contexts
+                                    if context.source == "Repair iteration evidence")
                     active = json.loads(
-                        request.prompt.split(
+                        evidence.split(
                             "Active approved design component:\n", 1
                         )[1].split("\n\nOriginal run error:", 1)[0]
                     )

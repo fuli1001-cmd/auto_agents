@@ -18,3 +18,10 @@ def isolate_verification_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTO_AGENTS_CLUSTER_HOME", str(tmp_path / "cluster-state"))
     monkeypatch.setenv("AUTO_AGENTS_STORAGE_ROOT", str(tmp_path / "storage-state"))
     monkeypatch.setenv("AUTO_AGENTS_STORAGE_MAINTENANCE", "off")
+    from auto_agents import artifact_runtime
+    token = artifact_runtime._context.set(None)
+    try:
+        yield
+    finally:
+        artifact_runtime.release_owned()
+        artifact_runtime._context.reset(token)

@@ -244,7 +244,31 @@ def _repair_progress_message(job, subscriber):
     if state == "queued":
         return "等待开始修复"
     if state == "repairing":
-        return "正在修复"
+        progress = job.get("progress") or {}
+        phase = progress.get("phase") or progress.get("kind", "")
+        labels = {
+            "request_contract_planning": "正在规划验收检查", "request_contract_ready": "验收检查已就绪",
+            "candidate_generation": "正在生成修复代码", "candidate_correction": "正在修正候选",
+            "repair_design": "正在设计修复方案", "contract_reanalysis": "正在重新分析验收要求",
+            "environment_preparation": "正在准备验证依赖", "preparing_verification_environment": "正在准备验证依赖",
+            "focused_verification": "正在执行针对性验证", "validating_focused_tests": "正在执行针对性验证",
+            "boundary_replay": "正在验证原任务恢复边界", "validating_boundary_replay": "正在验证原任务恢复边界",
+            "diagnosis_differential": "正在对比修复前后的行为", "full_suite": "正在执行完整回归",
+            "integration_verification": "正在验证集成结果", "proof_seal": "正在确认验证证据",
+            "candidate_result": "本轮候选已完成",
+        }
+        label = labels.get(phase, "正在审查候选" if phase.startswith("review_") else "正在修复")
+        if progress.get("candidate"):
+            label = f"第 {progress['candidate']} 轮：" + label
+        if progress.get("started_at"):
+            minutes = max(0, int((time.time() - progress["started_at"]) // 60))
+            if minutes:
+                label += f"（本阶段 {minutes} 分钟）"
+        previous = progress.get("last_result") or {}
+        if previous and previous.get("status") not in {"approved", "candidate_group_completed"}:
+            reason = _repair_text(previous.get("reason", ""))
+            label += f"；第 {previous.get('candidate', '?')} 轮未通过：{reason}"
+        return label
     return "等待修复进展"
 
 

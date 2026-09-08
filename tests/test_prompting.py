@@ -56,6 +56,17 @@ def test_raw_custom_request_is_unchanged(tmp_path):
     assert prepare_request(raw, ProviderRuntime("codex", resolved_model="gpt-6-astra")) is raw
 
 
+def test_native_session_environment_is_not_a_setting_change(tmp_path):
+    from auto_agents.prompting.runtime import _settings_fingerprint
+    config = ProviderConfig(kind="codex")
+    req = request(tmp_path)
+    original = _settings_fingerprint(config, req, {"CODEX_SESSION_ID": "first", "OPENAI_BASE_URL": "https://one.example"})
+    resumed = _settings_fingerprint(config, req, {"CODEX_SESSION_ID": "next", "OPENAI_BASE_URL": "https://one.example"})
+    changed = _settings_fingerprint(config, req, {"CODEX_SESSION_ID": "next", "OPENAI_BASE_URL": "https://two.example"})
+    assert original == resumed
+    assert original != changed
+
+
 def test_custom_shell_is_never_probed_for_model_information(tmp_path):
     with patch("auto_agents.prompting.runtime.cli_capabilities") as probe:
         runtime = resolve_runtime(ProviderConfig(kind="shell", binary="custom-wrapper"), request(tmp_path))

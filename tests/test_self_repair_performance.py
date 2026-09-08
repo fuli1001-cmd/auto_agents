@@ -53,6 +53,54 @@ def test_candidate_context_includes_bounded_redacted_verification_failure():
     assert len(evidence) <= 2400
 
 
+@pytest.mark.parametrize("change", ["feedback", "contract", "design", "component", "authorization"])
+def test_continuous_repair_reuses_session_only_for_unchanged_contract(tmp_path, change):
+    from auto_agents.models import AgentRequest
+    from auto_agents.prompting import ProviderRuntime, prepare_request
+    runner = _runner(tmp_path)
+    runner._experiment = SimpleNamespace(
+        contract_fingerprint="contract", repair_design_fingerprint="design",
+        prompt_context=lambda: {"recent_candidates": []},
+    )
+    runner._candidate_group = {"group_id": "component"}
+    runtime = ProviderRuntime("codex", resolved_model="gpt-6-astra")
+
+    def request(**kwargs):
+        return AgentRequest(stage="self_repair", purpose="self_repair", effort="deep",
+                            prompt=runner._build_prompt(), cwd=tmp_path, output_path=tmp_path / "answer",
+                            prompt_is_continuation=bool(kwargs.get("resume_session_id")),
+                            prompt_continuation=runner._candidate_continuation_prompt() if kwargs else "", **kwargs)
+
+    first = prepare_request(request(), runtime)
+    runner._candidate_attempt = 2
+    runner._candidate_resumed_from = "continuous-workspace"
+    runner._candidate_prior_failures = ["prior pytest failure"]
+    runner._experiment.prompt_context = lambda: {"recent_candidates": [{"status": "failed", "verification_failure": "retry evidence"}]}
+    if change == "contract":
+        runner._experiment.contract_fingerprint = "different"
+    elif change == "design":
+        runner._experiment.repair_design_fingerprint = "different"
+    elif change == "component":
+        runner._candidate_group = {"group_id": "different"}
+    elif change == "authorization":
+        runner._invocation_context = {"authorization": "different"}
+    second = prepare_request(request(resume_session_id="native-session", resume_provider="codex",
+                                     resume_prompt_hash=first.prompt_metadata["compatibility_hash"]), runtime)
+    assert "prior pytest failure" in second.prompt
+    assert "retry evidence" in second.prompt
+    if change == "feedback":
+        assert second.resume_session_id == "native-session"
+        assert second.prompt_metadata["prompt_mode"] == "delta"
+        assert "Target run state excerpt" not in second.prompt
+        assert second.prompt_metadata["resumed"]
+        assert second.prompt_metadata["contract_hash"] == first.prompt_metadata["contract_hash"]
+    else:
+        assert not second.resume_session_id
+        assert second.prompt_metadata["prompt_mode"] == "full"
+        assert "Target run state excerpt" in second.prompt
+        assert second.prompt_metadata["fallback_reason"] == "incompatible-native-session"
+
+
 def test_focused_failure_preserves_stdout_tail_even_when_stderr_has_warnings(tmp_path):
     runner = _runner(tmp_path)
     command = "python -m pytest -q tests/test_engine.py"
