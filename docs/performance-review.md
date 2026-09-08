@@ -68,3 +68,29 @@ records the enclosing wall time once rather than summing concurrent base/candida
 
 The effect on the number of candidates and total iteration time requires a subsequent real run.
 The historical experiment was analyzed without rerunning its provider calls.
+
+## September 8 retry feedback investigation
+
+A subsequent run on `99877f1` completed four candidates in about 101 minutes:
+55 minutes 48 seconds in candidate generation, 43 minutes 52 seconds in semantic
+review, and 44 seconds in focused verification. Each focused check passed; each
+candidate was rejected by review. These timings include provider tools and tests
+inside the corresponding generation/review call, rather than only model inference.
+
+The actual prompts exposed a retry defect. Native continuations from the third
+candidate retained finding IDs and output tails but omitted the full review
+reasons, counterexamples and required tests. Candidate regressions were also
+missing from full retry prompts because they are deliberately excluded from the
+root obligation ledger. Finally, continuous-workspace candidates recorded the
+search frontier as their parent even when their actual base was a newer candidate.
+
+Retry prompts now include complete, sanitized feedback from the actual parent's
+review receipt, verified against its experiment and commit. Historical summaries
+remain bounded. Candidate records inherit from the actual base, and an interrupted
+unregistered commit can recover earlier review evidence without inheriting its proof.
+Tests exercise the rendered full/native provider requests, retained-parent recording,
+receipt mismatches, and interruption after candidate squashing. Read-only replay of
+the saved fourth review and the fifth candidate's checkpoint preserves all four
+findings, including each reason, counterexample, required test and evidence field.
+This verifies feedback delivery; it does not establish the next live run's completion
+time or prove the outstanding project repair correct.

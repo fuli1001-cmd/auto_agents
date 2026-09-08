@@ -107,8 +107,19 @@ the top-level job remains `repairing`, including dependency preparation and
 contract/design work. It also retains the previous candidate's failure reason.
 A new generation clears the displayed phase history. Native candidate
 continuations separate stable scope/authorization/design from changing failure
-evidence. Compatible retries send bounded continuation context; a changed
-contract, component, settings or workspace still requires a fresh full prompt.
+evidence. Compatible retries bound historical summaries but carry complete current
+review findings, including reasons, counterexamples, required tests and evidence.
+Candidate regressions remain actionable even though they do not become new root
+contract obligations. Both full prompts and native continuations receive this feedback.
+A changed contract, component, settings or workspace still requires a fresh full prompt.
+
+Candidate lineage follows the actual retained commit, which can differ from the
+highest-scoring search candidate. Feedback is checked against the experiment,
+candidate and commit before use. If cancellation interrupted result registration,
+the next attempt can recover the previous review through Git ancestry or a scoped
+candidate ref and matching checkpoint diff. That historical review does not grant
+verification proof to the unreviewed commit. Resolved findings remain visible as
+constraints to preserve, and unrelated review observations remain outside repair scope.
 
 Output is redacted before writing: configured secret values and their URL-encoded
 forms, URL userinfo/query/fragment, secret assignments and authorization headers.

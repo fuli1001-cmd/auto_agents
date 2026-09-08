@@ -3710,6 +3710,7 @@ class AutoAgentsSelfRepairRunner:
             self._candidate_partial_diff_line_count = 0
             self._candidate_partial_path = ""
             self._candidate_resumed_from = ""
+            self._candidate_base_ref = ""
             try:
                 candidate = self._run_candidate(
                     experiment_id=experiment_id,
@@ -3733,19 +3734,19 @@ class AutoAgentsSelfRepairRunner:
                     reason=str(error),
                     experiment_id=experiment_id,
                     candidate_id=interrupted_candidate_id,
-                    base_commit=experiment.best_search_ref,
+                    base_commit=self._candidate_base_ref or experiment.best_search_ref,
                     parent_candidate_id=experiment.best_search_candidate_id,
                     patch_fingerprint=self._candidate_partial_fingerprint,
                     diff_line_count=self._candidate_partial_diff_line_count,
                     infrastructure_failure=self._is_infrastructure_candidate_error(error),
                 )
-            candidate.parent_candidate_id = experiment.best_search_candidate_id
             if not candidate.finding_group_id:
                 candidate.finding_group_id = str(
                     getattr(self, "_candidate_group", {}).get("group_id", "")
                 )
             if not candidate.base_commit:
-                candidate.base_commit = experiment.best_search_ref
+                candidate.base_commit = self._candidate_base_ref or experiment.best_search_ref
+            candidate.parent_candidate_id = self._candidate_parent_id(candidate.base_commit)
             self._decorate_candidate_result(candidate, attempt=attempt)
             self._register_search_result(candidate)
             callback = getattr(self, "_control_phase_callback", None)
@@ -4031,13 +4032,187 @@ class AutoAgentsSelfRepairRunner:
                     "resume_provider": parent.provider_kind}
         return {}
 
+    def _candidate_parent_id(self, base_ref: str = "") -> str:
+        experiment = getattr(self, "_experiment", None)
+        if base_ref:
+            for record in reversed(list(getattr(experiment, "candidates", {}).values())):
+                if base_ref in {record.candidate_commit, record.candidate_ref}:
+                    return record.candidate_id
+            if base_ref != getattr(experiment, "best_search_ref", ""):
+                # An unrecorded retained commit must not inherit another
+                # branch's proof or review just because it scored better.
+                return ""
+        return getattr(experiment, "best_search_candidate_id", "base")
+
+    def _candidate_previous_review_id(self, base_ref: str) -> str:
+        """Recover review evidence after interruption before result registration.
+
+        This lookup supplies historical feedback only, never inherited proof
+        for the intervening, unreviewed commit.
+        """
+        if not re.fullmatch(r"[0-9a-f]{40,64}", base_ref):
+            return ""
+        experiment = getattr(self, "_experiment", None)
+        candidates = getattr(experiment, "candidates", {})
+        by_commit = {
+            record.candidate_commit: record.candidate_id
+            for record in candidates.values() if record.candidate_id != "base" and record.candidate_commit
+        }
+        if not by_commit:
+            return ""
+        try:
+            history = subprocess.run(
+                ["git", "rev-list", "--first-parent", base_ref], cwd=self.repo_root,
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if history.returncode != 0:
+            return ""
+        ancestors = history.stdout.splitlines()
+        previous = next((by_commit[ref] for ref in ancestors if ref in by_commit), "")
+        if previous:
+            return previous
+        # Final candidates are squashed onto the engine base before review.
+        # Bind an interrupted checkpoint to its scoped Git ref and exact diff;
+        # Git ancestry alone no longer identifies the prior reviewed candidate.
+        store = getattr(self, "_experiment_store", None)
+        if store is None:
+            return ""
+        prefix = f"refs/auto-agents/self-repair/candidates/{store.safe_root}/{experiment.experiment_id}/"
+        try:
+            refs = subprocess.run(
+                ["git", "for-each-ref", "--format=%(objectname) %(refname)", prefix],
+                cwd=self.repo_root, capture_output=True, text=True, timeout=10,
+            )
+            checkpoints = {
+                commit: ref[len(prefix):]
+                for line in refs.stdout.splitlines()
+                for commit, _, ref in [line.partition(" ")]
+                if ref.startswith(prefix) and commit in ancestors
+            }
+            for commit in ancestors:
+                candidate_id = checkpoints.get(commit)
+                if not candidate_id:
+                    continue
+                root = store.candidate_root(candidate_id)
+                metadata = read_json(root / "partial-candidate.json", default={})
+                if (not isinstance(metadata, Mapping) or metadata.get("candidate_id") != candidate_id
+                        or metadata.get("status") not in {"generated", "interrupted"}
+                        or metadata.get("base_ref") not in by_commit):
+                    continue
+                patch_hash = hashlib.sha256((root / "partial-candidate.diff").read_bytes()).hexdigest()
+                if patch_hash != metadata.get("patch_sha256"):
+                    continue
+                diff = subprocess.run(
+                    ["git", "diff", "--binary", metadata["base_ref"], commit, "--"],
+                    cwd=self.repo_root, capture_output=True, timeout=10,
+                )
+                if diff.returncode == 0 and hashlib.sha256(diff.stdout).hexdigest() == patch_hash:
+                    return by_commit[metadata["base_ref"]]
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return ""
+        return ""
+
+    def _candidate_review_feedback(self, context: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep actionable feedback complete, including candidate regressions.
+
+        Candidate summaries/output tails are historical hints. They cannot
+        replace the counterexample and required proof from the actual parent's
+        review, even when the provider continues a native conversation.
+        """
+        from .repair_environment_log import sanitize
+
+        def sanitized(value):
+            if isinstance(value, str):
+                return sanitize(value)
+            if isinstance(value, list):
+                return [sanitized(item) for item in value]
+            if isinstance(value, dict):
+                return {key: sanitized(item) for key, item in value.items()}
+            return value
+
+        experiment = getattr(self, "_experiment", None)
+        base_ref = getattr(self, "_candidate_base_ref", "") or getattr(
+            experiment, "best_search_ref", ""
+        )
+        parent_id = self._candidate_parent_id(base_ref)
+        feedback = {
+            "parent_candidate": parent_id,
+            "parent_ref": base_ref,
+            "open_contract_findings": context.get("open_contract_findings", []),
+            "resolved_findings_that_must_not_regress": context.get(
+                "resolved_findings_that_must_not_regress", []
+            ),
+            "recent_automatic_corrections": context.get("recent_automatic_corrections", []),
+        }
+        store = getattr(self, "_experiment_store", None)
+        if store is None or parent_id == "base":
+            return sanitized(feedback)
+        review_id = parent_id or self._candidate_previous_review_id(base_ref)
+        if not review_id:
+            return sanitized(feedback)
+        path = store.candidate_root(review_id) / "result.json"
+        try:
+            result = read_json(path, default={})
+        except (OSError, ValueError):
+            result = {}
+        record = getattr(experiment, "candidates", {}).get(review_id)
+        if (
+            not record
+            or not isinstance(result, Mapping)
+            or result.get("candidate_id") != review_id
+            or result.get("experiment_id") != experiment.experiment_id
+            or result.get("candidate_commit", "") != record.candidate_commit
+        ):
+            feedback["parent_review_result_path"] = str(path)
+            return sanitized(feedback)
+        contract_ids = set(getattr(experiment, "contract_obligation_ids", []))
+        findings = [
+            finding for finding in result.get("review_findings", [])
+            if isinstance(finding, dict) and (
+                finding.get("disposition") == "candidate_regression"
+                or (
+                    finding.get("disposition") == "contract_violation"
+                    and (finding.get("causal_obligation_id") or finding.get("obligation_id")) in contract_ids
+                )
+            )
+        ]
+        current_ids = {f.get("finding_id") for f in findings}
+        resolved = (
+            set(result.get("resolved_finding_ids", []))
+            | {key for key, status in record.finding_states.items() if status == "resolved"}
+        ) - current_ids
+        feedback["parent_review" if parent_id else "previous_review"] = {
+            "candidate_id": review_id,
+            "candidate_commit": record.candidate_commit,
+            "status": result.get("status", ""),
+            "findings": findings,
+            "resolved_finding_ids": sorted(resolved),
+            "result_path": str(path),
+        }
+        # The retained worktree may be newer than the search frontier's best
+        # candidate. Do not reopen a finding resolved on this actual parent.
+        open_findings = {
+            f["finding_id"]: f for f in feedback["open_contract_findings"]
+            if f.get("finding_id") and f["finding_id"] not in resolved
+        }
+        open_findings.update({
+            f["finding_id"]: f for f in findings
+            if f.get("finding_id") and f.get("disposition") == "contract_violation"
+        })
+        feedback["open_contract_findings"] = list(open_findings.values())
+        feedback["resolved_findings_that_must_not_regress"] = sorted(
+            (set(feedback["resolved_findings_that_must_not_regress"]) | resolved) - current_ids
+        )
+        return sanitized(feedback)
+
     def _candidate_continuation_prompt(self) -> str:
         experiment = getattr(self, "_experiment", None)
         context = experiment.prompt_context() if experiment is not None else {}
         evidence = {
             "attempt": getattr(self, "_candidate_attempt", 1),
-            "parent_candidate": getattr(experiment, "best_search_candidate_id", ""),
-            "parent_ref": getattr(experiment, "best_search_ref", ""),
+            **self._candidate_review_feedback(context),
             "active_component": dict(getattr(self, "_candidate_group", {}) or {}),
             "recent_candidates": context.get("recent_candidates", [])[-3:],
             "prior_failures": getattr(self, "_candidate_prior_failures", [])[-3:],
@@ -7993,6 +8168,9 @@ class AutoAgentsSelfRepairRunner:
             retained_inputs = retained_route_inputs(
                 engine_route, target_evidence_root or self.target_project_root,
                 getattr(self, "_real_project_root", self.target_project_root))
+        experiment = getattr(self, "_experiment", None)
+        search_context = experiment.prompt_context() if experiment is not None else {}
+        search_context.update(self._candidate_review_feedback(search_context))
         lines = [
             f"auto_agents repository root: {repair_root or self.repo_root}",
             *([
@@ -8030,11 +8208,7 @@ class AutoAgentsSelfRepairRunner:
             "",
             "Persistent self-repair search context:",
             json.dumps(
-                (
-                    self._experiment.prompt_context()
-                    if hasattr(self, "_experiment")
-                    else {}
-                ),
+                search_context,
                 indent=2,
                 ensure_ascii=False,
             ),
@@ -8079,6 +8253,8 @@ class AutoAgentsSelfRepairRunner:
             "- Preserve existing public CLI behavior except for the new self-repair recovery path.",
             "",
             "Verification expectation:",
+            "- Address every current review finding using its complete reason, counterexample, evidence, and required_test. "
+            "Exercise the specified public entrypoint and retained semantics; a private helper or simplified proxy fixture does not substitute for that proof.",
             "- Use recent_candidates.verification_failure to address the exact failed "
             "commands and assertions before retrying the repair.",
             "- Run focused pytest checks for auto_agents before declaring success.",
