@@ -237,6 +237,68 @@ def test_imported_pending_ref_cannot_skip_fresh_candidate_validation(repair_feed
     assert git_call.call_count == 1
 
 
+def test_pre_review_failure_keeps_the_last_actual_review(repair_feedback):
+    runner, _ = repair_feedback
+    experiment, store = runner._experiment, runner._experiment_store
+    experiment.candidates["before-review"] = SelfRepairCandidateRecord(
+        candidate_id="before-review", candidate_commit="next-sha", parent_candidate_id="retained",
+        parent_ref="retained-sha", status="candidate_replay_failed",
+    )
+    store.write_candidate_artifact("before-review", "result.json", {
+        "candidate_id": "before-review", "candidate_commit": "next-sha",
+        "experiment_id": experiment.experiment_id, "status": "candidate_replay_failed",
+        "review_findings": [], "resolved_finding_ids": [],
+    })
+    runner._candidate_base_ref = "next-sha"
+    feedback = runner._candidate_review_feedback(experiment.prompt_context())
+    assert feedback["parent_candidate"] == "before-review"
+    assert feedback["previous_review"]["candidate_id"] == "retained"
+    assert "selector-regression" in {f["finding_id"] for f in feedback["previous_review"]["findings"]}
+
+
+def test_boundary_failure_does_not_claim_review_passed(repair_feedback):
+    runner, _ = repair_feedback
+    result = SelfRepairResult(False, "candidate_replay_failed", "replay failed before review")
+    runner._decorate_candidate_result(result, attempt=1)
+    passed, failed = runner._milestone_obligations(result)
+    assert "validation:adversarial_review" not in passed
+    assert "validation:focused" not in passed  # Pending replay can run before focused checks.
+    assert "validation:boundary_replay" in failed
+    reviewed = SelfRepairResult(False, "candidate_review_rejected", "review rejected after successful boundary")
+    runner._decorate_candidate_result(reviewed, attempt=2)
+    assert reviewed.validation_rank > result.validation_rank
+
+
+def test_failed_differential_does_not_also_fail_successful_boundary(repair_feedback):
+    runner, _ = repair_feedback
+    result = SelfRepairResult(False, "candidate_replay_failed", "differential failed",
+                              passed_obligations=["validation:boundary_replay"],
+                              failed_obligations=["validation:diagnosis_differential"])
+    runner._decorate_candidate_result(result, attempt=1)
+    passed, failed = runner._milestone_obligations(result)
+    assert "validation:boundary_replay" in passed and "validation:boundary_replay" not in failed
+    assert not set(passed) & set(failed)
+
+
+def test_completed_empty_review_replaces_older_findings(repair_feedback):
+    runner, _ = repair_feedback
+    experiment, store = runner._experiment, runner._experiment_store
+    experiment.candidates["reviewed"] = SelfRepairCandidateRecord(
+        candidate_id="reviewed", candidate_commit="next-sha", parent_candidate_id="retained",
+        parent_ref="retained-sha", status="candidate_verification_failed",
+    )
+    store.write_candidate_artifact("reviewed", "result.json", {
+        "candidate_id": "reviewed", "candidate_commit": "next-sha",
+        "experiment_id": experiment.experiment_id, "status": "candidate_verification_failed",
+        "review_completed": True, "review_findings": [], "resolved_finding_ids": [],
+    })
+    runner._candidate_base_ref = "next-sha"
+    feedback = runner._candidate_review_feedback(experiment.prompt_context())
+    assert feedback["parent_review"]["candidate_id"] == "reviewed"
+    assert feedback["parent_review"]["findings"] == []
+    assert "previous_review" not in feedback
+
+
 @pytest.mark.parametrize("history", ["linear", "squashed", "wrong_patch", "other_experiment"])
 def test_interrupted_unregistered_commit_keeps_review_evidence_without_inheriting_proof(repair_feedback, tmp_path, history):
     runner, artifact = repair_feedback

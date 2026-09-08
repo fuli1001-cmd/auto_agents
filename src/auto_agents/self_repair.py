@@ -94,7 +94,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "failed": 25,
     "candidate_rejected": 30,
     "candidate_validation_invalid": 35,
-    "candidate_review_rejected": 40,
+    "candidate_review_rejected": 75,
     "candidate_verification_failed": 50,
     "candidate_group_completed": 60,
     "candidate_replay_failed": 70,
@@ -189,6 +189,7 @@ class SelfRepairResult:
     finding_ids: list[str] = field(default_factory=list)
     resolved_finding_ids: list[str] = field(default_factory=list)
     review_findings: list[dict[str, object]] = field(default_factory=list)
+    review_completed: bool = False
     fatal_candidate: bool = False
     infrastructure_failure: bool = False
     diff_line_count: int = 0
@@ -1933,7 +1934,7 @@ class AutoAgentsSelfRepairRunner:
                 )
             )
         if result.status in {
-            "candidate_group_completed", "candidate_replay_failed",
+            "candidate_group_completed",
             "candidate_full_suite_failed", "candidate_full_suite_inconclusive",
             "candidate_proof_seal_failed", "approved_candidate",
         }:
@@ -1942,12 +1943,12 @@ class AutoAgentsSelfRepairRunner:
             failed.append("validation:adversarial_review")
         if (
             result.status == "candidate_group_completed"
-            or result.validation_rank >= 70
+            or (result.validation_rank >= 70 and result.status != "candidate_replay_failed")
         ):
             passed.append("validation:focused")
         elif result.status == "candidate_verification_failed":
             failed.append("validation:focused")
-        if result.status == "candidate_replay_failed":
+        if result.status == "candidate_replay_failed" and "validation:boundary_replay" not in result.passed_obligations:
             failed.append("validation:boundary_replay")
         if result.validation_rank >= 100:
             passed.append("validation:full_suite")
@@ -1965,7 +1966,7 @@ class AutoAgentsSelfRepairRunner:
             failed.append("validation:proof_seal")
         passed.extend(result.passed_obligations)
         failed.extend(result.failed_obligations)
-        return sorted(set(passed)), sorted(set(failed))
+        return sorted(set(passed) - set(failed)), sorted(set(failed))
 
     def _register_search_result(
         self,
@@ -2316,6 +2317,7 @@ class AutoAgentsSelfRepairRunner:
         if not candidate_ref:
             return None
         self._candidate_base_ref = base_head
+        self._candidate_review_completed = False
         candidate_id = candidate_ref.rsplit("/", 1)[-1]
         candidate_commit_process = subprocess.run(
             ["git", "rev-parse", candidate_ref],
@@ -3720,6 +3722,7 @@ class AutoAgentsSelfRepairRunner:
             self._candidate_partial_path = ""
             self._candidate_resumed_from = ""
             self._candidate_base_ref = ""
+            self._candidate_review_completed = False
             try:
                 candidate = self._run_candidate(
                     experiment_id=experiment_id,
@@ -4161,20 +4164,37 @@ class AutoAgentsSelfRepairRunner:
         review_id = parent_id or self._candidate_previous_review_id(base_ref)
         if not review_id:
             return sanitized(feedback)
-        path = store.candidate_root(review_id) / "result.json"
-        try:
-            result = read_json(path, default={})
-        except (OSError, ValueError):
-            result = {}
-        record = getattr(experiment, "candidates", {}).get(review_id)
-        if (
-            not record
-            or not isinstance(result, Mapping)
-            or result.get("candidate_id") != review_id
-            or result.get("experiment_id") != experiment.experiment_id
-            or result.get("candidate_commit", "") != record.candidate_commit
-        ):
-            feedback["parent_review_result_path"] = str(path)
+        visited = set()
+        while review_id and review_id != "base" and review_id not in visited:
+            visited.add(review_id)
+            path = store.candidate_root(review_id) / "result.json"
+            try:
+                result = read_json(path, default={})
+            except (OSError, ValueError):
+                result = {}
+            record = getattr(experiment, "candidates", {}).get(review_id)
+            if (
+                not record or not isinstance(result, Mapping)
+                or result.get("candidate_id") != review_id
+                or result.get("experiment_id") != experiment.experiment_id
+                or result.get("candidate_commit", "") != record.candidate_commit
+            ):
+                feedback["parent_review_result_path"] = str(path)
+                return sanitized(feedback)
+            completed = result.get("review_completed")
+            if completed is None:
+                completed = result.get("status") in {
+                    "candidate_review_rejected", "candidate_group_completed", "approved_candidate",
+                    "candidate_full_suite_failed", "candidate_full_suite_inconclusive",
+                    "candidate_final_review_rejected", "candidate_proof_seal_failed",
+                }
+            if completed or result.get("review_findings") or result.get("resolved_finding_ids"):
+                break
+            # A failed focused check or replay has no new semantic review.
+            # Follow actual lineage instead of dropping outstanding regressions.
+            review_id = (self._candidate_parent_id(record.parent_ref) if record.parent_ref
+                         else record.parent_candidate_id)
+        else:
             return sanitized(feedback)
         contract_ids = set(getattr(experiment, "contract_obligation_ids", []))
         findings = [
@@ -4192,7 +4212,7 @@ class AutoAgentsSelfRepairRunner:
             set(result.get("resolved_finding_ids", []))
             | {key for key, status in record.finding_states.items() if status == "resolved"}
         ) - current_ids
-        feedback["parent_review" if parent_id else "previous_review"] = {
+        feedback["parent_review" if review_id == parent_id else "previous_review"] = {
             "candidate_id": review_id,
             "candidate_commit": record.candidate_commit,
             "status": result.get("status", ""),
@@ -4361,6 +4381,7 @@ class AutoAgentsSelfRepairRunner:
         candidate_id = f"c{attempt}-{uuid.uuid4().hex[:8]}"
         self._candidate_id = candidate_id
         self._candidate_provider_result = None
+        self._candidate_review_completed = False
         if isinstance(experiment, SelfRepairExperiment):
             experiment.current_candidate_id = candidate_id
             self._experiment_store.save(experiment)
@@ -4729,6 +4750,8 @@ class AutoAgentsSelfRepairRunner:
                         candidate_commit=candidate_commit, candidate_ref=candidate_ref,
                         patch_fingerprint=fingerprint, strategy_fingerprint=strategy_fingerprint,
                         diff_line_count=diff_line_count,
+                        passed_obligations=["validation:focused", *(["validation:boundary_replay"] if replay.ok else [])],
+                        failed_obligations=(["validation:boundary_replay"] if not replay.ok else ["validation:diagnosis_differential"]),
                     )
                 boundary_passed_obligations = [
                     "safety:target_untouched",
@@ -4861,6 +4884,7 @@ class AutoAgentsSelfRepairRunner:
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
+                boundary_passed_obligations.append("validation:adversarial_review")
                 self._report_candidate_phase(
                     "validating_focused_tests",
                     "adversarial review approved; running focused verification",
@@ -5922,6 +5946,7 @@ class AutoAgentsSelfRepairRunner:
         }
         self._persist_deferred_candidate_findings(deferred_findings)
         review_ok = bool(reason) and not findings and decision in {"APPROVE", "REJECT"}
+        self._candidate_review_completed = bool(reason) and decision in {"APPROVE", "REJECT"}
         rendered_decision = decision or "INVALID"
         return _VerificationResult(
             review_ok,
@@ -7707,6 +7732,7 @@ class AutoAgentsSelfRepairRunner:
     ) -> None:
         from .config import load_run_state, run_path, save_run_state
 
+        result.review_completed = result.review_completed or bool(getattr(self, "_candidate_review_completed", False))
         try:
             state = (
                 RunState(run_id="session-" + str(self._invocation_context["session_id"]))

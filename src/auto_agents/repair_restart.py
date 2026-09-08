@@ -5,10 +5,14 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import time
 
 from .io_utils import read_json
 from .repair_control import alive, atomic_json, digest, git
 from .self_repair_search import SelfRepairExperimentStore
+
+RESTART_QUIESCENCE_SECONDS = 15
+_HISTORY_FILES = ("result.json", "candidate.diff", "partial-candidate.json", "partial-candidate.diff")
 
 
 def _identity(payload):
@@ -47,6 +51,30 @@ def _worktree_snapshot(root):
     return head, diff.stdout, untracked
 
 
+def _discard_incomplete_import(marker, destination, retained, repository):
+    pending = read_json(marker)
+    if retained.exists():
+        with repository.locked():
+            git(repository.cache, "worktree", "remove", "--force", str(retained))
+    for candidate_id in pending["candidate_ids"]:
+        for name in _HISTORY_FILES:
+            (destination.candidate_root(candidate_id) / name).unlink(missing_ok=True)
+    if pending["previous_experiment"] is None:
+        destination.path.unlink(missing_ok=True)
+    else:
+        atomic_json(destination.path, pending["previous_experiment"])
+    (retained.parent / "base.json").unlink(missing_ok=True)
+    marker.unlink()
+
+
+def _wait_for_quiescence(source):
+    deadline = time.monotonic() + RESTART_QUIESCENCE_SECONDS
+    while not _quiescent(source):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"previous repair {source.name} is still stopping; its candidate was not replaced")
+        time.sleep(0.1)
+
+
 def import_cancelled_repair(store, job, working, repository):
     """Seed fresh work only; never reactivate the cancelled job or its receipts."""
     payload = job["payload"]
@@ -57,10 +85,19 @@ def import_cancelled_repair(store, job, working, repository):
         return False
     directory = store.root / "jobs" / job["id"]
     receipt = directory / "prior-repair-import.json"
+    marker = directory / "prior-repair-importing.json"
     retained = directory / "continuous/repair"
     destination = SelfRepairExperimentStore(working, subject, payload["fingerprint"])
+    if receipt.exists():
+        if not retained.exists():
+            raise RuntimeError("committed repair import is missing its retained worktree; refusing to start from base")
+        store.event(job["id"], "prior_repair_imported", read_json(receipt))
+        marker.unlink(missing_ok=True)
+        return False
+    if marker.exists():
+        _discard_incomplete_import(marker, destination, retained, repository)
     current = destination.load()
-    if receipt.exists() or retained.exists() or (current and current.attempt_count):
+    if retained.exists() or (current and current.attempt_count):
         return False
     with store.connect() as db:
         rows = db.execute("SELECT id,payload FROM jobs WHERE state='cancelled' AND id!=? ORDER BY updated DESC",
@@ -71,8 +108,9 @@ def import_cancelled_repair(store, job, working, repository):
         source = store.root / "jobs" / row["id"]
         source_worktree = source / "continuous/repair"
         source_store = SelfRepairExperimentStore(source / "working-evidence", subject, payload["fingerprint"])
-        if not source_worktree.exists() or not _quiescent(source):
+        if not source_worktree.exists():
             continue
+        _wait_for_quiescence(source)
         experiment = source_store.load()
         if experiment is None or experiment.status == "completed":
             continue
@@ -81,9 +119,13 @@ def import_cancelled_repair(store, job, working, repository):
             continue
         directory.mkdir(parents=True, exist_ok=True)
         retained.parent.mkdir(parents=True, exist_ok=True)
-        with repository.locked():
-            git(repository.cache, "worktree", "add", "--detach", str(retained), snapshot[0])
+        candidate_ids = [path.name for path in source_store.root.iterdir()
+                         if path.is_dir() and not path.is_symlink() and path.name.startswith("c")]
+        atomic_json(marker, {"source_job": row["id"], "candidate_ids": candidate_ids,
+                             "previous_experiment": current.to_dict() if current else None})
         try:
+            with repository.locked():
+                git(repository.cache, "worktree", "add", "--detach", str(retained), snapshot[0])
             if snapshot[1]:
                 patch = directory / "prior-repair.diff"
                 patch.write_text(snapshot[1], encoding="utf-8")
@@ -96,12 +138,9 @@ def import_cancelled_repair(store, job, working, repository):
                 raise RuntimeError("cancelled repair changed during recovery; retained source is untouched")
             # Only history and code cross the invocation boundary. Old replay,
             # approval, provider-session and full-suite receipts do not.
-            candidate_ids = []
-            for candidate in source_store.root.iterdir():
-                if not candidate.is_dir() or not candidate.name.startswith("c"):
-                    continue
-                candidate_ids.append(candidate.name)
-                for name in ("result.json", "candidate.diff", "partial-candidate.json", "partial-candidate.diff"):
+            for candidate_id in candidate_ids:
+                candidate = source_store.candidate_root(candidate_id)
+                for name in _HISTORY_FILES:
                     old = candidate / name
                     if old.is_file() and not old.is_symlink():
                         new = destination.candidate_root(candidate.name) / name
@@ -144,9 +183,10 @@ def import_cancelled_repair(store, job, working, repository):
                         "verification_required": True}
             atomic_json(receipt, evidence)
             store.event(job["id"], "prior_repair_imported", evidence)
+            marker.unlink(missing_ok=True)
             return True
         except BaseException:
-            with repository.locked():
-                git(repository.cache, "worktree", "remove", "--force", str(retained), check=False)
+            if not receipt.exists():
+                _discard_incomplete_import(marker, destination, retained, repository)
             raise
     return False

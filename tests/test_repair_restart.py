@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -15,7 +16,8 @@ from test_repair_control import configuration, make_remote, registration
 
 
 @pytest.fixture
-def restart(tmp_path):
+def restart(tmp_path, monkeypatch):
+    monkeypatch.setattr("auto_agents.repair_restart.RESTART_QUIESCENCE_SECONDS", 0)
     config = configuration(tmp_path)
     engine = make_remote(config)
     repository = Repository(config)
@@ -82,7 +84,7 @@ def _new_job(restart, payload):
     return job, working
 
 
-@pytest.mark.parametrize("advance", [False, True])
+@pytest.mark.parametrize("advance", [False, True, "stale-receipt"])
 def test_cancel_then_original_invocation_retains_code_and_history_but_requires_new_proof(restart, advance):
     before = (git(restart.source, "status", "--porcelain"), git(restart.source, "diff"), git(restart.source, "diff", "--cached"))
     revision = restart.payload["base"]
@@ -97,12 +99,17 @@ def test_cancel_then_original_invocation_retains_code_and_history_but_requires_n
     assert import_cancelled_repair(restart.store, job, working, restart.repository)
     directory = working.parent
     retained = directory / "continuous/repair"
+    if advance == "stale-receipt":
+        atomic_json(retained.parent / "base.json", {"revision": revision})
     carry_continuous_work(SimpleNamespace(_continuous_workspace=retained.parent), revision)
     assert (retained / "bug.py").read_text() == "unfinished latest repair\n"
     assert not (retained / "remove.py").exists()
     assert (retained / "new regression.py").read_text() == "new test from cancelled attempt\n"
     if advance:
         assert (retained / "upstream.txt").read_text() == "new engine version\n"
+        assert git(retained, "merge-base", "--is-ancestor", revision, "HEAD", check=False).returncode == 0
+        assert git(retained, "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode != 0
+        assert not git(retained, "status", "--porcelain")
     copied = SelfRepairExperimentStore(working, "session-session", "root")
     experiment = copied.load()
     assert experiment.experiment_id == restart.evidence.load().experiment_id
@@ -147,7 +154,11 @@ def test_restart_never_adopts_different_scope_or_still_running_work(restart, cha
     elif change == "live_child":
         atomic_json(restart.source.parent.parent / "processes.json", {"processes": [{"pid": os.getpid(), "start_ticks": start_ticks(os.getpid())}]})
     job, working = _new_job(restart, payload)
-    assert not import_cancelled_repair(restart.store, job, working, restart.repository)
+    if change.startswith("live_"):
+        with pytest.raises(RuntimeError, match="still stopping"):
+            import_cancelled_repair(restart.store, job, working, restart.repository)
+    else:
+        assert not import_cancelled_repair(restart.store, job, working, restart.repository)
     assert not (working.parent / "continuous/repair").exists()
 
 
@@ -159,3 +170,54 @@ def test_restart_does_not_replace_an_attempt_already_started(restart):
     state.save(experiment)
     assert not import_cancelled_repair(restart.store, job, working, restart.repository)
     assert state.load().experiment_id == experiment.experiment_id
+
+
+@pytest.mark.parametrize("stage", ["base", "receipt", "event"])
+def test_interrupted_import_can_be_retried_without_losing_retained_code(restart, stage):
+    job, working = _new_job(restart, restart.payload)
+    def interrupted_write(path, payload):
+        if Path(path).name == ("base.json" if stage == "base" else "prior-repair-import.json"):
+            raise KeyboardInterrupt("interrupted import")
+        return atomic_json(path, payload)
+    with patch("auto_agents.repair_restart.atomic_json", side_effect=interrupted_write) if stage != "event" else patch.object(restart.store, "event", side_effect=KeyboardInterrupt("interrupted event")):
+        with pytest.raises(KeyboardInterrupt):
+            import_cancelled_repair(restart.store, job, working, restart.repository)
+    # A restart either completes the pending import or recognizes its committed
+    # state; it must never leave history without the corresponding code.
+    import_cancelled_repair(restart.store, job, working, restart.repository)
+    retained = working.parent / "continuous/repair"
+    assert (retained / "bug.py").read_text() == "unfinished latest repair\n"
+    assert (retained / "new regression.py").exists()
+    assert (working.parent / "prior-repair-import.json").exists()
+
+
+def test_still_stopping_latest_job_does_not_silently_start_fresh(restart):
+    job, working = _new_job(restart, restart.payload)
+    with patch("auto_agents.repair_restart._quiescent", return_value=False):
+        with pytest.raises(RuntimeError, match="still stopping"):
+            import_cancelled_repair(restart.store, job, working, restart.repository)
+
+
+def test_process_death_before_import_rollback_is_recovered_on_restart(restart):
+    job, working = _new_job(restart, restart.payload)
+    def interrupted(path, payload):
+        if Path(path).name == "prior-repair-import.json":
+            raise KeyboardInterrupt()
+        return atomic_json(path, payload)
+    with patch("auto_agents.repair_restart.atomic_json", side_effect=interrupted), \
+         patch("auto_agents.repair_restart._discard_incomplete_import", side_effect=KeyboardInterrupt()):
+        with pytest.raises(KeyboardInterrupt):
+            import_cancelled_repair(restart.store, job, working, restart.repository)
+    assert (working.parent / "prior-repair-importing.json").exists()
+    assert import_cancelled_repair(restart.store, job, working, restart.repository)
+    assert (working.parent / "continuous/repair/bug.py").read_text() == "unfinished latest repair\n"
+    assert not (working.parent / "prior-repair-importing.json").exists()
+
+
+def test_import_waits_for_cancelled_worker_cleanup_before_reusing_it(restart):
+    job, working = _new_job(restart, restart.payload)
+    with patch("auto_agents.repair_restart.RESTART_QUIESCENCE_SECONDS", 1), \
+         patch("auto_agents.repair_restart.time.sleep") as sleep, \
+         patch("auto_agents.repair_restart._quiescent", side_effect=[False, True, True]):
+        assert import_cancelled_repair(restart.store, job, working, restart.repository)
+    sleep.assert_called_once()

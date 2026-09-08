@@ -251,17 +251,11 @@ def carry_continuous_work(runner, revision):
     """Retain edits while bringing a restarted repair onto a newer upstream."""
     directory = Path(runner._continuous_workspace)
     receipt = directory / "base.json"
-    previous = json.loads(receipt.read_text()).get("revision") if receipt.exists() else revision
     retained = directory / "repair"
-    if retained.exists() and previous != revision:
-        if git(retained, "status", "--porcelain"):
-            git(retained, "add", "-A")
-            git(retained, "commit", "-m", "chore: checkpoint retained repair before upstream integration")
-        merged = git(retained, "merge", "--no-commit", "--no-ff", revision, check=False)
-        if merged.returncode:
-            paths = git(retained, "diff", "--name-only", "--diff-filter=U").splitlines()
-            if not paths:
-                raise RuntimeError("could not integrate upstream into retained repair")
+
+    def finish_merge():
+        paths = git(retained, "diff", "--name-only", "--diff-filter=U").splitlines()
+        if paths:
             from auto_agents.self_repair import _SelfRepairGitConflict, _SelfRepairRemote
             original_root = runner.repo_root
             try:
@@ -270,6 +264,23 @@ def carry_continuous_work(runner, revision):
                     _SelfRepairGitConflict("upstream changed while the repair was interrupted", paths))
             finally:
                 runner.repo_root = original_root
+        if git(retained, "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode == 0:
+            git(retained, "add", "-A")
+            git(retained, "commit", "--no-edit")
+
+    if retained.exists() and git(retained, "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode == 0:
+        finish_merge()
+    if (retained.exists()
+            and git(retained, "merge-base", "--is-ancestor", revision, "HEAD", check=False).returncode != 0):
+        if git(retained, "status", "--porcelain"):
+            git(retained, "add", "-A")
+            git(retained, "commit", "-m", "chore: checkpoint retained repair before upstream integration")
+        merged = git(retained, "merge", "--no-commit", "--no-ff", revision, check=False)
+        if merged.returncode:
+            paths = git(retained, "diff", "--name-only", "--diff-filter=U").splitlines()
+            if not paths:
+                raise RuntimeError("could not integrate upstream into retained repair")
+        finish_merge()
     atomic_json(receipt, {"revision": revision})
 
 

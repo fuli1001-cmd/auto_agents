@@ -132,6 +132,21 @@ checkpoints are not imported. Active or mismatched jobs and a new job that alrea
 started an attempt are never replaced. `prior-repair-import.json` records the source,
 and foreground progress explicitly confirms that the previous candidate was retained.
 
+Import has a durable preparation marker and a separate completion receipt. An
+interruption before completion rolls back only the new job's partial import and
+allows retry; an interruption after completion keeps the imported code. Cleanup
+can resume after a process dies before rollback. The worker waits briefly for a
+cancelled source's processes to exit and reports a stopping blocker if they remain
+alive, instead of silently generating from an older candidate or the base.
+
+Upstream integration checks actual Git ancestry, completes any pending merge and
+commits the merged tree before recording its revision. A stale `base.json` cannot
+make an unfinished integration count as complete. Failure before semantic review
+retains the last actual review, including candidate regressions; a completed review
+can explicitly replace it. Validation milestones follow the current execution order:
+replay failure alone grants neither focused-test nor semantic-review proof, and a
+failed differential does not invalidate a separately successful boundary replay.
+
 Bounded failure excerpts preserve both the beginning and end of diagnostics, so a
 primary replay failure cannot disappear behind later passing-test output. Under
 acceleration, failed boundary replay returns the candidate immediately; the expensive
