@@ -552,6 +552,12 @@ class Supervisor:
             for fd in previous["fds"]:
                 os.close(fd)
         self.registrations[identity] = {"fds": list(fds), "env": request.get("environment", {}), "payload": payload}
+        subscription = next(row for row in self.store.subscriptions() if row["id"] == identity)
+        if subscription["state"] in {"finished", "blocked"}:
+            # Older verified runtimes re-register before inspecting the terminal
+            # status. Keep this transferred lock until its owner reads that
+            # status, or register -> tick -> status loops forever.
+            self.registrations[identity]["terminal_status_pending"] = True
         resumed = self.resumes.get(identity)
         if resumed and resumed.poll() is None:
             self.registrations[identity]["payload"] = {**payload, "pid": resumed.pid, "ticks": start_ticks(resumed.pid)}
@@ -589,6 +595,12 @@ class Supervisor:
                 row = next((item for item in self.store.subscriptions() if item["id"] == request["subscriber"]), None)
                 if not row or not row["job"]:
                     raise RuntimeError("subscriber has no repair job")
+                registration = self.registrations.get(row["id"])
+                if registration and request.get("_peer_pid") == registration["payload"]["pid"]:
+                    # A read-only observer must not consume the owner's result.
+                    # The response still includes the held registration; tick
+                    # releases it after the response has been sent.
+                    registration.pop("terminal_status_pending", None)
                 return {"ok": True, "job": self.store.job(row["job"]), "subscribers": [row], "registered": list(self.registrations)}
             if request.get("job"):
                 return {"ok": True, "job": self.store.job(request["job"]), "subscribers": self.store.subscriptions(request["job"]), "registered": list(self.registrations)}
@@ -784,6 +796,11 @@ class Supervisor:
             if row["state"] == "verified" and identity not in self.resumes:
                 self.launch_resume(row)
             if row["state"] in {"finished", "cancelled", "blocked"} and identity not in self.resumes and row["job"] not in self.workers:
+                registration = self.registrations.get(identity)
+                if (row["state"] != "cancelled" and registration
+                        and registration.get("terminal_status_pending")
+                        and alive(registration["payload"]["pid"], registration["payload"]["ticks"])):
+                    continue
                 registration = self.registrations.pop(identity, None)
                 if registration:
                     for fd in registration["fds"]:

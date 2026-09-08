@@ -86,3 +86,21 @@ commands, not the substring `vitest`. For example, a pytest file named
 separators, comments, and existing cache flags are preserved. Nested shell
 programs that cannot be safely rewritten are left unchanged, not reparsed as
 top-level commands; use an explicit verification script for those cases.
+
+## Terminal repair delivery to older runtimes
+
+A resumed candidate can contain an older repair client that restores its
+registration before inspecting a terminal result. After a failed repair, the
+controller normally closes its copy of the project lock. If that older client
+re-registers, the controller retains the transferred descriptor until the owner
+reads its status, then closes it on the following tick. Diagnostic status reads
+from other processes do not consume this delivery. Owner death or cancellation
+still releases the registration without waiting for an acknowledgement.
+
+This compatibility path lets older resumed processes observe `blocked` or
+`finished`, exit, and release their own lock descriptors. It preserves the
+original repair result and resumable failure instead of converting a provider
+timeout into cancellation. `tests/test_repair_terminal_handoff.py` exercises the
+legacy ordering in real subprocesses and checks subsequent project lock
+acquisition. The current client continues to inspect terminal results before
+attempting re-registration.
