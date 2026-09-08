@@ -52,6 +52,15 @@ with the installation HEAD, even when their IPC protocol is identical. An idle
 older controller is replaced without resetting jobs or recovery evidence. Active
 work defers the update with an explicit error. Repair progress and stop reasons
 use the normal user-event renderer and are saved in the invocation's user log.
+The foreground shows an eight-character job ID and explains the problem once,
+using the current workflow's engine request or approved diagnosis. Without an
+approved diagnosis it labels the error as a symptom under investigation. Later
+lines show only progress in plain Chinese; repeated polls do not repeat messages.
+The full job log directory appears on first observation and again if repair stops.
+Validation and resume failures retain a sanitized, generation-specific reason
+with the affected subscriber, including the exit code when a resumed process
+provides no explanation. A passed recovery check means the original workflow is
+continuing, not that the entire workflow has finished.
 
 Package installation honors pip configuration and the invocation environment.
 If a configured mirror is unavailable, an operator can select an index for one

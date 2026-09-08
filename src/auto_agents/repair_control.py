@@ -243,6 +243,18 @@ class Store:
             rows = db.execute("SELECT * FROM subscribers" + (" WHERE job=?" if job else ""), (job,) if job else ()).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
+    def record_subscriber_failure(self, db, subscriber, job, phase, error):
+        """Keep the stop reason with its workflow, in the state-change transaction."""
+        from .repair_environment_log import sanitize
+        row = db.execute("SELECT payload FROM subscribers WHERE id=? AND job=? AND state='blocked'",
+                         (subscriber, job["id"])).fetchone()
+        if row is None:
+            return
+        payload = json.loads(row["payload"])
+        payload["repair_failure"] = {"job": job["id"], "generation": job["generation"],
+                                     "phase": phase, "error": sanitize(error)}
+        db.execute("UPDATE subscribers SET payload=? WHERE id=?", (json.dumps(payload), subscriber))
+
     def cancel(self, *, project=None, job=None):
         if not project and not job:
             raise ValueError("cancel needs a project or job")
@@ -724,6 +736,9 @@ class Supervisor:
                                    (json.dumps(updated), identity, generation))
                     db.execute("UPDATE subscribers SET state=?,updated=? WHERE id=? AND state='validating'",
                                ("verified" if result.get("ok") else "blocked", time.time(), subscriber_id))
+                    if not result.get("ok"):
+                        self.store.record_subscriber_failure(db, subscriber_id, job, "validation",
+                            result.get("error") or result.get("proof") or "未返回具体原因，请查看详细日志")
                 self.store.event(identity, "subscriber_validated", {"subscriber": subscriber_id, "ok": bool(result.get("ok"))})
             elif operation == "publish":
                 if result.get("ok"):
@@ -750,10 +765,14 @@ class Supervisor:
                 self.stop_process(process)
             if process and process.poll() is not None:
                 completion = self.store.root / "jobs" / row["job"] / ("resume-" + identity + "-result.json")
-                exit_code = json.loads(completion.read_text()).get("exit_code", 3) if completion.exists() else process.returncode
+                receipt = json.loads(completion.read_text()) if completion.exists() else {}
+                exit_code = receipt.get("exit_code", 3) if completion.exists() else process.returncode
                 with self.store.connect() as db:
                     db.execute("UPDATE subscribers SET state=?,updated=? WHERE id=? AND state!='cancelled'",
                                ("finished" if exit_code == 0 else "blocked", time.time(), identity))
+                    if exit_code != 0:
+                        self.store.record_subscriber_failure(db, identity, self.store.job(row["job"]), "resume",
+                            receipt.get("error") or f"原任务进程退出（退出码 {exit_code}），请查看详细日志")
                 self.store.event(row["job"], "workflow_exit", {"subscriber": identity, "exit_code": exit_code})
                 if exit_code == 0 and row["state"] != "cancelled":
                     job = self.store.job(row["job"])
@@ -878,6 +897,8 @@ class Supervisor:
         if registration is None:
             with self.store.connect() as db:
                 db.execute("UPDATE subscribers SET state='blocked' WHERE id=?", (row["id"],))
+                self.store.record_subscriber_failure(db, row["id"], self.store.job(row["job"]), "resume",
+                    "任务登记已失效，需要恢复登记后继续")
             return
         job = self.store.job(row["job"])
         root = self.store.root / "jobs" / job["id"]

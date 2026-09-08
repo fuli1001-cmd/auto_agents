@@ -162,6 +162,84 @@ def _report_repair_progress(project, message):
         print(message, file=sys.stderr)
 
 
+def _repair_text(value, limit=80):
+    from .repair_environment_log import sanitize
+    # Redact before flattening/truncating, including multiline authorization headers.
+    text = " ".join(sanitize(value).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _repair_problem(payload):
+    route = payload.get("invocation", {}).get("engine_route") or {}
+    if route:
+        for seed in (route.get("issue_seed"), route.get("spec_seed"), route):
+            if not isinstance(seed, dict):
+                continue
+            for key in ("summary", "title", "scope", "required_behavior", "requirements"):
+                value = seed.get(key)
+                if isinstance(value, list):
+                    value = "；".join(item for item in value if isinstance(item, str))
+                if isinstance(value, str) and value.strip():
+                    return "正在修复", _repair_text(value)
+        return "正在修复", "处理引擎修复请求（请求未提供问题说明）"
+    diagnosis = payload.get("diagnosis") or {}
+    if diagnosis.get("repair_approved"):
+        chain = (diagnosis.get("final") or {}).get("causal_chain", [])
+        causes = [item for item in chain if isinstance(item, str) and item.strip()]
+        if causes:
+            return "正在修复", _repair_text("；".join(causes[:2]))
+    symptom = (payload.get("repair_case") or {}).get("symptom") or payload.get("error")
+    if isinstance(symptom, str) and symptom.lstrip().startswith("Traceback (most recent call last):"):
+        symptom = symptom.rstrip().splitlines()[-1]
+    return "正在排查", _repair_text(symptom) or "任务执行异常，尚无具体问题说明"
+
+
+def _repair_failure_detail(job, subscriber):
+    failure = subscriber.get("payload", {}).get("repair_failure") or {}
+    if failure.get("job") == job["id"] and failure.get("generation") == job.get("generation"):
+        detail = _repair_text(failure.get("error"))
+        if detail:
+            phase = {"validation": "验证未通过", "resume": "原任务恢复失败"}.get(failure.get("phase"), "")
+            return f"{phase}：{detail}" if phase else detail
+    result = job.get("result") or {}
+    detail = result.get("control_error") or result.get("error")
+    known = {
+        "workflow registration must be restored before repair": "任务登记已失效，需要恢复登记后继续",
+        "repair worker exited without a receipt": "修复进程退出，未返回结果",
+        "stale worker receipt": "修复进程返回了过期结果",
+        "the same failure recurred in the verified runtime without a new contract": "恢复原任务后再次出现相同问题",
+        "upstream behavior passed but full engine proof is incomplete or failed": "修复的完整验证未通过",
+        "latest revision did not prove recovery; guarded mode will not generate code": "现有版本未通过恢复验证，当前模式不允许生成修复代码",
+        "approved repair has no immutable candidate revision": "修复结果缺少可供验证的代码版本",
+    }
+    if result.get("environment_diagnostics"):
+        return "修复环境准备失败，请查看详细日志中的环境安装记录"
+    return known.get(detail) or _repair_text(detail) or "未返回具体原因，请查看详细日志"
+
+
+def _repair_progress_message(job, subscriber):
+    state, workflow = job["state"], subscriber["state"]
+    if workflow == "finished":
+        return "原任务已完成"
+    if "cancelled" in (state, workflow):
+        return "修复已取消"
+    if "blocked" in (state, workflow):
+        return "修复受阻：" + _repair_failure_detail(job, subscriber)
+    if workflow == "resuming":
+        return "已通过恢复检查，原任务继续运行" if state == "completed" else "正在恢复原任务"
+    if workflow == "validating":
+        return "修复方案已就绪，正在验证"
+    if workflow == "verified":
+        return "验证已通过，等待恢复原任务"
+    if state in {"ready", "completed"}:
+        return "修复方案已就绪，等待验证"
+    if state == "queued":
+        return "等待开始修复"
+    if state == "repairing":
+        return "正在修复"
+    return "等待修复进展"
+
+
 def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosis=None, repair_case=None):
     from .cli import _run_command_for_self_repair_resume
     from .self_repair import auto_agents_repo_root
@@ -231,7 +309,8 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     # rather than treating diagnosis=None as permission for legacy repair.
     response = rpc(registration["config"], {"op": "submit", "subscriber": registration["subscriber"], "payload": payload})
     job = response["job"]
-    last = ""
+    last = None
+    announced = set()
     previous_term = signal.getsignal(signal.SIGTERM)
     def interrupted(signum, frame):
         from .process_supervision import RunInterruptedError
@@ -250,16 +329,28 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
             status = response["job"]["state"]
             job = response["job"]["id"]
             subscriber = next(item for item in response["subscribers"] if item["id"] == registration["subscriber"])
-            message = status + "/" + subscriber["state"]
-            if message != last:
-                _report_repair_progress(project, f"Self-repair {job}: {message}; logs: {registration['config']['root']}/jobs/{job}")
-                last = message
+            prefix = f"Self-repair {job[:8]}："
+            log_path = f"详细日志：{registration['config']['root']}/jobs/{job}"
+            message = _repair_progress_message(response["job"], subscriber)
+            first = job not in announced
+            if first:
+                # A resumed workflow can submit another repair while this relay waits.
+                current_payload = subscriber.get("payload", {}).get("repair") or response["job"].get("payload") or payload
+                action, problem = _repair_problem(current_payload)
+                if status != "repairing" or subscriber["state"] != "waiting":
+                    action = "修复问题" if action == "正在修复" else "待排查问题"
+                _report_repair_progress(project, prefix + action + "：" + problem)
+                _report_repair_progress(project, log_path)
+                announced.add(job)
+            if (job, message) != last:
+                if not (first and status == "repairing" and subscriber["state"] == "waiting"):
+                    _report_repair_progress(project, prefix + message)
+                if not first and (status in {"blocked", "cancelled"} or subscriber["state"] in {"blocked", "cancelled"}):
+                    _report_repair_progress(project, log_path)
+                last = (job, message)
             if subscriber["state"] == "finished":
                 return 0
             if status in {"blocked", "cancelled"} or subscriber["state"] in {"blocked", "cancelled"}:
-                detail = response["job"].get("result", {}).get("error", "")
-                if detail:
-                    _report_repair_progress(project, f"Self-repair stopped: {detail}")
                 return 3
             # Terminal subscribers have already released their registration.
             # Observe their durable result before trying to restore ownership,

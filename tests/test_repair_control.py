@@ -733,7 +733,147 @@ def test_foreground_observes_terminal_result_after_registration_cleanup(
     assert calls == ["submit", "status"] + (["status"] if reattach else [])
     assert signal.getsignal(signal.SIGTERM) == previous_term
     if exit_code:
-        assert "Self-repair stopped: environment unavailable" in capsys.readouterr().err
+        expected = "修复已取消" if "cancelled" in (job_state, subscriber_state) else "修复受阻：environment unavailable"
+        assert expected in capsys.readouterr().err
+
+
+def test_foreground_explains_each_problem_once_and_only_reports_progress_changes(tmp_path, monkeypatch, capsys):
+    from auto_agents import repair_client
+    from auto_agents.self_repair import SelfRepairDecision
+
+    config = configuration(tmp_path)
+    autonomy = SimpleNamespace(mode="max", to_dict=lambda: {"mode": "max"})
+    orchestrator = SimpleNamespace(
+        _repair_registration={"config": config, "subscriber": "workflow"},
+        config=SimpleNamespace(execution=SimpleNamespace(autonomy=autonomy)),
+        record_run_blocker=lambda **kwargs: None,
+    )
+    monkeypatch.setattr("auto_agents.cli._run_command_for_self_repair_resume", lambda args: ["run"])
+    monkeypatch.setattr("auto_agents.config.load_run_state", lambda project: SimpleNamespace(run_id="run", current_stage="implement"))
+    monkeypatch.setattr("auto_agents.process_supervision.ACTIVE_PROCESSES.terminate_all", lambda: None)
+    monkeypatch.setattr("auto_agents.process_supervision.ACTIVE_PROCESSES.snapshot", lambda: [])
+    monkeypatch.setattr(repair_client, "git", lambda *args: "base")
+    monkeypatch.setattr(repair_client.time, "sleep", lambda seconds: None)
+    first, second = "223d4c02f56845e79745958a", "f28ccccd37b2469cafc6c2a7"
+    problems = {first: "任务重试后进度未恢复，导致流程无法继续", second: "验证结果未正确保存，导致重复验证"}
+    states = iter([
+        (first, "repairing", "waiting"), (first, "repairing", "waiting"),
+        (first, "ready", "validating"), (first, "ready", "resuming"),
+        (first, "completed", "resuming"), (first, "completed", "resuming"),
+        (second, "repairing", "waiting"), (second, "blocked", "blocked"),
+    ])
+
+    def control_rpc(config, request):
+        if request["op"] == "submit":
+            return {"job": first}
+        assert request["op"] == "status"
+        job, state, workflow = next(states)
+        payload = {"invocation": {"engine_route": {"issue_seed": {"summary": problems[job]}}}}
+        return {"job": {"id": job, "state": state, "payload": {"error": "wrong shared-job symptom"},
+                        "result": {"error": "修复环境依赖安装失败"}},
+                "subscribers": [{"id": "workflow", "state": workflow, "payload": {"repair": payload}}],
+                "registered": ["workflow"]}
+
+    monkeypatch.setattr(repair_client, "rpc", control_rpc)
+    assert repair_client.submit_and_wait(
+        tmp_path, orchestrator, RuntimeError("original error"), SelfRepairDecision(True),
+        SimpleNamespace(command="run"), SimpleNamespace(),
+    ) == 3
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == [
+        f"Self-repair 223d4c02：正在修复：{problems[first]}",
+        f"详细日志：{config['root']}/jobs/{first}",
+        "Self-repair 223d4c02：修复方案已就绪，正在验证",
+        "Self-repair 223d4c02：正在恢复原任务",
+        "Self-repair 223d4c02：已通过恢复检查，原任务继续运行",
+        f"Self-repair f28ccccd：正在修复：{problems[second]}",
+        f"详细日志：{config['root']}/jobs/{second}",
+        "Self-repair f28ccccd：修复受阻：修复环境依赖安装失败",
+        f"详细日志：{config['root']}/jobs/{second}",
+    ]
+
+
+def test_repair_problem_uses_approved_diagnosis_and_redacts_before_shortening(monkeypatch):
+    from auto_agents.repair_client import _repair_problem
+
+    secret = "sensitive-value-that-would-be-partly-truncated-" * 4
+    monkeypatch.setenv("REPAIR_TEST_API_KEY", secret)
+    diagnosis = {"repair_approved": True, "final": {"causal_chain": [
+        f"任务重试状态未恢复 password={secret}\n", "导致流程无法继续",
+    ]}}
+    action, summary = _repair_problem({"diagnosis": diagnosis, "error": "generic failure"})
+    assert action == "正在修复"
+    assert "任务重试状态未恢复" in summary and "导致流程无法继续" in summary
+    assert "sensitive" not in summary and "<redacted>" in summary and "\n" not in summary
+    diagnosis["repair_approved"] = False
+    action, summary = _repair_problem({"diagnosis": diagnosis, "error": "网络请求失败"})
+    assert (action, summary) == ("正在排查", "网络请求失败")
+    assert _repair_problem({"error": "Traceback (most recent call last):\n  technical frame\nValueError: invalid state"}) == (
+        "正在排查", "ValueError: invalid state")
+    assert _repair_problem({"invocation": {"engine_route": {"issue_seed": {}}}, "error": "raw route JSON"}) == (
+        "正在修复", "处理引擎修复请求（请求未提供问题说明）")
+    assert len(_repair_problem({"error": "很长的错误" * 100})[1]) <= 80
+
+
+def test_validation_failure_is_durable_and_specific_to_the_subscriber(tmp_path):
+    from auto_agents.repair_client import _repair_progress_message
+
+    config = configuration(tmp_path)
+    supervisor = Supervisor(config)
+    subscribers = [supervisor.store.register(registration(tmp_path / name)) for name in ("a", "b")]
+    jobs = [supervisor.store.submit(subscriber, failure(tmp_path)) for subscriber in subscribers]
+    job = jobs[0]
+    assert jobs[1] == job
+    supervisor.store.transition(job, "ready", {"ok": True, "commit": "candidate"})
+    with supervisor.store.connect() as db:
+        db.execute("UPDATE subscribers SET state='validating' WHERE id=?", (subscribers[0],))
+        db.execute("UPDATE subscribers SET state='finished' WHERE id=?", (subscribers[1],))
+    operation = "validate-" + subscribers[0]
+    atomic_json(Path(config["root"]) / "jobs" / job / (operation + "-g1-result.json"),
+                {"ok": False, "proof": "恢复检查失败 password=hidden-secret", "generation": 1})
+    supervisor.workers[job] = (RecoveredProcess({"pid": -1, "ticks": 1}), 1, operation)
+    supervisor.tick()
+    restored = Supervisor(config)
+    response = restored.dispatch({"version": 1, "op": "status", "subscriber": subscribers[0]}, [])
+    blocked = response["subscribers"][0]
+    message = _repair_progress_message(response["job"], blocked)
+    assert "修复受阻：验证未通过：恢复检查失败" in message
+    assert "hidden-secret" not in json.dumps(blocked)
+    assert response["job"]["result"] == {"ok": True, "commit": "candidate"}
+    other = restored.dispatch({"version": 1, "op": "status", "subscriber": subscribers[1]}, [])["subscribers"][0]
+    assert "repair_failure" not in other["payload"]
+    # A later generation must not display the previous validation failure.
+    changed = {**response["job"], "generation": 2, "result": {"control_error": "new control failure"}}
+    assert _repair_progress_message(changed, blocked) == "修复受阻：new control failure"
+
+
+def test_resume_failure_reports_exit_code_after_controller_restart(tmp_path):
+    from auto_agents.repair_client import _repair_progress_message
+
+    config = configuration(tmp_path)
+    supervisor = Supervisor(config)
+    subscriber = supervisor.store.register(registration(tmp_path))
+    job = supervisor.store.submit(subscriber, failure(tmp_path))
+    supervisor.store.transition(job, "ready", {"ok": True})
+    with supervisor.store.connect() as db:
+        db.execute("UPDATE subscribers SET state='resuming' WHERE id=?", (subscriber,))
+    atomic_json(Path(config["root"]) / "jobs" / job / ("resume-" + subscriber + "-result.json"), {"exit_code": 7})
+    supervisor.resumes[subscriber] = RecoveredProcess({"pid": -1, "ticks": 1})
+    supervisor.tick()
+    response = Supervisor(config).dispatch({"version": 1, "op": "status", "subscriber": subscriber}, [])
+    message = _repair_progress_message(response["job"], response["subscribers"][0])
+    assert "原任务恢复失败" in message and "退出码 7" in message
+
+
+def test_repair_progress_does_not_claim_success_for_another_subscriber():
+    from auto_agents.repair_client import _repair_progress_message
+
+    job = {"id": "shared", "state": "completed", "result": {}}
+    assert _repair_progress_message(job, {"state": "validating"}) == "修复方案已就绪，正在验证"
+    assert _repair_progress_message(job, {"state": "waiting"}) == "修复方案已就绪，等待验证"
+    assert _repair_progress_message(job, {"state": "blocked"}) == "修复受阻：未返回具体原因，请查看详细日志"
+    job["result"] = {"error": "CalledProcessError: long installation command", "environment_diagnostics": {"metadata": "command.json"}}
+    assert _repair_progress_message(job, {"state": "blocked"}) == "修复受阻：修复环境准备失败，请查看详细日志中的环境安装记录"
 
 
 def test_registration_loss_preserves_an_approved_runtime(tmp_path):
