@@ -50,7 +50,7 @@ def test_job_deduplication_includes_contract_base_and_environment(tmp_path):
     assert store.submit(b, {**failure(tmp_path / "b"), "environment": "other"}) != first
 
 
-def test_status_exposes_phase_elapsed_and_previous_failure_without_stale_generation(tmp_path):
+def test_status_exposes_phase_and_previous_failure_without_stale_generation(tmp_path):
     from auto_agents.repair_client import _repair_progress_message
     store = Store(tmp_path / "state")
     subscriber = store.register(registration(tmp_path / "project"))
@@ -63,7 +63,7 @@ def test_status_exposes_phase_elapsed_and_previous_failure_without_stale_generat
     with patch("auto_agents.repair_client.time.time", return_value=current["progress"]["started_at"] + 125):
         message = _repair_progress_message(current, {"state": "waiting"})
     assert "第 1 轮：正在准备验证依赖" in message
-    assert "本阶段 2 分钟" in message
+    assert "本阶段" not in message
     assert "Vitest dependency missing" in message and "do-not-show" not in message
     store.transition(job, "blocked")
     store.transition(job, "repairing")
@@ -789,20 +789,31 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
     first, second = "223d4c02f56845e79745958a", "f28ccccd37b2469cafc6c2a7"
     problems = {first: "任务重试后进度未恢复，导致流程无法继续", second: "验证结果未正确保存，导致重复验证"}
     states = iter([
-        (first, "repairing", "waiting"), (first, "repairing", "waiting"),
-        (first, "ready", "validating"), (first, "ready", "resuming"),
-        (first, "completed", "resuming"), (first, "completed", "resuming"),
-        (second, "repairing", "waiting"), (second, "blocked", "blocked"),
+        (first, "repairing", "waiting", "candidate_generation", 1, 0),
+        (first, "repairing", "waiting", "candidate_generation", 1, 65),
+        (first, "repairing", "waiting", "candidate_generation", 1, 125),
+        (first, "repairing", "waiting", "focused_verification", 1, 130),
+        (first, "repairing", "waiting", "focused_verification", 1, 195),
+        (first, "repairing", "waiting", "candidate_generation", 2, 200),
+        (first, "repairing", "waiting", "focused_verification", 2, 265),
+        (first, "ready", "validating", "", 0, 270),
+        (first, "ready", "resuming", "", 0, 275),
+        (first, "completed", "resuming", "", 0, 280),
+        (first, "completed", "resuming", "", 0, 285),
+        (second, "repairing", "waiting", "", 0, 290),
+        (second, "blocked", "blocked", "", 0, 295),
     ])
 
     def control_rpc(config, request):
         if request["op"] == "submit":
             return {"job": first}
         assert request["op"] == "status"
-        job, state, workflow = next(states)
+        job, state, workflow, phase, candidate, elapsed = next(states)
+        monkeypatch.setattr(repair_client.time, "time", lambda: 1000 + elapsed)
+        progress = {"phase": phase, "candidate": candidate, "started_at": 1000} if phase else {}
         payload = {"invocation": {"engine_route": {"issue_seed": {"summary": problems[job]}}}}
         return {"job": {"id": job, "state": state, "payload": {"error": "wrong shared-job symptom"},
-                        "result": {"error": "修复环境依赖安装失败"}},
+                        "result": {"error": "修复环境依赖安装失败"}, "progress": progress},
                 "subscribers": [{"id": "workflow", "state": workflow, "payload": {"repair": payload}}],
                 "registered": ["workflow"]}
 
@@ -815,6 +826,10 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
     assert lines == [
         f"Self-repair 223d4c02：正在修复：{problems[first]}",
         f"详细日志：{config['root']}/jobs/{first}",
+        "Self-repair 223d4c02：第 1 轮：正在生成修复代码",
+        "Self-repair 223d4c02：第 1 轮：正在执行针对性验证",
+        "Self-repair 223d4c02：第 2 轮：正在生成修复代码",
+        "Self-repair 223d4c02：第 2 轮：正在执行针对性验证",
         "Self-repair 223d4c02：修复方案已就绪，正在验证",
         "Self-repair 223d4c02：正在恢复原任务",
         "Self-repair 223d4c02：已通过恢复检查，原任务继续运行",

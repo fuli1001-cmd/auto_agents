@@ -260,10 +260,6 @@ def _repair_progress_message(job, subscriber):
         label = labels.get(phase, "正在审查候选" if phase.startswith("review_") else "正在修复")
         if progress.get("candidate"):
             label = f"第 {progress['candidate']} 轮：" + label
-        if progress.get("started_at"):
-            minutes = max(0, int((time.time() - progress["started_at"]) // 60))
-            if minutes:
-                label += f"（本阶段 {minutes} 分钟）"
         previous = progress.get("last_result") or {}
         if previous and previous.get("status") not in {"approved", "candidate_group_completed"}:
             reason = _repair_text(previous.get("reason", ""))
@@ -378,7 +374,8 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                 _report_repair_progress(project, log_path)
                 announced.add(job)
             if (job, message) != last:
-                if not (first and status == "repairing" and subscriber["state"] == "waiting"):
+                if not (first and status == "repairing" and subscriber["state"] == "waiting"
+                        and not response["job"].get("progress")):
                     _report_repair_progress(project, prefix + message)
                 if not first and (status in {"blocked", "cancelled"} or subscriber["state"] in {"blocked", "cancelled"}):
                     _report_repair_progress(project, log_path)
