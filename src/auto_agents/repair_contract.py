@@ -79,7 +79,7 @@ class EngineRequestContract:
 
 
 def prepare_contract(payload, revision, checkout, evidence, directory):
-    """One bounded read-only planning call after fetch, cached by route + SHA."""
+    """Read-only planning under progress supervision, cached by route + SHA."""
     from .models import AgentRequest
     from .orchestrator import Orchestrator
     route = payload["invocation"]["engine_route"]
@@ -111,7 +111,7 @@ def prepare_contract(payload, revision, checkout, evidence, directory):
         stage="self_repair_contract", purpose="diagnosis",
         effort=orchestrator.config.efforts.get("self_repair", "deep"),
         prompt=prompt, cwd=checkout, output_path=output, sandbox_mode="read-only",
-        timeout_seconds=180, progress_managed_timeout=False, record_execution_incidents=False))
+        progress_managed_timeout=True, record_execution_incidents=False))
     if not result.ok:
         raise RuntimeError("engine acceptance planning failed; request retained for explicit resume")
     raw = (result.summary or result.stdout or (output.read_text() if output.exists() else "")).strip()

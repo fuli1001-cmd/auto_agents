@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -166,15 +167,15 @@ def test_acceptance_contract_rejects_missing_or_unsafe_checks(tmp_path, invalid)
         EngineRequestContract.from_dict(data, request)
 
 
-def test_acceptance_planning_is_bounded_read_only_and_cached(tmp_path):
+def test_acceptance_planning_is_progress_managed_read_only_and_cached(tmp_path):
     request = route(tmp_path / "engine")
     payload = {"invocation": {"engine_route": request}, "provider": "codex"}
     orch = SimpleNamespace(config=SimpleNamespace(efforts={}), _set_active_provider=lambda p: None)
     calls = []
     def plan(agent):
         calls.append(agent)
-        assert agent.sandbox_mode == "read-only" and agent.timeout_seconds == 180
-        assert not agent.progress_managed_timeout
+        assert agent.sandbox_mode == "read-only" and agent.timeout_seconds == 0
+        assert agent.progress_managed_timeout
         assert not agent.record_execution_incidents
         return SimpleNamespace(ok=True, summary=json.dumps({"checks": contract_data(request)["checks"]}))
     orch._call_with_failover = plan
@@ -183,6 +184,64 @@ def test_acceptance_planning_is_bounded_read_only_and_cached(tmp_path):
         second = prepare_contract(payload, "sha", tmp_path, tmp_path, tmp_path)
     assert first.to_dict() == second.to_dict()
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("progressing", [True, False])
+def test_acceptance_planning_obeys_progress_instead_of_provider_deadline(tmp_path, progressing):
+    from auto_agents.adapters.base import run_subprocess_with_optional_streaming
+    from auto_agents.adapters.codex import CodexProgressDecoder
+    from auto_agents.models import SmartTimeoutConfig
+
+    request = route(tmp_path / "engine")
+    payload = {"invocation": {"engine_route": request}, "provider": "codex"}
+    orch = SimpleNamespace(config=SimpleNamespace(efforts={}), _set_active_provider=lambda p: None)
+    checks = contract_data(request)["checks"]
+    # Scale the provider deadline to one second. Distinct completed inspections
+    # renew progress; status messages alone must not keep planning alive.
+    script = """
+import json, sys, time
+progressing = sys.argv[1] == 'True'
+for index in range(8):
+    if progressing:
+        item = {'id': str(index), 'type': 'command_execution',
+                'command': 'read evidence ' + str(index),
+                'aggregated_output': 'evidence ' + str(index), 'exit_code': 0}
+    else:
+        item = {'id': str(index), 'type': 'agent_message', 'text': 'Still reviewing'}
+    print(json.dumps({'type': 'item.completed', 'item': item}), flush=True)
+    time.sleep(0.4)
+print(json.dumps({'type': 'item.completed', 'item': {
+    'id': 'final', 'type': 'agent_message', 'text': sys.argv[2]}}), flush=True)
+"""
+    def plan(agent):
+        # Production leases have a 60-second minimum; shorten only that lease
+        # for this subprocess regression, leaving event decoding and polling real.
+        with patch("auto_agents.supervision.ProgressSupervisor._effective_progress_lease_seconds", return_value=2):
+            result = run_subprocess_with_optional_streaming(
+                [sys.executable, "-c", script, str(progressing), json.dumps({"checks": checks})],
+                agent, dict(os.environ), timeout=1,
+                smart_timeout=SmartTimeoutConfig(
+                    provider_idle_seconds=60, tool_idle_seconds=60,
+                    semantic_stall_seconds=60, safety_ceiling_seconds=60),
+                progress_decoder=CodexProgressDecoder(), provider="codex")
+        if progressing:
+            assert result.returncode == 0
+            assert result.termination is None
+        else:
+            assert result.returncode == -1
+            assert result.termination.reason == "semantic_stall"
+        summary = json.loads(result.stdout.splitlines()[-1])["item"].get("text", "")
+        return SimpleNamespace(ok=result.returncode == 0, summary=summary)
+
+    orch._call_with_failover = plan
+    with patch("auto_agents.orchestrator.Orchestrator", return_value=orch):
+        if progressing:
+            contract = prepare_contract(payload, "sha", tmp_path, tmp_path, tmp_path)
+            assert contract.checks == checks
+        else:
+            with pytest.raises(RuntimeError, match="acceptance planning failed"):
+                prepare_contract(payload, "sha", tmp_path, tmp_path, tmp_path)
+            assert not list(tmp_path.glob("request-contract-*.json"))
 
 
 @pytest.mark.parametrize("behavior,boundary,expected", [
