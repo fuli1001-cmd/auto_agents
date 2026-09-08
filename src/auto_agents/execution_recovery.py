@@ -584,13 +584,13 @@ def deterministic_diagnosis(incident: ExecutionIncident) -> Optional[IncidentDia
             evidence=["cleanup_incomplete=true"],
         )
     if incident.source == "provider":
-        if incident.termination_reason == "timed_out":
+        if incident.termination_reason in {"timed_out", "safety_ceiling", "execution_budget_exhausted"}:
             return IncidentDiagnosis(
                 owner="auto_agents",
-                action="RETRY",
+                action="STOP" if incident.termination_reason == "execution_budget_exhausted" else "RETRY",
                 confidence=1.0,
                 reason="auto_agents execution time budget exhausted; the local wall-clock deadline terminated the provider",
-                evidence=["termination_reason=timed_out"],
+                evidence=[f"termination_reason={incident.termination_reason}"],
             )
         return IncidentDiagnosis(
             owner="external_provider",

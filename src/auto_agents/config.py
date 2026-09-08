@@ -185,7 +185,6 @@ DEFAULT_CONFIG = {
             "cwd_flag": "-C",
             "prompt_via_stdin": True,
             "output_flag": "-o",
-            "idle_timeout_seconds": DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
             "subscription_tier": "default",
             "vision": "auto",
         },
@@ -197,8 +196,6 @@ DEFAULT_CONFIG = {
             "cwd_flag": "",
             "prompt_via_stdin": True,
             "output_flag": "",
-            "timeout_seconds": DEFAULT_CLAUDE_CODE_TIMEOUT_SECONDS,
-            "idle_timeout_seconds": DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
             "subscription_tier": "default",
             "vision": "auto",
         },
@@ -214,8 +211,6 @@ DEFAULT_CONFIG = {
             "cwd_flag": "",
             "prompt_via_stdin": True,
             "output_flag": "",
-            "timeout_seconds": 3600,
-            "idle_timeout_seconds": DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
             "subscription_tier": "default",
             "vision": "auto",
         },
@@ -231,8 +226,6 @@ DEFAULT_CONFIG = {
             "cwd_flag": "",
             "prompt_via_stdin": False,
             "output_flag": "",
-            "timeout_seconds": 7200,
-            "idle_timeout_seconds": 7200,
             "subscription_tier": "default",
             "vision": "disabled",
         },
@@ -248,8 +241,6 @@ DEFAULT_CONFIG = {
             "cwd_flag": "",
             "prompt_via_stdin": False,
             "output_flag": "",
-            "timeout_seconds": 7200,
-            "idle_timeout_seconds": 7200,
             "subscription_tier": "default",
             "vision": "disabled",
         },
@@ -360,11 +351,9 @@ DEFAULT_CONFIG = {
             "allow_downloads": True,
         },
         "smart_timeout": {
-            "enabled": True,
             "provider_idle_seconds": 1800,
             "tool_idle_seconds": 900,
             "semantic_stall_seconds": 3600,
-            "safety_ceiling_seconds": 14400,
             "loop_repeat_limit": 3,
             "same_provider_resume_limit": 1,
             "stage_progress_lease_seconds": {
@@ -375,8 +364,6 @@ DEFAULT_CONFIG = {
                 "design": 1200,
                 "readme": 900,
             },
-            "post_ceiling_finalize_seconds": 600,
-            "fresh_continuation_limit": 1,
         },
         "health_watch": {
             "enabled": True,
@@ -709,6 +696,22 @@ def _apply_project_config_migrations(data: object) -> bool:
     if not isinstance(data, dict):
         return False
     migrated = False
+    providers = data.get("providers", {})
+    if isinstance(providers, dict):
+        for provider in providers.values():
+            if isinstance(provider, dict):
+                for key in ("timeout_seconds", "idle_timeout_seconds"):
+                    if key in provider:
+                        del provider[key]
+                        migrated = True
+    execution = data.get("execution", {})
+    smart = execution.get("smart_timeout", {}) if isinstance(execution, dict) else {}
+    if isinstance(smart, dict):
+        for key in ("enabled", "safety_ceiling_seconds", "post_ceiling_finalize_seconds",
+                    "active_tool_grace_seconds", "fresh_continuation_limit"):
+            if key in smart:
+                del smart[key]
+                migrated = True
     gates = data.get("gates")
     execution = data.get("execution")
     if isinstance(execution, dict) and "acceleration" not in execution:
@@ -742,6 +745,11 @@ def load_project_config(project_root: Path) -> ProjectConfig:
     data = read_json(config_path(project_root), default=None)
     if data is None:
         raise FileNotFoundError(f"Missing config: {config_path(project_root)}")
+    from .validation import project_config_warnings
+    import warnings
+    for message in project_config_warnings(data):
+        if "obsolete and ignored" in message:
+            warnings.warn(message, UserWarning, stacklevel=2)
     _apply_project_config_migrations(data)
     return ProjectConfig.from_dict(data)
 

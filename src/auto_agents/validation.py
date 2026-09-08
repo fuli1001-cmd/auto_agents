@@ -2502,13 +2502,10 @@ def validate_project_config_payload(payload: object) -> List[str]:
             if not isinstance(smart_timeout, dict):
                 errors.append("execution.smart_timeout must be an object")
             else:
-                if not isinstance(smart_timeout.get("enabled", True), bool):
-                    errors.append("execution.smart_timeout.enabled must be a boolean")
                 timeout_defaults = {
                     "provider_idle_seconds": 1800,
                     "tool_idle_seconds": 900,
                     "semantic_stall_seconds": 3600,
-                    "safety_ceiling_seconds": 14400,
                 }
                 for key, default in timeout_defaults.items():
                     value = smart_timeout.get(key, default)
@@ -2556,60 +2553,6 @@ def validate_project_config_payload(payload: object) -> List[str]:
                                 f"execution.smart_timeout.{stage_lease_key} values "
                                 "must be integers >= 60"
                             )
-                if (
-                    "post_ceiling_finalize_seconds" in smart_timeout
-                    and "active_tool_grace_seconds" in smart_timeout
-                ):
-                    errors.append(
-                        "execution.smart_timeout cannot define both "
-                        "post_ceiling_finalize_seconds and deprecated active_tool_grace_seconds"
-                    )
-                finalize_key = (
-                    "post_ceiling_finalize_seconds"
-                    if "post_ceiling_finalize_seconds" in smart_timeout
-                    else "active_tool_grace_seconds"
-                )
-                finalize_seconds = smart_timeout.get(finalize_key, 600)
-                if (
-                    not isinstance(finalize_seconds, int)
-                    or isinstance(finalize_seconds, bool)
-                    or finalize_seconds < 0
-                ):
-                    errors.append(
-                        f"execution.smart_timeout.{finalize_key} "
-                        "must be an integer >= 0"
-                    )
-                fresh_limit = smart_timeout.get("fresh_continuation_limit", 1)
-                if (
-                    not isinstance(fresh_limit, int)
-                    or isinstance(fresh_limit, bool)
-                    or fresh_limit < 0
-                ):
-                    errors.append(
-                        "execution.smart_timeout.fresh_continuation_limit "
-                        "must be an integer >= 0"
-                    )
-                safety = smart_timeout.get("safety_ceiling_seconds", 14400)
-                leases = [
-                    smart_timeout.get(key, default)
-                    for key, default in timeout_defaults.items()
-                    if key != "safety_ceiling_seconds"
-                ]
-                if isinstance(stage_leases, dict):
-                    leases.extend(stage_leases.values())
-                if (
-                    isinstance(safety, int)
-                    and not isinstance(safety, bool)
-                    and all(
-                        isinstance(value, int) and not isinstance(value, bool)
-                        for value in leases
-                    )
-                    and leases
-                    and safety < max(leases)
-                ):
-                    errors.append(
-                        "execution.smart_timeout.safety_ceiling_seconds must be >= all lease timeouts"
-                    )
             provider_failover = execution.get("provider_failover", {})
             if not isinstance(provider_failover, dict):
                 errors.append("execution.provider_failover must be an object")
@@ -2679,10 +2622,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     if not isinstance(value, int) or value < 1:
                         errors.append(f"execution.recovery.{key} must be an integer >= 1")
 
-    smart_timeout_enabled = True
-    if isinstance(execution, dict) and isinstance(execution.get("smart_timeout", {}), dict):
-        smart_timeout_enabled = execution.get("smart_timeout", {}).get("enabled", True) is True
-    if smart_timeout_enabled and isinstance(providers, dict):
+    if isinstance(providers, dict):
         native_kinds = {"codex", "claude-code", "copilot-cli", "antigravity", "mock"}
         for provider_name, provider in providers.items():
             if not isinstance(provider, dict):
@@ -2692,7 +2632,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
             if provider.get("progress_protocol") != SMART_TIMEOUT_PROGRESS_PROTOCOL:
                 errors.append(
                     f"providers.{provider_name}.progress_protocol must be "
-                    f"'{SMART_TIMEOUT_PROGRESS_PROTOCOL}' when smart timeout is enabled"
+                    f"'{SMART_TIMEOUT_PROGRESS_PROTOCOL}' for mandatory progress supervision"
                 )
 
     approvals = payload.get("approvals")
@@ -2805,11 +2745,17 @@ def project_config_warnings(payload: object) -> List[str]:
             "execution.smart_timeout.stage_checkpoint_seconds is deprecated; "
             "use stage_progress_lease_seconds"
         )
-    if "active_tool_grace_seconds" in smart_timeout:
-        warnings.append(
-            "execution.smart_timeout.active_tool_grace_seconds is deprecated; "
-            "use post_ceiling_finalize_seconds"
-        )
+    for key in ("enabled", "safety_ceiling_seconds", "post_ceiling_finalize_seconds",
+                "active_tool_grace_seconds", "fresh_continuation_limit"):
+        if key in smart_timeout:
+            warnings.append(f"execution.smart_timeout.{key} is obsolete and ignored; progress supervision is mandatory without an elapsed-time ceiling")
+    providers = payload.get("providers", {})
+    if isinstance(providers, dict):
+        for name, provider in providers.items():
+            if isinstance(provider, dict):
+                for key in ("timeout_seconds", "idle_timeout_seconds"):
+                    if key in provider:
+                        warnings.append(f"providers.{name}.{key} is obsolete and ignored; configure execution.smart_timeout progress leases instead")
     return warnings
 
 

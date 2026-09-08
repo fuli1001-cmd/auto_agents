@@ -172,8 +172,8 @@ class ClaudeProgressDecoder(ProgressDecoder):
             tool_id=str(block.get("tool_use_id", "")),
             fingerprint=_block_fingerprint(
                 {
-                    "tool_use_id": block.get("tool_use_id", ""),
                     "content": block.get("content", ""),
+                    "is_error": block.get("is_error", False),
                 }
             ),
             detail=block_type,
@@ -197,7 +197,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         smart_timeout: Optional[SmartTimeoutConfig] = None,
     ) -> None:
         self.config = config
-        self.smart_timeout = smart_timeout or SmartTimeoutConfig(enabled=False)
+        self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
@@ -215,7 +215,6 @@ class ClaudeCodeAdapter(AgentAdapter):
         env = dict(os.environ)
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
-        timeout = request.timeout_seconds or self.config.timeout_seconds or None
 
         prompt = self._effective_prompt(request)
         if self.config.prompt_via_stdin:
@@ -236,9 +235,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             command,
             filtered_request,
             env,
-            timeout=timeout,
             stdin_input=stdin_input,
-            idle_timeout=self.config.idle_timeout_seconds or None,
             smart_timeout=self.smart_timeout,
             progress_decoder=ClaudeProgressDecoder(),
             provider="claude-code",

@@ -75,11 +75,13 @@ class CodexProgressDecoder(ProgressDecoder):
             if not isinstance(item, dict):
                 return (AgentProgressEvent(kind="activity", detail=event_type),)
             item_type = str(item.get("type", ""))
+            # Invocation IDs identify active tools, not new evidence.
+            fingerprint = hashlib.sha256(json.dumps(
+                {key: value for key, value in item.items() if key != "id"},
+                sort_keys=True, ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
             if item_type in {"command_execution", "file_change", "mcp_tool_call", "web_search"}:
                 detail = str(item.get("command") or item.get("name") or item_type)
-                fingerprint = hashlib.sha256(
-                    json.dumps(item, sort_keys=True, ensure_ascii=False).encode("utf-8")
-                ).hexdigest()
                 return (
                     AgentProgressEvent(
                         kind=(
@@ -97,7 +99,7 @@ class CodexProgressDecoder(ProgressDecoder):
             return (
                 AgentProgressEvent(
                     kind="milestone" if semantic else "activity",
-                    fingerprint=str(item.get("id", "")),
+                    fingerprint=fingerprint,
                     detail=item_type or event_type,
                     semantic=semantic,
                 ),
@@ -114,7 +116,7 @@ class CodexAdapter(AgentAdapter):
         smart_timeout: Optional[SmartTimeoutConfig] = None,
     ) -> None:
         self.config = config
-        self.smart_timeout = smart_timeout or SmartTimeoutConfig(enabled=False)
+        self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
@@ -162,7 +164,6 @@ class CodexAdapter(AgentAdapter):
         env = dict(os.environ)
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
-        timeout = request.timeout_seconds or self.config.timeout_seconds or None
 
         # Wrap the stream callback to parse codex JSON lines in real-time,
         # forwarding only visible agent messages (not raw JSON).
@@ -177,8 +178,6 @@ class CodexAdapter(AgentAdapter):
             command,
             filtered_request,
             env,
-            timeout=timeout,
-            idle_timeout=self.config.idle_timeout_seconds or None,
             smart_timeout=self.smart_timeout,
             progress_decoder=CodexProgressDecoder(),
             provider="codex",

@@ -177,8 +177,8 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
                 def respond(request):
                     fake.requests.append(request)
-                    self.assertFalse(request.progress_managed_timeout)
-                    self.assertGreater(request.timeout_seconds, 0)
+                    self.assertFalse(hasattr(request, "progress_managed_timeout"))
+                    self.assertGreater(request.progress_lease_seconds, 0)
                     if request.stage == "self_repair_reviewer":
                         raise RuntimeError("smart timeout: timed out after 600s")
                     self.assertEqual(request.stage, "self_repair_investigator")
@@ -2940,17 +2940,14 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertTrue(orchestrator.generation_requests)
             self.assertTrue(
                 all(
-                    request.progress_managed_timeout
-                    and request.progress_lease_seconds == 300
+                    request.progress_lease_seconds == 300
                     for request in orchestrator.generation_requests
                 )
             )
             self.assertEqual(len(orchestrator.review_requests), 1)
             review_request = orchestrator.review_requests[0]
-            self.assertEqual(review_request.timeout_seconds, 60)
-            self.assertEqual(review_request.effort, "max")
             self.assertEqual(review_request.progress_lease_seconds, 60)
-            self.assertTrue(review_request.progress_managed_timeout)
+            self.assertEqual(review_request.effort, "max")
             self.assertIn(
                 "REVIEW_PHASE: integration",
                 orchestrator.review_requests[0].prompt,

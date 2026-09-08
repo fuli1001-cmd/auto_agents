@@ -30,7 +30,7 @@ from auto_agents.models import (
     ProviderConfig,
     SmartTimeoutConfig,
 )
-from auto_agents.supervision import ProgressDecoder, ProgressSupervisor
+from auto_agents.supervision import ProgressDecoder, ProgressSupervisor, execution_budget_probe
 from auto_agents.process_supervision import RunInterruptedError
 from auto_agents.validation import (
     project_config_warnings,
@@ -123,7 +123,6 @@ def test_stage_progress_lease_renews_only_on_semantic_progress(tmp_path):
             provider_idle_seconds=600,
             tool_idle_seconds=600,
             semantic_stall_seconds=600,
-            safety_ceiling_seconds=600,
             stage_progress_lease_seconds={"implement": 60},
         ),
         ProgressDecoder(),
@@ -150,14 +149,12 @@ def test_request_progress_lease_overrides_stage_default(tmp_path):
     clock = [0.0]
     request = _request(tmp_path)
     request.progress_lease_seconds = 90
-    request.progress_managed_timeout = True
     with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
         supervisor = ProgressSupervisor(
             config=SmartTimeoutConfig(
                 provider_idle_seconds=600,
                 tool_idle_seconds=600,
                 semantic_stall_seconds=600,
-                safety_ceiling_seconds=600,
                 stage_progress_lease_seconds={"implement": 300},
             ),
             request=request,
@@ -183,7 +180,7 @@ def test_request_progress_lease_overrides_stage_default(tmp_path):
 
     payload = json.loads((tmp_path / "attempt.json").read_text(encoding="utf-8"))
     assert payload["effective_progress_lease_seconds"] == 90
-    assert payload["progress_managed_timeout"] is True
+    assert "progress_managed_timeout" not in payload
 
 
 def test_parallel_active_tools_defer_semantic_stall_until_all_complete(tmp_path):
@@ -195,7 +192,6 @@ def test_parallel_active_tools_defer_semantic_stall_until_all_complete(tmp_path)
             provider_idle_seconds=600,
             tool_idle_seconds=600,
             semantic_stall_seconds=600,
-            safety_ceiling_seconds=600,
             stage_progress_lease_seconds={"implement": 60},
         ),
         ProgressDecoder(),
@@ -219,83 +215,41 @@ def test_parallel_active_tools_defer_semantic_stall_until_all_complete(tmp_path)
         assert not supervisor.active_tools
 
 
-def test_safety_ceiling_terminates_immediately_without_active_tool(tmp_path):
+def test_continuing_progress_survives_all_former_elapsed_time_limits(tmp_path):
     clock = [0.0]
-    supervisor = _supervisor(
-        tmp_path,
-        clock,
-        SmartTimeoutConfig(
-            provider_idle_seconds=600,
-            tool_idle_seconds=600,
-            semantic_stall_seconds=600,
-            safety_ceiling_seconds=60,
-        ),
-        ProgressDecoder(),
-    )
-    clock[0] = 61.0
+    supervisor = _supervisor(tmp_path, clock, SmartTimeoutConfig(), ProgressDecoder())
     with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
-        assert supervisor.poll() == "safety_ceiling"
+        for timestamp in range(120, 30001, 120):
+            clock[0] = float(timestamp)
+            supervisor.observe_events([AgentProgressEvent(
+                kind="tool_completed", tool_id=str(timestamp), fingerprint=str(timestamp),
+                detail="new evidence", semantic=True)])
+            assert supervisor.poll() is None
+        assert supervisor.termination("completed").elapsed_seconds > 14400
 
 
-def test_active_tool_may_finish_after_ceiling_then_gets_finalize_window(tmp_path):
+def test_healthy_tool_can_finish_and_start_another_after_four_hours(tmp_path):
     clock = [0.0]
-    supervisor = _supervisor(
-        tmp_path,
-        clock,
-        SmartTimeoutConfig(
-            provider_idle_seconds=600,
-            tool_idle_seconds=600,
-            semantic_stall_seconds=600,
-            safety_ceiling_seconds=60,
-            post_ceiling_finalize_seconds=10,
-            stage_progress_lease_seconds={"implement": 60},
-        ),
-        ProgressDecoder(),
-    )
+    supervisor = _supervisor(tmp_path, clock, SmartTimeoutConfig(), ProgressDecoder())
     with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
-        supervisor.observe_events(
-            [AgentProgressEvent(kind="tool_started", tool_id="tool-1", detail="pytest")]
-        )
-        clock[0] = 61.0
+        supervisor.observe_events([AgentProgressEvent(kind="tool_started", tool_id="first")])
+        for timestamp in range(120, 16001, 120):
+            clock[0] = float(timestamp)
+            supervisor.observe_events([AgentProgressEvent(kind="tool_progress", tool_id="first")])
+            assert supervisor.poll() is None
+        supervisor.observe_events([AgentProgressEvent(kind="tool_completed", tool_id="first", semantic=True)])
+        supervisor.observe_events([AgentProgressEvent(kind="tool_started", tool_id="second")])
         assert supervisor.poll() is None
-        clock[0] = 90.0
-        supervisor.observe_events(
-            [AgentProgressEvent(kind="tool_progress", tool_id="tool-1", detail="running")]
-        )
-        clock[0] = 100.0
-        supervisor.observe_events(
-            [AgentProgressEvent(kind="tool_completed", tool_id="tool-1", detail="passed")]
-        )
-        clock[0] = 109.0
-        assert supervisor.poll() is None
-        clock[0] = 111.0
-        assert supervisor.poll() == "safety_ceiling"
+        assert set(supervisor.active_tools) == {"second"}
 
 
-def test_new_tool_is_rejected_after_safety_ceiling(tmp_path):
+def test_heartbeat_does_not_keep_analysis_alive_after_long_use(tmp_path):
     clock = [0.0]
-    supervisor = _supervisor(
-        tmp_path,
-        clock,
-        SmartTimeoutConfig(
-            provider_idle_seconds=600,
-            tool_idle_seconds=600,
-            semantic_stall_seconds=600,
-            safety_ceiling_seconds=60,
-        ),
-        ProgressDecoder(),
-    )
+    supervisor = _supervisor(tmp_path, clock, SmartTimeoutConfig(), ProgressDecoder())
     with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
-        supervisor.observe_events(
-            [AgentProgressEvent(kind="tool_started", tool_id="tool-1", detail="pytest")]
-        )
-        clock[0] = 61.0
-        assert supervisor.poll() is None
-        supervisor.observe_events(
-            [AgentProgressEvent(kind="tool_started", tool_id="tool-2", detail="lint")]
-        )
-        assert supervisor.poll() == "safety_ceiling"
-        assert set(supervisor.active_tools) == {"tool-1"}
+        clock[0] = 20000.0
+        supervisor.observe_events([AgentProgressEvent(kind="activity", detail="still thinking")])
+        assert supervisor.poll() == "semantic_stall"
 
 
 def test_repeated_completed_tool_fingerprint_detects_loop(tmp_path):
@@ -351,44 +305,33 @@ def test_checkpoint_persists_session_and_diagnostics(tmp_path):
     assert payload["active_tool_count"] == 0
     assert payload["active_tools"] == []
     assert payload["effective_progress_lease_seconds"] == 3600
-    assert payload["safety_ceiling_reached"] is False
+    assert "safety_ceiling_reached" not in payload
 
 
-def test_legacy_smart_timeout_keys_are_loaded_and_serialized_as_new_keys():
-    config = SmartTimeoutConfig.from_dict(
-        {
-            "stage_checkpoint_seconds": {"implement": 1800},
-            "active_tool_grace_seconds": 900,
-        }
-    )
-
-    assert config.stage_progress_lease_seconds == {"implement": 1800}
-    assert config.post_ceiling_finalize_seconds == 900
+def test_legacy_limits_are_ignored_and_stage_lease_alias_is_preserved():
+    config = SmartTimeoutConfig.from_dict({
+        "enabled": False, "safety_ceiling_seconds": 180,
+        "post_ceiling_finalize_seconds": 900, "fresh_continuation_limit": 2,
+        "stage_checkpoint_seconds": {"implement": 1800},
+    })
     serialized = config.to_dict()
     assert serialized["stage_progress_lease_seconds"] == {"implement": 1800}
-    assert serialized["post_ceiling_finalize_seconds"] == 900
-    assert "stage_checkpoint_seconds" not in serialized
-    assert "active_tool_grace_seconds" not in serialized
+    assert not {"enabled", "safety_ceiling_seconds", "post_ceiling_finalize_seconds",
+                "fresh_continuation_limit", "stage_checkpoint_seconds"} & serialized.keys()
 
 
-def test_legacy_smart_timeout_keys_warn_and_conflicting_aliases_fail_validation():
+def test_removed_limits_warn_but_conflicting_stage_lease_aliases_fail_validation():
     payload = copy.deepcopy(DEFAULT_CONFIG)
-    smart_timeout = payload["execution"]["smart_timeout"]
-    stage_leases = smart_timeout.pop("stage_progress_lease_seconds")
-    finalize_seconds = smart_timeout.pop("post_ceiling_finalize_seconds")
-    smart_timeout["stage_checkpoint_seconds"] = stage_leases
-    smart_timeout["active_tool_grace_seconds"] = finalize_seconds
-
-    assert validate_project_config_payload(payload) == []
+    smart = payload["execution"]["smart_timeout"]
+    smart.update(enabled=False, safety_ceiling_seconds=1, active_tool_grace_seconds=10)
+    stage_leases = smart.pop("stage_progress_lease_seconds")
+    smart["stage_checkpoint_seconds"] = stage_leases
     warnings = project_config_warnings(payload)
-    assert any("stage_checkpoint_seconds is deprecated" in warning for warning in warnings)
-    assert any("active_tool_grace_seconds is deprecated" in warning for warning in warnings)
-
-    smart_timeout["stage_progress_lease_seconds"] = stage_leases
-    smart_timeout["post_ceiling_finalize_seconds"] = finalize_seconds
-    errors = validate_project_config_payload(payload)
-    assert any("stage_progress_lease_seconds and deprecated" in error for error in errors)
-    assert any("post_ceiling_finalize_seconds and deprecated" in error for error in errors)
+    assert len(warnings) == 4
+    assert validate_project_config_payload(payload) == []
+    smart["stage_progress_lease_seconds"] = stage_leases
+    assert any("stage_progress_lease_seconds and deprecated" in error
+               for error in validate_project_config_payload(payload))
 
 
 def test_smart_runner_terminates_process_group_and_writes_report(tmp_path):
@@ -402,7 +345,6 @@ def test_smart_runner_terminates_process_group_and_writes_report(tmp_path):
             provider_idle_seconds=0,
             tool_idle_seconds=60,
             semantic_stall_seconds=60,
-            safety_ceiling_seconds=60,
         ),
         provider="shell-test",
     )
@@ -410,48 +352,48 @@ def test_smart_runner_terminates_process_group_and_writes_report(tmp_path):
     assert result.returncode == -1
     assert result.termination is not None
     assert result.termination.reason == "provider_idle"
-    assert "smart timeout: provider idle" in result.stderr
+    assert "provider supervision: provider idle" in result.stderr
     payload = json.loads((tmp_path / "attempt.json").read_text(encoding="utf-8"))
     assert payload["status"] == "terminated"
     assert payload["reason"] == "provider_idle"
 
 
-def test_request_hard_timeout_remains_absolute_with_smart_supervision(tmp_path):
+def test_explicit_budget_cancels_without_disabling_supervision(tmp_path):
     request = _request(tmp_path)
+    request.termination_probe = execution_budget_probe(1)
 
     result = run_subprocess_with_optional_streaming(
         ["/bin/sh", "-c", "sleep 10"],
         request,
         dict(os.environ),
-        timeout=1,
         smart_timeout=SmartTimeoutConfig(
             provider_idle_seconds=600,
             tool_idle_seconds=600,
             semantic_stall_seconds=600,
-            safety_ceiling_seconds=600,
         ),
         provider="shell-test",
     )
 
     assert result.returncode == -1
     assert result.termination is not None
-    assert result.termination.reason == "timed_out"
-    assert "smart timeout: timed out" in result.stderr
+    assert result.termination.reason == "execution_budget_exhausted"
+    assert "execution budget exhausted" in result.stderr
 
 
-def test_streaming_timeout_covers_blocked_prompt_delivery(tmp_path):
+def test_explicit_budget_covers_blocked_prompt_delivery(tmp_path):
     request = _request(tmp_path)
+    request.termination_probe = execution_budget_probe(0.1)
     request.prompt = "x" * (2 * 1024 * 1024)
     request.stream_output = lambda *_args: None
     started = time.monotonic()
 
     result = run_subprocess_with_optional_streaming(
         [sys.executable, "-c", "import time; time.sleep(4)"],
-        request, dict(os.environ), timeout=0.1,
+        request, dict(os.environ),
     )
 
     assert result.returncode == -1
-    assert "timed out after 0.1s" in result.stderr
+    assert result.termination.reason == "execution_budget_exhausted"
     assert time.monotonic() - started < 3
 
 
@@ -462,28 +404,25 @@ def test_streaming_provider_may_close_stdin_before_consuming_prompt(tmp_path):
 
     result = run_subprocess_with_optional_streaming(
         [sys.executable, "-c", "import os; os.close(0); print('finished')"],
-        request, dict(os.environ), timeout=5,
+        request, dict(os.environ),
     )
 
     assert result.returncode == 0
     assert result.stdout.strip() == "finished"
 
 
-def test_progress_managed_request_is_not_cut_off_by_absolute_timeout(tmp_path):
+def test_default_request_writes_progress_report_without_opt_in(tmp_path):
     request = _request(tmp_path)
     request.progress_lease_seconds = 60
-    request.progress_managed_timeout = True
 
     result = run_subprocess_with_optional_streaming(
         ["/bin/sh", "-c", "sleep 2"],
         request,
         dict(os.environ),
-        timeout=1,
         smart_timeout=SmartTimeoutConfig(
             provider_idle_seconds=60,
             tool_idle_seconds=60,
             semantic_stall_seconds=60,
-            safety_ceiling_seconds=60,
         ),
         provider="shell-test",
     )
@@ -493,28 +432,19 @@ def test_progress_managed_request_is_not_cut_off_by_absolute_timeout(tmp_path):
     payload = json.loads((tmp_path / "attempt.json").read_text(encoding="utf-8"))
     assert payload["status"] == "completed"
     assert payload["effective_progress_lease_seconds"] == 60
-    assert payload["progress_managed_timeout"] is True
+    assert "progress_managed_timeout" not in payload
 
 
-def test_progress_managed_request_keeps_hard_timeout_without_smart_supervision(
-    tmp_path,
-):
+def test_omitted_supervision_config_still_monitors_and_accepts_cancellation(tmp_path):
     request = _request(tmp_path)
-    request.progress_lease_seconds = 60
-    request.progress_managed_timeout = True
-
+    request.termination_probe = execution_budget_probe(0.1)
     result = run_subprocess_with_optional_streaming(
-        ["/bin/sh", "-c", "sleep 10"],
-        request,
-        dict(os.environ),
-        timeout=1,
-        smart_timeout=SmartTimeoutConfig(enabled=False),
-        provider="shell-test",
-    )
-
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        request, dict(os.environ), provider="test")
     assert result.returncode == -1
-    assert result.termination is None
-    assert "timed out after 1s" in result.stderr
+    assert result.termination.reason == "execution_budget_exhausted"
+    payload = json.loads((tmp_path / "attempt.json").read_text())
+    assert payload["reason"] == "execution_budget_exhausted"
 
 
 def test_external_health_probe_can_quiesce_provider_without_provider_incident(tmp_path):
@@ -529,7 +459,6 @@ def test_external_health_probe_can_quiesce_provider_without_provider_incident(tm
             provider_idle_seconds=600,
             tool_idle_seconds=600,
             semantic_stall_seconds=600,
-            safety_ceiling_seconds=600,
         ),
         provider="shell-test",
     )

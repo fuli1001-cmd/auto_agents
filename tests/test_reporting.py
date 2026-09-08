@@ -173,7 +173,7 @@ def test_diagnostic_capture_does_not_mark_output_as_visible(report, tmp_path, st
                            stream_transport=stream_transport)
     result = run_subprocess_with_optional_streaming(
         [sys.executable, "-c", "import sys; print('raw evidence'); print('failure detail', file=sys.stderr)"],
-        request, dict(os.environ), timeout=5,
+        request, dict(os.environ),
     )
     assert result.returncode == 0
     assert not result.streamed_stdout and not result.streamed_stderr
@@ -370,7 +370,7 @@ def test_visible_shell_output_without_final_newline_is_flushed(tmp_path):
     callback = orchestrator._stream_agent_output_callback("implement")
     request = AgentRequest("implement", "deep", "", project, project / "out", stream_output=callback)
     result = run_subprocess_with_optional_streaming(
-        [sys.executable, "-c", "print('last partial line', end='')"], request, dict(os.environ), timeout=5,
+        [sys.executable, "-c", "print('last partial line', end='')"], request, dict(os.environ),
     )
     assert result.returncode == 0
     assert stream.getvalue().count("last partial line") == 1

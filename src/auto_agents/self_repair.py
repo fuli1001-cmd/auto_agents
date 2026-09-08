@@ -764,7 +764,8 @@ def classify_auto_agents_error(
         return SelfRepairDecision(False, reason="target project preflight failure")
     if "review rejected the task" in lowered:
         return SelfRepairDecision(False, reason="target task review failure")
-    if "auto_agents execution time budget exhausted" in lowered:
+    if ("auto_agents execution time budget exhausted" in lowered
+            or "provider supervision: execution budget exhausted" in lowered):
         return SelfRepairDecision(
             False,
             category="execution_time_budget",
@@ -3174,9 +3175,7 @@ class AutoAgentsSelfRepairRunner:
             cwd=self.repo_root,
             output_path=output_path,
             sandbox_mode="read-only",
-            timeout_seconds=progress_lease,
             progress_lease_seconds=progress_lease,
-            progress_managed_timeout=True,
         )
         try:
             result: AgentResult = self.target_orchestrator._call_with_failover(request)
@@ -3398,9 +3397,7 @@ class AutoAgentsSelfRepairRunner:
             cwd=self.repo_root,
             output_path=output_path,
             sandbox_mode="read-only",
-            timeout_seconds=lease,
             progress_lease_seconds=lease,
-            progress_managed_timeout=True,
         )
         try:
             result: AgentResult = self.target_orchestrator._call_with_failover(request)
@@ -4166,15 +4163,8 @@ class AutoAgentsSelfRepairRunner:
                     prompt=prompt,
                     cwd=repair_root,
                     output_path=output_path,
-                    timeout_seconds=candidate_timeout,
-                    # Candidate generation can legitimately exceed the legacy
-                    # wall-clock timeout while it is still editing or running
-                    # focused checks. Let semantic/tool progress renew this
-                    # lease; smart_timeout.safety_ceiling_seconds remains the
-                    # absolute bound. The timeout is still the fallback when
-                    # smart supervision is disabled.
+                    # The configured duration is an inactivity lease, not a total budget.
                     progress_lease_seconds=candidate_timeout,
-                    progress_managed_timeout=True,
                     progress_report_path=(
                         self._experiment_store.candidate_root(candidate_id)
                         / "provider-progress.json"
@@ -5252,9 +5242,7 @@ class AutoAgentsSelfRepairRunner:
             prompt=prompt,
             cwd=repair_root,
             output_path=output_path,
-            timeout_seconds=timeout_seconds,
             progress_lease_seconds=timeout_seconds,
-            progress_managed_timeout=True,
             progress_report_path=(
                 self._experiment_store.candidate_root(candidate_id)
                 / "provider-progress-correction.json"
@@ -5588,9 +5576,7 @@ class AutoAgentsSelfRepairRunner:
             # This remains the hard-timeout fallback when smart supervision is
             # disabled. With smart supervision it is a no-progress lease, while
             # the configured safety ceiling remains the final bound.
-            timeout_seconds=progress_lease_seconds,
             progress_lease_seconds=progress_lease_seconds,
-            progress_managed_timeout=True,
         )
         try:
             before_review = capture_repository_guard(repair_root)

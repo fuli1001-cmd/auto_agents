@@ -224,6 +224,7 @@ from .models import (
     APPROVAL_BY_STAGE,
     AgentResult,
     AgentRequest,
+    AgentTermination,
     AgentUsage,
     CommandResult,
     DOCUMENT_LANGUAGE_OPTIONS,
@@ -290,7 +291,7 @@ from .prototype_variants import (
     variant_prototype_dir,
 )
 from .prototype_recovery import PrototypeGenerationCheckpoint
-from .supervision import process_start_identity
+from .supervision import LOCAL_EXECUTION_LIMITS, combine_termination_probes, process_start_identity
 from .requirements import (
     AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
     NonAmendableRequirementContractRecoveryError,
@@ -5851,7 +5852,7 @@ class Orchestrator:
                     output_path=output_path,
                     attempt_id=f"operator-input-{request.request_id}",
                     sandbox_mode="read-only",
-                    timeout_seconds=120,
+                    progress_lease_seconds=120,
                     logical_call_id=uuid.uuid4().hex,
                     usage_context={"project_root": str(self.project_root), "workflow_kind": "run",
                                    "subject_id": load_run_state(self.project_root).run_id},
@@ -42563,9 +42564,6 @@ class Orchestrator:
                     output_path=output_path,
                     stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
                     attempt_id=artifact_stage,
-                    progress_managed_timeout=(
-                        stage == "prototype" and stage_key.startswith("prototype-generate-")
-                    ),
                     resume_session_id=str(selected_continuation.get("session_id", "")),
                     resume_provider=str(selected_continuation.get("provider", "")),
                     resume_prompt_hash=str(selected_continuation.get("prompt_hash", "")),
@@ -42593,6 +42591,8 @@ class Orchestrator:
                     cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
                     usage_available = True
                 self._emit_agent_output(artifact_stage, result)
+                if result.termination is not None and result.termination.reason == "execution_budget_exhausted":
+                    return result
                 self._cleanup_ephemeral_tooling_artifacts(include_untracked_build_lib=stage != "implement")
                 if state is not None:
                     state.agent_attempts[stage_key] = attempt
@@ -43401,6 +43401,8 @@ class Orchestrator:
 
     @staticmethod
     def _is_failover_error(result: AgentResult) -> bool:
+        if result.termination is not None and result.termination.reason in LOCAL_EXECUTION_LIMITS:
+            return False
         if not result.ok:
             provider_error = (result.stderr or "").lower()
             if any(
@@ -43439,8 +43441,8 @@ class Orchestrator:
         termination = result.termination
         if termination is not None:
             reason = termination.reason.lower()
-            if reason == "timed_out":
-                return "timeout"
+            if reason in LOCAL_EXECUTION_LIMITS:
+                return "execution_limit"
             if any(token in reason for token in ("timeout", "stall", "idle", "ceiling", "loop")):
                 return "timeout"
             if reason == "provider_error":
@@ -43558,11 +43560,7 @@ class Orchestrator:
         if not isinstance(provider, ProviderConfig):
             return self._build_adapter_for_provider(provider_kind)
         timeout = self._provider_failover_config().probe_timeout_seconds
-        probe_provider = replace(
-            provider,
-            timeout_seconds=min(provider.timeout_seconds, timeout),
-            idle_timeout_seconds=min(provider.idle_timeout_seconds, timeout),
-        )
+        probe_provider = provider
         smart = replace(
             self.config.execution.smart_timeout,
             provider_idle_seconds=min(
@@ -43577,7 +43575,7 @@ class Orchestrator:
                 self.config.execution.smart_timeout.semantic_stall_seconds,
                 timeout,
             ),
-            safety_ceiling_seconds=timeout,
+            stage_progress_lease_seconds={"provider_probe": timeout},
             same_provider_resume_limit=0,
         )
         if probe_provider.kind == "codex":
@@ -43684,6 +43682,14 @@ class Orchestrator:
         return ShellAdapter(prov, self.config.execution.smart_timeout)
 
     def _call_with_failover(self, request: AgentRequest) -> AgentResult:
+        if request.termination_probe is not None and request.termination_probe() == "execution_budget_exhausted":
+            # An already-cancelled task must not spend another model call on a
+            # provider health canary before reaching the adapter's own check.
+            return AgentResult(
+                ok=False, command=[], output_path=request.output_path, returncode=-1,
+                stderr=f"provider supervision: execution budget exhausted; stage={request.stage}",
+                termination=AgentTermination(reason="execution_budget_exhausted"),
+            )
         from .managed_verification import attach_context
         request = attach_context(self, request)
         from .provider_usage import with_attempt_usage
@@ -43788,20 +43794,6 @@ class Orchestrator:
                 reporter.emit("provider.recovering")
             last_error = result.stderr or result.summary or "unknown error"
 
-        if (
-            request.stage == "prototype"
-            and request.progress_managed_timeout
-            and last_result is not None
-            and last_result.termination is not None
-            and last_result.termination.reason == "timed_out"
-        ):
-            # Let the bounded stage retry loop handle the preserved draft.
-            # A local deadline is not evidence of provider unavailability.
-            return replace(
-                last_result,
-                stderr="auto_agents execution time budget exhausted during prototype generation. "
-                + (last_result.stderr or last_result.summary),
-            )
         raise RuntimeError(
             f"All providers exhausted. Tried: {tried}. Last error: {last_error}"
         )
@@ -44003,6 +43995,8 @@ class Orchestrator:
                     session_id or "fresh",
                 )
                 continue
+            if reason == "execution_budget_exhausted":
+                return result
             incident = (
                 self._record_provider_execution_incident(
                     request.stage, provider, result
@@ -44010,34 +44004,12 @@ class Orchestrator:
                 if request.record_execution_incidents
                 else None
             )
-            resumable = reason in {
-                "tool_stalled",
-                "semantic_stall",
-                "loop_detected",
-                "safety_ceiling",
-            }
-            resumable = resumable or (
-                reason == "timed_out"
-                and self.config.execution.smart_timeout.enabled
-                and request.stage == "prototype"
-                and request.progress_managed_timeout
-                and not request.timeout_seconds
-                and bool(result.provider_session_id)
-            )
-            resume_limit = (
-                self.config.execution.smart_timeout.fresh_continuation_limit
-                if reason == "safety_ceiling"
-                else self.config.execution.smart_timeout.same_provider_resume_limit
-            )
+            resumable = reason in {"tool_stalled", "semantic_stall", "loop_detected"}
+            resume_limit = self.config.execution.smart_timeout.same_provider_resume_limit
             if resumable and resume_count < resume_limit:
                 resume_count += 1
                 handoff = self._smart_timeout_handoff(result, reason)
-                session_id = (
-                    ""
-                    if reason == "safety_ceiling"
-                    else result.provider_session_id
-                )
-                prompt = handoff if session_id else f"{request.prompt}\n\n{handoff}"
+                session_id = result.provider_session_id
                 provider_request = self._provider_request_for_attempt(
                     self._prompt_handoff(provider_request, handoff, session_id),
                     provider=provider,
@@ -44048,11 +44020,7 @@ class Orchestrator:
                     "[smart-timeout] provider=%s reason=%s action=%s session=%s",
                     provider,
                     reason,
-                    (
-                        "continue-fresh"
-                        if reason == "safety_ceiling"
-                        else "resume-same"
-                    ),
+                    "resume-same",
                     session_id or "fresh",
                 )
                 if incident is not None:
@@ -44060,11 +44028,7 @@ class Orchestrator:
                         {
                             "event": "route",
                             "action": "RETRY",
-                            "mode": (
-                                "continue-fresh"
-                                if reason == "safety_ceiling"
-                                else "resume-same"
-                            ),
+                            "mode": "resume-same",
                         }
                     )
                     state = load_run_state(self.project_root)
@@ -44249,7 +44213,7 @@ class Orchestrator:
             resume_session_id=resume_session_id,
             resume_prompt_hash=resume_prompt_hash,
             prompt_is_continuation=interrupted_resume or request.prompt_is_continuation,
-            termination_probe=self._health_termination_probe,
+            termination_probe=combine_termination_probes(request.termination_probe, self._health_termination_probe),
         )
 
     @staticmethod

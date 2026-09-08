@@ -92,11 +92,11 @@ class _TimeoutInspectingAdapter(_FakeAdapter):
     def __init__(self, result, smart_timeout):
         super().__init__(result)
         self.smart_timeout = smart_timeout
-        self.observed_safety_ceilings = []
+        self.observed_provider_leases = []
 
     def run(self, request):
-        self.observed_safety_ceilings.append(
-            self.smart_timeout.safety_ceiling_seconds
+        self.observed_provider_leases.append(
+            self.smart_timeout.provider_idle_seconds
         )
         return super().run(request)
 
@@ -297,47 +297,28 @@ class TestFailoverProviderOrder(unittest.TestCase):
 
 
 class TestCallWithFailover(unittest.TestCase):
-    def test_prototype_deadline_resumes_session_and_has_bounded_recovery(self):
-        failed = _make_result(
-            ok=False, returncode=-1, stderr="smart timeout: timed out; quota page screenshot",
-            termination=AgentTermination(reason="timed_out"), provider_session_id="prototype-session",
-        )
-        for completes in (True, False):
-            with self.subTest(completes=completes), tempfile.TemporaryDirectory() as tmp:
-                adapter = _SequenceAdapter([failed, _make_result()] if completes else [failed])
-                stub = _stub_orchestrator({"codex": {}}, "codex", {"codex": adapter})
-                request = AgentRequest(
-                    stage="prototype", effort="deep", prompt="generate draft",
-                    cwd=Path(tmp), output_path=Path(tmp) / "out.md",
-                    progress_managed_timeout=True,
-                )
-                result = stub._call_with_failover(request)
-                self.assertEqual(result.ok, completes)
-                self.assertEqual(adapter.calls, 2)
-                self.assertEqual(adapter.requests[1].resume_session_id, "prototype-session")
-                self.assertEqual(stub._failover_error_category(failed), "timeout")
-                if not completes:
-                    self.assertIn("auto_agents execution time budget exhausted", result.stderr)
+    def test_local_execution_limits_do_not_resume_failover_or_cool_down(self):
+        for reason in ("timed_out", "safety_ceiling", "execution_budget_exhausted"):
+            for stage in ("prototype", "self_repair_reviewer", "implement"):
+                with self.subTest(reason=reason, stage=stage), tempfile.TemporaryDirectory() as tmp:
+                    failed = _make_result(ok=False, returncode=-1, stderr="quota page screenshot",
+                        termination=AgentTermination(reason=reason), provider_session_id="old-session")
+                    adapter = _SequenceAdapter([failed, _make_result()])
+                    alternate = _SequenceAdapter([_make_result()])
+                    stub = _stub_orchestrator({"codex": {}, "copilot-cli": {}}, "codex",
+                                             {"codex": adapter, "copilot-cli": alternate})
+                    request = AgentRequest(stage=stage, effort="deep", prompt="work",
+                                           cwd=Path(tmp), output_path=Path(tmp) / "out.md")
+                    result = stub._call_with_failover(request)
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.termination.reason, reason)
+                    self.assertEqual(adapter.calls, 1)
+                    self.assertEqual(alternate.calls, 0)
+                    self.assertEqual(stub._provider_health_map(), {})
+                    self.assertEqual(stub._failover_error_category(result), "execution_limit")
 
-    def test_explicit_diagnostic_deadline_is_not_resumed(self):
-        failed = _make_result(
-            ok=False, returncode=-1,
-            termination=AgentTermination(reason="timed_out"), provider_session_id="diagnostic-session",
-        )
-        adapter = _SequenceAdapter([failed, _make_result()])
-        stub = _stub_orchestrator({"codex": {}}, "codex", {"codex": adapter})
-        with tempfile.TemporaryDirectory() as tmp:
-            request = AgentRequest(
-                stage="self_repair_reviewer", effort="deep", prompt="review evidence",
-                cwd=Path(tmp), output_path=Path(tmp) / "out.md", timeout_seconds=600,
-            )
-            with self.assertRaisesRegex(RuntimeError, "All providers exhausted"):
-                stub._call_with_failover(request)
-        self.assertEqual(adapter.calls, 1)
-
-    def test_stage_progress_lease_does_not_clamp_provider_safety_ceiling(self):
+    def test_stage_progress_lease_does_not_clamp_provider_activity_lease(self):
         smart_timeout = SmartTimeoutConfig(
-            safety_ceiling_seconds=14400,
             stage_progress_lease_seconds={"plan": 60},
         )
         adapter = _TimeoutInspectingAdapter(_make_result(ok=True), smart_timeout)
@@ -347,7 +328,7 @@ class TestCallWithFailover(unittest.TestCase):
         result = stub._call_with_failover(_make_request())
 
         self.assertTrue(result.ok)
-        self.assertEqual(adapter.observed_safety_ceilings, [14400])
+        self.assertEqual(adapter.observed_provider_leases, [1800])
 
     def test_semantic_stall_resumes_same_session_once(self):
         stalled = _make_result(

@@ -111,9 +111,10 @@ def prepare_contract(payload, revision, checkout, evidence, directory):
         stage="self_repair_contract", purpose="diagnosis",
         effort=orchestrator.config.efforts.get("self_repair", "deep"),
         prompt=prompt, cwd=checkout, output_path=output, sandbox_mode="read-only",
-        progress_managed_timeout=True, record_execution_incidents=False))
+         record_execution_incidents=False))
     if not result.ok:
-        raise RuntimeError("engine acceptance planning failed; request retained for explicit resume")
+        raise RuntimeError("engine acceptance planning failed; request retained for explicit resume: "
+                           + (getattr(result, "stderr", "") or result.summary or "no complete contract"))
     raw = (result.summary or result.stdout or (output.read_text() if output.exists() else "")).strip()
     if raw.startswith("```") and raw.endswith("```"):
         raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]

@@ -211,16 +211,19 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(config.providers["antigravity-gemini"].vision, "disabled")
             self.assertEqual(config.providers["codex"].idle_timeout_seconds, 3600)
 
-    def test_init_project_writes_idle_timeout_3600_to_config(self) -> None:
+    def test_init_project_writes_progress_leases_without_provider_deadlines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo")
 
             raw = json.loads(config_path(project_root).read_text(encoding="utf-8"))
-            self.assertEqual(raw["providers"]["codex"]["idle_timeout_seconds"], 3600)
-            self.assertEqual(raw["providers"]["copilot-cli"]["idle_timeout_seconds"], 3600)
+            for provider in raw["providers"].values():
+                self.assertNotIn("timeout_seconds", provider)
+                self.assertNotIn("idle_timeout_seconds", provider)
+            self.assertEqual(raw["execution"]["smart_timeout"]["provider_idle_seconds"], 1800)
+            self.assertNotIn("enabled", raw["execution"]["smart_timeout"])
 
-    def test_load_project_config_upgrades_legacy_copilot_timeout_default(self) -> None:
+    def test_load_project_config_ignores_legacy_copilot_timeout_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo")
@@ -231,21 +234,22 @@ class BootstrapTests(unittest.TestCase):
             raw["providers"]["copilot-cli"]["idle_timeout_seconds"] = 300
             config_file.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
-            config = load_project_config(project_root)
-            self.assertEqual(config.providers["copilot-cli"].timeout_seconds, 3600)
+            with self.assertWarns(UserWarning):
+                config = load_project_config(project_root)
+            self.assertNotIn("timeout_seconds", config.providers["copilot-cli"].to_dict())
 
-    def test_load_project_config_defaults_missing_copilot_idle_timeout_to_3600(self) -> None:
+    def test_load_project_config_accepts_missing_provider_deadlines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo")
 
             config_file = config_path(project_root)
             raw = json.loads(config_file.read_text(encoding="utf-8"))
-            del raw["providers"]["copilot-cli"]["idle_timeout_seconds"]
+            raw["providers"]["copilot-cli"].pop("idle_timeout_seconds", None)
             config_file.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
             config = load_project_config(project_root)
-            self.assertEqual(config.providers["copilot-cli"].idle_timeout_seconds, 3600)
+            self.assertEqual(config.execution.smart_timeout.provider_idle_seconds, 1800)
 
     def test_explicit_project_config_migration_upgrades_v2_gates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

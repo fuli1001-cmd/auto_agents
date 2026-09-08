@@ -168,18 +168,25 @@ def run(args):
                                            case["baseline_prompt"].replace(PLACEHOLDER, str(root)) if variant == "baseline" else fresh,
                                            root, root / ".auto-agents/eval-answer.md",
                                            sandbox_mode="read-only" if case.get("purpose") == "review" else "workspace-write",
-                                           timeout_seconds=args.timeout, model_adaptation=config.prompting.model_adaptation)
+                                           attempt_id=label,
+                                           progress_report_path=args.output / (label + ".progress.json"),
+                                           model_adaptation=config.prompting.model_adaptation)
                         runtime = adapter.describe_runtime(req)
                         if variant == "new":
                             req = prepare_request(req, runtime)
                         before = fixture_fingerprint(root)
                         start = time.monotonic()
+                        if args.timeout is not None:
+                            from auto_agents.supervision import execution_budget_probe
+                            req.termination_probe = execution_budget_probe(args.timeout)
                         result = adapter.run(req)
                         elapsed = time.monotonic() - start
                         checks = check_result(case, root, result.summary, before)
+                        checks["accepted"] = bool(checks["accepted"] and result.ok and not result.cleanup_incomplete)
                         row = {"case": case["id"], "provider": provider, "variant": variant,
                                "repetition": repetition + 1, "effort": args.effort, "runtime": asdict(runtime),
                                "ok": result.ok, **checks, "elapsed_seconds": elapsed,
+                               "termination": asdict(result.termination) if result.termination else None,
                                "prompt_bytes": len(req.prompt.encode("utf-8")), "prompt_metadata": result.prompt_metadata,
                                "usage": asdict(result.usage) if result.usage else None}
                         with report.open("a", encoding="utf-8") as handle:
@@ -201,8 +208,10 @@ def main(argv=None):
     command.add_argument("--providers", nargs="+")
     command.add_argument("--effort", choices=("balanced", "deep", "max"), default="deep")
     command.add_argument("--repetitions", type=int, choices=range(1, 11), default=3)
-    command.add_argument("--timeout", type=int, default=600)
+    command.add_argument("--timeout", type=int, default=None, help="explicit budget in seconds per evaluation; omitted means progress supervision only")
     args = parser.parse_args(argv)
+    if args.command == "run" and args.timeout is not None and args.timeout <= 0:
+        parser.error("--timeout must be positive")
     capture(args.output) if args.command == "capture" else run(args)
 
 

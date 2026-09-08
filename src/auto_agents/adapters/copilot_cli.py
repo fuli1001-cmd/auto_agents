@@ -89,7 +89,8 @@ class CopilotProgressDecoder(ProgressDecoder):
             )
         if event_type == "tool.execution_complete":
             fingerprint = hashlib.sha256(
-                json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                json.dumps({key: value for key, value in data.items() if key != "toolCallId"},
+                           sort_keys=True, ensure_ascii=False).encode("utf-8")
             ).hexdigest()
             return (
                 AgentProgressEvent(
@@ -124,7 +125,7 @@ class CopilotCliAdapter(AgentAdapter):
         smart_timeout: Optional[SmartTimeoutConfig] = None,
     ) -> None:
         self.config = config
-        self.smart_timeout = smart_timeout or SmartTimeoutConfig(enabled=False)
+        self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
@@ -154,7 +155,6 @@ class CopilotCliAdapter(AgentAdapter):
         else:
             stdin_input = request.prompt
 
-        timeout = request.timeout_seconds or self.config.timeout_seconds or None
 
         filtered_request = request
         if request.stream_output is not None:
@@ -167,9 +167,7 @@ class CopilotCliAdapter(AgentAdapter):
             command,
             filtered_request,
             env,
-            timeout=timeout,
             stdin_input=stdin_input,
-            idle_timeout=self.config.idle_timeout_seconds or None,
             smart_timeout=self.smart_timeout,
             progress_decoder=CopilotProgressDecoder(),
             provider="copilot-cli",

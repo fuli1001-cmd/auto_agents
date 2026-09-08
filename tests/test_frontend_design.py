@@ -210,7 +210,7 @@ def frontend_task(*, status: str = "in_progress") -> TaskSpec:
 
 
 class FrontendDesignTests(unittest.TestCase):
-    def test_exhausted_prototype_deadline_reaches_bounded_stage_retry(self):
+    def test_explicit_prototype_budget_cancellation_does_not_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"
             Orchestrator.init_project(root, "demo", "mock")
@@ -233,19 +233,19 @@ class FrontendDesignTests(unittest.TestCase):
                     requests.append(request)
                     return AgentResult(
                         ok=False, command=[], output_path=request.output_path,
-                        stderr="smart timeout: timed out", returncode=-1,
-                        termination=AgentTermination(reason="timed_out"),
+                        stderr="provider supervision: execution budget exhausted", returncode=-1,
+                        termination=AgentTermination(reason="execution_budget_exhausted"),
                         provider_session_id="prototype-session",
                     )
 
             orchestrator.adapter = TimeoutAdapter()
-            with patch.object(orchestrator, "_probe_active_provider", return_value=False):
-                with self.assertRaisesRegex(RuntimeError, "auto_agents execution time budget exhausted"):
-                    orchestrator._run_agent_with_retries(
-                        state, "prototype", "prototype-generate-draft", "generate draft",
-                    )
-            self.assertEqual(len(requests), 4)
-            self.assertTrue(any("attempt-2" in request.attempt_id for request in requests))
+            result = orchestrator._run_agent_with_retries(
+                state, "prototype", "prototype-generate-draft", "generate draft",
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(result.termination.reason, "execution_budget_exhausted")
+            self.assertEqual(len(requests), 1)
+            self.assertFalse(orchestrator._provider_health_map())
 
     def test_interrupted_prototype_is_preserved_and_resumed_before_becoming_candidate(self):
         for error_type in (RuntimeError, KeyboardInterrupt):
@@ -306,7 +306,7 @@ class FrontendDesignTests(unittest.TestCase):
                 entry = resumed._create_prototype_variant(**kwargs)
                 self.assertEqual(entry["id"], checkpoint["variant_id"])
                 self.assertEqual(requests[-1].resume_session_id, "saved-session")
-                self.assertTrue(all(request.progress_managed_timeout for request in requests))
+                self.assertTrue(all(not hasattr(request, "timeout_seconds") for request in requests))
                 self.assertFalse((draft / "interruption.json").exists())
                 self.assertEqual(len(candidate_variants(load_registry(root))), 1)
                 self.assertEqual(json.loads(checkpoints[0].read_text())["status"], "candidate")
@@ -331,17 +331,17 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertEqual(first.resumable_variant_id(), "")
             self.assertTrue(draft.is_dir())
 
-    def test_only_prototype_generation_uses_progress_managed_stage_requests(self):
+    def test_stage_requests_share_mandatory_progress_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"
             Orchestrator.init_project(root, "demo", "mock")
             orchestrator = Orchestrator(root)
             state = load_run_state(root)
             state.run_id = "request-timeout-policy"
-            for stage, key, expected in (
-                ("prototype", "prototype-generate-draft", True),
-                ("prototype", "prototype-select-draft", False),
-                ("plan", "plan", False),
+            for stage, key in (
+                ("prototype", "prototype-generate-draft"),
+                ("prototype", "prototype-select-draft"),
+                ("plan", "plan"),
             ):
                 requests = []
 
@@ -351,7 +351,8 @@ class FrontendDesignTests(unittest.TestCase):
 
                 with patch.object(orchestrator, "_call_with_failover", side_effect=respond):
                     orchestrator._run_agent_with_retries(state, stage, key, "work")
-                self.assertEqual(requests[0].progress_managed_timeout, expected)
+                self.assertFalse(hasattr(requests[0], "progress_managed_timeout"))
+                self.assertFalse(hasattr(requests[0], "timeout_seconds"))
 
     def test_prototype_cli_parses_generate_and_lists_virtual_legacy_without_migration(self) -> None:
         args = build_parser().parse_args(

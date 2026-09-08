@@ -5,10 +5,11 @@ import json
 import os
 import time
 from collections import deque
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 from .git_ops import worktree_fingerprint
 from .models import (
@@ -22,6 +23,31 @@ from .models import (
 PROTOCOL_STARTUP_SECONDS = 120
 WORKSPACE_POLL_SECONDS = 15
 CHECKPOINT_SECONDS = 30
+
+# Old reports remain readable, but these reasons describe local execution
+# limits, never provider availability or a reason to obtain a fresh budget.
+LOCAL_EXECUTION_LIMITS = frozenset({"execution_budget_exhausted", "timed_out", "safety_ceiling"})
+
+
+def execution_budget_probe(seconds: float) -> Callable[[], str]:
+    """Create one explicit caller budget, shared across copies and continuations."""
+    import math
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("execution budget must be a finite positive duration")
+    deadline = time.monotonic() + seconds
+    return lambda: "execution_budget_exhausted" if time.monotonic() >= deadline else ""
+
+
+def combine_termination_probes(*probes: Optional[Callable[[], str]]) -> Callable[[], str]:
+    """Preserve caller cancellation while adding workflow health supervision."""
+    def poll() -> str:
+        for probe in probes:
+            if probe is not None:
+                reason = probe()
+                if reason:
+                    return reason
+        return ""
+    return poll
 
 
 def process_start_identity(pid: int) -> str:
@@ -72,13 +98,12 @@ class ProgressSupervisor:
         self.output_fingerprint = self._file_fingerprint(request.output_path)
         self.session_id = request.resume_session_id
         self.active_tools: Dict[str, str] = {}
+        self._tool_context: Dict[str, Tuple[str, str]] = {}
         self.protocol_seen = decoder is None or not decoder.requires_protocol
         self.repeat_count = 0
         self.last_loop_fingerprint = ""
         self.seen_semantic_fingerprints: set[str] = set()
         self.forced_reason = ""
-        self.safety_ceiling_reached_at: Optional[float] = None
-        self.post_ceiling_finalize_deadline: Optional[float] = None
         self.events: Deque[Dict[str, object]] = deque(maxlen=50)
         self._events_lock = Lock()
         self._checkpoint_lock = Lock()
@@ -118,9 +143,6 @@ class ProgressSupervisor:
 
         if self.forced_reason:
             return self.forced_reason
-        self._observe_safety_ceiling(now)
-        if self.forced_reason:
-            return self.forced_reason
         elapsed = now - self.started_at
         if (
             not self.protocol_seen
@@ -131,13 +153,6 @@ class ProgressSupervisor:
             return "provider_idle"
         if self.active_tools and now - self.last_tool_activity >= self.config.tool_idle_seconds:
             return "tool_stalled"
-        if self.safety_ceiling_reached_at is not None:
-            if self.active_tools:
-                return None
-            if self.post_ceiling_finalize_deadline is not None:
-                if now >= self.post_ceiling_finalize_deadline:
-                    return "safety_ceiling"
-                return None
         if (
             not self.active_tools
             and now - self.last_semantic_progress
@@ -149,7 +164,6 @@ class ProgressSupervisor:
     def observe_events(self, events: Iterable[AgentProgressEvent]) -> None:
         for event in events:
             now = time.monotonic()
-            self._observe_safety_ceiling(now)
             self.protocol_seen = True
             self.last_provider_activity = now
             session_changed = False
@@ -158,49 +172,39 @@ class ProgressSupervisor:
                 self.session_id = event.session_id
             if event.kind == "tool_started":
                 tool_id = self._tool_key(event)
-                if self.safety_ceiling_reached_at is not None:
-                    self.forced_reason = "safety_ceiling"
-                    self._record(
-                        "post_ceiling_tool_rejected",
-                        detail=event.detail,
-                        fingerprint=event.fingerprint,
-                    )
-                else:
-                    self.active_tools[tool_id] = (
-                        event.detail or event.fingerprint or event.tool_id
-                    )
+                self.active_tools[tool_id] = (
+                    event.detail or event.fingerprint or event.tool_id
+                )
+                self._tool_context[tool_id] = (event.fingerprint, event.detail)
                 self.last_tool_activity = now
             elif event.kind == "tool_progress":
                 if self._tool_key(event) in self.active_tools:
                     self.last_tool_activity = now
             elif event.kind == "tool_completed":
                 self.last_tool_activity = now
+                context = self._tool_context.pop(self._tool_key(event), None)
+                if context is not None:
+                    # Equal results from different inputs are distinct evidence.
+                    fingerprint = hashlib.sha256(json.dumps(
+                        [context, event.fingerprint], ensure_ascii=False,
+                    ).encode("utf-8")).hexdigest()
+                    event = replace(event, fingerprint=fingerprint)
                 self._observe_loop(event)
                 self.active_tools.pop(self._tool_key(event), None)
-                if (
-                    self.safety_ceiling_reached_at is not None
-                    and not self.active_tools
-                    and self.post_ceiling_finalize_deadline is None
-                ):
-                    self.post_ceiling_finalize_deadline = now + max(
-                        0, int(self.config.post_ceiling_finalize_seconds)
-                    )
-                    self._record(
-                        "post_ceiling_finalize_started",
-                        detail=str(self.config.post_ceiling_finalize_seconds),
-                    )
             elif event.kind == "error":
                 self.forced_reason = "provider_error"
+            new_progress = False
             if event.semantic:
                 semantic_fingerprint = self._semantic_fingerprint(event)
                 if semantic_fingerprint not in self.seen_semantic_fingerprints:
                     self.seen_semantic_fingerprints.add(semantic_fingerprint)
                     self.last_semantic_progress = now
+                    new_progress = True
             self._record(
                 event.kind,
                 detail=event.detail,
                 fingerprint=event.fingerprint,
-                semantic=event.semantic,
+                semantic=new_progress,
             )
             if session_changed:
                 self.write_checkpoint("running", force=True)
@@ -256,11 +260,6 @@ class ProgressSupervisor:
                 for tool_id, detail in sorted(self.active_tools.items())
             ],
             "effective_progress_lease_seconds": self._effective_progress_lease_seconds(),
-            "progress_managed_timeout": bool(
-                self.request.progress_managed_timeout
-            ),
-            "safety_ceiling_reached": self.safety_ceiling_reached_at is not None,
-            "post_ceiling_finalize_seconds_remaining": self._finalize_seconds_remaining(now),
             "repeat_count": self.repeat_count,
             "workspace_fingerprint": self.workspace_fingerprint,
             "output_fingerprint": self.output_fingerprint,
@@ -295,7 +294,11 @@ class ProgressSupervisor:
             self.last_loop_fingerprint = fingerprint
             self.repeat_count = 1
         if self.repeat_count >= self.config.loop_repeat_limit:
-            self.forced_reason = "loop_detected"
+            # A fast edit/tool cycle may precede the periodic workspace probe.
+            # Confirm there was no workspace progress before stopping it.
+            self._sample_workspace(time.monotonic())
+            if self.repeat_count >= self.config.loop_repeat_limit:
+                self.forced_reason = "loop_detected"
 
     def _sample_workspace(self, now: float) -> None:
         workspace = self._workspace_fingerprint()
@@ -319,27 +322,15 @@ class ProgressSupervisor:
                 self.last_tool_activity = now
         self._process_snapshot = snapshot
 
-    def _observe_safety_ceiling(self, now: float) -> None:
-        if self.safety_ceiling_reached_at is not None:
-            return
-        if now - self.started_at < self.config.safety_ceiling_seconds:
-            return
-        self.safety_ceiling_reached_at = self.started_at + self.config.safety_ceiling_seconds
-        if self.active_tools:
-            self._record(
-                "safety_ceiling_deferred",
-                detail=f"active_tools={len(self.active_tools)}",
-            )
-            return
-        self.forced_reason = "safety_ceiling"
-        self._record("safety_ceiling_reached")
-
     def _effective_progress_lease_seconds(self) -> int:
+        # Canary configuration permits short waits; it is not a task-analysis
+        # lease and must not silently inherit the ordinary 60-second minimum.
+        minimum = 1 if self.request.stage == "provider_probe" else 60
         request_lease = int(self.request.progress_lease_seconds or 0)
         if request_lease > 0:
-            return max(60, request_lease)
+            return max(minimum, request_lease)
         return max(
-            60,
+            minimum,
             int(
                 self.config.stage_progress_lease_seconds.get(
                     self.request.stage,
@@ -350,11 +341,6 @@ class ProgressSupervisor:
 
     def _active_tool_summary(self) -> str:
         return "; ".join(self.active_tools.values())[:300]
-
-    def _finalize_seconds_remaining(self, now: float) -> Optional[float]:
-        if self.post_ceiling_finalize_deadline is None:
-            return None
-        return round(max(0.0, self.post_ceiling_finalize_deadline - now), 3)
 
     def _tool_key(self, event: AgentProgressEvent) -> str:
         return str(

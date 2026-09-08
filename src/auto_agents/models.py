@@ -278,6 +278,7 @@ class ProviderConfig:
     cwd_flag: str = "-C"
     prompt_via_stdin: bool = True
     output_flag: str = "-o"
+    # Deprecated constructor compatibility only; provider execution ignores these.
     timeout_seconds: int = DEFAULT_PROVIDER_TIMEOUT_SECONDS
     idle_timeout_seconds: int = DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS
     subscription_tier: str = "default"
@@ -328,7 +329,8 @@ class ProviderConfig:
         )
 
     def to_dict(self) -> Dict[str, object]:
-        return asdict(self)
+        return {key: value for key, value in asdict(self).items()
+                if key not in {"timeout_seconds", "idle_timeout_seconds"}}
 
     @staticmethod
     def _timeout_seconds_from_dict(data: Dict[str, object], timeout_default: int) -> int:
@@ -1109,45 +1111,28 @@ class ProjectRuntimeConfig:
 
 @dataclass
 class SmartTimeoutConfig:
-    enabled: bool = True
+    """Mandatory provider progress supervision; no elapsed-time ceiling."""
     provider_idle_seconds: int = 1800
     tool_idle_seconds: int = 900
     semantic_stall_seconds: int = 3600
-    safety_ceiling_seconds: int = 14400
     loop_repeat_limit: int = 3
     same_provider_resume_limit: int = 1
     stage_progress_lease_seconds: Dict[str, int] = field(default_factory=dict)
-    post_ceiling_finalize_seconds: int = 600
-    fresh_continuation_limit: int = 1
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "SmartTimeoutConfig":
         return cls(
-            enabled=bool(data.get("enabled", True)),
             provider_idle_seconds=int(data.get("provider_idle_seconds", 1800)),
             tool_idle_seconds=int(data.get("tool_idle_seconds", 900)),
             semantic_stall_seconds=int(data.get("semantic_stall_seconds", 3600)),
-            safety_ceiling_seconds=int(data.get("safety_ceiling_seconds", 14400)),
             loop_repeat_limit=int(data.get("loop_repeat_limit", 3)),
             same_provider_resume_limit=int(data.get("same_provider_resume_limit", 1)),
             stage_progress_lease_seconds={
                 str(stage): int(seconds)
-                for stage, seconds in dict(
-                    data.get(
-                        "stage_progress_lease_seconds",
-                        data.get("stage_checkpoint_seconds", {}),
-                    )
-                ).items()
+                for stage, seconds in dict(data.get(
+                    "stage_progress_lease_seconds", data.get("stage_checkpoint_seconds", {}),
+                )).items()
             },
-            post_ceiling_finalize_seconds=int(
-                data.get(
-                    "post_ceiling_finalize_seconds",
-                    data.get("active_tool_grace_seconds", 600),
-                )
-            ),
-            fresh_continuation_limit=int(
-                data.get("fresh_continuation_limit", 1)
-            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -2173,9 +2158,7 @@ class AgentRequest:
     resume_session_id: str = ""
     resume_provider: str = ""
     sandbox_mode: str = ""
-    timeout_seconds: int = 0
     progress_lease_seconds: int = 0
-    progress_managed_timeout: bool = False
     termination_probe: Optional[Callable[[], str]] = None
     record_execution_incidents: bool = True
     purpose: str = ""

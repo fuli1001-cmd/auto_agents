@@ -5181,7 +5181,7 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(usage.output_tokens if usage else None, 25)
             self.assertEqual(usage.total_tokens if usage else None, 225)
 
-    def test_codex_adapter_honors_diagnostic_sandbox_and_timeout(self) -> None:
+    def test_codex_adapter_honors_diagnostic_sandbox_and_mandatory_progress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp)
             output_path = project_root / "diagnosis.json"
@@ -5196,7 +5196,6 @@ class ProjectValidationTests(unittest.TestCase):
                 cwd=project_root,
                 output_path=output_path,
                 sandbox_mode="read-only",
-                timeout_seconds=123,
             )
 
             with patch(
@@ -5208,7 +5207,8 @@ class ProjectValidationTests(unittest.TestCase):
             command = run_mock.call_args.args[0]
             sandbox_index = command.index("--sandbox")
             self.assertEqual(command[sandbox_index + 1], "read-only")
-            self.assertEqual(run_mock.call_args.kwargs["timeout"], 123)
+            self.assertNotIn("timeout", run_mock.call_args.kwargs)
+            self.assertIsNotNone(run_mock.call_args.kwargs["smart_timeout"])
 
     def test_run_can_persist_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

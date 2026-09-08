@@ -59,7 +59,7 @@ def test_antigravity_build_command():
         "--add-dir",
         "/tmp/myproject",
         "--print-timeout",
-        "600s",
+        "14460s",
         "--sandbox",
         "--print",
         "Write a python script",

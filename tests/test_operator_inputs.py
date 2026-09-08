@@ -224,7 +224,7 @@ class OperatorInputStoreTests(unittest.TestCase):
             self.assertEqual(len(adapter.requests), 1)
             self.assertEqual(adapter.requests[0].stage, "operator_input")
             self.assertEqual(adapter.requests[0].sandbox_mode, "read-only")
-            self.assertEqual(adapter.requests[0].timeout_seconds, 120)
+            self.assertEqual(adapter.requests[0].progress_lease_seconds, 120)
             self.assertFalse(
                 str(adapter.requests[0].cwd).startswith(str(project))
             )

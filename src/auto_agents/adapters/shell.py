@@ -94,7 +94,7 @@ class ShellAdapter(AgentAdapter):
         smart_timeout: Optional[SmartTimeoutConfig] = None,
     ) -> None:
         self.config = config
-        self.smart_timeout = smart_timeout or SmartTimeoutConfig(enabled=False)
+        self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
@@ -102,8 +102,7 @@ class ShellAdapter(AgentAdapter):
     def run(self, request: AgentRequest) -> AgentResult:
         request = self.prepare_request(request)
         if (
-            self.smart_timeout.enabled
-            and self.config.progress_protocol != SMART_TIMEOUT_PROGRESS_PROTOCOL
+            self.config.progress_protocol != SMART_TIMEOUT_PROGRESS_PROTOCOL
         ):
             return AgentResult(
                 prompt_metadata=dict(request.prompt_metadata),
@@ -137,8 +136,6 @@ class ShellAdapter(AgentAdapter):
             command,
             request,
             env,
-            timeout=request.timeout_seconds or self.config.timeout_seconds or None,
-            idle_timeout=self.config.idle_timeout_seconds or None,
             smart_timeout=self.smart_timeout,
             progress_decoder=ShellProgressDecoder(progress_path),
             provider=self.config.kind,

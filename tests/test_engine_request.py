@@ -174,8 +174,7 @@ def test_acceptance_planning_is_progress_managed_read_only_and_cached(tmp_path):
     calls = []
     def plan(agent):
         calls.append(agent)
-        assert agent.sandbox_mode == "read-only" and agent.timeout_seconds == 0
-        assert agent.progress_managed_timeout
+        assert agent.sandbox_mode == "read-only"
         assert not agent.record_execution_incidents
         return SimpleNamespace(ok=True, summary=json.dumps({"checks": contract_data(request)["checks"]}))
     orch._call_with_failover = plan
@@ -196,8 +195,8 @@ def test_acceptance_planning_obeys_progress_instead_of_provider_deadline(tmp_pat
     payload = {"invocation": {"engine_route": request}, "provider": "codex"}
     orch = SimpleNamespace(config=SimpleNamespace(efforts={}), _set_active_provider=lambda p: None)
     checks = contract_data(request)["checks"]
-    # Scale the provider deadline to one second. Distinct completed inspections
-    # renew progress; status messages alone must not keep planning alive.
+    # Distinct completed inspections renew progress; status messages alone
+    # must not keep planning alive.
     script = """
 import json, sys, time
 progressing = sys.argv[1] == 'True'
@@ -219,10 +218,10 @@ print(json.dumps({'type': 'item.completed', 'item': {
         with patch("auto_agents.supervision.ProgressSupervisor._effective_progress_lease_seconds", return_value=2):
             result = run_subprocess_with_optional_streaming(
                 [sys.executable, "-c", script, str(progressing), json.dumps({"checks": checks})],
-                agent, dict(os.environ), timeout=1,
+                agent, dict(os.environ),
                 smart_timeout=SmartTimeoutConfig(
                     provider_idle_seconds=60, tool_idle_seconds=60,
-                    semantic_stall_seconds=60, safety_ceiling_seconds=60),
+                    semantic_stall_seconds=60, ),
                 progress_decoder=CodexProgressDecoder(), provider="codex")
         if progressing:
             assert result.returncode == 0

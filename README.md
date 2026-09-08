@@ -564,9 +564,7 @@ Example project config (`providers` and `active_provider` only):
       "extra_args": [],
       "cwd_flag": "-C",
       "prompt_via_stdin": true,
-      "output_flag": "-o",
-      "timeout_seconds": 1800,
-      "idle_timeout_seconds": 3600
+      "output_flag": "-o"
     },
     "claude-code": {
       "kind": "claude-code",
@@ -579,9 +577,7 @@ Example project config (`providers` and `active_provider` only):
       "extra_args": [],
       "cwd_flag": "",
       "prompt_via_stdin": true,
-      "output_flag": "",
-      "timeout_seconds": 3600,
-      "idle_timeout_seconds": 3600
+      "output_flag": ""
     },
     "copilot-cli": {
       "kind": "copilot-cli",
@@ -594,9 +590,7 @@ Example project config (`providers` and `active_provider` only):
       "extra_args": [],
       "cwd_flag": "",
       "prompt_via_stdin": true,
-      "output_flag": "",
-      "timeout_seconds": 3600,
-      "idle_timeout_seconds": 3600
+      "output_flag": ""
     }
   },
   "active_provider": "claude-code"
@@ -609,11 +603,9 @@ Switch to Claude Code at run time with:
 python3 -m auto_agents run --project /tmp/demo --provider claude-code
 ```
 
-Legacy auto-generated `copilot-cli.timeout_seconds = 1800` configs are treated as the old default
-and normalize to `3600` on load.
-
-New project configs write `idle_timeout_seconds: 3600` for the bundled providers, and omitted
-provider entries now also default to `3600` on load.
+Provider `timeout_seconds` and `idle_timeout_seconds` are obsolete. Existing values are
+ignored with a compatibility warning and removed by normal configuration migration.
+Configure the independent `execution.smart_timeout` progress leases instead.
 
 To use an absolute path instead of the conventional `~/.copilot/profiles/` location, set the
 `providers.copilot-cli.profile_map` value to the full path:
@@ -1151,11 +1143,9 @@ acceleration switches provide one rollback boundary for the additional fast path
       "require_remote_publish": false
     },
     "smart_timeout": {
-      "enabled": true,
       "provider_idle_seconds": 1800,
       "tool_idle_seconds": 900,
       "semantic_stall_seconds": 3600,
-      "safety_ceiling_seconds": 14400,
       "loop_repeat_limit": 3,
       "same_provider_resume_limit": 1,
       "stage_progress_lease_seconds": {
@@ -1165,9 +1155,7 @@ acceleration switches provide one rollback boundary for the additional fast path
         "implement": 3600,
         "review": 900,
         "readme": 900
-      },
-      "post_ceiling_finalize_seconds": 600,
-      "fresh_continuation_limit": 1
+      }
     },
     "health_watch": {
       "enabled": true,
@@ -1293,36 +1281,50 @@ When multiple providers are configured, the orchestrator automatically switches 
 next available provider if the current one returns a **qualifying error** — rate-limit
 (429), quota exhaustion, timeout/stall, service unavailable, or binary not found.
 
-Smart timeout is enabled by default. It replaces a single hard provider deadline with independent
-progress leases:
+Progress supervision is mandatory for every model call, including direct adapter calls,
+health probes, input interpretation, sessions, and repair/review roles. Calls have no engine-owned
+elapsed-time deadline or four-hour ceiling. Independent progress leases govern execution:
 
 - `provider_idle_seconds`: no protocol, output, child-process CPU/I/O, or workspace activity
 - `tool_idle_seconds`: a declared tool remains active without tool/process progress
 - `semantic_stall_seconds`: no new tool result, milestone, output artifact, or workspace fingerprint
 - `loop_repeat_limit`: the same completed-tool fingerprint repeats without a workspace change
 - `stage_progress_lease_seconds`: stage-specific time allowed without semantic progress while no tool is active
-- `safety_ceiling_seconds`: emergency ceiling for one provider attempt; an already-running healthy tool may drain past it
-- `post_ceiling_finalize_seconds`: time allowed to summarize results after that tool finishes
-- `fresh_continuation_limit`: fresh-context continuations allowed after the emergency ceiling
 
-`stage_checkpoint_seconds` and `active_tool_grace_seconds` are deprecated compatibility aliases for
-`stage_progress_lease_seconds` and `post_ceiling_finalize_seconds`. New and legacy names cannot be
-mixed for the same setting. Loading an old project preserves its values; the next config save emits
-only the new names.
+`stage_checkpoint_seconds` remains a deprecated alias for `stage_progress_lease_seconds`;
+defining both is invalid. The old `enabled`, `safety_ceiling_seconds`,
+`post_ceiling_finalize_seconds`, `active_tool_grace_seconds`, and `fresh_continuation_limit`
+settings are ignored with a compatibility warning and removed during normal migration.
+Reading old configurations does not write the project. Old attempt reports remain readable.
+
+The root-cause role `*_timeout_seconds` settings and autonomy's `candidate_timeout_seconds`
+and `candidate_review_timeout_seconds` now supply inactivity leases only. Network requests,
+verification commands, replay probes, locks, and cleanup retain their own time limits.
+Health canaries use their configured probe duration as an inactivity allowance; answer
+interpretation uses a 120-second semantic progress allowance.
 
 Provider output heartbeats refresh only the provider lease; they do not count as semantic progress.
+Tool invocation IDs do not count as new evidence: progress fingerprints combine the operation's
+inputs and results, and loop detection checks for intervening workspace changes before stopping.
 Codex and Copilot use native JSONL events, while Antigravity combines its native log with its local
-conversation SQLite state. Checkpoints are written every 30 seconds under the run's
-`provider-attempts/` directory and include the provider session ID and bounded diagnostics.
+conversation SQLite state. Custom Shell providers must implement `auto-agents-jsonl-v1`;
+there is no unmonitored fallback. Checkpoints are written every 30 seconds under
+`provider-attempts/` and include the session ID, last progress, and termination reason.
 
-`provider_idle`, explicit provider errors, and protocol errors switch provider immediately. Tool
-stalls, semantic stalls, and loops first resume the same provider once using its exact captured
-session. Reaching the emergency ceiling without an active tool starts a fresh continuation. If a
-healthy tool is already active, it may finish and the provider receives a bounded finalization
-window; starting another tool after the ceiling ends the attempt. After the configured fresh
-continuation limit, normal failover applies. Set
-`execution.smart_timeout.enabled` to `false` to restore the legacy `timeout_seconds` and
-`idle_timeout_seconds` hard-deadline behavior.
+`provider_idle`, explicit provider errors, and protocol errors switch provider. Tool stalls,
+semantic stalls, and loops first resume the same provider within `same_provider_resume_limit`.
+Workflow health supervision independently detects the lack of durable task progress.
+
+An explicit caller budget is a cancellation condition alongside progress supervision. Prompt
+assessment (`python -m auto_agents.prompting.evaluate run`) has no default budget; passing
+`--timeout SECONDS` explicitly limits each evaluated model invocation. Budget cancellation is
+reported as `execution_budget_exhausted`, preserves evidence, and does not restart the budget,
+cool down the provider, fail over, or start engine self-repair. Cancellation callbacks are preserved
+when workflow health supervision and continuations are attached. Historical `timed_out` and
+`safety_ceiling` reports describe local limits, not provider availability.
+
+Antigravity's native CLI still receives `--print-timeout 14460s` as a separate compatibility limit.
+Removing that CLI-owned deadline is deferred; it is independent of engine progress supervision.
 
 Run-health supervision is also enabled by default. Smart timeout answers whether one provider
 attempt is active; health watch answers whether the whole workflow is making durable progress.
@@ -1384,7 +1386,7 @@ and omitted when configuration is saved.
 ```
 [failover] provider=codex quota/rate error (429 Too Many Requests), trying next...
 [failover] using provider=copilot-cli
-[failover] provider=copilot-cli timeout/stall (timed out after 3600s), trying next...
+[failover] provider=copilot-cli timeout/stall (provider idle), trying next...
 ```
 
 ## Task plan contract

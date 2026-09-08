@@ -1237,7 +1237,7 @@ class RootCauseCoordinator:
                 stage=f"self_repair_{role}", attempt_id=f"root-cause-{role}", kind="provider",
             ) if reporter is not None else None),
             sandbox_mode="read-only",
-            timeout_seconds=timeout,
+            progress_lease_seconds=timeout,
             # Root-cause roles diagnose an existing failure. Their provider
             # success or failure must not resolve, replace, or advance an
             # unrelated target-run execution incident while the repository

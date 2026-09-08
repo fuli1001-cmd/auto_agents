@@ -103,7 +103,7 @@ class AntigravityProgressDecoder(ProgressDecoder):
                     session_id=self.session_id,
                     tool_id=f"step-{idx}" if is_tool else "",
                     fingerprint=fingerprint,
-                    detail=f"antigravity step={idx} type={step_type} status={status}",
+                    detail=f"antigravity type={step_type} status={status}",
                     semantic=(kind == "tool_completed"),
                 )
             )
@@ -161,14 +161,14 @@ class AntigravityAdapter(AgentAdapter):
         smart_timeout: Optional[SmartTimeoutConfig] = None,
     ) -> None:
         self.config = config
-        self.smart_timeout = smart_timeout or SmartTimeoutConfig(enabled=False)
+        self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
 
     def run(self, request: AgentRequest) -> AgentResult:
         request = self.prepare_request(request)
-        log_path = self._progress_log_path(request) if self.smart_timeout.enabled else None
+        log_path = self._progress_log_path(request)
         if log_path is not None:
             write_text(log_path, "")
         command = self._build_command(request, log_path=log_path)
@@ -207,11 +207,9 @@ class AntigravityAdapter(AgentAdapter):
                 command,
                 request,
                 env,
-                timeout=request.timeout_seconds or self.config.timeout_seconds or None,
                 # agy 1.1+ takes the print prompt as the flag value. Sending
                 # it on stdin can make the next CLI option become the prompt.
                 stdin_input="",
-                idle_timeout=self.config.idle_timeout_seconds or None,
                 smart_timeout=self.smart_timeout,
                 progress_decoder=(
                     AntigravityProgressDecoder(log_path)
@@ -273,13 +271,9 @@ class AntigravityAdapter(AgentAdapter):
         command.extend(["--dangerously-skip-permissions"])  # 跳过权限提示
         command.extend(["--add-dir", str(request.cwd)])  # 添加 workspace 目录
         
-        # 注入 print-timeout
-        timeout = (
-            self.smart_timeout.safety_ceiling_seconds + 60
-            if self.smart_timeout.enabled
-            else self.config.timeout_seconds or 1800
-        )
-        command.extend(["--print-timeout", f"{timeout}s"])
+        # Native CLI compatibility limit, independent of engine supervision.
+        # Removing agy's own deadline is a separate compatibility task.
+        command.extend(["--print-timeout", "14460s"])
 
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
