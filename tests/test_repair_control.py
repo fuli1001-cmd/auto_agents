@@ -500,6 +500,84 @@ def test_foreground_registration_retains_original_cwd(tmp_path, monkeypatch):
     assert call.call_args.args[1]["payload"]["cwd"] == str(tmp_path)
 
 
+def test_same_protocol_idle_controller_upgrades_to_new_committed_revision(tmp_path):
+    from auto_agents import repair_control
+    import signal
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    fake_worker_install(config)
+    (engine / "src/auto_agents/verification_worker.py").write_text("# fixture\n")
+    git(engine, "add", "src")
+    git(engine, "commit", "-m", "controller installation")
+    store = Store(config["root"])
+    subscriber = store.register(registration(tmp_path / "project"))
+    blocked_job = store.submit(subscriber, failure(tmp_path / "project"))
+    store.transition(blocked_job, "blocked", {"error": "pip failed"})
+    with store.connect() as db:
+        db.execute("UPDATE subscribers SET state='blocked' WHERE id=?", (subscriber,))
+    repair_control.ensure_supervisor(config)
+    old = rpc(config, {"op": "ping"})
+    processes = [old]
+    try:
+        (engine / "diagnostics-version.txt").write_text("new worker behavior\n")
+        git(engine, "add", "diagnostics-version.txt")
+        git(engine, "commit", "-m", "upgrade worker without protocol change")
+        actual_rpc = repair_control.rpc
+        def legacy_ping(config, request, *args):
+            result = actual_rpc(config, request, *args)
+            if result.get("pid") == old["pid"]:
+                result.pop("implementation_revision", None)
+            return result
+        with patch.object(repair_control, "rpc", side_effect=legacy_ping):
+            repair_control.ensure_supervisor(config)
+        new = rpc(config, {"op": "ping"})
+        processes.append(new)
+        assert new["pid"] != old["pid"]
+        assert new["implementation_revision"] == git(engine, "rev-parse", "HEAD")
+        assert store.job(blocked_job)["state"] == "blocked"
+        assert store.job(blocked_job)["generation"] == 1
+        assert store.job(blocked_job)["result"]["error"] == "pip failed"
+        assert not repair_control.alive(old["pid"], old["ticks"])
+        repair_control.ensure_supervisor(config)
+        assert rpc(config, {"op": "ping"})["pid"] == new["pid"]
+    finally:
+        for process in processes:
+            if repair_control.alive(process["pid"], process["ticks"]):
+                os.kill(process["pid"], signal.SIGTERM)
+            try:
+                os.waitpid(process["pid"], 0)
+            except ChildProcessError:
+                pass  # subprocess may already have reaped the retired daemon.
+
+
+def test_busy_old_controller_is_not_replaced_or_used_silently(tmp_path):
+    from auto_agents import repair_control
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    (engine / "src/auto_agents").mkdir(parents=True)
+    (engine / "src/auto_agents/verification_worker.py").write_text("# fixture\n")
+    git(engine, "add", "src")
+    git(engine, "commit", "-m", "new runtime")
+    reply = {"capabilities": ["managed-verification-v1"], "implementation_revision": "older"}
+    with patch.object(repair_control, "rpc", return_value=reply), \
+         patch.object(repair_control, "retire_idle_legacy_supervisor", return_value=False), \
+         patch.object(repair_control, "Repository", side_effect=AssertionError("busy controller must not be replaced")):
+        with pytest.raises(RuntimeError, match="upgrade deferred"):
+            repair_control._ensure_supervisor(config)
+
+
+def test_repair_stop_is_persisted_as_a_user_event(tmp_path):
+    from auto_agents.repair_client import _report_repair_progress
+    from unittest.mock import Mock
+    reporter = Mock()
+    with patch("auto_agents.reporting.find_reporter", return_value=reporter):
+        _report_repair_progress(tmp_path, "Self-repair stopped: missing dependency; password=secret-value")
+    call = reporter.event.call_args
+    assert call.kwargs["audience"] == "user"
+    assert "missing dependency" in call.kwargs["message"]
+    assert "secret-value" not in call.kwargs["message"]
+
+
 def test_shared_generic_contract_skips_repeated_diagnosis_calls(tmp_path):
     from auto_agents.cli import _triage_terminal_run_error
     from auto_agents.self_repair import SelfRepairDecision

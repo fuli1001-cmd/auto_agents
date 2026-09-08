@@ -151,6 +151,17 @@ def cancel(lock):
         rpc(registration["config"], {"op": "cancel", "project": str(lock.project_root)})
 
 
+def _report_repair_progress(project, message):
+    from .reporting import find_reporter
+    from .repair_environment_log import sanitize
+    message = sanitize(message)
+    reporter = find_reporter(project)
+    if reporter is not None:
+        reporter.event("repair.control", {}, audience="user", message=message)
+    else:
+        print(message, file=sys.stderr)
+
+
 def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosis=None, repair_case=None):
     from .cli import _run_command_for_self_repair_resume
     from .self_repair import auto_agents_repo_root
@@ -241,14 +252,14 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
             subscriber = next(item for item in response["subscribers"] if item["id"] == registration["subscriber"])
             message = status + "/" + subscriber["state"]
             if message != last:
-                print(f"Self-repair {job}: {message}; logs: {registration['config']['root']}/jobs/{job}", file=sys.stderr)
+                _report_repair_progress(project, f"Self-repair {job}: {message}; logs: {registration['config']['root']}/jobs/{job}")
                 last = message
             if subscriber["state"] == "finished":
                 return 0
             if status in {"blocked", "cancelled"} or subscriber["state"] in {"blocked", "cancelled"}:
                 detail = response["job"].get("result", {}).get("error", "")
                 if detail:
-                    print(f"Self-repair stopped: {detail}", file=sys.stderr)
+                    _report_repair_progress(project, f"Self-repair stopped: {detail}")
                 return 3
             # Terminal subscribers have already released their registration.
             # Observe their durable result before trying to restore ownership,

@@ -387,7 +387,7 @@ def ensure_supervisor(config):
 
 
 def retire_idle_legacy_supervisor(config, response):
-    """Freeze submissions before replacing an idle old protocol generation.
+    """Freeze submissions before replacing an idle older controller revision.
 
     A SQLite write transaction fences even old clients that do not know about
     the startup lock. Never stop a controller with live owners, workers or work.
@@ -420,16 +420,24 @@ def retire_idle_legacy_supervisor(config, response):
 
 
 def _ensure_supervisor(config):
+    revision = git(config["source_root"], "rev-parse", "HEAD")
     try:
         response = rpc(config, {"op": "ping"})
+    except (OSError, RuntimeError):
+        response = None
+    if response is not None:
         supports = "managed-verification-v1" in response.get("capabilities", [])
         committed_support = git(config["source_root"], "cat-file", "-e", "HEAD:src/auto_agents/verification_worker.py", check=False).returncode == 0
-        if supports or not committed_support or not retire_idle_legacy_supervisor(config, response):
+        running_revision = response.get("implementation_revision", "")
+        if not running_revision and config.get("implementation_root"):
+            pinned_revision = git(config["implementation_root"], "rev-parse", "HEAD", check=False)
+            if not pinned_revision.returncode:
+                running_revision = pinned_revision.stdout.strip()
+        if (supports and running_revision == revision) or not committed_support:
             return
-    except (OSError, RuntimeError):
-        pass
+        if not retire_idle_legacy_supervisor(config, response):
+            raise RuntimeError("repair supervisor upgrade deferred: the older controller still owns active work; retry after it becomes idle")
     root = Path(config["root"])
-    revision = git(config["source_root"], "rev-parse", "HEAD")
     pinned = config.get("implementation_root")
     if pinned:
         old = git(pinned, "rev-parse", "HEAD", check=False)
@@ -442,7 +450,8 @@ def _ensure_supervisor(config):
         if not (implementation / "src/auto_agents/repair_worker.py").is_file():
             raise RuntimeError("repair controller must be installed from a committed implementation")
         config["implementation_root"] = str(implementation)
-        atomic_json(root / "operator.json", config)
+    config["implementation_revision"] = revision
+    atomic_json(root / "operator.json", config)
     source = (Path(config["implementation_root"]) / "src/auto_agents/repair_control.py").read_bytes()
     bootstrap = root / ("bootstrap-" + hashlib.sha256(source).hexdigest()[:20] + ".py")
     if not bootstrap.exists():
@@ -543,6 +552,7 @@ class Supervisor:
         op = request["op"]
         if op == "ping":
             return {"ok": True, "version": VERSION, "pid": os.getpid(), "ticks": start_ticks(os.getpid()),
+                    "implementation_revision": self.config.get("implementation_revision", ""),
                     "capabilities": ["managed-verification-v1"]}
         if op.startswith("verify-"):
             return self.verification_dispatch(request)

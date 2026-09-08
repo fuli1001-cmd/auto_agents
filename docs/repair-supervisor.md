@@ -47,6 +47,17 @@ venv rather than the launching Conda environment so preparing a candidate does
 not replace the running engine or change its dependencies; the venv does not
 inherit the launching environment's site-packages.
 
+On startup, the foreground compares the running controller's committed revision
+with the installation HEAD, even when their IPC protocol is identical. An idle
+older controller is replaced without resetting jobs or recovery evidence. Active
+work defers the update with an explicit error. Repair progress and stop reasons
+use the normal user-event renderer and are saved in the invocation's user log.
+
+Package installation honors pip configuration and the invocation environment.
+If a configured mirror is unavailable, an operator can select an index for one
+invocation with `PIP_INDEX_URL=https://pypi.org/simple auto-agents ...`; this does
+not modify the global pip configuration or silently introduce an index fallback.
+
 Commands and current retention behavior are documented in
 [Storage maintenance](storage-maintenance.md), with the cross-stage design in
 [Artifact cleanup design](artifact-cleanup-design.md).
