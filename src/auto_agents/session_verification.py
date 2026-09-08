@@ -73,7 +73,7 @@ def bind_session(session, state) -> None:
             state.verification_binding['task_scope'] = _task_scope(session, state)
             session._save(state)
         validate_binding(session, state)
-        if state.verification_binding.get('schema_version', 1) < 11:
+        if state.verification_binding.get('schema_version', 1) < 12:
             _recover_retained_plan(session, state)
             _seal_inventory(session, state)
             session._save(state)
@@ -232,7 +232,11 @@ def _future_foreign_step(session, state, step, excluded):
             tree = ast.parse(result.stdout)
         except SyntaxError:
             return False
-        if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == parts[1]
+        # Parameter IDs are collection-time identities, not Python function
+        # names. A retained function is regression evidence even when static
+        # inspection cannot establish whether the requested parameter exists.
+        function_name = parts[1].split('[', 1)[0]
+        if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
                for node in ast.walk(tree)):
             return False
     return True
@@ -406,7 +410,7 @@ def _seal_inventory(session, state):
                          for command in _legacy_commands(gates)
                          if any(_command_covers(command, ref) for ref in owned_refs)}
     binding.update({
-        'schema_version': 11, 'repository': str(session.project_root.resolve()),
+        'schema_version': 12, 'repository': str(session.project_root.resolve()),
         'original_handoff_id': state.parent_handoff_id,
         'required_proof_ids': required, 'proof_owners': owners,
         'required_commands': required_commands,
@@ -529,7 +533,7 @@ def _validate_required_node_selection(session, state, commands):
                                                     targets, configurations)
                 addopts = settings.get('addopts', [])
                 config_args = shlex.split(addopts) if isinstance(addopts, str) else list(addopts)
-                for key in ('python_functions', 'python_classes', 'python_files'):
+                for key in ('python_functions', 'python_classes', 'python_files', 'norecursedirs'):
                     if key in settings:
                         value = settings[key]
                         config_args.extend(['-o', key + '=' + (value if isinstance(value, str) else ' '.join(value))])
@@ -545,7 +549,9 @@ def _validate_required_node_selection(session, state, commands):
                         selection_args = [*config_args, *env_args, *options]
                         if (contains and not _pytest_selection_restricted(selection_args)
                                 and not _pytest_discovery_excludes(selection_args, ref,
-                                                                 directory=absolute != selected)):
+                                                                 directory=absolute != selected,
+                                                                 collection_root=selected,
+                                                                 source_path=absolute)):
                             covered.add(ref)
         except ValueError:
             continue  # Unparseable commands cannot attest required nodes.
@@ -599,13 +605,14 @@ def _pytest_selection_config(root, cwd, args, targets, configurations):
     return {}
 
 
-def _pytest_discovery_excludes(args, ref, *, directory):
+def _pytest_discovery_excludes(args, ref, *, directory, collection_root, source_path):
     """A containing path cannot cover names excluded by pytest discovery.
 
     Respect override precedence and pytest's prefix-or-glob name matching.
     File patterns apply to directory discovery, not explicit file arguments.
     """
     from fnmatch import fnmatch
+    import os
 
     overrides = {}
     index = 0
@@ -623,9 +630,11 @@ def _pytest_discovery_excludes(args, ref, *, directory):
             value = arg[2:]
         key, separator, pattern = value.partition('=')
         if separator:
-            if key.strip() == 'addopts' and _pytest_discovery_excludes(shlex.split(pattern), ref, directory=directory):
+            if key.strip() == 'addopts' and _pytest_discovery_excludes(
+                    shlex.split(pattern), ref, directory=directory,
+                    collection_root=collection_root, source_path=source_path):
                 return True
-            overrides[key.strip()] = pattern.split()
+            overrides[key.strip()] = shlex.split(pattern) if key.strip() == 'norecursedirs' else pattern.split()
         index += 1
     path, *nodes = ref.split('::')
     checks = [('python_functions', nodes[-1].split('[', 1)[0])]
@@ -634,6 +643,24 @@ def _pytest_discovery_excludes(args, ref, *, directory):
         if key in overrides and not any(name.startswith(pattern) or fnmatch(name, pattern)
                                         for pattern in overrides[key]):
             return True
+    if directory:
+        patterns = overrides.get('norecursedirs',
+                                 ['*.egg', '.*', '_darcs', 'build', 'CVS', 'dist',
+                                  'node_modules', 'venv', '{arch}'])
+        # Pytest bypasses recursion exclusions for explicit initial paths.
+        # Only directories traversed below this invocation's target matter.
+        for parent in source_path.parents:
+            if parent == collection_root:
+                break
+            for pattern in patterns:
+                pattern = pattern.replace('/', os.sep)
+                name = parent.name
+                if os.sep in pattern:
+                    name = str(parent)
+                    if not os.path.isabs(pattern):
+                        pattern = '*' + os.sep + pattern
+                if fnmatch(name, pattern):
+                    return True
     return bool(directory and 'python_files' in overrides
                 and not any(fnmatch(Path(path).name, pattern) for pattern in overrides['python_files']))
 
