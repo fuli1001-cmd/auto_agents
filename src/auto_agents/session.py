@@ -77,7 +77,7 @@ from .performance_trace import PerformanceTrace
 from .session_verification import (
     SessionOwnershipError, bind_session, collection_command, diagnostic_owners,
     fingerprint as verification_fingerprint, owned_paths, record_candidate,
-    validate_selected_contracts, session_gates,
+    validate_selected_contracts, session_gates, validate_binding, validate_plan, ownership_error,
 )
 from .provider_contract import provider_policy_prompt_lines
 from .prompting import (ContextBlock, PromptBlock, append_context, compose_prompt,
@@ -198,15 +198,24 @@ class Session:
         )
         state = self._current_state
         if state is not None and state.verification_binding:
+            validate_binding(self, state)
             ambient = self.config.gates
             self.config.gates = session_gates(self, state)
             try:
                 if release:
-                    return self.orch._resolved_gate_plan("final", level="release")
-                return self.orch._resolved_gate_plan(
-                    "implement", level="affected",
-                    changed_path_set=sorted(set(owned_paths(self.orch, state)) | set(state.lineage_changed_paths)),
-                )
+                    plan = self.orch._resolved_gate_plan("final", level="release",
+                        changed_path_set=sorted(set(owned_paths(self.orch, state)) | set(state.lineage_changed_paths)),
+                        required_proof_ids=state.verification_binding.get('required_proof_ids', []))
+                else:
+                    plan = self.orch._resolved_gate_plan(
+                        "implement", level="affected",
+                        changed_path_set=sorted(set(owned_paths(self.orch, state)) | set(state.lineage_changed_paths)),
+                        required_proof_ids=state.verification_binding.get('required_proof_ids', []),
+                    )
+                validate_plan(state, self.config.gates, plan)
+                return plan
+            except ValueError as error:
+                raise ownership_error(state, str(error)) from error
             finally:
                 self.config.gates = ambient
         if release:
@@ -367,7 +376,7 @@ class Session:
             "duration_seconds": float(verify.get("duration_seconds", 0.0)),
             "timestamp": self._now(),
         }
-        for key in ("failure_kind", "raw_log_path", "retry_fix"):
+        for key in ("failure_kind", "raw_log_path", "retry_fix", "diagnostic"):
             if key in verify:
                 entry[key] = verify[key]
         state.execution_log.append(entry)
@@ -1942,8 +1951,16 @@ class Session:
                 self._save(state)
                 return state
         if self.mode in {"fix", "collab"} and not state.baseline_git_ref:
-            self.orch._apply_generated_verification_config()
-            self._ensure_baseline(state)
+            if self.mode == 'fix':
+                try:
+                    bind_session(self, state)
+                    with self._session_verification_context():
+                        self._ensure_baseline(state)
+                except SessionOwnershipError as error:
+                    return self._block_execution_binding(state, error, 'verification_ownership')
+            else:
+                self.orch._apply_generated_verification_config()
+                self._ensure_baseline(state)
         handoff_payload = dict(payload)
         handoff_payload.setdefault(
             "authorization_policy",
@@ -1996,9 +2013,11 @@ class Session:
         state.execution_log.append({
             "action": "execution_preflight_blocked", "result": error,
             "failure_kind": kind, "retry_fix": False, "timestamp": self._now(),
+            "diagnostic": getattr(error, 'diagnostic', {}),
         })
+        state.execution_log[-1]['result'] = str(error)
         self._save(state)
-        self._print(error)
+        self._print(str(error))
         return state
 
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
@@ -2014,7 +2033,7 @@ class Session:
             with self._session_verification_context():
                 self._ensure_baseline(state)
         except SessionOwnershipError as error:
-            return self._block_execution_binding(state, str(error), "verification_ownership")
+            return self._block_execution_binding(state, error, "verification_ownership")
         feedback = ""
         while True:
             self._reconcile_interrupted_collab_checkpoints(state)
@@ -2291,6 +2310,10 @@ class Session:
             return state
 
         self._current_state = state
+        try:
+            bind_session(self, state)
+        except SessionOwnershipError as error:
+            return self._block_execution_binding(state, error, "verification_ownership")
         verify = self._run_verify(scope="final")
         self._append_verification_log(state, "post_child_fix_verify", verify)
         self._save(state)
@@ -3857,7 +3880,8 @@ class Session:
                 return result
         except SessionOwnershipError as error:
             return {"ok": False, "reason": str(error), "retry_fix": False,
-                    "failure_kind": "verification_ownership", "executed_commands": 0}
+                    "failure_kind": "verification_ownership", "executed_commands": 0,
+                    "diagnostic": error.diagnostic}
         finally:
             if callable(publish_operation):
                 publish_operation()
@@ -3868,6 +3892,7 @@ class Session:
         if state is None or not state.verification_binding:
             yield
             return
+        validate_binding(self, state)
         if state.verification_binding.get("session_id") != state.session_id:
             raise SessionOwnershipError("verification contract belongs to another session")
         if state.verification_binding.get("workflow_id") != state.workflow_id:
@@ -3892,6 +3917,9 @@ class Session:
             self.config.gates = ambient
 
     def _session_gate_executor_context(self, metadata=None, *, source_ref="", **kwargs):
+        state = self._current_state
+        if state is not None and state.verification_binding:
+            kwargs['contract_fingerprint'] = state.verification_binding.get('binding_fingerprint', '')
         return self.orch._gate_executor_context(
             metadata, source_ref=source_ref or getattr(self, "_candidate_source_ref", ""), **kwargs
         )
@@ -4147,7 +4175,7 @@ class Session:
             commands = self._logical_gate_commands(plan)
             if self.mode == "fix" and state.fix_verify_command:
                 commands = [self._fix_verify_command_for_execution(state.fix_verify_command), *commands]
-            validate_selected_contracts(self, state, commands)
+            validate_selected_contracts(self, state, commands, metadata=plan.metadata)
             for command in dict.fromkeys(commands):
                 collect = collection_command(command)
                 if not collect:
@@ -4249,6 +4277,13 @@ class Session:
         record_gate(gate)
         self.orch._classify_reported_infrastructure_failures(gate)
         extraction = extract_failure_info(gate)
+        required = set(state.verification_binding.get('required_proof_ids', []))
+        failed_owned = [result.command for result in gate.commands if not result.ok
+                        and (required.intersection(getattr(metadata.get(result.command), 'proof_ids', []))
+                             or result.command in state.verification_binding.get('required_commands', {}))]
+        if failed_owned:
+            return outcome(False, 'mandatory owned verification failed: ' + ', '.join(failed_owned),
+                           retry_fix=extraction.comparable, failure_kind='owned_verification_failed')
         raw_output = self.orch._gate_raw_output(gate)
         if not gate.ok and not extraction.comparable:
             diagnostic_gate = run_identity_diagnostic(
@@ -5088,6 +5123,12 @@ class Session:
         state: SessionState,
         verify: Dict[str, object],
     ) -> None:
+        if state.verification_binding:
+            # A child-scoped release cannot attest the ambient workflow's
+            # excluded pending obligations or subtract their required gates.
+            enqueue_release_verification(self.project_root,
+                source=f"{self.mode}:{state.session_id}", affected_proof_ids=[])
+            return
         if str(verify.get("attestation_level", "")) == "release":
             payload = complete_release_verification(self.project_root, verify)
         elif self.config.gates.release_verification_mode == "deferred":

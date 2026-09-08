@@ -192,12 +192,22 @@ def select_verification_steps(
     *,
     level: str,
     changed_paths: Iterable[str] = (),
+    required_proof_ids: Iterable[str] = (),
+    preserve_release_targets: bool = False,
 ) -> VerificationSelection:
     requested_level = str(level).strip().lower()
     if requested_level not in {"affected", "release"}:
         raise ValueError(f"unsupported verification level: {level}")
     changed = list(dict.fromkeys(_normalized(path) for path in changed_paths if _normalized(path)))
     indexed = {step.proof_id: step for step in steps if step.proof_id}
+    required = list(dict.fromkeys(required_proof_ids))
+    missing = set(required) - indexed.keys()
+    if missing:
+        raise ValueError("required proofs are unavailable: " + ", ".join(sorted(missing)))
+
+    def release_selection():
+        eligible = [step for step in steps if "release" in _step_levels(step)]
+        return eligible if preserve_release_targets else remove_release_target_overlap(eligible, steps)
 
     effective_level = requested_level
     forced_reason = ""
@@ -211,7 +221,7 @@ def select_verification_steps(
 
     eligible = [step for step in steps if effective_level in _step_levels(step)]
     if effective_level == "release":
-        selected = remove_release_target_overlap(eligible, steps)
+        selected = release_selection()
         mapped = changed
         unmapped: list[str] = []
     elif not changed:
@@ -263,7 +273,7 @@ def select_verification_steps(
                     cadence="implement_and_final",
                     impact_paths=[path],
                     targets=[path],
-                    depends_on_proofs=[],
+                    depends_on_proofs=list(owner.depends_on_proofs) if preserve_release_targets else [],
                 )
             )
             mapped_set.add(path)
@@ -272,10 +282,8 @@ def select_verification_steps(
         if unmapped:
             if gate_config.unmapped_change_policy == "release":
                 effective_level = "release"
-                selected = remove_release_target_overlap(
-                    [step for step in steps if "release" in _step_levels(step)],
-                    steps,
-                )
+                selected = (selected + [step for step in release_selection() if step not in selected]
+                            if preserve_release_targets else release_selection())
                 forced_reason = "changed paths are outside the declared/static impact graph"
                 mapped = changed
                 unmapped = []
@@ -286,14 +294,24 @@ def select_verification_steps(
                     if proof_id in indexed and indexed[proof_id] not in selected
                 )
 
-    selected = _include_dependencies(selected, indexed)
+    if preserve_release_targets and effective_level == "release" and changed:
+        dependency_index = StaticDependencyIndex(project_root)
+        for step in steps:
+            if "affected" not in _step_levels(step):
+                continue
+            declared = [*step.impact_paths, *[_target_file(item) for item in step.targets]]
+            dependencies = dependency_index.closure_for_targets(step.targets)
+            if any(path in dependencies or any(_matches(path, pattern) for pattern in declared)
+                   for path in changed) and step not in selected:
+                selected.append(step)
+    selected.extend(indexed[key] for key in required if indexed[key] not in selected)
+    selected = _include_dependencies(selected, indexed, strict=preserve_release_targets)
     if effective_level == "affected" and any(step.risk == "critical" for step in selected):
         effective_level = "release"
-        selected = remove_release_target_overlap(
-            [step for step in steps if "release" in _step_levels(step)],
-            steps,
-        )
-        selected = _include_dependencies(selected, indexed)
+        selected = (selected + [step for step in release_selection() if step not in selected]
+                    if preserve_release_targets else release_selection())
+        selected.extend(indexed[key] for key in required if indexed[key] not in selected)
+        selected = _include_dependencies(selected, indexed, strict=preserve_release_targets)
         forced_reason = "affected proof is classified critical"
     proof_ids = list(dict.fromkeys(step.proof_id for step in selected if step.proof_id))
     return VerificationSelection(
@@ -333,6 +351,7 @@ def _is_test_path(path: str) -> bool:
 def _include_dependencies(
     selected: Sequence[VerificationStep],
     indexed: dict[str, VerificationStep],
+    *, strict: bool = False,
 ) -> list[VerificationStep]:
     result = list(selected)
     present = {step.proof_id for step in result}
@@ -342,6 +361,8 @@ def _include_dependencies(
         cursor += 1
         for proof_id in step.depends_on_proofs:
             dependency = indexed.get(proof_id)
+            if strict and dependency is None:
+                raise ValueError(f"proof {step.proof_id} requires unavailable prerequisite {proof_id}")
             if dependency is not None and proof_id not in present:
                 result.append(dependency)
                 present.add(proof_id)
