@@ -123,3 +123,12 @@ in diagnostics. The workflow stays resumable and reports that engine versions
 must be synchronized. This does not merge divergent histories, force-push, or
 silently replace upstream work with the local checkout. Integrate and verify the
 required changes before publishing a compatible upstream revision and retrying.
+
+Acceptance-planning capability v2 retains explicit planned pytest nodes from
+coverage explanations as required checks, including when the structured list
+is empty or contains only partial existing coverage. Normalization only adds
+fully qualified, repository-local identifiers; it never invents test names or
+discards existing checks. The raw provider output remains unchanged, and the
+normalized unverified contract is cached. Missing planned tests still prevent
+upstream reuse and must be implemented and proved by the candidate. The
+controller's planning probe checks this behavior before runtime replacement.

@@ -58,7 +58,7 @@ def progress_supervision(root):
 def acceptance_planning(root):
     from auto_agents.repair_contract import prepare_contract
 
-    route = {"issue_seed": {"required_behavior": ["preserve progress supervision"]}}
+    route = {"issue_seed": {"required_behavior": ["preserve progress supervision", "implement missing coverage"]}}
     calls = []
 
     def plan(request):
@@ -68,7 +68,10 @@ def acceptance_planning(root):
         assert request.sandbox_mode == "read-only" and not request.record_execution_incidents
         return SimpleNamespace(ok=True, summary=json.dumps({"checks": [{
             "obligation": "preserve progress supervision", "nodeids": ["tests/test_runtime.py::test_progress"],
-            "reason": "assert progress supervision remains active",
+            "reason": "Also implement tests/test_runtime.py::test_planned_progress for missing coverage.",
+        }, {
+            "obligation": "implement missing coverage", "nodeids": [],
+            "reason": "Implement tests/test_runtime.py::test_planned_coverage before claiming reuse.",
         }]}))
 
     orchestrator = SimpleNamespace(config=SimpleNamespace(efforts={}), _call_with_failover=plan)
@@ -77,6 +80,9 @@ def acceptance_planning(root):
         first = prepare_contract(payload, "probe", root, root, root)
         second = prepare_contract(payload, "probe", root, root, root)
     assert len(calls) == 1 and first.to_dict() == second.to_dict(), "planning cache is not preserved"
+    assert first.checks[0]["nodeids"] == ["tests/test_runtime.py::test_progress", "tests/test_runtime.py::test_planned_progress"]
+    assert first.checks[1]["nodeids"] == ["tests/test_runtime.py::test_planned_coverage"]
+    assert not first.to_dict()["repair_approved"], "planned checks cannot approve a repair"
 
 
 def terminal_repair_status(root):

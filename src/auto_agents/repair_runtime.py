@@ -14,7 +14,7 @@ import subprocess
 RUNTIME_CAPABILITIES = {
     "control_protocol": 1,
     "progress_supervision": 1,
-    "acceptance_planning": 1,
+    "acceptance_planning": 2,
     "terminal_repair_status": 1,
 }
 

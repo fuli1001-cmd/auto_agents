@@ -17,6 +17,12 @@ from .root_cause import RootCauseReport
 from .execution_binding import route_sources
 
 
+_PYTEST_NODE_ID = r"tests/(?:[A-Za-z0-9_]+/)*test_[A-Za-z0-9_]+\.py::[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)?"
+_EXPLAINED_NODE_ID = re.compile(
+    r"(?<![-\w./:\\])" + _PYTEST_NODE_ID + r"(?![-\w/:\[\\]|\.[A-Za-z0-9_])"
+)
+
+
 def retained_route_inputs(route, evidence, project=None):
     """Identify retained inputs in frozen evidence, never in the live project."""
     root = Path(evidence).resolve()
@@ -88,19 +94,27 @@ class EngineRequestContract:
         checks = data.get("checks")
         if not isinstance(checks, list) or len(checks) != len(required):
             raise ValueError("every engine request obligation needs a verification mapping")
+        normalized = []
         for index, check in enumerate(checks):
             if not isinstance(check, dict) or check.get("obligation") != required[index]:
                 raise ValueError("engine acceptance obligations cannot be omitted or rewritten")
             nodes = check.get("nodeids")
-            if not isinstance(nodes, list) or not nodes or not isinstance(check.get("reason"), str) or not check["reason"].strip():
+            if not isinstance(nodes, list) or not isinstance(check.get("reason"), str) or not check["reason"].strip():
                 raise ValueError("engine acceptance check needs test node IDs and a coverage explanation")
             for node in nodes:
                 # No shell, pytest options, external paths, or diagnostic-only
                 # commands. New tests may be planned, but cannot prove reuse.
-                if (not isinstance(node, str) or not re.fullmatch(
-                        r"tests/(?:[A-Za-z0-9_]+/)*test_[A-Za-z0-9_]+\.py::[A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)?", node)):
+                if not isinstance(node, str) or not re.fullmatch(_PYTEST_NODE_ID, node):
                     raise ValueError("engine acceptance requires repository-local pytest node IDs")
-        return cls(route, str(data.get("revision", "")), checks)
+            # A plan may put required new tests only in its explanation. Add
+            # those explicit identifiers to the obligations; never let partial
+            # existing coverage hide missing tests or manufacture passing proof.
+            nodes = list(dict.fromkeys([*nodes, *_EXPLAINED_NODE_ID.findall(check["reason"])]))
+            if not nodes:
+                raise ValueError("engine acceptance check needs test node IDs and a coverage explanation"
+                                 f" (obligation {index + 1}: {required[index]})")
+            normalized.append({**check, "nodeids": nodes})
+        return cls(route, str(data.get("revision", "")), normalized)
 
 
 def prepare_contract(payload, revision, checkout, evidence, directory):
@@ -124,9 +138,11 @@ def prepare_contract(payload, revision, checkout, evidence, directory):
         "Do not decide whether that signal proves a bug, and do not claim the request is fixed. "
         "Inspect the selected upstream checkout read-only. Do not edit files, run tests, invoke providers, "
         "or change project state. Use at most 8 focused inspection commands, no broad /tmp searches. "
-        "For EVERY exact obligation below select existing repository-local pytest node IDs whose assertions "
-        "actually establish it. If coverage is missing, name the new test that must be implemented; "
-        "a missing test will prevent upstream reuse. Explain the coverage for each mapping. "
+        "For EVERY exact obligation below provide a nonempty nodeids list containing ALL repository-local "
+        "pytest node IDs needed to establish it, including planned tests that do not exist yet. "
+        "If coverage is missing, put the full node ID of each required new test in nodeids, not only in reason. "
+        "Partial existing coverage must not replace those required new tests; a missing test will prevent "
+        "upstream reuse. Explain existing and missing coverage for each mapping. "
         "Do not substitute a general passing suite or a synthetic route receipt for requested behavior. "
         "Review the retained inputs below in frozen_evidence before selecting checks. "
         "Reuse the existing spec, cache options and environment candidate where applicable; "
