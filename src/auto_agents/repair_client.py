@@ -268,6 +268,9 @@ def _repair_progress_message(job, subscriber):
         if previous and previous.get("status") not in {"approved", "candidate_group_completed"}:
             reason = _repair_text(previous.get("reason", ""))
             label += f"；第 {previous.get('candidate', '?')} 轮未通过：{reason}"
+        imported = job.get("prior_repair_input") or {}
+        if imported.get("source_job"):
+            label = f"已接续上次候选（{_repair_text(imported['source_job'])[:8]}）；" + label
         return label
     return "等待修复进展"
 

@@ -94,3 +94,29 @@ the saved fourth review and the fifth candidate's checkpoint preserves all four
 findings, including each reason, counterexample, required test and evidence field.
 This verifies feedback delivery; it does not establish the next live run's completion
 time or prove the outstanding project repair correct.
+
+## September 8 restart investigation
+
+The next invocation loaded `51afd34`, and its fifth candidate received all four
+findings from the preceding review. However, cancelling the earlier job and
+rerunning the command created a new job without importing the cancelled job's
+retained fifth candidate. The only request input that changed was the engine base.
+The four new candidates spent 56 minutes 40 seconds in generation, 12 minutes
+in diagnosis differential, 5 minutes 34 seconds in focused checks, and 7 minutes
+32 seconds in review. Three candidates failed before reaching semantic review.
+
+Two failed boundary replays were followed by roughly four minutes of differential
+work each. Their primary errors appeared at the start of the combined diagnostic,
+while the retry excerpts retained only the passing-test output at the end.
+The engine now stops that candidate's later proof after the boundary failure and
+preserves both ends of failure evidence. A newly authorized matching invocation
+can also import a quiescent cancelled job's code and review history, with fresh
+verification required and explicit progress reporting.
+
+An isolated replay used the actual cancelled job and subsequent request: it retained
+the fifth candidate's code, four registered candidates and four complete review
+findings, and integrated `51afd34` successfully. The live jobs were left untouched.
+Separate replay of both failed boundary diagnostics confirmed that their primary
+errors survive both retry excerpt limits. Outstanding candidate correctness still
+requires review; these checks establish recovery continuity and failure delivery,
+not a guaranteed wall-clock completion time.

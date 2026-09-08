@@ -237,6 +237,10 @@ class Store:
                     "ORDER BY sequence DESC LIMIT 1", (identity, start)).fetchone()
                 previous = db.execute("SELECT payload FROM events WHERE job=? AND sequence>? AND kind='candidate_result' "
                                       "ORDER BY sequence DESC LIMIT 1", (identity, start)).fetchone()
+                imported = db.execute("SELECT payload FROM events WHERE job=? AND kind='prior_repair_imported' "
+                                      "ORDER BY sequence DESC LIMIT 1", (identity,)).fetchone()
+            if imported:
+                result["prior_repair_input"] = json.loads(imported["payload"])
             if progress:
                 result["progress"] = {**json.loads(progress["payload"]), "kind": progress["kind"],
                                       "started_at": progress["created"]}

@@ -121,6 +121,23 @@ candidate ref and matching checkpoint diff. That historical review does not gran
 verification proof to the unreviewed commit. Resolved findings remain visible as
 constraints to preserve, and unrelated review observations remain outside repair scope.
 
+Cancelling a repair still cancels its workflow registration. Running the original
+command again creates a newly authorized job. If every request input except the
+engine base revision matches, that job can import a quiescent cancelled job's
+retained code and review history. It preserves committed, staged, unstaged and
+untracked candidate changes, then integrates the current trusted engine revision.
+The cancelled job and its subscribers remain cancelled; the new job must earn
+fresh verification and recovery approval. Native provider sessions and full-suite
+checkpoints are not imported. Active or mismatched jobs and a new job that already
+started an attempt are never replaced. `prior-repair-import.json` records the source,
+and foreground progress explicitly confirms that the previous candidate was retained.
+
+Bounded failure excerpts preserve both the beginning and end of diagnostics, so a
+primary replay failure cannot disappear behind later passing-test output. Under
+acceleration, failed boundary replay returns the candidate immediately; the expensive
+diagnosis differential waits until the replay passes. Invalid replay evidence also
+stops later proof. No final validation requirement is removed.
+
 Output is redacted before writing: configured secret values and their URL-encoded
 forms, URL userinfo/query/fragment, secret assignments and authorization headers.
 Environment variables are not dumped. Each stream retains up to approximately

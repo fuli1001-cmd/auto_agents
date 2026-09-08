@@ -10,7 +10,7 @@ import pytest
 
 from auto_agents.models import AgentRequest
 from auto_agents.prompting import ProviderRuntime, prepare_request
-from auto_agents.self_repair import AutoAgentsSelfRepairRunner, SelfRepairDecision, SelfRepairResult
+from auto_agents.self_repair import AutoAgentsSelfRepairRunner, SelfRepairDecision, SelfRepairResult, _VerificationResult
 from auto_agents.self_repair_search import (
     SelfRepairCandidateRecord, SelfRepairExperiment, SelfRepairExperimentStore, SelfRepairFinding,
 )
@@ -189,6 +189,52 @@ def test_unrecorded_retained_head_does_not_borrow_another_candidates_proof(repai
     assert context["parent_candidate"] == ""
     assert context["parent_ref"] == "unrecorded-sha"
     assert "parent_review" not in context
+
+
+def test_retry_retains_primary_replay_error_before_long_passing_differential(repair_feedback, tmp_path):
+    runner, _ = repair_feedback
+    blocker = "{'ok': False, 'error': 'verification_execution_binding', 'route_consumed': True}"
+    record = runner._experiment.candidates["retained"]
+    record.status = "candidate_replay_failed"
+    record.verification = blocker + "\n" + "passing differential output\n" * 500 + "46 passed\n"
+    request = AgentRequest(
+        stage="self_repair", purpose="self_repair", effort="deep", cwd=tmp_path,
+        output_path=tmp_path / "answer", prompt=runner._build_prompt(),
+    )
+    prepared = prepare_request(request, ProviderRuntime("codex", resolved_model="gpt-6-astra"))
+    context = _delivered_context(prepared.prompt, delta=False)
+    evidence = context["recent_candidates"][0]["verification_failure"]
+    assert blocker in evidence and "46 passed" in evidence
+    assert len(evidence) <= 2400
+
+
+@pytest.mark.parametrize("outcome", ["failed", "invalid", "passed", "component"])
+def test_boundary_failure_does_not_run_later_expensive_proof(repair_feedback, tmp_path, outcome):
+    runner, _ = repair_feedback
+    runner.diagnosis = SimpleNamespace()
+    replay = _VerificationResult(outcome == "passed", "specific boundary failure", payload={"outcome": outcome})
+    with (
+        patch.object(runner, "_report_candidate_phase"),
+        patch.object(runner, "_replay_candidate", return_value=replay) as replay_call,
+        patch.object(runner, "_diagnosis_differential", return_value=_VerificationResult(True, "passed")) as differential,
+    ):
+        actual, proof = runner._candidate_boundary_checks(tmp_path, "commit", "candidate", final_group=outcome != "component")
+    if outcome == "passed":
+        assert actual.ok and proof.ok
+        differential.assert_called_once()
+    else:
+        differential.assert_not_called()
+        assert not proof.ok
+    assert replay_call.call_count == (0 if outcome == "component" else 1)
+
+
+def test_imported_pending_ref_cannot_skip_fresh_candidate_validation(repair_feedback, tmp_path):
+    runner, _ = repair_feedback
+    runner._inherited_candidate_ids = {"old"}
+    listing = subprocess.CompletedProcess([], 0, "refs/auto-agents/self-repair/pending-validation/repair/old\n", "")
+    with patch("auto_agents.self_repair.subprocess.run", return_value=listing) as git_call:
+        assert runner._latest_pending_validation_ref("base") == ""
+    assert git_call.call_count == 1
 
 
 @pytest.mark.parametrize("history", ["linear", "squashed", "wrong_patch", "other_experiment"])

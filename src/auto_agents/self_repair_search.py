@@ -19,6 +19,16 @@ from .io_utils import read_json
 SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 4
 
 
+def verification_failure_excerpt(value: str, limit: int = 2400) -> str:
+    """Retain the primary failure and final assertions, after redaction."""
+    text = redact_incident_text(value)
+    if len(text) <= limit:
+        return text
+    marker = "\n[... diagnostic middle omitted ...]\n"
+    head = (limit - len(marker)) // 2
+    return text[:head] + marker + text[-(limit - len(marker) - head):]
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1069,7 +1079,7 @@ class SelfRepairExperiment:
                     "component_receipts": item.component_receipts,
                     "duration_seconds": item.duration_seconds,
                     "verification_failure": (
-                        redact_incident_text(item.verification)[-2400:]
+                        verification_failure_excerpt(item.verification)
                         if item.status not in {"approved_candidate", "candidate_group_completed"}
                         else ""
                     ),

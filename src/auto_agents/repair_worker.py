@@ -224,7 +224,12 @@ def repair(request):
                 "engine_full_proof": {"policy": 1, "commit": revision, "environment": environment, "ok": True}}
     if payload.get("autonomy") != "max":
         return {"ok": False, "error": "latest revision did not prove recovery; guarded mode will not generate code", "proof": proof}
+    from auto_agents.repair_restart import import_cancelled_repair
+    import_cancelled_repair(store, job, working, repository)
     runner = make_runner(payload, checkout, working, python)
+    restart_receipt = directory / "prior-repair-import.json"
+    if restart_receipt.exists():
+        runner._inherited_candidate_ids = set(json.loads(restart_receipt.read_text()).get("candidate_ids", []))
     runner._latest_remote_check = proof
     runner._continuous_workspace = directory / "continuous"
     carry_continuous_work(runner, revision)

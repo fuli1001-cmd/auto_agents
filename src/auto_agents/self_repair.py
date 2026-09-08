@@ -61,6 +61,7 @@ from .self_repair_search import (
     SelfRepairExperiment,
     SelfRepairExperimentStore,
     SelfRepairFinding,
+    verification_failure_excerpt,
     _stable_hash as _search_stable_hash,
 )
 
@@ -2056,6 +2057,8 @@ class AutoAgentsSelfRepairRunner:
             candidate_ref = candidate_ref.strip()
             if not candidate_ref:
                 continue
+            if candidate_ref.rsplit("/", 1)[-1] in getattr(self, "_inherited_candidate_ids", set()):
+                continue
             parent = subprocess.run(
                 ["git", "rev-parse", f"{candidate_ref}^"],
                 cwd=str(self.repo_root),
@@ -3682,8 +3685,14 @@ class AutoAgentsSelfRepairRunner:
             self._candidate_started_at = time.monotonic()
             reporter = getattr(self.target_orchestrator, "reporter", None)
             if reporter is not None and hasattr(reporter, "emit"):
+                reported_parent = experiment.best_search_candidate_id
+                if self._continuous_mode():
+                    retained = Path(self._continuous_workspace) / "repair"
+                    if retained.exists():
+                        retained_head = head_ref(retained)
+                        reported_parent = self._candidate_parent_id(retained_head) or retained_head[:12]
                 reporter.emit("repair.candidate_started", candidate=attempt,
-                              parent=experiment.best_search_candidate_id,
+                              parent=reported_parent,
                               component=active_group.get("group_id", ""),
                               remaining=len(experiment.blocking_findings()))
             recent_records = [
@@ -3697,7 +3706,7 @@ class AutoAgentsSelfRepairRunner:
                     f"group={record.finding_group_id or 'none'} "
                     f"strategy={record.strategy_fingerprint or 'none'} "
                     f"reason={redact_incident_text(record.reason)[-1200:]} "
-                    f"verification={redact_incident_text(record.verification)[-1200:]}"
+                    f"verification={verification_failure_excerpt(record.verification, 1200)}"
                 )
                 for record in recent_records
             ]
@@ -4696,17 +4705,8 @@ class AutoAgentsSelfRepairRunner:
                     "candidate generation completed; replaying the blocked boundary",
                 )
                 final_group = bool(getattr(self, "_candidate_is_final_group", True))
-                replay = (
-                    self._replay_candidate(repair_root, candidate_commit, candidate_id)
-                    if final_group else _VerificationResult(False, "root replay belongs to integration", payload={"outcome": "deferred"})
-                )
-                self._report_candidate_phase(
-                    "validating_diagnosis_differential",
-                    "boundary replay completed; running diagnosis-specific proof",
-                )
-                differential = (
-                    self._diagnosis_differential(self._experiment.base_commit, repair_root)
-                    if final_group else _VerificationResult(False, "root differential belongs to integration", payload={"outcome": "deferred"})
+                replay, differential = self._candidate_boundary_checks(
+                    repair_root, candidate_commit, candidate_id, final_group=final_group,
                 )
                 if final_group and self.diagnosis is not None and any(proof.payload.get("outcome") == "invalid" for proof in (replay, differential)):
                     return SelfRepairResult(
@@ -4722,7 +4722,8 @@ class AutoAgentsSelfRepairRunner:
                         and (not replay.ok or not differential.ok)):
                     return SelfRepairResult(
                         ok=False, status="candidate_replay_failed", category=self.decision.category,
-                        reason="candidate failed its required boundary before semantic review",
+                        reason=("candidate failed its required boundary before semantic review: "
+                                + verification_failure_excerpt(replay.summary if not replay.ok else differential.summary, 800)),
                         summary=summary, verification=replay.summary + "\n" + differential.summary,
                         experiment_id=experiment_id, candidate_id=candidate_id, base_commit=base_head,
                         candidate_commit=candidate_commit, candidate_ref=candidate_ref,
@@ -8294,6 +8295,27 @@ class AutoAgentsSelfRepairRunner:
         if result.summary and result.summary != result.stdout:
             parts.append(f"summary={result.summary[:500]}")
         return "; ".join(parts) if parts else "self-repair agent failed without output"
+
+    def _candidate_boundary_checks(self, repair_root, candidate_commit, candidate_id, *, final_group):
+        if not final_group:
+            return (
+                _VerificationResult(False, "root replay belongs to integration", payload={"outcome": "deferred"}),
+                _VerificationResult(False, "root differential belongs to integration", payload={"outcome": "deferred"}),
+            )
+        replay = self._replay_candidate(repair_root, candidate_commit, candidate_id)
+        if self.diagnosis is not None and (
+            replay.payload.get("outcome") == "invalid"
+            or (self._acceleration_enabled() and not replay.ok)
+        ):
+            return replay, _VerificationResult(
+                False, "diagnosis differential deferred until boundary replay passes",
+                payload={"outcome": "deferred"},
+            )
+        self._report_candidate_phase(
+            "validating_diagnosis_differential",
+            "boundary replay completed; running diagnosis-specific proof",
+        )
+        return replay, self._diagnosis_differential(self._experiment.base_commit, repair_root)
 
     @_timed_repair_phase("focused_verification")
     def _run_active_group_verification(
