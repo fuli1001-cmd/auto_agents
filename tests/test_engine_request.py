@@ -302,3 +302,203 @@ def test_real_sandbox_replay_consumes_only_the_original_engine_route(tmp_path, m
     assert result.get("route_consumed") is matching, result
     assert result["ok"] is matching, result
     assert (project / ".auto-agents/state/sessions/parent/session_state.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("problem", ["disabled", "unregistered", "disconnected"])
+def test_unavailable_engine_channel_blocks_repeated_requests_without_children_or_providers(tmp_path, monkeypatch, problem):
+    from auto_agents.config import load_run_state, save_run_state
+    from auto_agents.models import SessionState
+    from auto_agents.orchestrator import Orchestrator
+    from auto_agents.session import Session
+    from auto_agents.workflow_runtime import WorkflowCoordinator
+    from test_session import _make_project
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", raising=False)
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_ROUTE_PROBE", raising=False)
+    monkeypatch.setenv("AUTO_AGENTS_REPAIR_SUBSCRIBER", "resuming-subscriber")
+    project = _make_project(str(tmp_path))
+    run = load_run_state(project)
+    run.status, run.current_stage, run.active_blocker = "pending", "implement", {}
+    save_run_state(project, run)
+    before = (project / ".auto-agents/state/run_state.json").read_bytes()
+    orch = Orchestrator(project)
+    orch._repair_registration = {"config": {"source_root": str(tmp_path / "engine")}}
+    if problem == "disabled":
+        monkeypatch.setenv("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", "1")
+    elif problem == "unregistered":
+        orch._repair_registration = None
+    coordinator = WorkflowCoordinator(orch)
+    session = Session(orch, mode="collab", coordinator=coordinator)
+    state = SessionState(session_id="parent", mode="collab", status="executing")
+    with patch("auto_agents.repair_client.rpc", side_effect=OSError("channel closed")) as transport, \
+         patch.object(coordinator, "prepare_run_route", side_effect=AssertionError("ambient run preflight")), \
+         patch.object(coordinator, "start_seeded_session", side_effect=AssertionError("child")), \
+         patch.object(orch, "_call_with_failover", side_effect=AssertionError("provider")):
+        for _ in range(3):
+            result = session._prepare_workflow_handoff(state, target="run", reason="engine", payload=route(tmp_path / "engine"))
+            assert result.status == "blocked" and result.resolution == "execution_binding_mismatch"
+            assert result.execution_log[-1]["retry_fix"] is False
+            assert not result.active_handoff_id
+        assert transport.call_count == (1 if problem == "disconnected" else 0)
+    assert (project / ".auto-agents/state/run_state.json").read_bytes() == before
+
+
+def test_conflicting_engine_targets_cannot_consume_a_receipt(tmp_path, monkeypatch):
+    from auto_agents.repair_client import engine_route
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", raising=False)
+    monkeypatch.setenv("AUTO_AGENTS_REPAIR_SUBSCRIBER", "subscriber")
+    orch = SimpleNamespace(_repair_registration={"config": {"source_root": str(tmp_path / "engine")}})
+    request = {**route(tmp_path / "engine"), "target_repository": str(tmp_path / "foreign")}
+    with patch("auto_agents.repair_client.rpc", side_effect=AssertionError("must validate before receipt")):
+        assert engine_route(orch, request) is False
+
+
+def test_nested_engine_target_uses_the_same_admission_and_execution_owner(tmp_path, monkeypatch):
+    from auto_agents.repair_client import engine_route
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", raising=False)
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_ROUTE_PROBE", raising=False)
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_SUBSCRIBER", raising=False)
+    engine = tmp_path / "engine"
+    orch = SimpleNamespace(_repair_registration={"config": {"source_root": str(engine)}},
+                           _invocation_context={"auto_approve": True})
+    request = {"fix_disposition": route(engine)}
+    with pytest.raises(EngineRepairRequired) as raised:
+        engine_route(orch, request)
+    assert triage_engine_request(orch, tmp_path, raised.value).decision.eligible
+
+
+def test_engine_route_reviews_and_consumes_retained_spec_cache_options_and_conda_candidate_once(tmp_path):
+    from auto_agents.repair_contract import retained_route_inputs
+    from auto_agents.self_repair import AutoAgentsSelfRepairRunner, SelfRepairDecision
+    evidence = tmp_path / "frozen"
+    evidence.mkdir()
+    retained = {"spec.md": "Engine routing spec", "cache.json": '{"vitest": "--no-cache"}',
+                "environment.json": '{"mode": "conda", "candidate": "existing-prefix"}'}
+    for name, content in retained.items():
+        (evidence / name).write_text(content)
+    request = route(tmp_path / "engine")
+    request["issue_seed"]["evidence_refs"] = list(retained)
+    payload = {"invocation": {"engine_route": request}, "project": str(tmp_path / "live")}
+    calls = []
+    def review(agent):
+        context = json.loads(agent.prompt.splitlines()[-1])
+        reviewed = {item["path"]: (Path(context["frozen_evidence"]) / item["path"]).read_text()
+                    for item in context["retained_inputs"]}
+        assert reviewed == retained
+        calls.append(reviewed)
+        return SimpleNamespace(ok=True, summary=json.dumps({"checks": contract_data(request)["checks"]}))
+    orch = SimpleNamespace(config=SimpleNamespace(efforts={}), _call_with_failover=review,
+                           _invocation_context=payload["invocation"])
+    with patch("auto_agents.orchestrator.Orchestrator", return_value=orch):
+        first = prepare_contract(payload, "base", tmp_path, evidence, tmp_path)
+        second = prepare_contract(payload, "base", tmp_path, evidence, tmp_path)
+        assert first.to_dict() == second.to_dict()
+        assert len(calls) == 1
+        # A modified retained candidate must be reviewed again, not hidden by
+        # a cached route/SHA pair. No live project input is read or generated.
+        retained["environment.json"] = '{"mode": "conda", "candidate": "updated-prefix"}'
+        (evidence / "environment.json").write_text(retained["environment.json"])
+        prepare_contract(payload, "base", tmp_path, evidence, tmp_path)
+        assert len(calls) == 2
+    runner = AutoAgentsSelfRepairRunner(orch, target_project_root=evidence,
+        error=EngineRepairRequired(request), decision=SelfRepairDecision(True), diagnosis=first)
+    prompt = runner._build_prompt(tmp_path / "candidate", evidence)
+    for item in retained_route_inputs(request, evidence):
+        assert item["sha256"] in prompt
+    assert {name: (evidence / name).read_text() for name in retained} == retained
+
+
+def _exercise_engine_candidate(tmp_path, monkeypatch, *, dirty):
+    from contextlib import ExitStack
+    from auto_agents.config import load_run_state, save_run_state
+    from auto_agents.models import AgentResult, SessionState
+    from auto_agents.orchestrator import Orchestrator
+    from auto_agents.repair_control import Repository
+    from auto_agents.self_repair import AutoAgentsSelfRepairRunner
+    from auto_agents.session import Session
+    from auto_agents.workflow_runtime import WorkflowCoordinator
+    from test_session import _make_project, _configure_git_identity
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", raising=False)
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_ROUTE_PROBE", raising=False)
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_SUBSCRIBER", raising=False)
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    project = _make_project(str(tmp_path))
+    _configure_git_identity(project)
+    run = load_run_state(project)
+    run.status, run.current_stage, run.active_blocker = "pending", "implement", {}
+    save_run_state(project, run)
+    git(project, "add", "-A")
+    git(project, "commit", "-m", "product fixture")
+    if dirty:
+        for root in (engine, project):
+            (root / "developer.txt").write_text("staged")
+            git(root, "add", "developer.txt")
+            (root / "developer.txt").write_text("unstaged")
+            (root / "untracked.txt").write_text("untracked")
+    def snapshot(root):
+        return (git(root, "rev-parse", "HEAD"), git(root, "diff", "--binary"),
+                git(root, "diff", "--cached", "--binary"), git(root, "status", "--porcelain"),
+                (root / "untracked.txt").read_bytes() if dirty else b"")
+    before = {root: snapshot(root) for root in (engine, project)}
+    run_before = (project / ".auto-agents/state/run_state.json").read_bytes()
+    orch = Orchestrator(project)
+    orch._repair_registration = {"config": config}
+    orch._invocation_context = {"auto_approve": True}
+    coordinator = WorkflowCoordinator(orch)
+    session = Session(orch, mode="collab", coordinator=coordinator)
+    with patch.object(coordinator, "prepare_run_route", side_effect=AssertionError("product preflight")):
+        with pytest.raises(EngineRepairRequired) as raised:
+            session._prepare_workflow_handoff(SessionState(session_id="parent", mode="collab"),
+                target="run", reason="engine", payload=route(engine))
+    admission = triage_engine_request(orch, project, raised.value)
+    assert admission.decision.eligible
+    repository = Repository(config)
+    base, _ = repository.fetch()
+    runtime = repository.worktree(base, "runtime")
+    frozen = tmp_path / "frozen"
+    from auto_agents.root_cause import RootCauseCoordinator
+    RootCauseCoordinator._copy_diagnostic_tree(project, frozen)
+    orch._invocation_context["engine_route"] = raised.value.route_payload
+    runner = AutoAgentsSelfRepairRunner(orch, target_project_root=frozen,
+        error=raised.value, decision=admission.decision)
+    runner.repo_root = runtime
+    runner._real_project_root = project
+    runner._engine_source_root = engine
+    runner._verification_python_cache = sys.executable
+    called = []
+    def implement(request):
+        assert request.sandbox_mode == "workspace-write"
+        assert request.cwd not in (engine, project, runtime)
+        assert git(request.cwd, "rev-parse", "HEAD") == base
+        code = "from pathlib import Path\nPath('bug.py').write_text(\"value = 'candidate'\\n\")\n"
+        for root in (engine, project):
+            code += (f"try:\n Path({str(root / 'bug.py')!r}).write_text('forbidden')\n"
+                     "except PermissionError:\n pass\nelse:\n raise AssertionError('foreign write permitted')\n")
+        with runner._verification_argv([runner._verification_python(), "-c", code], request.cwd,
+                                       read_roots=(engine,)) as command:
+            result = subprocess.run(command, cwd=request.cwd, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        assert (request.cwd / "bug.py").read_text() == "value = 'candidate'\n"
+        called.append(request.cwd)
+        # Fail the candidate deliberately to exercise real worktree cleanup.
+        return AgentResult(False, [], request.output_path, summary="candidate rejected")
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(orch, "_call_with_failover", side_effect=implement))
+        stack.enter_context(patch.object(runner, "_artifact_paths", return_value=(tmp_path / "prompt", tmp_path / "output")))
+        stack.enter_context(patch.object(runner, "_resume_interrupted_candidate", return_value=""))
+        stack.enter_context(patch.object(runner, "_preserve_interrupted_candidate", return_value=True))
+        stack.enter_context(patch.object(runner, "_provider_continuation", return_value={}))
+        result = runner._run_candidate(experiment_id="engine", attempt=1, deadline=None,
+                                       prior_failures=[], seen_fingerprints=set())
+    assert result.status == "candidate_failed"
+    assert len(called) == 1 and not called[0].exists()
+    assert {root: snapshot(root) for root in (engine, project)} == before
+    assert (project / ".auto-agents/state/run_state.json").read_bytes() == run_before
+
+
+def test_authorized_engine_route_executes_in_permissioned_engine_workspace(tmp_path, monkeypatch):
+    _exercise_engine_candidate(tmp_path, monkeypatch, dirty=False)
+
+
+def test_engine_candidate_verification_and_rollback_preserve_both_dirty_repositories(tmp_path, monkeypatch):
+    _exercise_engine_candidate(tmp_path, monkeypatch, dirty=True)

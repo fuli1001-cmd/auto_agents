@@ -110,15 +110,21 @@ def disable_vitest_cache(command: str) -> str:
         return command
 
 
-def repository_binding_error(project_root: Path, payload: Mapping[str, object]) -> str:
-    root = project_root.resolve()
+def route_sources(payload: Mapping[str, object]):
+    """Walk the same routing envelopes for admission and execution."""
     sources = [payload]
     while sources:
         source = sources.pop()
-        for key in ("issue_seed", "spec_seed", "fix_disposition"):
+        yield source
+        for key in reversed(("issue_seed", "spec_seed", "fix_disposition")):
             value = source.get(key)
             if isinstance(value, dict):
                 sources.append(value)
+
+
+def repository_binding_error(project_root: Path, payload: Mapping[str, object]) -> str:
+    root = project_root.resolve()
+    for source in route_sources(payload):
         target = str(source.get("target_repository", "")).strip()
         if target and (root / Path(target).expanduser()).resolve() != root:
             return (

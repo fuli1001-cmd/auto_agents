@@ -21,7 +21,11 @@ class EngineRepairRequired(RuntimeError):
 
 def engine_route(orchestrator, payload):
     """Return True only for a verified receipt; otherwise request engine repair."""
+    from .execution_binding import repository_binding_error, route_sources
     registration = getattr(orchestrator, "_repair_registration", None)
+    if registration and (not any(source.get("target_repository") for source in route_sources(payload))
+                         or repository_binding_error(Path(registration["config"]["source_root"]), payload)):
+        return False
     probe = os.environ.get("AUTO_AGENTS_REPAIR_ROUTE_PROBE")
     if probe:
         approved = json.loads(Path(probe).read_text())
@@ -30,15 +34,22 @@ def engine_route(orchestrator, payload):
             return True
     if not registration or not enabled():
         return False
-    target = str(payload.get("target_repository", ""))
-    for name in ("issue_seed", "spec_seed"):
-        target = str(payload.get(name, {}).get("target_repository", target))
-    if not target or Path(target).resolve() != Path(registration["config"]["source_root"]).resolve():
+    route_key = digest(payload)
+    if route_key in getattr(orchestrator, "_unavailable_engine_routes", set()):
         return False
     subscriber = os.environ.get("AUTO_AGENTS_REPAIR_SUBSCRIBER")
     if subscriber:
-        response = rpc(registration["config"], {"op": "consume-route", "subscriber": subscriber,
-                        "route_digest": digest(payload), "pid": os.getpid()})
+        try:
+            response = rpc(registration["config"], {"op": "consume-route", "subscriber": subscriber,
+                            "route_digest": route_key, "pid": os.getpid()})
+        except (OSError, RuntimeError, ValueError) as error:
+            # This coordinator cannot recover a lost execution channel by
+            # repeating the same product-bound child or provider request.
+            unavailable = set(getattr(orchestrator, "_unavailable_engine_routes", set()))
+            unavailable.add(route_key)
+            orchestrator._unavailable_engine_routes = unavailable
+            orchestrator._repair_control_error = str(error)
+            return False
         if response.get("accepted"):
             return True
     raise EngineRepairRequired(payload)
@@ -54,19 +65,15 @@ def triage_engine_request(orchestrator, project, error):
         return None
     from .authorization import authorization_policy_for_state
     from .config import load_session_state
-    from .execution_binding import repository_binding_error
+    from .execution_binding import repository_binding_error, route_sources
     from .self_repair import SelfRepairDecision, SelfRepairTriageResult
     registration = getattr(orchestrator, "_repair_registration", None)
     invocation = getattr(orchestrator, "_invocation_context", {}) or {}
     reason = ""
-    target = error.route_payload.get("target_repository", "")
-    for key in ("issue_seed", "spec_seed"):
-        seed = error.route_payload.get(key, {})
-        if isinstance(seed, dict):
-            target = seed.get("target_repository", target)
+    has_target = any(source.get("target_repository") for source in route_sources(error.route_payload))
     if not enabled() or not registration:
         reason = "independent repair control is unavailable"
-    elif (not target or Path(target).resolve() != Path(registration["config"]["source_root"]).resolve()
+    elif (not has_target
           or repository_binding_error(Path(registration["config"]["source_root"]), error.route_payload)):
         reason = "engine request does not target the registered engine repository"
     # Authorization comes from the invocation/saved session, never the model's
