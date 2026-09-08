@@ -5,12 +5,16 @@ import sys
 import time
 if __package__:
     from .verification_inputs import InputObserver
+    from .verification_dependencies import exception_dependencies, detect_verification_dependencies
 else:
     from verification_inputs import InputObserver
+    from verification_dependencies import exception_dependencies, detect_verification_dependencies
 
 
 class Recorder:
-    def __init__(self):
+    def __init__(self, root=None):
+        self.root = root
+        self.missing_dependencies = {}
         self.nodes = {}
         self.collected = []
         self.phases = {"setup": 0.0, "call": 0.0, "teardown": 0.0}
@@ -27,6 +31,19 @@ class Recorder:
         node["seconds"] += report.duration
         self.phases[report.when] = self.phases.get(report.when, 0.0) + report.duration
 
+    def pytest_exception_interact(self, node, call, report):
+        if not report.failed or call.excinfo is None:
+            return
+        error = call.excinfo.value
+        evidence = f"{type(error).__name__}: {error}"
+        for stream in ("stdout", "stderr"):
+            value = getattr(error, stream, "") or ""
+            evidence += "\n" + (value.decode(errors="replace") if isinstance(value, bytes) else str(value))
+        dependencies = [*exception_dependencies(error, self.root),
+                        *detect_verification_dependencies(evidence, workspace=self.root)]
+        for dependency in dependencies:
+            self.missing_dependencies[dependency.key] = {**dependency.to_dict(), "nodeid": report.nodeid, "phase": report.when}
+
     def result(self):
         passed = [node for node, data in self.nodes.items()
                   if all(data["phases"].get(phase) == "passed" for phase in ("setup", "call", "teardown"))]
@@ -37,6 +54,7 @@ class Recorder:
             group["seconds"] += data["seconds"]
             group["tests"] += 1
         return {"version": 1, "collected": self.collected, "passed": passed,
+                "missing_dependencies": list(self.missing_dependencies.values()),
                 "groups": sorted(groups.values(), key=lambda item: item["seconds"], reverse=True),
                 "phases": {**self.phases, "collection": self.collection_seconds},
                 "slowest": sorted(({"nodeid": node, **data} for node, data in self.nodes.items()),
@@ -54,7 +72,7 @@ def main():
                        if (Path(root) / name).is_file()), Path("/dev/null"))
         arguments.extend(["-c", str(config)])
     import pytest
-    recorder = Recorder()
+    recorder = Recorder(root)
     observer = InputObserver(root)
     observer.start()
     code = pytest.main(arguments, plugins=[recorder])

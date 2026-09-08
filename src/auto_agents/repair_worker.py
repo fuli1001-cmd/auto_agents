@@ -104,7 +104,9 @@ def make_runner(payload, checkout, evidence, python):
     config_path = os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_CONFIG")
     job_id = os.environ.get("AUTO_AGENTS_REPAIR_JOB")
     if config_path and job_id:
-        store = Store(json.loads(Path(config_path).read_text())["root"])
+        root = json.loads(Path(config_path).read_text())["root"]
+        store = Store(root)
+        runner._repair_control_binding = {"root": root, "job": job_id, "generation": store.job(job_id)["generation"]}
         runner._control_phase_callback = lambda phase, details: store.event(job_id, phase, details)
     return runner
 
@@ -228,7 +230,8 @@ def repair(request):
     carry_continuous_work(runner, revision)
     result = runner.run()
     if not result.ok:
-        return {"ok": False, "error": result.reason, "result": result.to_dict()}
+        return {**getattr(runner, "_verification_dependency_failure", {}),
+                "ok": False, "error": result.reason, "result": result.to_dict()}
     candidate = result.candidate_commit or result.commit_sha
     if not candidate:
         return {"ok": False, "error": "approved repair has no immutable candidate revision"}
@@ -382,7 +385,8 @@ def main():
         result = {**failure_result(error), "permission": True}
     except Exception as error:
         from auto_agents.repair_environment_log import failure_result
-        result = failure_result(error)
+        from auto_agents.verification_dependencies import VerificationDependencyError
+        result = error.to_result() if isinstance(error, VerificationDependencyError) else failure_result(error)
     except KeyboardInterrupt:
         result = {"ok": False, "error": "repair cancelled", "cancelled": True}
     finally:

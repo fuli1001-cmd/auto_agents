@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "recipes": {
+    "node-tools": {
+      "installer": "npm",
+      "requires": ["executable:node", "executable:npm"],
+      "provides": ["executable:vitest", "node:vitest"],
+      "executables": {"vitest": "vitest/vitest.mjs"}
+    }
+  }
+}

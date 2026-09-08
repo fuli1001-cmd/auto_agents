@@ -80,10 +80,11 @@ def test_attempt_preparation_preserves_budget_and_health_across_continuation(tmp
         assert continuation.termination_probe() == "execution_budget_exhausted"
 
 
-def test_budget_cancellation_does_not_retry_or_modify_run_incidents(tmp_path):
+@pytest.mark.parametrize("reason", ["execution_budget_exhausted", "verification_environment_blocked"])
+def test_budget_cancellation_does_not_retry_or_modify_run_incidents(tmp_path, reason):
     from test_failover import _SequenceAdapter, _stub_orchestrator
     result = AgentResult(False, [], tmp_path / "out",
-                         termination=AgentTermination("execution_budget_exhausted"))
+                         termination=AgentTermination(reason))
     adapter = _SequenceAdapter([result])
     orchestrator = _stub_orchestrator({"codex": {}}, "codex", {"codex": adapter})
     orchestrator._record_provider_execution_incident = Mock(side_effect=AssertionError("unexpected incident"))
@@ -94,12 +95,13 @@ def test_budget_cancellation_does_not_retry_or_modify_run_incidents(tmp_path):
     assert not orchestrator._provider_health_map()
 
 
-def test_expired_budget_precedes_provider_health_canary(tmp_path):
+@pytest.mark.parametrize("reason", ["execution_budget_exhausted", "verification_environment_blocked"])
+def test_expired_budget_precedes_provider_health_canary(tmp_path, reason):
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator._probe_active_provider = Mock(side_effect=AssertionError("unexpected model call"))
     request = AgentRequest("implement", "deep", "work", tmp_path, tmp_path / "out",
-                           termination_probe=lambda: "execution_budget_exhausted")
-    assert orchestrator._call_with_failover(request).termination.reason == "execution_budget_exhausted"
+                           termination_probe=lambda: reason)
+    assert orchestrator._call_with_failover(request).termination.reason == reason
     orchestrator._probe_active_provider.assert_not_called()
 
 

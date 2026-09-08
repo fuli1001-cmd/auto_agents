@@ -43682,13 +43682,14 @@ class Orchestrator:
         return ShellAdapter(prov, self.config.execution.smart_timeout)
 
     def _call_with_failover(self, request: AgentRequest) -> AgentResult:
-        if request.termination_probe is not None and request.termination_probe() == "execution_budget_exhausted":
+        stop_reason = request.termination_probe() if request.termination_probe is not None else ""
+        if stop_reason in {"execution_budget_exhausted", "verification_environment_blocked"}:
             # An already-cancelled task must not spend another model call on a
             # provider health canary before reaching the adapter's own check.
             return AgentResult(
                 ok=False, command=[], output_path=request.output_path, returncode=-1,
-                stderr=f"provider supervision: execution budget exhausted; stage={request.stage}",
-                termination=AgentTermination(reason="execution_budget_exhausted"),
+                stderr=f"provider supervision: {stop_reason.replace('_', ' ')}; stage={request.stage}",
+                termination=AgentTermination(reason=stop_reason),
             )
         from .managed_verification import attach_context
         request = attach_context(self, request)
@@ -43773,7 +43774,7 @@ class Orchestrator:
                     self.logger.info(f"[failover] using provider={kind}")
                 return result
 
-            if not self._is_failover_error(result):
+            if (result.termination is not None and result.termination.reason == "verification_environment_blocked") or not self._is_failover_error(result):
                 return result
 
             handoffs.append(self._provider_failover_handoff(provider_request, kind, result))
@@ -43995,7 +43996,7 @@ class Orchestrator:
                     session_id or "fresh",
                 )
                 continue
-            if reason == "execution_budget_exhausted":
+            if reason in {"execution_budget_exhausted", "verification_environment_blocked"}:
                 return result
             incident = (
                 self._record_provider_execution_incident(

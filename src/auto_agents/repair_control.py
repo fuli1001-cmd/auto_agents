@@ -1106,6 +1106,15 @@ class Supervisor:
                     path = root / "result.json"
                     result = json.loads(path.read_text()) if path.exists() else {}
                     state = "completed" if result.get("ok") else "failed"
+                    if state == "failed" and context.get("job") and result.get("status") == "verification_environment_blocked":
+                        # Only a result from the trusted worker in a still-live
+                        # owner/generation can stop that owner's provider call.
+                        atomic_json(self.store.root / "jobs" / context["job"] /
+                            f"verification-environment-g{context['generation']}.json", {
+                                "job": context["job"], "generation": context["generation"],
+                                "owner_pid": context["pid"], "owner_ticks": context["ticks"],
+                                "workspace": context["workspace"], "inode": context["inode"],
+                                "verification": row["id"], "result": result})
             with self.store.connect() as db:
                 db.execute("UPDATE verifications SET state=? WHERE id=?", (state, row["id"]))
             if state != "running":

@@ -80,22 +80,27 @@ including captured partial output on timeout. A failed worker result includes
 command metadata. If persistence fails, `environment_diagnostics_error` explains
 the logging failure while retaining the original setup failure.
 
-Engine proof failures caused by an unavailable Vitest runner now enter dependency
-preparation before any new candidate or redesign. The trusted executor installs
-the bundled, pinned npm lockfile under the selected Python environment's private
-`verification-tools/` directory. Installation is bounded, disables lifecycle
-scripts, enforces Node requirements and saves the normal setup diagnostics. The
-candidate cannot supply a package, command, version or installation directory.
-Python-only repairs do not install Node tools unless a proof needs them.
+Engine proof prerequisites use a shared software-failure classifier, covering
+executables, Python imports, Node packages and shared libraries. Trusted pytest
+receipts distinguish subprocess launch failures from missing input files, while
+collection and non-pytest errors use the same classification boundary. Missing
+repository modules/scripts and ordinary assertions remain candidate failures.
 
-After preparation, the same candidate and required tests run again. A private
-HOME and offline proof execution remain in force; the toolchain is exposed on
-the verifier PATH as a read-only input. Its fingerprint participates in proof
-identity. Each missing capability permits one preparation attempt per runner;
-failed preparation or the same unavailable dependency afterwards preserves the
-candidate and returns an infrastructure blocker instead of consuming code-search
-patience. This path currently provisions Vitest; it is not a general package
-installer driven by test output.
+Preparation comes from the bundled recipe catalog or operator-owned dependency
+declarations, rather than software-name branches in the repair loop. Supported
+recipes install hash-locked Python wheels, install locked npm toolchains without
+lifecycle scripts, or snapshot a supplied executable/library with a declared
+SHA-256. Undeclared or unsuccessful prerequisites return a structured environment
+blocker and preserve the candidate. A trusted verification worker also signals
+the matching owner/generation so a running code-generation call stops instead of
+continuing to rewrite code around an unavailable tool.
+
+After preparation, the same candidate and required checks run again. Tooling is
+read-only inside the private HOME/network/filesystem sandbox and participates in
+proof identity. Concurrent failures from an older environment retry the newer
+environment without duplicating setup; failed setup cannot repeat in the same
+repair generation. See [Verification dependencies](verification-dependencies.md)
+for declarations and recovery behavior.
 
 The foreground relays the current candidate, phase and elapsed minutes while
 the top-level job remains `repairing`, including dependency preparation and

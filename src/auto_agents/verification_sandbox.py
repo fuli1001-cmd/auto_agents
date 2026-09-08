@@ -79,13 +79,16 @@ def namespace_exec(payload):
 
 
 @contextmanager
-def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=(), path_entries=()):
+def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=(), path_entries=(),
+                      python_paths=(), node_paths=(), library_paths=()):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     if root == target or root in target.parents or target in root.parents:
         raise RuntimeError("verification workspace overlaps the live target project")
     executable = shutil.which("codex")
     if not executable:
-        raise RuntimeError("engine verification needs a local Codex sandbox executable; no model calls are made by this command")
+        from auto_agents.verification_dependencies import MissingDependency, VerificationDependencyError
+        raise VerificationDependencyError(MissingDependency("executable", "codex"),
+            "engine verification needs a local Codex sandbox executable; no model calls are made by this command")
     temporary_parent = os.environ.get("TMPDIR", "/tmp") if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX") else "/tmp"
     with tempfile.TemporaryDirectory(prefix="aav-", dir=temporary_parent) as temporary:
         scratch = Path(temporary)
@@ -135,10 +138,15 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
                                            os.environ.get("PATH", os.defpath)])
         clean_environment = ["env", "-i", "PATH=" + executable_path,
                              "HOME=" + str(home), "CODEX_HOME=" + str(codex_home),
-                             "TMPDIR=" + temporary, "LANG=C.UTF-8", "PYTHONPATH=" + str(root / "src"),
+                             "TMPDIR=" + temporary, "LANG=C.UTF-8",
+                             "PYTHONPATH=" + os.pathsep.join([str(root / "src"), *map(str, python_paths)]),
                              "PYTHONDONTWRITEBYTECODE=1",
                              "AUTO_AGENTS_TEST=True", "TESTING=True", "AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1",
                              "AUTO_AGENTS_VERIFICATION_SANDBOX=1"]
+        if node_paths:
+            clean_environment.append("NODE_PATH=" + os.pathsep.join(map(str, node_paths)))
+        if library_paths:
+            clean_environment.append("LD_LIBRARY_PATH=" + os.pathsep.join(map(str, library_paths)))
         if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
             yield [sys.executable, str(Path(__file__).resolve()), "--landlock", json.dumps(writable), *clean_environment, *argv]
             return
@@ -148,7 +156,10 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         if not os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
             unshare, ip, mount = shutil.which("unshare"), shutil.which("ip"), shutil.which("mount")
             if not unshare or not ip or not mount:
-                raise RuntimeError("verification requires unshare, mount and ip for private test namespaces")
+                from auto_agents.verification_dependencies import MissingDependency, VerificationDependencyError
+                missing = next(name for name, value in (("unshare", unshare), ("ip", ip), ("mount", mount)) if not value)
+                raise VerificationDependencyError(MissingDependency("executable", missing),
+                    "verification requires unshare, mount and ip for private test namespaces")
             payload = {"cwd": str(root), "preserve": preserve, "command": sandbox, "ip": ip, "mount": mount}
             sandbox = [unshare, "--user", "--map-root-user", "--mount", "--net", "--pid", "--fork", "--mount-proc",
                        sys.executable, str(Path(__file__).resolve()), "--namespace", json.dumps(payload)]

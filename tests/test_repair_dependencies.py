@@ -55,7 +55,9 @@ def test_same_candidate_proof_is_retried_after_dependency_preparation(tmp_path):
          patch.object(runner, "_prepare_verification_dependency") as prepare:
         result = runner._run_verification_commands([command], tmp_path)
     assert result.ok and "25 passed" in result.summary
-    prepare.assert_called_once_with("vitest", MISSING + "\n")
+    prepare.assert_called_once()
+    assert prepare.call_args.args[0].key == "node:vitest"
+    assert prepare.call_args.args[1] == MISSING + "\n"
     assert execute.call_count == 2
     assert execute.call_args_list[0] == execute.call_args_list[1]
 
@@ -84,7 +86,11 @@ def init_repo(path):
     subprocess.run(["git", "commit", "-qm", "initial"], cwd=path, check=True)
 
 
-def test_missing_environment_retains_candidate_without_redesign_or_codegen_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize("output", [MISSING, "/bin/sh: 1: ffmpeg: not found",
+    "E ModuleNotFoundError: No module named 'missing_verifier_package'",
+    "Error: Cannot find module '@unlisted/compiler'",
+    "E OSError: libunlisted.so: cannot open shared object file: No such file or directory"])
+def test_missing_environment_retains_candidate_without_redesign_or_codegen_retry(tmp_path, monkeypatch, output):
     engine, target = tmp_path / "engine", tmp_path / "target"
     init_repo(engine)
     init_repo(target)
@@ -101,7 +107,7 @@ def test_missing_environment_retains_candidate_without_redesign_or_codegen_retry
         return AgentResult(True, [], request.output_path, summary="COMMIT_MESSAGE: fix engine")
 
     runner.target_orchestrator._call_with_failover = generate
-    failure = GateResult(False, [CommandResult("pytest", False, 1, stdout=MISSING)], "missing")
+    failure = GateResult(False, [CommandResult("pytest", False, 1, stdout=output)], "missing")
     with patch("auto_agents.self_repair.auto_agents_repo_root", return_value=engine), \
          patch("auto_agents.self_repair.run_commands", return_value=failure), \
          patch.object(runner, "_automatic_contract_reanalysis") as redesign:
@@ -122,18 +128,25 @@ def test_tool_setup_uses_trusted_lock_and_never_certifies_failed_install(tmp_pat
     artifact_runtime.activate(scope="test-dependencies")
     config = {"root": str(tmp_path / "controller")}
     python = Path(config["root"]) / "environments/python/bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
     node = tmp_path / "node"
     node.write_bytes(b"node binary identity")
     npm = tmp_path / "npm"
+    npm.write_bytes(b"npm binary identity")
     calls = []
     original_which = __import__("shutil").which
     monkeypatch.setattr("auto_agents.repair_dependencies.shutil.which",
-                        lambda name: str(node if name == "node" else npm) if name in {"node", "npm"} else original_which(name))
+                        lambda name, **kwargs: str(node if name == "node" else npm) if name in {"node", "npm"} else original_which(name, **kwargs))
 
     def execute(self, command, **kwargs):
         calls.append((command, kwargs))
         if "ci" in command and fail:
             raise subprocess.CalledProcessError(1, command, stderr="registry unavailable")
+        if "ci" in command:
+            entry = kwargs["cwd"] / "node_modules/vitest/vitest.mjs"
+            entry.parent.mkdir(parents=True)
+            entry.write_text("// installed fixture")
         return subprocess.CompletedProcess(command, 0, "v22.20.0\n" if command[0] == str(node) else "vitest/5.0.0", "")
 
     monkeypatch.setattr("auto_agents.repair_dependencies.EnvironmentSetupLog.run", execute)
@@ -144,7 +157,7 @@ def test_tool_setup_uses_trusted_lock_and_never_certifies_failed_install(tmp_pat
         assert not list(python.parent.parent.glob("verification-tools/*/ready.json"))
         return
     state = prepare_verification_dependency(config, str(python), "vitest")
-    assert verification_dependency_state(python) == state
+    assert verification_dependency_state(python)["tools"]["node-tools"] == state
     root = Path(state["root"])
     assert json.loads((root / "package.json").read_text())["dependencies"] == {"vitest": "5.0.0"}
     installation = next(call for call in calls if "ci" in call[0])

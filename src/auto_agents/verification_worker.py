@@ -43,7 +43,9 @@ def main():
     except KeyboardInterrupt:
         result = {"ok": False, "error": "verification cancelled"}
     except Exception as error:
-        result = {"ok": False, "error": f"{type(error).__name__}: {error}"[:2000]}
+        from auto_agents.verification_dependencies import VerificationDependencyError
+        result = error.to_result() if isinstance(error, VerificationDependencyError) else {
+            "ok": False, "error": f"{type(error).__name__}: {error}"[:2000]}
     finally:
         ACTIVE_PROCESSES.terminate_all()
     atomic_json(path.with_name("result.json"), result)
