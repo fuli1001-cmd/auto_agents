@@ -191,7 +191,7 @@ class GateSnapshotManager:
             pathspecs.append(f":(top,exclude,literal){path}")
         return tuple(pathspecs)
 
-    def create(self) -> GateSourceSnapshot:
+    def create(self, *, paths: Optional[Sequence[str]] = None) -> GateSourceSnapshot:
         git_dir = _run_git(
             self.project_root, "rev-parse", "--git-common-dir"
         ).stdout.strip()
@@ -220,15 +220,17 @@ class GateSnapshotManager:
                 _run_git(self.project_root, "read-tree", "HEAD", env=env)
             else:
                 _run_git(self.project_root, "read-tree", "--empty", env=env)
-            _run_git(
-                self.project_root,
-                "add",
-                "-A",
-                "--",
-                ".",
-                *self._negative_exclusion_pathspecs(env),
-                env=env,
-            )
+            if paths is None or paths:
+                _run_git(
+                    self.project_root,
+                    "add", "-A", "--",
+                    *(["."] if paths is None else [
+                        f":(top,literal){path}"
+                        for path in normalize_repository_exclusions(paths)
+                    ]),
+                    *self._negative_exclusion_pathspecs(env),
+                    env=env,
+                )
             self._force_remove_excluded_index_entries(env)
             tree = _run_git(self.project_root, "write-tree", env=env).stdout.strip()
             commit_args = ["commit-tree", tree, "-m", f"auto_agents gate snapshot {self.plan_id}"]
@@ -1569,6 +1571,8 @@ class LocalGatePlanExecutor:
                     "not_checked",
                 ),
             )
+            from .gates import reject_empty_vitest_selection
+            reject_empty_vitest_selection(result, sandbox)
             if trace_path is not None and result.ok:
                 observed_inputs, network_observed = _observed_input_manifest(
                     trace_path,

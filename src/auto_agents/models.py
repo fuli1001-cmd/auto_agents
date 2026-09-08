@@ -1964,6 +1964,9 @@ class SessionState:
     lineage_head_ref: str = ""
     last_child_result_ref: str = ""
     protected_preexisting_paths: List[str] = field(default_factory=list)
+    verification_binding: Dict[str, object] = field(default_factory=dict)
+    candidate_paths: Dict[str, str] = field(default_factory=dict)
+    verification_diagnostics: Dict[str, object] = field(default_factory=dict)
     mode: str = "fix"
     status: str = "conversing"
     goal: str = ""
@@ -2017,6 +2020,9 @@ class SessionState:
             protected_preexisting_paths=[
                 str(item) for item in data.get("protected_preexisting_paths", [])
             ],
+            verification_binding=dict(data.get("verification_binding", {})),
+            candidate_paths=dict(data.get("candidate_paths", {})),
+            verification_diagnostics=dict(data.get("verification_diagnostics", {})),
             mode=str(data.get("mode", "fix")),
             status=str(data.get("status", "conversing")),
             goal=str(data.get("goal", "")),
@@ -2101,6 +2107,9 @@ class SessionState:
             "lineage_head_ref": self.lineage_head_ref,
             "last_child_result_ref": self.last_child_result_ref,
             "protected_preexisting_paths": list(self.protected_preexisting_paths),
+            "verification_binding": dict(self.verification_binding),
+            "candidate_paths": dict(self.candidate_paths),
+            "verification_diagnostics": dict(self.verification_diagnostics),
             "mode": self.mode,
             "status": self.status,
             "goal": self.goal,

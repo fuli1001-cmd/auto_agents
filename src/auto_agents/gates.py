@@ -349,10 +349,46 @@ def command_from_verification_step(step: VerificationStep, project_root: Optiona
         parts.extend(targets or ["tests"])
         return shlex.join(parts)
     if kind == "test" and runner == "vitest":
-        parts = ["npm", "exec", "--", "vitest", "run"]
-        parts.extend(args)
-        parts.extend(targets)
-        return shlex.join(parts)
+        # Name filters are a single-valued Vitest option. Keep regex semantics
+        # for explicit filters and keep file::name selectors paired per file.
+        filters: List[str] = []
+        remaining: List[str] = []
+        index = 0
+        options = {"-t", "--testNamePattern", "--test-name-pattern"}
+        while index < len(args):
+            arg = args[index]
+            if arg in options:
+                index += 1
+                if index == len(args):
+                    raise ValueError("Vitest name filter requires a value")
+                filters.append(args[index])
+            elif arg.split("=", 1)[0] in options and "=" in arg:
+                filters.append(arg.split("=", 1)[1])
+            else:
+                remaining.append(arg)
+            index += 1
+        if len(filters) <= 1 and not any("::" in target for target in targets):
+            return shlex.join(["npm", "exec", "--", "vitest", "run", *args, *targets])
+        paired: dict[str, List[str]] = {}
+        for target in targets:
+            path, sep, name = target.partition("::")
+            paired.setdefault(path, []).append(name if sep else "")
+        groups = list(paired.items()) if any("::" in t for t in targets) else [(None, [])]
+        commands = []
+        for path, names in groups:
+            pattern = "|".join(f"(?:{value})" for value in filters)
+            if names and all(names):
+                # Escape only JavaScript regexp metacharacters (Python's
+                # re.escape also escapes whitespace, invalid under JS /u).
+                literal = "|".join(re.sub(r"([\\^$.*+?()\[\]{}|])", r"\\\1", name) for name in names)
+                selected = f"(?:{literal})"
+                pattern = f"^(?=[\\s\\S]*(?:{pattern}))(?=[\\s\\S]*{selected})[\\s\\S]*$" if pattern else selected
+            parts = ["npm", "exec", "--", "vitest", "run", *remaining]
+            parts.extend([path] if path is not None else targets)
+            if pattern:
+                parts.extend(["-t", pattern])
+            commands.append(shlex.join(parts))
+        return " && ".join(commands)
     raise ValueError(f"unsupported verification step runner: {step.runner or '<empty>'}")
 
 
@@ -1234,6 +1270,45 @@ def _run_with_browser_artifact_publication_confirmation(
     return confirmed
 
 
+def reject_empty_vitest_selection(result: CommandResult, cwd: Path) -> CommandResult:
+    """Vitest exits zero when a name filter skips every test in a file."""
+    if not result.ok:
+        return result
+    try:
+        args = shlex.split(result.command)
+    except ValueError:
+        return result
+    if not any(Path(arg).name == 'vitest' for arg in args):
+        return result
+    if not any(arg.split('=', 1)[0] in {'-t', '--testNamePattern', '--test-name-pattern'} for arg in args):
+        return result
+    output = _ANSI_ESCAPE.sub('', result.stdout + '\n' + result.stderr)
+    empty = bool(re.search(r'^\s*Tests\s+\d+ skipped \(\d+\)\s*$', output, re.MULTILINE))
+    # Vitest versions can emit JSON on stdout or report its output file.
+    reports = output.splitlines()
+    for path in re.findall(r'^JSON report written to (.+)$', output, re.MULTILINE):
+        report_path = (cwd / path.strip()).resolve()
+        if report_path.is_relative_to(cwd.resolve()):
+            try:
+                reports.append(report_path.read_text(encoding='utf-8'))
+            except OSError:
+                pass
+    for line in reports:
+        try:
+            report = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(report, dict) and 'numTotalTests' in report
+                and report.get('numPassedTests') == 0
+                and report.get('numFailedTests') == 0):
+            empty = True
+    if empty:
+        result.ok = False
+        result.returncode = 5
+        result.stderr = (result.stderr + '\nVitest selection executed no tests').strip()
+    return result
+
+
 def _run_command_once(
     command: str,
     cwd: Path,
@@ -1292,6 +1367,7 @@ def _run_command_once(
         activity_kind=process.activity_kind,
         process_snapshot=process.process_snapshot,
     )
+    reject_empty_vitest_selection(result, cwd)
     if progress is not None:
         progress("finish", command, result.duration_seconds)
     return result
