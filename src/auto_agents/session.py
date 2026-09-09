@@ -3966,7 +3966,7 @@ class Session:
             if (source_ref or getattr(self, '_candidate_source_ref', '')) == receipt.get('source_revision'):
                 executor.source_file_modes = {path: entry['postimage']['worktree']['mode']
                     for path, entry in receipt.get('manifest', {}).items()
-                    if entry['postimage']['worktree']['kind'] == 'file'}
+                    if entry['postimage']['worktree']['kind'] in {'file', 'directory'}}
         return executor
 
     def _run_verify_inner(self, scope: str = "final") -> Dict[str, object]:
@@ -5096,6 +5096,10 @@ class Session:
 
     def _git_commit(self, state: SessionState, prefix: str, reply: str = "") -> bool:
         """Persist current state, then commit current changes."""
+        if state.candidate_custody and self.project_root != Path(state.candidate_custody['checkout']):
+            from .session_candidate import execution_checkout
+            with execution_checkout(self, state):
+                return self._git_commit(state, prefix, reply=reply)
         if state.candidate_custody.get("receipt"):
             from .session_candidate import deliver_candidate
             return deliver_candidate(self, state, prefix + ": " + self._session_commit_summary(state, reply))
@@ -5134,6 +5138,11 @@ class Session:
                 ".auto-agents/state/workflows/active.json",
                 ".auto-agents/.gitignore",
             ]
+            if state.candidate_custody:
+                # The shared coordinator owns workflow records; the private
+                # checkout may contain only ignored checkpoints in that scope.
+                owned_state = [path for path in changed_paths(self.project_root, ignored_prefixes=())
+                               if any(path == scope or path.startswith(scope + '/') for scope in owned_state)]
             commit_sha = commit_only_paths(
                 self.project_root,
                 message,

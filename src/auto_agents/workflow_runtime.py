@@ -574,26 +574,28 @@ class WorkflowCoordinator:
         session: object,
         state: object,
     ) -> None:
-        if (
-            state.status != "completed"
-            or state.mode not in {"fix", "collab"}
-            or _head_contains_completed_session(
-                self.project_root,
-                state.session_id,
-            )
-        ):
+        if state.status != "completed" or state.mode not in {"fix", "collab"}:
             return
-        session._coordinator = self
-        session._coordinator_managed = True
-        session._git_commit(state, state.mode)
-        if not _head_contains_completed_session(
-            self.project_root,
-            state.session_id,
-        ):
-            raise RuntimeError(
-                "completed session is missing its durable Git commit: "
-                f"{state.session_id}"
-            )
+        from contextlib import nullcontext
+        from .session_candidate import completed_delivery, execution_checkout
+
+        # Completion recovery runs before _drive_session. Resolve its durable
+        # source inside custody here too; shared HEAD is not its commit log.
+        context = execution_checkout(session, state) if state.candidate_custody else nullcontext()
+        with context:
+            def committed():
+                return (bool(state.candidate_custody) and completed_delivery(state)
+                        or _head_contains_completed_session(session.project_root, state.session_id))
+            if committed():
+                return
+            session._coordinator = self
+            session._coordinator_managed = True
+            session._git_commit(state, state.mode)
+            if not committed():
+                raise RuntimeError(
+                    "completed session is missing its durable Git commit: "
+                    f"{state.session_id}"
+                )
 
     def _drive_session(
         self,
@@ -669,6 +671,9 @@ class WorkflowCoordinator:
             if state.status in {"conversing", "executing"}:
                 continue
             if root and state.status == "completed" and state.candidate_custody:
+                # The private commit appended operation receipts through the
+                # shared coordinator. Preserve that journal head on completion.
+                snapshot = self.store.load(snapshot.workflow_id)
                 self.store.complete(snapshot, status="completed")
             elif root and state.status == "completed":
                 self.store.complete(snapshot, status="completed")

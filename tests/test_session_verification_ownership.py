@@ -81,6 +81,13 @@ def test_session_gate_selection_binds_authorization_candidate_and_contract(tmp_p
     assert saved.verification_binding['contract_fingerprint']
     assert set(saved.candidate_paths) == {'value.py'}
     assert len(calls) == 1
+    shared_head = head_ref(root)
+    delivered = saved.candidate_custody['delivered_revision']
+    resumed, repeated_calls, _ = run_session(root, monkeypatch)
+    assert resumed.status == 'completed', resumed.to_dict()
+    assert repeated_calls == []
+    assert resumed.candidate_custody['delivered_revision'] == delivered
+    assert head_ref(root) == shared_head
 
 
 def test_resumed_fix_ignores_foreign_pending_plan_without_weakening_its_gates(tmp_path, monkeypatch):
@@ -2212,3 +2219,137 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(tmp_pa
     assert (root / 'foreign.txt').read_bytes() == b'initial worktree\x00bytes'
     assert (root / 'late-foreign.txt').read_bytes() == b'concurrent\x00bytes'
     assert (root / '.auto-agents/config.json').read_bytes() == original_config
+
+
+@pytest.mark.parametrize('entrypoint', ['session', 'workflow'])
+def test_completed_parent_resume_preserves_shared_work_after_private_delivery(tmp_path, monkeypatch, entrypoint):
+    from auto_agents.workflow_runtime import WorkflowCoordinator
+    from test_engine_child_recovery import parent_workflow
+
+    root, child = project(tmp_path)
+    # Retain the executable proof unchanged while exercising completion recovery.
+    config = load_project_config(root)
+    config.gates.allow_agent_updates = False
+    save_project_config(root, config)
+    git(root, 'add', '-A')
+    git(root, 'commit', '-m', 'retain completion verification contract')
+    child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
+    save_session_state(root, child)
+    store, snapshot, handoff = parent_workflow(root, child)
+    parent = load_session_state(root, 'parent')
+    parent.goal = 'Confirm the delivered value against the existing checks.'
+    save_session_state(root, parent)
+    shared_head = head_ref(root)
+    calls = []
+    def provider(self, request):
+        calls.append(request.purpose)
+        assert request.cwd != root
+        if request.purpose == 'fix':
+            (request.cwd / 'value.py').write_text('VALUE = 1\n')
+            reply = 'Fixed value.\nCOMMIT_MESSAGE: Repair owned value'
+        else:
+            assert request.purpose.startswith('collab')
+            assert (request.cwd / 'value.py').read_text() == 'VALUE = 1\n'
+            reply = 'GOAL_ACHIEVED: The delivered value passes its retained checks.\n'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
+    result = Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
+    assert result.status == 'completed', result.to_dict()
+    assert store.load(snapshot.workflow_id).status == 'completed'
+    assert store.events(snapshot.workflow_id)[-1]['kind'] == 'workflow_terminal'
+    assert store.load_handoff(handoff.handoff_id).result['status'] == 'completed'
+    assert calls == ['fix', 'collab']
+    private = Path(result.candidate_custody['checkout'])
+    completion_revision = head_ref(private)
+    committed = json.loads(git(private, 'show',
+        completion_revision + ':.auto-agents/state/sessions/parent/session_state.json'))
+    assert committed['status'] == 'completed'
+    assert head_ref(root) == shared_head
+
+    (root / 'value.py').write_text('VALUE = 77\n')
+    (root / 'foreign.py').write_text('VALUE = 8\n')
+    git(root, 'add', 'value.py', 'foreign.py')
+    (root / 'value.py').write_text('VALUE = 99\n')
+    (root / 'foreign.py').write_text('VALUE = 9\n')
+    (root / 'late-foreign.txt').write_bytes(b'late foreign\x00bytes')
+    index = (root / '.git/index').read_bytes()
+    shared = {name: (root / name).read_bytes() for name in (
+        'value.py', 'foreign.py', 'late-foreign.txt', '.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
+    def no_input(*args, **kwargs):
+        pytest.fail('Completed private recovery must not request another confirmation')
+    for _ in range(2):
+        orch = Orchestrator(root, user_input_fn=no_input)
+        if entrypoint == 'session':
+            resumed = Session(orch, mode='collab', auto_approve=True).resume('parent')
+        else:
+            resumed = WorkflowCoordinator(orch).resume_workflow(snapshot.workflow_id)
+        assert resumed.status == 'completed', resumed.to_dict()
+        assert head_ref(root) == shared_head
+        assert head_ref(private) == completion_revision
+        assert (root / '.git/index').read_bytes() == index
+        assert {name: (root / name).read_bytes() for name in shared} == shared
+        assert calls == ['fix', 'collab']
+        assert store.load(snapshot.workflow_id).status == 'completed'
+        assert store.active() is None
+
+
+@pytest.mark.parametrize('staged', [False, True])
+def test_public_child_receipt_materializes_directory_to_file_replacement(tmp_path, monkeypatch, staged):
+    import base64
+    import shutil
+    from test_engine_child_recovery import parent_workflow, resume_to_observation
+
+    root, child = project(tmp_path)
+    (root / 'assets').mkdir()
+    (root / 'assets/old.json').write_bytes(b'{"retained": true}\n')
+    check = root / 'tests/test_owned.py'
+    check.write_text(check.read_text() +
+        '    assert Path("assets").is_file()\n'
+        '    assert Path("assets").read_bytes() == b"replacement\\x00bytes"\n'
+        '    assert not Path("assets/old.json").exists()\n')
+    git(root, 'add', '-A')
+    git(root, 'commit', '-m', 'retain directory replacement contract')
+    child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
+    save_session_state(root, child)
+    store, _, handoff = parent_workflow(root, child)
+    (root / 'assets/old.json').write_bytes(b'foreign staged')
+    git(root, 'add', 'assets/old.json')
+    (root / 'assets/old.json').write_bytes(b'foreign worktree')
+    shared_index = (root / '.git/index').read_bytes()
+    shared_head = head_ref(root)
+    observed = []
+    def writer(state, prompt, candidate_root):
+        assert (candidate_root / 'assets/old.json').read_bytes() == b'{"retained": true}\n'
+        shutil.rmtree(candidate_root / 'assets')
+        (candidate_root / 'assets').write_bytes(b'replacement\x00bytes')
+        (candidate_root / 'value.py').write_text('VALUE = 1\n')
+        if staged:
+            git(candidate_root, 'add', '-A', '--', 'assets')
+        return 'Replaced the directory.\nCOMMIT_MESSAGE: Replace owned assets'
+    def observe(request):
+        observed.append(request.cwd)
+        assert request.cwd != root
+        assert (request.cwd / 'assets').is_file()
+        assert (request.cwd / 'assets').read_bytes() == b'replacement\x00bytes'
+        assert not (request.cwd / 'assets/old.json').exists()
+    resume_to_observation(root, monkeypatch, writer, observe=observe)
+    saved = load_session_state(root, child.session_id)
+    assert saved.status == 'completed', saved.to_dict()
+    assert len(observed) == 1
+    receipt = saved.candidate_custody['receipt']
+    assert receipt['manifest']['assets']['preimage']['worktree']['kind'] == 'directory'
+    replacement = receipt['manifest']['assets']['postimage']
+    assert replacement['worktree']['kind'] == 'file'
+    assert base64.b64decode(replacement['worktree']['bytes']) == b'replacement\x00bytes'
+    removed = receipt['manifest']['assets/old.json']
+    assert base64.b64decode(removed['preimage']['worktree']['bytes']) == b'{"retained": true}\n'
+    assert removed['postimage']['worktree'] == {'kind': 'absent'}
+    assert bool(replacement['index']) == staged
+    assert bool(removed['postimage']['index']) != staged
+    assert store.load_handoff(handoff.handoff_id).result['status'] == 'completed'
+    assert head_ref(root) == shared_head
+    assert (root / '.git/index').read_bytes() == shared_index
+    assert (root / 'assets').is_dir()
+    assert (root / 'assets/old.json').read_bytes() == b'foreign worktree'

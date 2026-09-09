@@ -23,7 +23,7 @@ def _git(root, *args):
 def _image(path):
     try:
         info = path.lstat()
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return {'kind': 'absent'}
     mode = stat.S_IMODE(info.st_mode)
     if stat.S_ISLNK(info.st_mode):
@@ -41,6 +41,10 @@ def _inventory(root):
             identity, path = row.split('\t', 1)
             index.setdefault(path, []).append(identity)
     paths = set(index) | set(_git(root, 'ls-files', '--others', '--exclude-standard', '-z').split('\0'))
+    # Git indexes leaves, but a replacement also owns the directory preimage.
+    # Retain ancestor kinds and modes so file/directory transitions are exact.
+    paths.update(parent.as_posix() for path in list(paths) if path
+                 for parent in Path(path).parents if parent != Path('.'))
     dependencies = discover_dependency_links(root)
     return {path: {'worktree': _image(root / path), 'index': index.get(path, [])}
             for path in sorted(paths) if path and product_path(path)
@@ -160,7 +164,11 @@ def candidate_request(session, state, request):
     absent = {'worktree': {'kind': 'absent'}, 'index': []}
     manifest = {path: {'preimage': before.get(path, absent), 'postimage': after.get(path, absent)}
                 for path in sorted(set(before) | set(after)) if before.get(path) != after.get(path)}
-    snapshot = GateSnapshotManager(session.project_root, 'candidate-' + uuid4().hex).create(paths=list(manifest))
+    # Stage each replaced subtree once. Naming an indexed descendant below
+    # its new regular-file ancestor is not a valid Git pathspec.
+    snapshot_paths = [path for path in manifest
+                      if not any(parent.as_posix() in manifest for parent in Path(path).parents)]
+    snapshot = GateSnapshotManager(session.project_root, 'candidate-' + uuid4().hex).create(paths=snapshot_paths)
     receipt = {'attempt_id': uuid4().hex, 'attempt': state.current_attempt,
         'session_id': state.session_id, 'binding_fingerprint': state.verification_binding['binding_fingerprint'],
         'base_revision': state.candidate_custody['base_revision'],
@@ -222,6 +230,20 @@ def deliver_candidate(session, state, message):
     return True
 
 
+def completed_delivery(state):
+    """A fix completion is durable in its verified private Git revision."""
+    custody = state.candidate_custody
+    receipt = custody.get('receipt')
+    revision = custody.get('delivered_revision')
+    if not receipt or not revision:
+        return False
+    validate_receipt(state)
+    root = Path(custody['checkout'])
+    if _git(root, 'rev-parse', revision + '^{tree}') != _git(root, 'rev-parse', receipt['source_revision'] + '^{tree}'):
+        raise ownership_error(state, 'completed delivery differs from verified candidate')
+    return True
+
+
 def consume_delivery(root, state, delivery, *, child_id):
     """Materialize the child's revision for the parent's next public execution."""
     source = Path(delivery['checkout'])
@@ -240,7 +262,7 @@ def consume_delivery(root, state, delivery, *, child_id):
     _clone(source, revision, destination)
     for path, entry in receipt['manifest'].items():
         image = entry['postimage']['worktree']
-        if image['kind'] == 'file':
+        if image['kind'] in {'file', 'directory'}:
             (destination / path).chmod(image['mode'])
     state.lineage_changed_paths = sorted(set(state.lineage_changed_paths) | set(state.candidate_paths))
     state.candidate_paths = {}
