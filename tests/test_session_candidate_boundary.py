@@ -1,6 +1,7 @@
 """Public fix dispatch with real provider subprocesses and filesystem denial."""
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 
@@ -43,7 +44,7 @@ for name in paths:
             else: p.chmod(0o777)
         except OSError as error:
             assert error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), (name, error)
-            results.append([name, action])
+            results.append([name, action, os.getcwd()])
         else:
             raise AssertionError('unconfined writer: ' + name + ':' + action)
     assert p.read_bytes() == before and p.stat().st_mode == mode
@@ -88,6 +89,9 @@ for key in ('HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'TMPDIR'):
     (root / 'foreign.py').chmod(0o711)
     (root / 'foreign-note.txt').write_bytes(b'foreign\x00untracked')
     monkeypatch.setenv('BOUND_EXECUTION_ENVIRONMENT', 'retained-runtime')
+    # Select the configured first provider on each resume. Provider execution
+    # and filesystem denial remain real, including the subsequent fallback.
+    monkeypatch.setattr(Orchestrator, '_provider_health_map', lambda self: {})
     before = _shared_image(root, dependency)
     return root, dependency, before
 
@@ -102,24 +106,58 @@ def _resume(root):
     return Session(orch, mode='fix', auto_approve=True).resume('owned-child')
 
 
-def test_claude_writer_cannot_write_shared_or_dependency_targets(tmp_path, monkeypatch):
-    root, dependency, before = _writer_project(tmp_path, monkeypatch)
+def _resume_retained_location(root, location):
+    if location == 'runtime':
+        return _resume(root)
+    saved = _resume(root)
+    assert saved.status == 'completed', json.dumps(saved.execution_log[-1], indent=2)
+    custody = saved.candidate_custody
+    previous_receipt = custody['receipt']['attempt_id']
+    original_checkout = Path(custody['checkout'])
+    legacy = root / '.auto-agents/candidate-custody/retained/project'
+    legacy.parent.mkdir(parents=True)
+    shutil.move(original_checkout, legacy)
+    custody['checkout'] = str(legacy)
+    # Legacy custody predates external-runtime registration. Its existing
+    # source and receipt admission, not a new registration, authorize resume.
+    for record in (root / '.auto-agents/state/custody').glob('*.json'):
+        if json.loads(record.read_text())['checkout'] == str(original_checkout):
+            record.unlink()
+    saved.status = 'failed'
+    save_session_state(root, saved)
+    identity = (legacy.stat().st_dev, legacy.stat().st_ino)
     result = _resume(root)
     assert result.status == 'completed', json.dumps(result.execution_log[-1], indent=2)
+    assert result.candidate_custody['checkout'] == str(legacy)
+    assert (legacy.stat().st_dev, legacy.stat().st_ino) == identity
+    assert result.candidate_custody['receipt']['attempt_id'] != previous_receipt
+    return result
+
+
+@pytest.mark.parametrize('location', ['runtime', 'legacy'])
+def test_claude_writer_cannot_write_shared_or_dependency_targets(tmp_path, monkeypatch, location):
+    root, dependency, before = _writer_project(tmp_path, monkeypatch)
+    result = _resume_retained_location(root, location)
+    assert result.status == 'completed', json.dumps(result.execution_log[-1], indent=2)
     candidate = Path(result.candidate_custody['checkout'])
-    assert len(json.loads((candidate / 'claude-boundary.json').read_text())) == 10
+    evidence = json.loads((candidate / 'claude-boundary.json').read_text())
+    assert len(evidence) == 10
+    assert all(row[2] == str(candidate) for row in evidence)
     assert (candidate / 'value.py').read_text() == 'VALUE = 1\n'
     assert _shared_image(root, dependency) == before
     assert (root / 'value.py').read_text() == 'VALUE = 0\n'
 
 
-def test_claude_fallback_keeps_candidate_write_boundary(tmp_path, monkeypatch):
+@pytest.mark.parametrize('location', ['runtime', 'legacy'])
+def test_claude_fallback_keeps_candidate_write_boundary(tmp_path, monkeypatch, location):
     root, dependency, before = _writer_project(tmp_path, monkeypatch, fallback=True)
-    result = _resume(root)
+    result = _resume_retained_location(root, location)
     assert result.status == 'completed', json.dumps(result.execution_log[-1], indent=2)
     candidate = Path(result.candidate_custody['checkout'])
     for provider in ('codex', 'claude'):
-        assert len(json.loads((candidate / (provider + '-boundary.json')).read_text())) == 10
+        evidence = json.loads((candidate / (provider + '-boundary.json')).read_text())
+        assert len(evidence) == 10
+        assert all(row[2] == str(candidate) for row in evidence)
     assert _shared_image(root, dependency) == before
 
 

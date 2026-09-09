@@ -227,8 +227,13 @@ class CandidateWriterBoundary:
         from .session_verification import ownership_error
         self.root, self.scratch, self.state = root.resolve(), scratch.resolve(), state
         self.shared = Path(state.verification_binding['repository']).resolve()
-        if self.root == self.shared or self.root.is_relative_to(self.shared):
+        if self.root == self.shared or self.shared.is_relative_to(self.root):
             raise ownership_error(state, 'writer confinement requires a private candidate checkout')
+        # Custody admission supports both registered external runtimes and
+        # retained independent legacy repositories beneath the control tree.
+        # Grant writes to that validated checkout, never to its shared parent.
+        from .session_source import validate_checkout
+        validate_checkout(self.shared, state, root)
         self.nested = bool(os.environ.get('AUTO_AGENTS_VERIFICATION_SANDBOX'))
         if self.nested and landlock_abi() < 3:
             raise ownership_error(state, 'writer confinement is unavailable', detail='Landlock ABI 3 is required')
