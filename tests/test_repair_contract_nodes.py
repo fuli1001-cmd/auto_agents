@@ -85,3 +85,18 @@ def test_missing_planned_node_still_prevents_successful_verification(tmp_path):
     assert result.returncode == 4, result.stdout + result.stderr
     assert "test_planned.py" in result.stderr
     assert not contract.to_dict()["repair_approved"]
+
+
+def test_new_engine_revision_reuses_frozen_checks_without_replanning(tmp_path):
+    route, data = plan([EXISTING, PLANNED], "Retain both original obligations.")
+    old, new = tmp_path / 'old-job', tmp_path / 'new-job'
+    old.mkdir()
+    new.mkdir()
+    old_key = digest([route, 'old-revision'])
+    data['revision'] = 'old-revision'
+    (old / ('request-contract-' + old_key[:24] + '.json')).write_text(json.dumps(data))
+    with patch('auto_agents.orchestrator.Orchestrator', side_effect=AssertionError('no new planner')):
+        contract = prepare_contract({'invocation': {'engine_route': route}}, 'new-revision', tmp_path, tmp_path, new)
+    assert contract.revision == 'new-revision'
+    assert contract.checks == data['checks']
+    assert not contract.to_dict()['repair_approved']

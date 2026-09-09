@@ -145,6 +145,20 @@ def test_review_feedback_rejects_artifacts_from_another_candidate(repair_feedbac
     assert "preflight" not in context["resolved_findings_that_must_not_regress"]
 
 
+def test_pending_check_does_not_overwrite_the_last_completed_review(repair_feedback):
+    runner, artifact = repair_feedback
+    result = SelfRepairResult(False, 'candidate_verification_failed', 'a later check failed',
+        candidate_id='retained', candidate_commit='retained-sha',
+        experiment_id=runner._experiment.experiment_id)
+    runner._candidate_review_completed = False
+    runner._record_candidate_result(result, attempt=2)
+    context = runner._candidate_review_feedback(runner._experiment.prompt_context())
+    assert not result.review_completed
+    assert {item['finding_id'] for item in context['parent_review']['findings']} == {
+        'public-resume', 'selector-regression'}
+    assert context['parent_review']['result_path'].endswith('review-receipt.json')
+
+
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_search_records_actual_retained_parent_and_inherits_its_state(repair_feedback, interrupted):
     runner, _ = repair_feedback

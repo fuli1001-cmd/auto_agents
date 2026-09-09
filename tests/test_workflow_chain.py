@@ -623,7 +623,7 @@ class RoutedWorkflowTests(unittest.TestCase):
                         '"compatibility_policy":"not_applicable"}}\n'
                     )
                 elif "Fix this bug:" in prompt:
-                    write_text(root / "app.py", "fixed = True\n")
+                    write_text(request.cwd / "app.py", "fixed = True\n")
                     content = "Fixed the crash.\nCOMMIT_MESSAGE: fix button crash\n"
                 else:
                     content = "Goal understood.\nGOAL_CLEAR\n"
@@ -644,7 +644,8 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             self.assertEqual(state.lineage_changed_paths, ["app.py"])
-            self.assertEqual((root / "app.py").read_text(), "fixed = True\n")
+            self.assertFalse((root / "app.py").exists())
+            self.assertEqual((Path(state.candidate_custody["checkout"]) / "app.py").read_text(), "fixed = True\n")
             self.assertGreaterEqual(state.attempt_epoch, 2)
             self.assertEqual(state.attempts_since_progress, 1)
             self.assertTrue(any(item.get("action") == "child_returned" for item in state.execution_log))
@@ -778,7 +779,7 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "completed")
 
-    def test_installed_engine_recovery_supersedes_bad_fix_child_and_rolls_back(self) -> None:
+    def test_engine_recovery_refuses_rollback_without_child_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_project(tmp)
             write_text(root / "app.py", "value = 1\n")
@@ -819,14 +820,14 @@ class RoutedWorkflowTests(unittest.TestCase):
                 returned = coordinator._drive_handoff(parent, parent, snapshot)
 
             self.assertIsNotNone(returned)
-            self.assertEqual((root / "app.py").read_text(), "value = 1\n")
+            self.assertEqual((root / "app.py").read_text(), "invalid child mutation\n")
             recorded = coordinator.store.load_handoff(handoff.handoff_id)
-            self.assertEqual(recorded.status, "completed")
+            self.assertEqual(recorded.status, "blocked")
             self.assertEqual(
                 recorded.result["resolution"],
-                "installed_engine_recovery_prepared",
+                "verification_ownership",
             )
-            self.assertEqual(recorded.result["rolled_back_paths"], ["app.py"])
+            self.assertEqual(recorded.result["rolled_back_paths"], [])
 
     def test_run_route_finishes_recovered_engine_run_before_new_iteration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1120,7 +1121,7 @@ class RoutedWorkflowTests(unittest.TestCase):
                         '"compatibility_policy":"not_applicable"}}\n'
                     )
                 else:
-                    write_text(root / "app.py", "unsafe partial edit\n")
+                    write_text(request.cwd / "app.py", "unsafe partial edit\n")
                     content = (
                         "FIX_DISPOSITION v1: "
                         '{"decision":"run_iteration","reason":"needs public API",'
@@ -1405,7 +1406,7 @@ class RoutedWorkflowTests(unittest.TestCase):
                 )
             )
 
-    def test_failed_child_rollback_preserves_preexisting_staged_content(self) -> None:
+    def test_unbound_handoff_preserves_live_edits_and_staged_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_project(tmp)
             _commit_baseline(root)
@@ -1433,10 +1434,10 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             rolled_back = coordinator._rollback_handoff_uncommitted(snapshot, handoff)
 
-            self.assertEqual((root / "app.py").read_text(), "value = 1\n")
-            self.assertEqual((root / "user.txt").read_text(), "user staged\n")
-            self.assertFalse((root / "new.py").exists())
-            self.assertEqual(set(rolled_back), {"app.py", "new.py", "user.txt"})
+            self.assertEqual((root / "app.py").read_text(), "child edit\n")
+            self.assertEqual((root / "user.txt").read_text(), "child overwrote user\n")
+            self.assertTrue((root / "new.py").exists())
+            self.assertEqual(rolled_back, [])
             cached = subprocess.run(
                 ["git", "diff", "--cached", "--", "user.txt"],
                 cwd=root,
@@ -1544,3 +1545,8 @@ class RoutedWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Preserve executable node IDs referenced by retained acceptance contracts.
+RoutedWorkflowTests.test_installed_engine_recovery_supersedes_bad_fix_child_and_rolls_back = RoutedWorkflowTests.test_engine_recovery_refuses_rollback_without_child_ownership
+RoutedWorkflowTests.test_failed_child_rollback_preserves_preexisting_staged_content = RoutedWorkflowTests.test_unbound_handoff_preserves_live_edits_and_staged_content

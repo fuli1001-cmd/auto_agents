@@ -1099,6 +1099,8 @@ class Supervisor:
                         environment["AUTO_AGENTS_REPAIR_JOB"] = context["job"]
                     environment["PYTHONPATH"] = str(Path(context["runtime"]) / "src")
                     environment.update(context.get("resource_environment", {}))
+                    environment["AUTO_AGENTS_VERIFICATION_PROGRESS"] = str(
+                        self.store.root / "verification-progress" / (row["context"] + ".json"))
                     with (root / "worker.log").open("ab") as output:
                         process = subprocess.Popen([context["python"], str(Path(context["runtime"]) / "src/auto_agents/verification_worker.py"), str(root / "request.json")],
                             stdout=output, stderr=output, stdin=subprocess.DEVNULL, env=environment,

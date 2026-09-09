@@ -128,6 +128,24 @@ def prepare_contract(payload, revision, checkout, evidence, directory):
     receipt = directory / ("request-contract-" + key[:24] + ".json")
     if receipt.exists():
         return EngineRequestContract.from_dict(json.loads(receipt.read_text()), route)
+    # The authorized checks do not change merely because the engine changed.
+    # A filename binds the previous revision to the SAME retained input digest.
+    for previous in sorted(directory.parent.glob("*/request-contract-*.json"),
+                           key=lambda path: path.stat().st_mtime, reverse=True):
+        if previous.is_symlink() or previous.name.endswith(".output.json"):
+            continue
+        try:
+            data = json.loads(previous.read_text())
+            old_revision = data.get("revision", "")
+            old_key = digest([route, old_revision, retained] if retained else [route, old_revision])
+            if previous.name != "request-contract-" + old_key[:24] + ".json":
+                continue
+            retained_contract = EngineRequestContract.from_dict(data, route)
+            contract = EngineRequestContract(route, revision, retained_contract.checks)
+            atomic_json(receipt, contract.to_dict())
+            return contract
+        except (OSError, ValueError, TypeError):
+            continue
     orchestrator = Orchestrator(evidence)
     if payload.get("provider"):
         orchestrator._set_active_provider(payload["provider"])

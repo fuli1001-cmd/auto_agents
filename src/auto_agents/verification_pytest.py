@@ -12,8 +12,10 @@ else:
 
 
 class Recorder:
-    def __init__(self, root=None):
+    def __init__(self, root=None, output=None):
         self.root = root
+        self.output = output
+        self.failures = []
         self.missing_dependencies = {}
         self.nodes = {}
         self.collected = []
@@ -21,15 +23,30 @@ class Recorder:
         self.started = time.monotonic()
         self.collection_seconds = 0.0
 
+    def checkpoint(self, identity):
+        if self.output is not None:
+            path = Path(str(self.output) + ".progress.json")
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"checkpoints": [identity]}))
+            temporary.replace(path)
+
+    def pytest_runtest_logstart(self, nodeid, location):
+        self.checkpoint("start:" + nodeid)
+
     def pytest_collection_finish(self, session):
         self.collected = [item.nodeid for item in session.items]
         self.collection_seconds = time.monotonic() - self.started
+        self.checkpoint("collected:" + str(len(self.collected)))
 
     def pytest_runtest_logreport(self, report):
         node = self.nodes.setdefault(report.nodeid, {"phases": {}, "seconds": 0.0})
         node["phases"][report.when] = report.outcome
         node["seconds"] += report.duration
         self.phases[report.when] = self.phases.get(report.when, 0.0) + report.duration
+        self.checkpoint(f"{report.nodeid}:{report.when}:{report.outcome}")
+        if report.failed:
+            self.failures.append({"nodeid": report.nodeid, "phase": report.when,
+                                  "detail": str(report.longreprtext)})
 
     def pytest_exception_interact(self, node, call, report):
         if not report.failed or call.excinfo is None:
@@ -53,7 +70,7 @@ class Recorder:
             group = groups.setdefault(name, {"file": name, "seconds": 0.0, "tests": 0})
             group["seconds"] += data["seconds"]
             group["tests"] += 1
-        return {"version": 1, "collected": self.collected, "passed": passed,
+        return {"version": 2, "failures": self.failures, "collected": self.collected, "passed": passed,
                 "missing_dependencies": list(self.missing_dependencies.values()),
                 "groups": sorted(groups.values(), key=lambda item: item["seconds"], reverse=True),
                 "phases": {**self.phases, "collection": self.collection_seconds},
@@ -72,7 +89,7 @@ def main():
                        if (Path(root) / name).is_file()), Path("/dev/null"))
         arguments.extend(["-c", str(config)])
     import pytest
-    recorder = Recorder(root)
+    recorder = Recorder(root, output)
     observer = InputObserver(root)
     observer.start()
     code = pytest.main(arguments, plugins=[recorder])

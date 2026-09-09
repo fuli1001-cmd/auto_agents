@@ -20627,6 +20627,7 @@ class Orchestrator:
         *,
         level: Optional[str] = None,
         changed_path_set: Optional[Iterable[str]] = None,
+        required_proof_ids: Optional[Iterable[str]] = None,
     ) -> ResolvedGatePlan:
         """Resolve one deduplicated plan for the requested execution phase."""
         if phase not in {"implement", "final"}:
@@ -20654,6 +20655,8 @@ class Orchestrator:
                 self.config.gates,
                 level=requested_level,
                 changed_paths=candidate_paths,
+                required_proof_ids=required_proof_ids or (),
+                preserve_release_targets=required_proof_ids is not None,
             )
             steps = selection.steps
         manual_groups = [
@@ -20666,7 +20669,7 @@ class Orchestrator:
             resolved = resolve_gate_plan_from_verification_steps(
                 steps,
                 self.project_root,
-                phase=phase,
+                phase="final" if required_proof_ids is not None else phase,
             )
             commands = list(resolved.commands)
             groups = [
@@ -20806,9 +20809,14 @@ class Orchestrator:
         *,
         source_ref: str = "",
         use_result_cache: bool = True,
+        contract_fingerprint: str = "",
     ):
         use_result_cache = bool(use_result_cache and not self._force_full_verify)
         result_context_fingerprint = self._gate_result_context_fingerprint()
+        if contract_fingerprint:
+            result_context_fingerprint = hashlib.sha256(
+                (result_context_fingerprint + contract_fingerprint).encode()
+            ).hexdigest()
         operator_environment = self._operator_gate_environment()
         acceleration = self.config.execution.acceleration
         proof_audit_sample_rate = (
