@@ -3,12 +3,63 @@ from __future__ import annotations
 
 import re
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
 
 class ExecutionBindingError(ValueError):
     """A command cannot be executed by the currently bound repository."""
+
+
+@dataclass(frozen=True)
+class SessionExecutionBinding:
+    """An execution location authorized against an existing session contract.
+
+    This engine-created context travels with a private checkout; a copied
+    session file or a change of cwd alone grants no execution authority.
+    """
+
+    repository: str
+    execution_root: str
+    session_id: str
+    binding_fingerprint: str
+    source_revision: str
+
+    @classmethod
+    def for_checkout(cls, session, state, execution_root: Path):
+        from .session_verification import bind_session, validate_binding
+
+        bind_session(session, state)
+        validate_binding(session, state)
+        binding = state.verification_binding
+        return cls(binding['repository'], str(execution_root.resolve()), state.session_id,
+                   binding['binding_fingerprint'], binding['contract_revision'])
+
+
+def session_execution_error(session, state) -> str:
+    binding = state.verification_binding
+    root = str(session.project_root.resolve())
+    context = getattr(session, '_execution_binding', None)
+    if context is None:
+        return ('' if binding.get('repository') == root else
+                'session verification binding belongs to another repository')
+    if binding.get('schema_version', 1) < 13:
+        return 'private execution requires an upgraded canonical session binding'
+    if (not isinstance(context, SessionExecutionBinding)
+            or context.repository != binding.get('repository')
+            or context.execution_root != root
+            or context.session_id != state.session_id
+            or context.binding_fingerprint != binding.get('binding_fingerprint')
+            or context.source_revision != binding.get('contract_revision')):
+        return 'private execution context conflicts with session verification binding'
+    import subprocess
+
+    source = subprocess.run(['git', 'rev-parse', '--verify', f'{context.source_revision}^{{commit}}'],
+                            cwd=session.project_root, capture_output=True, text=True)
+    if source.returncode or source.stdout.strip() != context.source_revision:
+        return 'private execution checkout lacks retained source provenance'
+    return ''
 
 
 def command_spans(command: str) -> list[tuple[int, int]]:

@@ -148,9 +148,12 @@ class Session:
         auto_approve: bool = False,
         health_runtime: object = None,
         coordinator: object = None,
+        execution_binding: object = None,
     ) -> None:
         self.orch = orchestrator
         self.project_root = orchestrator.project_root
+        self._execution_binding = execution_binding
+        self._resumed_verification_state = None
         self.mode = mode
         self._print_agent_output = print_agent_output
         self._full_verify = bool(full_verify)
@@ -405,10 +408,19 @@ class Session:
         where the previous run left off while preserving all prior context.
         """
         existing = load_session_state(self.project_root, session_id)
+        self._resumed_verification_state = existing
         if existing.mode != self.mode:
             raise ValueError(
                 f"session {session_id} is {existing.mode}, not {self.mode}"
             )
+        if (self.mode == 'fix' and existing.status != 'completed'
+                and not existing.verification_binding and not existing.parent_handoff_id
+                and not (existing.baseline_git_ref or existing.baseline_head_ref or existing.lineage_head_ref)
+                and head_ref(self.project_root)):
+            # Block before workflow migration can persist today's HEAD as
+            # apparent legacy history and authorize it on the next resume.
+            return self._block_execution_binding(existing, ownership_error(
+                existing, 'session verification contract revision is unavailable'), 'verification_ownership')
         if existing.status == "completed" and not existing.parent_handoff_id:
             if not existing.workflow_id:
                 self._print(f"Session {session_id} is already completed.")

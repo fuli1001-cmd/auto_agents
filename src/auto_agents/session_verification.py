@@ -68,14 +68,30 @@ def engine_verification_refs(command: str, project_root: Path, payload: dict) ->
 
 
 def bind_session(session, state) -> None:
+    # Upgrades and initial sealing are transactional: a rejected authority must
+    # not leave a partially rewritten inventory in the durable session.
+    original = state.verification_binding
+    state.verification_binding = deepcopy(original)
+    try:
+        _bind_session(session, state)
+    except Exception:
+        state.verification_binding = original
+        raise
+
+
+def _bind_session(session, state) -> None:
     if state.verification_binding:
-        if 'task_scope' not in state.verification_binding:
-            state.verification_binding['task_scope'] = _task_scope(session, state)
-            session._save(state)
         validate_binding(session, state)
+        scope = _task_scope(session, state)
+        if 'task_scope' not in state.verification_binding:
+            state.verification_binding['task_scope'] = scope
+        elif any(scope.values()) and scope != state.verification_binding['task_scope']:
+            raise ownership_error(state, 'retained task authority conflicts with session evidence')
         if state.verification_binding.get('schema_version', 1) < 12:
             _recover_retained_plan(session, state)
             _seal_inventory(session, state)
+        if state.verification_binding.get('schema_version', 1) < 13:
+            _seal_authority(session, state)
             session._save(state)
         return
     root = session.project_root
@@ -84,6 +100,13 @@ def bind_session(session, state) -> None:
     tasks = read_json(task_plan_path(root), default={})
     run = read_json(run_state_path(root), default={})
     revision = state.baseline_git_ref or state.baseline_head_ref or state.lineage_head_ref
+    resumed = getattr(session, '_resumed_verification_state', None)
+    if resumed is not None and resumed.session_id == state.session_id:
+        # Workflow migration may populate lineage with today's HEAD. That is
+        # not evidence of the contract authorized by a legacy session.
+        revision = resumed.baseline_git_ref or resumed.baseline_head_ref or resumed.lineage_head_ref
+        if not revision and head_ref(root):
+            raise ownership_error(state, 'session verification contract revision is unavailable')
     if state.parent_handoff_id and not revision:
         raise ownership_error(state, 'session verification contract revision is unavailable')
     if (not state.parent_handoff_id and not state.baseline_head_ref
@@ -91,7 +114,7 @@ def bind_session(session, state) -> None:
         # An unborn legacy standalone repository has no historical contract
         # to recover. Preserve its normal first-baseline capture behavior.
         revision = ""
-    if revision and (state.parent_handoff_id or state.baseline_git_ref or state.baseline_head_ref
+    if revision and (resumed is not None or state.parent_handoff_id or state.baseline_git_ref or state.baseline_head_ref
                      or state.current_attempt or revision != head_ref(root)):
         # Baseline snapshot refs are disposable. Recover from the recorded
         # source HEAD (or workflow lineage) if the snapshot has disappeared,
@@ -133,18 +156,36 @@ def bind_session(session, state) -> None:
         "schema_version": 1,
         "session_id": state.session_id,
         "workflow_id": state.workflow_id,
-        "authorization": dict(state.authorization_policy),
+        "authorization": deepcopy(state.authorization_policy),
         "gates": gates,
         "tasks": tasks.get("tasks", []),
         "plan": deepcopy(tasks),
         "task_scope": task_scope,
         "plan_workflow_id": plan_workflow,
-        "contract_revision": revision,
+        "contract_revision": revision or head_ref(root),
         "contract_fingerprint": fingerprint([gates, tasks, task_scope, plan_workflow]),
         "plan_fingerprint": fingerprint(tasks),
     }
     _seal_inventory(session, state)
+    _seal_authority(session, state)
     session._save(state)
+
+
+def _seal_authority(session, state):
+    binding = state.verification_binding
+    binding.update({
+        'schema_version': 13,
+        'execution_environment': deepcopy(state.goal_execution_environment),
+        'session_mode': state.mode,
+        'source_provenance': {
+            'repository': binding['repository'],
+            'revision': binding['contract_revision'],
+            'contract_fingerprint': binding['contract_fingerprint'],
+            'plan_fingerprint': binding['plan_fingerprint'],
+        },
+    })
+    binding['binding_fingerprint'] = fingerprint({key: value for key, value in binding.items()
+                                                 if key != 'binding_fingerprint'})
 
 
 def _recover_retained_plan(session, state):
@@ -250,15 +291,43 @@ def validate_binding(session, state):
     ):
         if binding.get(key) != expected:
             raise ownership_error(state, f'session verification binding has conflicting {key}')
+    # Check legacy identity before inventory migration can replace it.
+    if ('original_handoff_id' in binding
+            and binding['original_handoff_id'] != state.parent_handoff_id):
+        raise ownership_error(state, 'session verification binding has conflicting handoff identity',
+                              resumed_handoff_id=state.parent_handoff_id)
     if binding.get('schema_version', 1) >= 2:
-        if binding.get('repository') != str(session.project_root.resolve()):
-            raise ownership_error(state, 'session verification binding belongs to another repository')
+        from .execution_binding import session_execution_error
+        error = session_execution_error(session, state)
+        if error:
+            raise ownership_error(state, error)
         if binding.get('binding_fingerprint') != fingerprint({
             key: value for key, value in binding.items() if key != 'binding_fingerprint'
         }):
             raise ownership_error(state, 'session verification binding inventory changed')
         if binding.get('fix_verify_command') != state.fix_verify_command:
             raise ownership_error(state, 'explicit fix verification changed since binding')
+    if binding.get('schema_version', 1) >= 13:
+        for key, expected in (('execution_environment', state.goal_execution_environment),
+                              ('session_mode', state.mode)):
+            if binding.get(key) != expected:
+                raise ownership_error(state, f'session verification binding has conflicting {key}')
+    _validate_task_authority(state)
+
+
+def _validate_task_authority(state):
+    binding = state.verification_binding
+    scope = binding.get('task_scope', {})
+    if (not any(scope.values()) and binding.get('plan_workflow_id')
+            and binding['plan_workflow_id'] != state.workflow_id):
+        raise ownership_error(state, 'retained plan belongs to another workflow without matching task authority')
+    for task in binding.get('tasks', []):
+        explicit = (task.get('task_id') in scope.get('task_ids', [])
+                    or set(scope.get('requirement_ids', [])).intersection(task.get('requirement_ids', [])))
+        owner = task.get('workflow_id') or binding.get('plan_workflow_id')
+        if explicit and owner and owner != state.workflow_id:
+            raise ownership_error(state, 'task authority conflicts with retained workflow owner',
+                                  conflicting_task_id=task.get('task_id'), task_workflow_id=owner)
 
 
 def _task_refs(task):
@@ -322,6 +391,7 @@ def _legacy_commands(gates):
 
 def _mandatory_refs(state):
     binding = state.verification_binding
+    _validate_task_authority(state)
     scope = binding.get('task_scope', {})
     task_ids, requirement_ids = set(scope.get('task_ids', [])), set(scope.get('requirement_ids', []))
     tasks = binding.get('tasks', [])
@@ -883,22 +953,39 @@ def validate_plan(state, gates, plan):
 
 
 def _task_scope(session, state):
-    task_ids = set()
-    requirement_ids = set()
     seeds = [read_json(session.project_root / '.auto-agents/state/sessions' / state.session_id / 'issue.json', default={})]
     if state.parent_handoff_id:
         handoff = read_json(session.project_root / '.auto-agents/state/handoffs' / (state.parent_handoff_id + '.json'), default={})
         child = handoff.get('child', {}) or {}
         child_id = child.get('native_id') or handoff.get('payload', {}).get('child_session_id')
-        if not handoff or (child_id and child_id != state.session_id):
+        if (not handoff or (child_id and child_id != state.session_id)
+                or (handoff.get('workflow_id') and handoff['workflow_id'] != state.workflow_id)
+                or (handoff.get('handoff_id') and handoff['handoff_id'] != state.parent_handoff_id)):
             raise ownership_error(state, 'original child handoff ownership is unavailable or conflicting')
+        for key, expected in (('authorization_policy', state.authorization_policy),
+                              ('goal_execution_environment', state.goal_execution_environment)):
+            if key in handoff.get('payload', {}) and handoff['payload'][key] != expected:
+                raise ownership_error(state, f'original child handoff has conflicting {key}')
         seeds.append(handoff.get('payload', {}))
+    task_ids, requirement_ids = set(), set()
     for seed in seeds:
+        seed_tasks, seed_requirements = set(), set()
         for source in route_sources(seed):
-            task_ids.update(source.get('task_ids', []))
+            source_tasks = set(source.get('task_ids', []))
             if source.get('task_id'):
-                task_ids.add(source['task_id'])
-            requirement_ids.update(source.get('requirement_ids', []))
+                source_tasks.add(source['task_id'])
+            source_requirements = set(source.get('requirement_ids', []))
+            for existing, incoming, field in ((seed_tasks, source_tasks, 'task_ids'),
+                                               (seed_requirements, source_requirements, 'requirement_ids')):
+                if existing and incoming and existing != incoming:
+                    raise ownership_error(state, f'conflicting {field} in session authority evidence')
+                existing.update(incoming)
+        for existing, incoming, field in ((task_ids, seed_tasks, 'task_ids'),
+                                           (requirement_ids, seed_requirements, 'requirement_ids')):
+            if existing and incoming and existing != incoming:
+                raise ownership_error(state, f'conflicting issue and handoff {field}',
+                                      retained_scope=sorted(existing), conflicting_scope=sorted(incoming))
+            existing.update(incoming)
     return {'task_ids': sorted(task_ids), 'requirement_ids': sorted(requirement_ids)}
 
 
@@ -1022,7 +1109,8 @@ def owned_paths(orchestrator, state) -> list[str]:
     conflicts = [path for path, digest in state.candidate_paths.items()
                  if snapshot.get(path, "") != digest]
     if conflicts:
-        raise SessionOwnershipError("candidate ownership changed: " + ", ".join(sorted(conflicts)))
+        raise ownership_error(state, "candidate ownership changed: " + ", ".join(sorted(conflicts)),
+                              conflicting_paths=sorted(conflicts))
     return sorted(state.candidate_paths)
 
 

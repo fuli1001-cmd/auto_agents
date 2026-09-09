@@ -1633,3 +1633,261 @@ def test_public_resume_retains_existing_foreign_release_regression(
     assert (root / path).read_bytes() == retained_source
     assert not (root / 'tests/test_future.py').exists()
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+def _binding_fixture(root, child):
+    from auto_agents.authorization import authorization_policy_for_state
+    from auto_agents.session_verification import bind_session
+    from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
+
+    if not child.workflow_id:
+        child.workflow_id = WorkflowStore(root).create_root(WorkflowRef('fix', child.session_id)).workflow_id
+    child.authorization_policy = authorization_policy_for_state(auto_approve=True).to_dict()
+    session = Session(Orchestrator(root), mode='fix', auto_approve=True)
+    bind_session(session, child)
+    return session
+
+
+def _switch_ambient_binding_plan(root):
+    from auto_agents.config import load_run_state, save_run_state
+
+    config = load_project_config(root)
+    config.gates.steps = [VerificationStep(proof_id='foreign.future', runner='pytest',
+        targets=['tests/test_future.py::test_future'], levels=['affected', 'release'], impact_paths=['**'])]
+    save_project_config(root, config)
+    save_task_plan(root, {'tasks': [{'task_id': 'task-foreign', 'title': 'Foreign pending task',
+        'workflow_id': 'foreign-workflow', 'status': 'pending', 'verification_refs': ['foreign.future']}],
+        'verification_steps': [step.to_dict() for step in config.gates.steps]})
+    run = load_run_state(root)
+    run.resume_context['workflow_id'] = 'foreign-workflow'
+    save_run_state(root, run)
+    return {name: (root / name).read_bytes() for name in
+            ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
+
+
+def _assert_binding_blocked_before_execution(root, monkeypatch, *, parent=False):
+    def baseline(*args, **kwargs):
+        pytest.fail('Unresolved session authority must block before baseline capture')
+    monkeypatch.setattr(Session, '_ensure_baseline', baseline)
+    if parent:
+        from test_engine_child_recovery import ObservationBoundary, resume_to_observation
+        collab_loop = Session._phase_collab_loop
+        def parent_boundary(self, state):
+            if state.session_id == 'parent':
+                raise ObservationBoundary()
+            return collab_loop(self, state)
+        monkeypatch.setattr(Session, '_phase_collab_loop', parent_boundary)
+        def writer(*args):
+            pytest.fail('Unresolved session authority must block before the writer')
+        resume_to_observation(root, monkeypatch, writer)
+        saved = load_session_state(root, 'owned-child')
+    else:
+        saved, calls, _ = run_session(root, monkeypatch)
+        assert calls == []
+    assert saved.status == 'blocked', saved.to_dict()
+    assert saved.resolution == 'verification_ownership'
+    diagnostic = saved.execution_log[-1]['diagnostic']
+    assert diagnostic['session_id'] == saved.session_id
+    assert diagnostic['workflow_id'] == saved.workflow_id
+    assert diagnostic['retry_fix'] is False
+    return saved
+
+
+def _prepare_binding_child_resume(root, store, snapshot, handoff):
+    store.record_result(snapshot, handoff, status='failed',
+                        result={'status': 'failed', 'resolution': 'verification_ownership'})
+    store.consume_result(snapshot, handoff, operation_id='retained-binding-failure')
+    resume = store.prepare_handoff(snapshot, parent=snapshot.root, target='resume',
+        goal=handoff.goal, reason='Resume retained child authority',
+        payload={'resume_handoff_id': handoff.handoff_id})
+    parent = load_session_state(root, 'parent')
+    parent.active_handoff_id = resume.handoff_id
+    save_session_state(root, parent)
+
+
+@pytest.mark.parametrize('has_workflow', [True, False])
+def test_public_legacy_resume_without_history_rejects_ambient_plan(tmp_path, monkeypatch, has_workflow):
+    from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
+
+    root, child = project(tmp_path)
+    if has_workflow:
+        child.workflow_id = WorkflowStore(root).create_root(WorkflowRef('fix', child.session_id)).workflow_id
+    child.baseline_git_ref = child.baseline_head_ref = child.lineage_head_ref = ''
+    save_session_state(root, child)
+    ambient = _switch_ambient_binding_plan(root)
+    git(root, 'add', '-A')
+    git(root, 'commit', '-m', 'switch global contract without child history')
+    saved = _assert_binding_blocked_before_execution(root, monkeypatch)
+    assert saved.verification_binding == {}
+    assert 'contract revision is unavailable' in saved.execution_log[-1]['result']
+    assert saved.workflow_id == child.workflow_id
+    assert saved.baseline_git_ref == saved.baseline_head_ref == saved.lineage_head_ref == ''
+    repeated = _assert_binding_blocked_before_execution(root, monkeypatch)
+    assert repeated.verification_binding == {}
+    assert repeated.lineage_head_ref == ''
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+
+
+@pytest.mark.parametrize('conflict', ['issue_handoff', 'foreign_task', 'foreign_requirement'])
+def test_public_child_binding_rejects_conflicting_task_authority(tmp_path, monkeypatch, conflict):
+    from auto_agents.config import load_task_plan
+    from test_engine_child_recovery import parent_workflow
+
+    root, child = project(tmp_path)
+    plan = load_task_plan(root)
+    plan['tasks'].append({'task_id': 'task-foreign', 'title': 'Foreign owned proof',
+        'workflow_id': 'foreign-workflow', 'requirement_ids': ['REQ-foreign'],
+        'verification_refs': ['owned.contract']})
+    _retain_contract(root, child, load_project_config(root), plan)
+    store, snapshot, handoff = parent_workflow(root, child)
+    handoff.payload['task_id'] = 'task-owned' if conflict == 'issue_handoff' else 'task-foreign'
+    issue_scope = {'task_id': 'task-foreign'}
+    if conflict == 'foreign_requirement':
+        handoff.payload.pop('task_id')
+        handoff.payload['requirement_ids'] = ['REQ-foreign']
+        issue_scope = {'requirement_ids': ['REQ-foreign']}
+    store.save_handoff(handoff)
+    issue = root / '.auto-agents/state/sessions' / child.session_id / 'issue.json'
+    issue.write_text(json.dumps(issue_scope))
+    _prepare_binding_child_resume(root, store, snapshot, handoff)
+    ambient = _switch_ambient_binding_plan(root)
+    saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
+    assert saved.verification_binding == {}
+    assert 'conflict' in saved.execution_log[-1]['result']
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+def test_public_legacy_upgrade_preserves_conflicting_retained_handoff(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from auto_agents.session_verification import fingerprint
+    from auto_agents.workflow_chain import WorkflowRef
+    from test_engine_child_recovery import parent_workflow
+
+    root, child = project(tmp_path)
+    store, snapshot, original = parent_workflow(root, child)
+    _binding_fixture(root, child)
+    child.verification_binding['schema_version'] = 11
+    child.verification_binding['binding_fingerprint'] = fingerprint({
+        key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+    retained = deepcopy(child.verification_binding)
+    replacement = store.prepare_handoff(snapshot, parent=snapshot.root, target='fix',
+        goal=child.goal, reason='Conflicting legacy recovery',
+        payload={'child_session_id': child.session_id, 'head_before': child.baseline_head_ref, 'auto_approve': True})
+    store.bind_child(snapshot, replacement, WorkflowRef('fix', child.session_id))
+    child.parent_handoff_id = replacement.handoff_id
+    save_session_state(root, child)
+    parent = load_session_state(root, 'parent')
+    parent.active_handoff_id = replacement.handoff_id
+    save_session_state(root, parent)
+    _prepare_binding_child_resume(root, store, snapshot, replacement)
+    ambient = _switch_ambient_binding_plan(root)
+    saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
+    assert saved.verification_binding == retained
+    assert saved.execution_log[-1]['diagnostic']['handoff_id'] == original.handoff_id
+    assert saved.execution_log[-1]['diagnostic']['resumed_handoff_id'] == replacement.handoff_id
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_path, monkeypatch, legacy):
+    from copy import deepcopy
+    from auto_agents.session_verification import fingerprint
+
+    root, child = project(tmp_path)
+    child.goal_execution_environment = {'mode': 'real', 'confirmed': True, 'source': 'explicit_goal'}
+    _binding_fixture(root, child)
+    if legacy:
+        child.verification_binding['schema_version'] = 11
+        for key in ('execution_environment', 'source_provenance', 'session_mode'):
+            child.verification_binding.pop(key)
+        child.verification_binding['binding_fingerprint'] = fingerprint({
+            key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+    retained = deepcopy(child.verification_binding)
+    save_session_state(root, child)
+    assert load_session_state(root, child.session_id).verification_binding == retained
+    ambient = _switch_ambient_binding_plan(root)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed', saved.to_dict()
+    assert calls == ['fix']
+    binding = saved.verification_binding
+    for key in ('repository', 'contract_revision', 'authorization', 'gates', 'plan', 'required_proof_ids',
+                'session_id', 'workflow_id', 'original_handoff_id', 'task_scope'):
+        assert binding[key] == retained[key]
+    assert binding['schema_version'] == 13
+    assert binding['execution_environment'] == child.goal_execution_environment
+    assert binding['source_provenance']['revision'] == child.baseline_head_ref
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+@pytest.mark.parametrize('mismatch', ['authorization', 'environment', 'contract', 'candidate'])
+def test_public_resume_rejects_mismatched_session_binding(tmp_path, monkeypatch, mismatch):
+    root, child = project(tmp_path)
+    _binding_fixture(root, child)
+    if mismatch == 'authorization':
+        child.authorization_policy['source'] = 'different authority'
+    elif mismatch == 'environment':
+        child.goal_execution_environment = {'mode': 'simulated', 'confirmed': True}
+    elif mismatch == 'contract':
+        child.verification_binding['gates']['steps'][0]['targets'] = []
+    else:
+        child.candidate_paths = {'value.py': 'unreceipted-foreign-content'}
+        (root / 'value.py').write_text('VALUE = 99\n')
+    save_session_state(root, child)
+    ambient = _switch_ambient_binding_plan(root)
+    saved = _assert_binding_blocked_before_execution(root, monkeypatch)
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+    if mismatch == 'candidate':
+        assert (root / 'value.py').read_text() == 'VALUE = 99\n'
+
+
+@pytest.mark.parametrize('context_case', ['authorized', 'cwd_only', 'wrong_session', 'wrong_directory', 'environment'])
+def test_public_resume_private_checkout_requires_original_execution_authority(tmp_path, monkeypatch, context_case):
+    import shutil
+    from dataclasses import replace
+    from auto_agents.execution_binding import SessionExecutionBinding
+
+    root, child = project(tmp_path)
+    original_session = _binding_fixture(root, child)
+    private = tmp_path / 'private-checkout'
+    context = SessionExecutionBinding.for_checkout(original_session, child, private)
+    shutil.copytree(root, private, symlinks=True)
+    if context_case == 'cwd_only':
+        context = None
+    elif context_case == 'wrong_session':
+        context = replace(context, session_id='foreign-child')
+    elif context_case == 'wrong_directory':
+        context = replace(context, execution_root=str(tmp_path / 'another-checkout'))
+    elif context_case == 'environment':
+        copied = load_session_state(private, child.session_id)
+        copied.goal_execution_environment = {'mode': 'simulated', 'confirmed': True}
+        save_session_state(private, copied)
+    before = {name: (root / name).read_bytes() for name in
+              ('value.py', '.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
+    calls = []
+    def writer(self, request):
+        calls.append(request.purpose)
+        (request.cwd / 'value.py').write_text('VALUE = 1\n')
+        reply = 'Repaired\nCOMMIT_MESSAGE: Repair owned value'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', writer)
+    if context_case != 'authorized':
+        def baseline(*args, **kwargs):
+            pytest.fail('Private checkout authority must be validated before baseline capture')
+        monkeypatch.setattr(Session, '_ensure_baseline', baseline)
+    saved = Session(Orchestrator(private), mode='fix', auto_approve=True,
+                    execution_binding=context).resume(child.session_id)
+    if context_case == 'authorized':
+        assert saved.status == 'completed', saved.to_dict()
+        assert calls == ['fix']
+        assert saved.verification_binding == child.verification_binding
+        assert (private / 'value.py').read_text() == 'VALUE = 1\n'
+    else:
+        assert saved.status == 'blocked', saved.to_dict()
+        assert saved.resolution == 'verification_ownership'
+        assert saved.execution_log[-1]['diagnostic']['session_id'] == child.session_id
+        assert calls == []
+        assert (private / 'value.py').read_text() == 'VALUE = 0\n'
+    assert {name: (root / name).read_bytes() for name in before} == before
