@@ -404,6 +404,11 @@ def validate_binding(session, state):
             if binding.get(key) != expected:
                 raise ownership_error(state, f'session verification binding has conflicting {key}')
     _validate_task_authority(state)
+    if binding.get('proof_graph'):
+        # Retained inventories may have been sealed by the old untyped
+        # command matcher. A valid fingerprint cannot supply a missing proof.
+        from .models import GateConfig
+        _owned_inventory(state, GateConfig.from_dict(_complete_gates(state)))
 
 
 def _validate_task_authority(state):
@@ -468,13 +473,13 @@ def _effective_targets(step):
 def _command_covers(command, ref):
     if ref.startswith('cmd:'):
         return command.strip() == ref[4:].strip()
+    if '::' not in ref and not ref.endswith('.py'):
+        return False  # Opaque proof IDs require definitions, not shell arguments.
     try:
         from .models import VerificationStep
         from .orchestrator import Orchestrator
         for start, end in command_spans(command):
             args = executable_tokens(command[start:end])
-            if ref in args:
-                return True
             targets = Orchestrator._pytest_targets_from_command(shlex.join(args))
             if targets and _ref_covered(ref, VerificationStep(targets=targets)):
                 # This establishes ownership, not selection evidence. The
@@ -530,10 +535,13 @@ def _owned_inventory(state, gates):
     required = []
     owners = {}
     for ref in sorted(refs):
-        matches = [step for step in gates.steps if _ref_covered(ref, step)]
-        executable = _reference_kind(ref, gates) != 'artifact'
-        if (not matches and executable and not _command_covers(state.fix_verify_command, ref)
-                and not any(_command_covers(command, ref) for command in _legacy_commands(gates))):
+        kind = _reference_kind(ref, gates)
+        matches = [step for step in gates.steps if (
+            step.proof_id == ref if kind == 'proof' else _ref_covered(ref, step))]
+        command_covered = kind in {'command', 'selector'} and (
+            _command_covers(state.fix_verify_command, ref)
+            or any(_command_covers(command, ref) for command in _legacy_commands(gates)))
+        if not matches and kind != 'artifact' and not command_covered:
             raise ownership_error(state, f'required verification reference has no executable proof: {ref}',
                                   verification_ref=ref, owners=diagnostic_owners(state, ref))
         for step in matches:
@@ -1333,8 +1341,6 @@ def collection_command(command: str) -> str:
 
 
 def diagnostic_owners(state, command: str, *, proof_ids=()) -> list[dict[str, object]]:
-    from .models import VerificationStep
-
     owners = []
     for key in proof_ids:
         for owner in state.verification_binding.get('proof_owners', {}).get(key, []):
@@ -1345,18 +1351,11 @@ def diagnostic_owners(state, command: str, *, proof_ids=()) -> list[dict[str, ob
             owners.append(owner)
     # Broader file/directory invocations still carry the node's owner. This
     # also supplies diagnostics for legacy commands without proof metadata.
-    try:
-        targets = [arg for start, end in command_spans(command)
-                   for arg in executable_tokens(command[start:end]) if not arg.startswith('-')]
-    except ValueError:
-        targets = []
-    evidence = VerificationStep(targets=targets)
     for task in state.verification_binding.get("tasks", []):
         refs = list(task.get("verification_refs", []))
         for proof in task.get("requirement_proofs", []):
             refs.extend(proof.get("evidence_refs", []))
-        if any(str(ref) == command or _command_covers(command, str(ref))
-               or (not str(ref).startswith('cmd:') and _ref_covered(str(ref), evidence)) for ref in refs):
+        if any(str(ref) == command or _command_covers(command, str(ref)) for ref in refs):
             owner = _task_owner(task)
             if owner not in owners:
                 owners.append(owner)

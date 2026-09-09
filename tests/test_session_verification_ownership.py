@@ -641,6 +641,40 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
     assert {path: (root / path).read_bytes() for path in ambient} == ambient
 
 
+@pytest.mark.parametrize('command_source', ['legacy', 'manual', 'fix'])
+@pytest.mark.parametrize('reference_kind', ['selector', 'proof', 'command'])
+def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch, command_source, reference_kind):
+    from auto_agents.models import GateParallelGroup
+
+    root, child = project(tmp_path)
+    config = load_project_config(root)
+    command = './.conda/bin/python -m pytest -q tests/test_owned.py --junitxml report.xml'
+    reference = {'selector': 'tests/test_owned.py::test_owned', 'proof': 'owned.contract',
+                 'command': 'cmd:' + command}[reference_kind]
+    if reference_kind != 'proof':
+        config.gates.steps = []
+    config.gates.commands = []
+    config.gates.parallel_groups = []
+    if command_source == 'legacy':
+        config.gates.commands = [command]
+    elif command_source == 'manual':
+        config.gates.parallel_groups = [GateParallelGroup(name='manual', commands=[command])]
+    else:
+        child.fix_verify_command = command
+    plan = {'tasks': [{'task_id': 'task-owned', 'title': 'Executable owned proof',
+                      'requirement_ids': ['REQ-owned'], 'verification_refs': [reference]}],
+            'verification_steps': [step.to_dict() for step in config.gates.steps]}
+    _retain_contract(root, child, config, plan)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed', saved.to_dict()
+    assert calls == ['fix']
+    binding = saved.verification_binding
+    assert binding['required_references'][reference]['kind'] == reference_kind
+    assert binding['task_ids'] == ['task-owned']
+    assert binding['requirement_ids'] == ['REQ-owned']
+    assert any(entry.get('result') == 'pass' for entry in saved.execution_log)
+
+
 @pytest.mark.parametrize('edit', ['delete', 'skip', 'replace', 'independent_addition'])
 def test_public_resume_protects_default_target_sources(tmp_path, monkeypatch, edit):
     from auto_agents.config import load_task_plan
@@ -1163,9 +1197,11 @@ def test_public_resume_rejects_pytest_control_file_weakening(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize('passing_proof', [False, True])
-@pytest.mark.parametrize('reference', ['owned.contract', 'owned.report.json'])
-def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference):
+@pytest.mark.parametrize('reference', ['owned.contract', 'owned.report.json', 'tests/test_owned.py::test_owned'])
+@pytest.mark.parametrize('command_source', ['none', 'legacy', 'manual', 'fix'])
+def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference, command_source):
     import auto_agents.session as session_module
+    from auto_agents.models import GateParallelGroup
 
     root, child = project(tmp_path)
     config = load_project_config(root)
@@ -1175,10 +1211,27 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
         (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
         config.gates.steps = [VerificationStep(proof_id='unrelated.control', runner='pytest',
             targets=['tests/test_control.py'], levels=['affected', 'release'], impact_paths=['**'])]
+    if command_source != 'none':
+        # Supply a valid local conda prefix so explicit-command environment
+        # admission cannot substitute for the missing-reference diagnostic.
+        (root / '.conda').unlink()
+        (root / '.conda/conda-meta').mkdir(parents=True)
+        (root / '.conda/bin').mkdir()
+        (root / '.conda/bin/python').symlink_to(sys.executable)
+        (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
+        command = 'conda run -p ./.conda python -m pytest -q tests/test_control.py --junitxml ' + reference
+        if command_source == 'legacy':
+            config.gates.commands = [command]
+        elif command_source == 'manual':
+            config.gates.parallel_groups = [GateParallelGroup(name='manual', commands=[command])]
+        else:
+            child.fix_verify_command = command
     plan = {'tasks': [{'task_id': 'task-owned', 'title': 'Missing owned proof',
                       'requirement_ids': ['REQ-owned'], 'verification_refs': [reference]}],
             'verification_steps': [step.to_dict() for step in config.gates.steps]}
     _retain_contract(root, child, config, plan)
+    ambient = {path: (root / path).read_bytes() for path in
+               ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
     dispatched = []
     execute = session_module.run_gate_plan
     def observe(commands, *args, **kwargs):
@@ -1196,6 +1249,57 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
     assert diagnostic['owners'][0]['requirement_ids'] == ['REQ-owned']
     assert diagnostic['contract_fingerprint']
     assert diagnostic['retry_fix'] is False
+    assert {path: (root / path).read_bytes() for path in ambient} == ambient
+
+
+def test_public_resume_rechecks_retained_unresolved_proof_inventory(tmp_path, monkeypatch):
+    from copy import deepcopy
+    import auto_agents.session_verification as verification
+
+    root, child = project(tmp_path)
+    (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
+    config = load_project_config(root)
+    config.gates.steps = []
+    command = './.conda/bin/python -m pytest -q tests/test_control.py --junitxml owned.contract'
+    config.gates.commands = [command]
+    plan = {'tasks': [{'task_id': 'task-owned', 'title': 'Retained unresolved proof',
+                      'requirement_ids': ['REQ-owned'], 'verification_refs': ['owned.contract']}],
+            'verification_steps': []}
+    _retain_contract(root, child, config, plan)
+    # Encode the old inventory, where argument equality removed the mandatory
+    # ID. Restore production resolution before exercising public resume.
+    covers = verification._command_covers
+    with monkeypatch.context() as legacy:
+        legacy.setattr(verification, '_owned_inventory', lambda *_: ([], {}))
+        legacy.setattr(verification, '_command_covers',
+                       lambda command, ref: ref in shlex.split(command) or covers(command, ref))
+        _binding_fixture(root, child)
+    retained = deepcopy(child.verification_binding)
+    assert retained['required_references']['owned.contract']['kind'] == 'proof'
+    assert retained['required_proof_ids'] == []
+    assert command in retained['required_commands']
+    save_session_state(root, child)
+    ambient = _switch_ambient_binding_plan(root)
+    def reject_execution(*args, **kwargs):
+        pytest.fail('Unresolved retained proof must block before baseline or verification')
+    monkeypatch.setattr(Session, '_ensure_baseline', reject_execution)
+    monkeypatch.setattr('auto_agents.session.run_gate_plan', reject_execution)
+    for _ in range(2):
+        saved, calls, _ = run_session(root, monkeypatch)
+        assert saved.status == 'blocked' and saved.resolution == 'verification_ownership'
+        assert calls == []
+        # An unchanged blocked resume reuses the retained diagnostic and may
+        # append a resume log entry; it need not emit the same failure again.
+        diagnostic = next(entry['diagnostic'] for entry in reversed(saved.execution_log)
+                          if 'diagnostic' in entry)
+        assert diagnostic['verification_ref'] == 'owned.contract'
+        assert diagnostic['session_id'] == child.session_id
+        assert diagnostic['contract_fingerprint']
+        assert diagnostic['retry_fix'] is False
+        assert diagnostic['owners'][0]['task_id'] == 'task-owned'
+        assert diagnostic['owners'][0]['requirement_ids'] == ['REQ-owned']
+        assert saved.verification_binding == retained
+        assert {path: (root / path).read_bytes() for path in ambient} == ambient
 
 
 @pytest.mark.parametrize('control,existing,edit', [
@@ -3058,3 +3162,5 @@ test_resumed_fix_uses_owned_contract_after_global_plan_switch = test_resumed_fix
 test_public_legacy_resume_requires_resolved_contract_ownership = test_public_resume_before_first_baseline_uses_child_history
 test_retained_plan_proofs_survive_generated_gate_overlap = test_public_resume_recovers_release_proof_removed_from_generated_config
 test_covering_commands_validate_bound_requirement_hashes = test_public_resume_validates_contract_owners_after_command_expansion
+# Preserve the frozen acceptance entrypoint using the existing public regression.
+test_missing_owned_proof_cannot_be_replaced_by_empty_selection_or_cached_success = test_missing_owned_proof_cannot_be_waived_by_reference_deletion_or_cached_success
