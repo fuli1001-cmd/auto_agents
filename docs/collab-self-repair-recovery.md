@@ -54,6 +54,14 @@ no accepted component or root-proof gain returns `search_stalled`, preserving co
 diagnostics. Infrastructure interruptions and operator stops also retain resumable
 evidence instead of manufacturing successful proof.
 
+After an operator fixes a stopped deep-repair checkout, restart preserves its
+committed and unfinished corrections when Git proves that checkout descends from
+the latest recorded candidate. An older continuous checkout still yields to the
+newer deep candidate, and an interrupted deep checkpoint keeps precedence. The
+import receipt records the actual source commit. This carries code only: prior
+approval receipts remain invalid, and the stalled state, counters, and progress
+credits are not reset by the import.
+
 ## Isolated operational check
 
 `scripts/verify_collab_recovery.py --project PATH --session ID` compares the
