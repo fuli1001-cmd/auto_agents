@@ -1206,6 +1206,8 @@ class LocalGatePlanExecutor:
         from .artifact_runtime import track
         track(sandbox, "worktree", project=self.project_root, metadata={"repository": str(self.project_root)})
         install_dependency_links(sandbox, self.dependency_links)
+        for relative, mode in getattr(self, "source_file_modes", {}).items():
+            (sandbox / relative).chmod(mode)
         if lane:
             with self._lock:
                 self._shared_sandboxes[lane] = sandbox

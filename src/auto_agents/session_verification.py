@@ -122,7 +122,8 @@ def _bind_session(session, state) -> None:
         # standalone resumes acquire their lineage during workflow migration;
         # routed children must retain their own recorded contract history.
         for candidate in dict.fromkeys(filter(None, (
-            state.baseline_git_ref, state.baseline_head_ref, state.lineage_head_ref,
+            (resumed or state).baseline_git_ref, (resumed or state).baseline_head_ref,
+            (resumed or state).lineage_head_ref,
         ))):
             probe = subprocess.run(
                 ["git", "rev-parse", "--verify", f"{candidate}^{{commit}}"],
@@ -966,9 +967,10 @@ def validate_plan(state, gates, plan):
 
 
 def _task_scope(session, state):
-    seeds = [read_json(session.project_root / '.auto-agents/state/sessions' / state.session_id / 'issue.json', default={})]
+    control_root = getattr(session, '_custody_control_root', session.project_root)
+    seeds = [read_json(control_root / '.auto-agents/state/sessions' / state.session_id / 'issue.json', default={})]
     if state.parent_handoff_id:
-        handoff = read_json(session.project_root / '.auto-agents/state/handoffs' / (state.parent_handoff_id + '.json'), default={})
+        handoff = read_json(control_root / '.auto-agents/state/handoffs' / (state.parent_handoff_id + '.json'), default={})
         child = handoff.get('child', {}) or {}
         child_id = child.get('native_id') or handoff.get('payload', {}).get('child_session_id')
         if (not handoff or (child_id and child_id != state.session_id)
@@ -1118,6 +1120,10 @@ def session_gates(session, state):
 
 
 def owned_paths(orchestrator, state) -> list[str]:
+    if state.candidate_custody:
+        from .session_candidate import validate_receipt
+        validate_receipt(state)
+        return sorted(state.candidate_paths)
     snapshot = candidate_snapshot(orchestrator)
     conflicts = [path for path, digest in state.candidate_paths.items()
                  if snapshot.get(path, "") != digest]
@@ -1145,6 +1151,10 @@ def product_path(path: str) -> bool:
 
 
 def record_candidate(session, state, before: dict[str, str]) -> None:
+    if state.candidate_custody:
+        from .session_candidate import record_receipt
+        record_receipt(session, state)
+        return
     after = session.orch._worktree_change_snapshot()
     delta = session.orch._snapshot_delta_paths(before, after)
     protected = set(state.protected_preexisting_paths) | (set(before) - set(state.candidate_paths))
@@ -1276,7 +1286,8 @@ def validate_selected_contracts(session, state, commands: list[str], *, metadata
         item = (metadata or {}).get(command)
         proof_ids = item.get('proof_ids', []) if isinstance(item, dict) else getattr(item, 'proof_ids', [])
         task_ids.update(owner['task_id'] for owner in diagnostic_owners(state, command, proof_ids=proof_ids))
-    trace = read_json(requirements_trace_path(session.project_root), default={})
+    trace = read_json(requirements_trace_path(
+        getattr(session, '_custody_control_root', session.project_root)), default={})
     requirements = {row.get('id'): row for row in trace.get('requirements', [])}
     for task in state.verification_binding.get('tasks', []):
         if task.get('task_id') not in task_ids:

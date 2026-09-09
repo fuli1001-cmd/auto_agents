@@ -108,12 +108,16 @@ def test_candidate_verification_excludes_foreign_dirty_changes(tmp_path, monkeyp
     (root / 'foreign.py').write_text('VALUE = 9\n')
     (root / 'foreign-note.txt').write_bytes(b'foreign\x00bytes')
     index = git(root, 'show', ':foreign.py')
+    original_head = head_ref(root)
     result, _, _ = run_session(root, monkeypatch)
     assert result.status == 'completed', result.to_dict()
     assert git(root, 'show', ':foreign.py') == index
     assert (root / 'foreign.py').read_text() == 'VALUE = 9\n'
     assert (root / 'foreign-note.txt').read_bytes() == b'foreign\x00bytes'
-    assert 'foreign.py' not in git(root, 'show', '--format=', '--name-only', 'HEAD')
+    assert head_ref(root) == original_head
+    delivery = result.candidate_custody
+    assert 'foreign.py' not in git(Path(delivery['checkout']), 'diff', '--name-only',
+                                   delivery['base_revision'], delivery['delivered_revision'])
 
 
 @pytest.mark.parametrize('routed', [False, True])
@@ -231,8 +235,9 @@ def test_overlapping_ownership_blocks_without_discarding_foreign_changes(tmp_pat
     git(root, 'add', 'value.py')
     (root / 'value.py').write_text('VALUE = 31\n')
     result, _, _ = run_session(root, monkeypatch)
-    assert result.status == 'blocked'
-    assert result.resolution == 'verification_ownership'
+    assert result.status == 'completed', result.to_dict()
+    delivery = result.candidate_custody
+    assert git(Path(delivery['checkout']), 'show', delivery['delivered_revision'] + ':value.py') == 'VALUE = 1\n'
     assert git(root, 'show', ':value.py') == 'VALUE = 30\n'
     assert (root / 'value.py').read_text() == 'VALUE = 31\n'
 
@@ -303,7 +308,10 @@ def test_child_rollback_preserves_foreign_index_worktree_and_untracked_bytes(tmp
     if candidate == 'provider_doc':
         expected.insert(0, '.auto-agents/docs/provider_references/candidate.md')
         assert not (root / expected[0]).exists()
-    assert returned.result['rolled_back_paths'] == expected
+    assert returned.result['rolled_back_paths'] == []
+    custody = load_session_state(root, child.session_id).candidate_custody
+    assert sorted(custody['receipt']['manifest']) == expected
+    assert (Path(custody['checkout']) / 'value.py').read_text() == 'VALUE = 1\n'
     assert (root / 'value.py').read_text() == 'VALUE = 0\n'
     assert git(root, 'show', ':foreign.py') == 'VALUE = 8\n'
     assert (root / 'foreign.py').read_text() == 'VALUE = 9\n'
@@ -1978,7 +1986,9 @@ def test_public_resume_private_checkout_requires_original_execution_authority(tm
         assert saved.status == 'completed', saved.to_dict()
         assert calls == ['fix']
         assert saved.verification_binding == child.verification_binding
-        assert (private / 'value.py').read_text() == 'VALUE = 1\n'
+        assert (private / 'value.py').read_text() == 'VALUE = 0\n'
+        delivery = saved.candidate_custody
+        assert git(Path(delivery['checkout']), 'show', delivery['delivered_revision'] + ':value.py') == 'VALUE = 1\n'
     else:
         assert saved.status == 'blocked', saved.to_dict()
         assert saved.resolution == 'verification_ownership'
@@ -1986,3 +1996,157 @@ def test_public_resume_private_checkout_requires_original_execution_authority(tm
         assert calls == []
         assert (private / 'value.py').read_text() == 'VALUE = 0\n'
     assert {name: (root / name).read_bytes() for name in before} == before
+
+
+@pytest.mark.parametrize('failure', [False, True])
+@pytest.mark.parametrize('boundary', ['before_record', 'after_snapshot', 'after_record'])
+def test_candidate_receipt_excludes_intervening_foreign_content_index_and_modes(tmp_path, monkeypatch, boundary, failure):
+    import base64
+    import stat
+    import auto_agents.session as session_module
+    from auto_agents.session_candidate import GateSnapshotManager
+    from test_engine_child_recovery import parent_workflow, resume_to_observation
+
+    root, child = project(tmp_path, missing=failure)
+    owned_test = root / 'tests/test_owned.py'
+    owned_test.write_text(owned_test.read_text() +
+        '    assert Path("value.py").stat().st_mode & 0o7777 == 0o750\n'
+        '    assert Path("writer-link").is_symlink()\n'
+        '    assert not Path("obsolete.txt").exists()\n')
+    (root / 'obsolete.txt').write_bytes(b'retained deletion preimage')
+    git(root, 'add', '-A')
+    git(root, 'commit', '-m', 'retain file kind and mode contract')
+    child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
+    save_session_state(root, child)
+    store, _, handoff = parent_workflow(root, child)
+    shared_head = head_ref(root)
+    shared_refs = git(root, 'show-ref')
+    observations = []
+    def foreign_edit():
+        (root / 'value.py').write_text('VALUE = 88\n')
+        git(root, 'add', 'value.py')
+        (root / 'value.py').write_text('VALUE = 99\n')
+        (root / 'value.py').chmod(0o711)
+        (root / 'late-foreign.txt').write_bytes(b'foreign\x00untracked')
+        observations.append((root / '.git/index').read_bytes())
+    record = session_module.record_candidate
+    def record_with_interleaving(session, state, before):
+        if boundary == 'before_record':
+            foreign_edit()
+        record(session, state, before)
+        if boundary == 'after_record':
+            # Include a same-path mode-only edit after receipt acceptance.
+            (root / 'value.py').chmod(0o711)
+            observations.append((root / '.git/index').read_bytes())
+    monkeypatch.setattr(session_module, 'record_candidate', record_with_interleaving)
+    create = GateSnapshotManager.create
+    def snapshot_with_interleaving(manager, **kwargs):
+        result = create(manager, **kwargs)
+        if boundary == 'after_snapshot' and manager.plan_id.startswith('candidate-'):
+            foreign_edit()
+        return result
+    monkeypatch.setattr(GateSnapshotManager, 'create', snapshot_with_interleaving)
+    def writer(state, prompt, candidate_root):
+        assert candidate_root != root
+        assert (candidate_root / '.git').is_dir()
+        assert (candidate_root / 'value.py').read_text() == 'VALUE = 0\n'
+        (candidate_root / 'value.py').write_text('VALUE = 1\n')
+        (candidate_root / 'value.py').chmod(0o640)
+        git(candidate_root, 'add', 'value.py')
+        (candidate_root / 'value.py').chmod(0o750)
+        (candidate_root / 'writer-link').symlink_to('value.py')
+        (candidate_root / 'obsolete.txt').unlink()
+        return 'Fixed\nCOMMIT_MESSAGE: Repair owned value'
+    resume_to_observation(root, monkeypatch, writer)
+    saved = load_session_state(root, child.session_id)
+    assert (saved.status == 'completed') == (not failure), saved.to_dict()
+    assert len(observations) == 1
+    assert (root / '.git/index').read_bytes() == observations[0]
+    assert head_ref(root) == shared_head
+    if not failure:
+        assert git(root, 'show-ref') == shared_refs
+    assert stat.S_IMODE((root / 'value.py').stat().st_mode) == 0o711
+    if boundary != 'after_record':
+        assert (root / 'value.py').read_text() == 'VALUE = 99\n'
+        assert git(root, 'show', ':value.py') == 'VALUE = 88\n'
+        assert (root / 'late-foreign.txt').read_bytes() == b'foreign\x00untracked'
+    else:
+        assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+    receipt = saved.candidate_custody['receipt']
+    assert set(receipt['manifest']) == {'value.py', 'writer-link', 'obsolete.txt'}
+    assert receipt['manifest']['obsolete.txt']['postimage']['worktree']['kind'] == 'absent'
+    assert (root / 'obsolete.txt').read_bytes() == b'retained deletion preimage'
+    entry = receipt['manifest']['value.py']
+    assert base64.b64decode(entry['preimage']['worktree']['bytes']) == b'VALUE = 0\n'
+    assert base64.b64decode(entry['postimage']['worktree']['bytes']) == b'VALUE = 1\n'
+    assert entry['postimage']['worktree']['mode'] == 0o750
+    assert entry['postimage']['index'] != entry['preimage']['index']
+    assert receipt['manifest']['writer-link']['postimage']['worktree']['target'] == 'value.py'
+    assert receipt['binding_fingerprint'] == saved.verification_binding['binding_fingerprint']
+    assert git(Path(saved.candidate_custody['checkout']), 'show', receipt['source_revision'] + ':value.py') == 'VALUE = 1\n'
+    if failure:
+        assert store.load_handoff(handoff.handoff_id).result['rolled_back_paths'] == []
+
+
+def test_candidate_publication_preserves_foreign_edit_after_final_snapshot(tmp_path, monkeypatch):
+    test_candidate_receipt_excludes_intervening_foreign_content_index_and_modes(
+        tmp_path, monkeypatch, 'after_snapshot', False)
+
+
+def test_parent_consumes_delivered_child_revision_without_shared_copyback(tmp_path, monkeypatch):
+    from test_engine_child_recovery import parent_workflow, ObservationBoundary
+    root, child = project(tmp_path)
+    store, _, handoff = parent_workflow(root, child)
+    before = head_ref(root)
+    index = (root / '.git/index').read_bytes()
+    observed = []
+    def agent(self, request):
+        if request.purpose.startswith('collab'):
+            parent = load_session_state(root, 'parent')
+            observed.append(request.cwd)
+            assert request.cwd != root
+            assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+            delivery = store.load_handoff(handoff.handoff_id).result['candidate_delivery']
+            assert request.cwd != Path(delivery['checkout'])
+            assert head_ref(request.cwd) == delivery['delivered_revision']
+            assert parent.candidate_custody['consumed_delivery']['revision'] == head_ref(request.cwd)
+            assert (request.cwd / 'value.py').read_text() == 'VALUE = 1\n'
+            assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+            assert (root / '.git/index').read_bytes() == index
+            raise ObservationBoundary()
+        (request.cwd / 'value.py').write_text('VALUE = 1\n')
+        reply = 'Fixed\nCOMMIT_MESSAGE: Repair owned value'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', agent)
+    for _ in range(2):
+        with pytest.raises(ObservationBoundary):
+            Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
+        assert head_ref(root) == before
+    assert len(observed) == 2
+    assert observed[0] == observed[1]
+
+
+def test_expired_legacy_baseline_cannot_adopt_migrated_ambient_lineage(tmp_path, monkeypatch):
+    root, child = project(tmp_path)
+    child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/expired'
+    child.baseline_head_ref = child.lineage_head_ref = ''
+    save_session_state(root, child)
+    ambient = _switch_ambient_binding_plan(root)
+    git(root, 'add', '-A')
+    git(root, 'commit', '-m', 'foreign current contract')
+    before = head_ref(root)
+    def forbidden(*args, **kwargs):
+        pytest.fail('Unrecoverable retained authority must block before baseline or writer')
+    monkeypatch.setattr(Session, '_ensure_baseline', forbidden)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', forbidden)
+    for _ in range(2):
+        result = Session(Orchestrator(root), mode='fix', auto_approve=True).resume(child.session_id)
+        assert result.status == 'blocked'
+        assert result.execution_log[-1]['retry_fix'] is False
+        assert result.execution_log[-1]['diagnostic']['session_id'] == child.session_id
+        assert not result.verification_binding
+        assert not result.lineage_head_ref
+        assert head_ref(root) == before
+        assert {name: (root / name).read_bytes() for name in ambient} == ambient

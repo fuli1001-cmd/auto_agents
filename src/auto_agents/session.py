@@ -415,8 +415,10 @@ class Session:
             )
         if (self.mode == 'fix' and existing.status != 'completed'
                 and not existing.verification_binding and not existing.parent_handoff_id
-                and not (existing.baseline_git_ref or existing.baseline_head_ref or existing.lineage_head_ref)
-                and head_ref(self.project_root)):
+                and head_ref(self.project_root)
+                and not any(subprocess.run(['git', 'rev-parse', '--verify', ref + '^{commit}'],
+                    cwd=self.project_root, capture_output=True).returncode == 0
+                    for ref in (existing.baseline_git_ref, existing.baseline_head_ref, existing.lineage_head_ref) if ref)):
             # Block before workflow migration can persist today's HEAD as
             # apparent legacy history and authorize it on the next resume.
             return self._block_execution_binding(existing, ownership_error(
@@ -467,6 +469,16 @@ class Session:
 
     @reporting_scope
     def _drive_local(self, state: SessionState) -> SessionState:
+        if state.candidate_custody:
+            from .session_candidate import execution_checkout
+            try:
+                with execution_checkout(self, state):
+                    return self._drive_local_owned(state)
+            except SessionOwnershipError as error:
+                return self._block_execution_binding(state, error, "verification_ownership")
+        return self._drive_local_owned(state)
+
+    def _drive_local_owned(self, state: SessionState) -> SessionState:
         """Drive the session through its phases until completion or pause."""
         reporter = getattr(self.orch, "reporter", None)
         if reporter is not None:
@@ -2033,6 +2045,16 @@ class Session:
         return state
 
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
+        from .session_candidate import execution_checkout
+        self._current_state = state
+        try:
+            bind_session(self, state)
+            with execution_checkout(self, state):
+                return self._phase_fix_execute_owned(state)
+        except SessionOwnershipError as error:
+            return self._block_execution_binding(state, error, "verification_ownership")
+
+    def _phase_fix_execute_owned(self, state: SessionState) -> SessionState:
         self._current_state = state
         from .execution_binding import ExecutionBindingError
 
@@ -3921,7 +3943,8 @@ class Session:
         )
         previous = getattr(self, "_candidate_source_ref", "")
         try:
-            self._candidate_source_ref = manager.create(paths=paths).ref_name
+            self._candidate_source_ref = (state.candidate_custody.get("receipt", {}).get("source_revision")
+                                          or manager.create(paths=paths).ref_name)
             yield
         finally:
             self._candidate_source_ref = previous
@@ -3931,10 +3954,20 @@ class Session:
     def _session_gate_executor_context(self, metadata=None, *, source_ref="", **kwargs):
         state = self._current_state
         if state is not None and state.verification_binding:
-            kwargs['contract_fingerprint'] = state.verification_binding.get('binding_fingerprint', '')
-        return self.orch._gate_executor_context(
+            kwargs['contract_fingerprint'] = verification_fingerprint([
+                state.verification_binding.get('binding_fingerprint', ''),
+                state.candidate_custody.get('receipt', {}).get('fingerprint', ''),
+            ])
+        executor = self.orch._gate_executor_context(
             metadata, source_ref=source_ref or getattr(self, "_candidate_source_ref", ""), **kwargs
         )
+        if state is not None and state.candidate_custody:
+            receipt = state.candidate_custody.get('receipt', {})
+            if (source_ref or getattr(self, '_candidate_source_ref', '')) == receipt.get('source_revision'):
+                executor.source_file_modes = {path: entry['postimage']['worktree']['mode']
+                    for path, entry in receipt.get('manifest', {}).items()
+                    if entry['postimage']['worktree']['kind'] == 'file'}
+        return executor
 
     def _run_verify_inner(self, scope: str = "final") -> Dict[str, object]:
         """Run verification appropriate for the session mode.
@@ -5063,6 +5096,9 @@ class Session:
 
     def _git_commit(self, state: SessionState, prefix: str, reply: str = "") -> bool:
         """Persist current state, then commit current changes."""
+        if state.candidate_custody.get("receipt"):
+            from .session_candidate import deliver_candidate
+            return deliver_candidate(self, state, prefix + ": " + self._session_commit_summary(state, reply))
         summary = self._session_commit_summary(state, reply)
         message = f"{prefix}: {summary}"
         state.execution_log.append({
@@ -5176,6 +5212,9 @@ class Session:
     def _save(self, state: SessionState) -> None:
         state.updated_at = self._now()
         save_session_state(self.project_root, state)
+        control_root = getattr(self, "_custody_control_root", self.project_root)
+        if control_root != self.project_root:
+            save_session_state(control_root, state)
         publish = getattr(self._health_runtime, "publish_session", None)
         if callable(publish):
             publish(state)

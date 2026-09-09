@@ -668,7 +668,9 @@ class WorkflowCoordinator:
                 continue
             if state.status in {"conversing", "executing"}:
                 continue
-            if root and state.status == "completed":
+            if root and state.status == "completed" and state.candidate_custody:
+                self.store.complete(snapshot, status="completed")
+            elif root and state.status == "completed":
                 self.store.complete(snapshot, status="completed")
                 workflow_paths = [
                     f".auto-agents/state/workflows/{snapshot.workflow_id}",
@@ -848,6 +850,8 @@ class WorkflowCoordinator:
         if handoff.child is not None and handoff.child.kind == "fix":
             from .session_verification import owned_paths
             child_state = load_session_state(self.project_root, handoff.child.native_id)
+            if child_state.candidate_custody:
+                return []
             if child_state.verification_binding:
                 owned = set(owned_paths(self.orch, child_state))
                 current = sorted(owned & {path for _, path in changed_entries(self.project_root, ignored_prefixes=())})
@@ -1366,6 +1370,13 @@ class WorkflowCoordinator:
 
     def _apply_child_result(self, parent_state: object, handoff: WorkflowHandoff):
         result = dict(handoff.result)
+        delivery = result.get('candidate_delivery')
+        if result.get('status') == 'completed' and delivery:
+            from .session_candidate import consume_delivery
+            consumed = parent_state.candidate_custody.get('consumed_delivery', {})
+            if consumed.get('revision') != delivery['delivered_revision']:
+                consume_delivery(self.project_root, parent_state, delivery,
+                                 child_id=str(result.get('session_id', '')))
         changed = {
             str(item) for item in parent_state.lineage_changed_paths if str(item).strip()
         }
@@ -1415,8 +1426,11 @@ class WorkflowCoordinator:
 
     def _session_result(self, state: object, handoff: WorkflowHandoff) -> Dict[str, object]:
         before = str(handoff.payload.get("head_before", ""))
-        after = head_ref(self.project_root)
+        delivery = dict(getattr(state, 'candidate_custody', {}))
+        after = delivery.get('delivered_revision') or head_ref(self.project_root)
+        source = Path(delivery['checkout']) if delivery else self.project_root
         return {
+            "candidate_delivery": delivery if delivery.get('delivered_revision') else {},
             "status": state.status,
             "resolution": state.resolution,
             "summary": state.resolution or f"{state.mode} status={state.status}",
@@ -1426,7 +1440,7 @@ class WorkflowCoordinator:
             ),
             "head_before": before,
             "head_after": after,
-            "commit_shas": _commits_between(self.project_root, before, after),
+            "commit_shas": _commits_between(source, before, after),
             "changed_paths": (
                 sorted(set(state.candidate_paths) | set(state.lineage_changed_paths))
                 if getattr(state, "verification_binding", {})

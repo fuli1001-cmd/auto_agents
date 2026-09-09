@@ -1966,6 +1966,7 @@ class SessionState:
     protected_preexisting_paths: List[str] = field(default_factory=list)
     verification_binding: Dict[str, object] = field(default_factory=dict)
     candidate_paths: Dict[str, str] = field(default_factory=dict)
+    candidate_custody: Dict[str, object] = field(default_factory=dict)
     verification_diagnostics: Dict[str, object] = field(default_factory=dict)
     mode: str = "fix"
     status: str = "conversing"
@@ -2022,6 +2023,7 @@ class SessionState:
             ],
             verification_binding=dict(data.get("verification_binding", {})),
             candidate_paths=dict(data.get("candidate_paths", {})),
+            candidate_custody=dict(data.get("candidate_custody", {})),
             verification_diagnostics=dict(data.get("verification_diagnostics", {})),
             mode=str(data.get("mode", "fix")),
             status=str(data.get("status", "conversing")),
@@ -2109,6 +2111,7 @@ class SessionState:
             "protected_preexisting_paths": list(self.protected_preexisting_paths),
             "verification_binding": dict(self.verification_binding),
             "candidate_paths": dict(self.candidate_paths),
+            "candidate_custody": dict(self.candidate_custody),
             "verification_diagnostics": dict(self.verification_diagnostics),
             "mode": self.mode,
             "status": self.status,

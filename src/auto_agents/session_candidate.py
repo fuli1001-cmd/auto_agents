@@ -1,15 +1,116 @@
-"""Attribute fix edits to one isolated provider workspace before publishing."""
+"""Private candidate custody: writer receipts never authorize shared copy-back."""
+import base64
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+import os
+import stat
+import subprocess
+from uuid import uuid4
 
-from auto_agents import artifact_temp as tempfile
+from .gate_execution import GateSnapshotManager, discover_dependency_links, install_dependency_links
+from .session_verification import fingerprint, ownership_error, product_path
 
-from .gate_execution import discover_dependency_links, install_dependency_links
-from .git_ops import head_ref
-from .root_cause import RootCauseCoordinator
-from .session_verification import SessionOwnershipError, candidate_snapshot, product_path
+
+def _git(root, *args):
+    result = subprocess.run(['git', *args], cwd=root, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip())
+    return result.stdout.strip()
+
+
+def _image(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {'kind': 'absent'}
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        return {'kind': 'symlink', 'mode': mode, 'target': os.readlink(path)}
+    if stat.S_ISREG(info.st_mode):
+        return {'kind': 'file', 'mode': mode,
+                'bytes': base64.b64encode(path.read_bytes()).decode('ascii')}
+    return {'kind': 'directory' if stat.S_ISDIR(info.st_mode) else 'special', 'mode': mode}
+
+
+def _inventory(root):
+    index = {}
+    for row in _git(root, 'ls-files', '--stage', '-z').split('\0'):
+        if '\t' in row:
+            identity, path = row.split('\t', 1)
+            index.setdefault(path, []).append(identity)
+    paths = set(index) | set(_git(root, 'ls-files', '--others', '--exclude-standard', '-z').split('\0'))
+    dependencies = discover_dependency_links(root)
+    return {path: {'worktree': _image(root / path), 'index': index.get(path, [])}
+            for path in sorted(paths) if path and product_path(path)
+            and path not in dependencies}
+
+
+def _clone(source, revision, destination):
+    # A clone owns its object database, refs, config and index. Git worktrees
+    # would still mutate the shared repository's metadata during verification.
+    _git(source, 'clone', '--no-local', '--no-checkout', str(source), str(destination))
+    _git(destination, 'fetch', '--no-tags', str(source), revision)
+    _git(destination, 'checkout', '--detach', 'FETCH_HEAD')
+    _git(destination, 'config', 'user.name', 'auto_agents')
+    _git(destination, 'config', 'user.email', 'auto-agents@localhost')
+    install_dependency_links(destination, discover_dependency_links(source))
+
+
+@contextmanager
+def execution_checkout(session, state):
+    """Keep session control records durable while all product work is private."""
+    if getattr(session, '_custody_control_root', None) is not None:
+        yield
+        return
+    from .execution_binding import SessionExecutionBinding
+    from .orchestrator import Orchestrator
+    from .session_verification import validate_binding
+
+    root = session.project_root
+    if state.verification_binding:
+        validate_binding(session, state)
+    if not state.candidate_custody:
+        if state.candidate_paths:
+            raise ownership_error(state, 'candidate ownership is unavailable without a frozen receipt')
+        revision = state.verification_binding['contract_revision']
+        destination = root / '.auto-agents' / 'candidate-custody' / uuid4().hex / 'project'
+        destination.parent.mkdir(parents=True)
+        _clone(root, revision, destination)
+        state.candidate_custody = {'schema_version': 1, 'checkout': str(destination),
+            'repository': state.verification_binding['repository'], 'session_id': state.session_id,
+            'binding_fingerprint': state.verification_binding['binding_fingerprint'],
+            'base_revision': revision, 'preimages': _inventory(destination)}
+        session._save(state)
+    custody = state.candidate_custody
+    destination = Path(custody['checkout'])
+    if (custody['session_id'] != state.session_id
+            or custody['repository'] != (state.verification_binding.get('repository') or str(root.resolve()))
+            or (state.verification_binding and custody['binding_fingerprint'] != state.verification_binding['binding_fingerprint'])):
+        raise ownership_error(state, 'candidate custody conflicts with session authority')
+    validate_receipt(state)
+    context = (SessionExecutionBinding.for_checkout(session, state, destination)
+               if state.verification_binding else None)
+    previous = session.orch
+    execution = Orchestrator(destination)
+    # Instance-installed provider transports are also used by embedders.
+    if '_call_with_failover' in previous.__dict__:
+        execution._call_with_failover = previous.__dict__['_call_with_failover']
+    execution.config = session.config
+    execution._force_full_verify = previous._force_full_verify
+    previous_context = getattr(session, '_execution_binding', None)
+    session._custody_control_root = root
+    session.project_root = destination
+    session.orch = execution
+    session._execution_binding = context
+    try:
+        yield
+    finally:
+        session._save(state)
+        session.project_root = root
+        session.orch = previous
+        session._execution_binding = previous_context
+        del session._custody_control_root
 
 
 @contextmanager
@@ -17,34 +118,106 @@ def candidate_request(session, state, request):
     if request.purpose != 'fix' or not state.verification_binding:
         yield request
         return
-    from .workflow_runtime import _copy_path, _remove_path
+    if not state.candidate_custody or Path(state.candidate_custody['checkout']) != session.project_root:
+        raise ownership_error(state, 'bound writer requires its private execution checkout')
+    source_head = _git(session.project_root, 'rev-parse', 'HEAD')
+    yield replace(request, resume_session_id='', resume_provider='',
+                  prompt_is_continuation=False, prompt_continuation='')
+    if _git(session.project_root, 'rev-parse', 'HEAD') != source_head:
+        raise ownership_error(state, 'isolated candidate changed its Git checkpoint')
+    # Freeze before returning to ownership recording. Nothing is copied into
+    # the shared worktree, including at the former publication boundary.
+    after = _inventory(session.project_root)
+    before = state.candidate_custody['preimages']
+    absent = {'worktree': {'kind': 'absent'}, 'index': []}
+    manifest = {path: {'preimage': before.get(path, absent), 'postimage': after.get(path, absent)}
+                for path in sorted(set(before) | set(after)) if before.get(path) != after.get(path)}
+    snapshot = GateSnapshotManager(session.project_root, 'candidate-' + uuid4().hex).create(paths=list(manifest))
+    receipt = {'attempt_id': uuid4().hex, 'attempt': state.current_attempt,
+        'session_id': state.session_id, 'binding_fingerprint': state.verification_binding['binding_fingerprint'],
+        'base_revision': state.candidate_custody['base_revision'],
+        'source_revision': snapshot.commit_sha, 'manifest': manifest}
+    receipt['fingerprint'] = fingerprint(receipt)
+    session._candidate_receipt = receipt
 
-    root = session.project_root
-    before = candidate_snapshot(session.orch)
-    protected = set(state.protected_preexisting_paths) | (set(before) - set(state.candidate_paths))
-    session._candidate_attempt_paths = []
-    with tempfile.TemporaryDirectory(prefix='auto-agents-fix-candidate-') as temporary:
-        candidate = Path(temporary) / 'project'
-        RootCauseCoordinator._copy_diagnostic_tree(root, candidate, include_private=True)
-        install_dependency_links(candidate, discover_dependency_links(root))
-        observer = SimpleNamespace(project_root=candidate)
-        observer._worktree_change_snapshot = lambda: type(session.orch)._worktree_change_snapshot(observer)
-        candidate_before = observer._worktree_change_snapshot()
-        source_head = head_ref(candidate)
-        # Continuations refer to a different physical workspace. Resume via
-        # the durable transcript, never via a provider's old writable checkout.
-        yield replace(request, cwd=candidate, resume_session_id='', resume_provider='',
-                      prompt_is_continuation=False, prompt_continuation='')
-        if head_ref(candidate) != source_head:
-            raise SessionOwnershipError('isolated candidate changed its Git checkpoint')
-        delta = [path for path in session.orch._snapshot_delta_paths(
-            candidate_before, observer._worktree_change_snapshot()) if product_path(path)]
-        current = candidate_snapshot(session.orch)
-        conflicts = [path for path in delta
-                     if path in protected or before.get(path) != current.get(path)]
-        if conflicts:
-            raise SessionOwnershipError('candidate ownership is ambiguous: ' + ', '.join(sorted(conflicts)))
-        for path in delta:
-            _remove_path(root / path)
-            _copy_path(candidate / path, root / path)
-        session._candidate_attempt_paths = delta
+
+def validate_receipt(state):
+    custody = state.candidate_custody
+    receipt = custody.get('receipt')
+    if not receipt:
+        if state.candidate_paths:
+            raise ownership_error(state, 'candidate receipt is unavailable')
+        return
+    if (receipt.get('fingerprint') != fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'})
+            or receipt['session_id'] != custody['session_id']
+            or receipt['binding_fingerprint'] != custody['binding_fingerprint']):
+        raise ownership_error(state, 'candidate receipt identity changed')
+    expected_paths = {path: fingerprint(entry['postimage']) for path, entry in receipt['manifest'].items()}
+    if state.candidate_paths != expected_paths:
+        raise ownership_error(state, 'candidate paths differ from the writer receipt')
+    root = Path(custody['checkout'])
+    actual = _inventory(root)
+    for path, entry in receipt['manifest'].items():
+        postimage = entry['postimage']
+        # Delivery intentionally commits the worktree, so its index then has
+        # the delivered tree semantics. Before delivery the writer index is exact.
+        if _image(root / path) != postimage['worktree'] or (
+                not custody.get('delivered_revision') and actual.get(path, {}).get('index', []) != postimage['index']):
+            raise ownership_error(state, 'private candidate changed after receipt', conflicting_paths=[path])
+    _git(root, 'cat-file', '-e', receipt['source_revision'] + '^{commit}')
+
+
+def record_receipt(session, state):
+    receipt = getattr(session, '_candidate_receipt', None)
+    if receipt is None:
+        raise ownership_error(state, 'candidate writer did not return a frozen receipt')
+    state.candidate_custody['receipt'] = receipt
+    state.candidate_paths = {path: fingerprint(entry['postimage']) for path, entry in receipt['manifest'].items()}
+    validate_receipt(state)
+    session._candidate_receipt = None
+    session._save(state)
+
+
+def deliver_candidate(session, state, message):
+    validate_receipt(state)
+    custody = state.candidate_custody
+    receipt = custody.get('receipt')
+    if not receipt:
+        raise ownership_error(state, 'candidate delivery requires a writer receipt')
+    # The verified snapshot is a real commit in the private object database.
+    # Give delivery its normal user-facing subject without changing its tree.
+    tree = _git(session.project_root, 'rev-parse', receipt['source_revision'] + '^{tree}')
+    revision = _git(session.project_root, 'commit-tree', tree, '-p', custody['base_revision'], '-m', message)
+    custody['delivered_revision'] = revision
+    _git(session.project_root, 'update-ref', 'refs/auto-agents/delivered/' + state.session_id, revision)
+    session._save(state)
+    return True
+
+
+def consume_delivery(root, state, delivery, *, child_id):
+    """Materialize the child's revision for the parent's next public execution."""
+    source = Path(delivery['checkout'])
+    receipt = delivery['receipt']
+    if (delivery['session_id'] != child_id or receipt['session_id'] != child_id
+            or delivery['repository'] != str(root.resolve())
+            or delivery['binding_fingerprint'] != receipt['binding_fingerprint']):
+        raise ownership_error(state, 'delivered candidate belongs to another child or repository')
+    if receipt['fingerprint'] != fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'}):
+        raise ownership_error(state, 'delivered candidate receipt changed')
+    revision = delivery['delivered_revision']
+    if _git(source, 'rev-parse', revision + '^{tree}') != _git(source, 'rev-parse', receipt['source_revision'] + '^{tree}'):
+        raise ownership_error(state, 'delivered revision differs from verified candidate')
+    destination = root / '.auto-agents' / 'candidate-custody' / uuid4().hex / 'project'
+    destination.parent.mkdir(parents=True)
+    _clone(source, revision, destination)
+    for path, entry in receipt['manifest'].items():
+        image = entry['postimage']['worktree']
+        if image['kind'] == 'file':
+            (destination / path).chmod(image['mode'])
+    state.lineage_changed_paths = sorted(set(state.lineage_changed_paths) | set(state.candidate_paths))
+    state.candidate_paths = {}
+    state.candidate_custody = {'schema_version': 1, 'checkout': str(destination),
+        'repository': str(root.resolve()), 'session_id': state.session_id,
+        'binding_fingerprint': state.verification_binding.get('binding_fingerprint', ''),
+        'base_revision': revision, 'preimages': _inventory(destination),
+        'consumed_delivery': {'revision': revision, 'receipt_fingerprint': receipt['fingerprint']}}
