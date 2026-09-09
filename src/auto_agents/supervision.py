@@ -312,10 +312,17 @@ class ProgressSupervisor:
                 self._record("checkpoint_error", detail=str(exc)[:300])
 
     def _observe_loop(self, event: AgentProgressEvent) -> None:
+        # Some native edit events report only the path and update status, not
+        # the patch. Distinct edits must not look like an identical tool loop.
+        # Sampling their identity still cannot renew a trusted progress lease.
+        edit_state = ""
+        if self.trusted_progress and event.detail == "file_change":
+            self._sample_workspace(time.monotonic())
+            edit_state = self.workspace_fingerprint
         basis = "\0".join(
             (
                 self.request.stage,
-                "" if self.trusted_progress else self.workspace_fingerprint,
+                edit_state if self.trusted_progress else self.workspace_fingerprint,
                 event.fingerprint,
                 self._normalize_detail(event.detail),
             )

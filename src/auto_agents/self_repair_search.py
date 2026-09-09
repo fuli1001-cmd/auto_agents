@@ -76,6 +76,7 @@ class SelfRepairFinding:
     reopened_by: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
+    repair_group_id: str = ""
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "SelfRepairFinding":
@@ -95,6 +96,7 @@ class SelfRepairFinding:
             counterexample=str(payload.get("counterexample", "")),
             required_test=str(payload.get("required_test", "")),
             defer_until=defer_until,
+            repair_group_id=str(payload.get("repair_group_id", "")).strip(),
             evidence=[
                 str(item)
                 for item in (raw_evidence if isinstance(raw_evidence, list) else [])
@@ -619,7 +621,7 @@ class SelfRepairExperiment:
             finding
             for finding in self.findings.values()
             if finding.status in {"confirmed", "reopened"}
-            and finding.disposition == "contract_violation"
+            and finding.disposition in {"contract_violation", "candidate_regression"}
             and finding.causal_obligation_id in contract_ids
         ]
 
@@ -633,9 +635,16 @@ class SelfRepairExperiment:
                  if group.get("group_id") and group["group_id"] not in completed
                  and set(group.get("depends_on", [])).issubset(completed)]
         if ready:
+            regressions = [finding for finding in self.blocking_findings()
+                           if finding.disposition == "candidate_regression"]
+            regression_ids = {finding.finding_id for finding in regressions}
+            regression_owners = {finding.repair_group_id for finding in regressions}
+            regression_owners.update(group.get("group_id") for group in ready
+                                     if regression_ids.intersection(group.get("finding_ids", [])))
             def priority(group):
                 identity = group["group_id"]
-                return (identity == self.active_finding_group_id,
+                return (identity in regression_owners,
+                        identity == self.active_finding_group_id,
                         sum(identity in item.get("depends_on", []) for item in self.finding_groups
                             if item.get("group_id") not in completed),
                         len(group.get("finding_ids", [])))
@@ -830,6 +839,37 @@ class SelfRepairExperiment:
         self.best_safe_ref = best_safe.candidate_ref or self.base_commit
         return tuple(self.frontier) != previous
 
+    def remember_candidate_regression(self, finding, record):
+        """Retain the blocker and route its correction without waiving proof."""
+        failure_id = f"candidate_regression:{finding.finding_id}"
+        if failure_id not in record.failed_obligations:
+            record.failed_obligations.append(failure_id)
+        if finding.causal_obligation_id not in set(self.contract_obligation_ids):
+            # Unanchored observations remain candidate-local; routing cannot
+            # expand the frozen repair contract.
+            return
+        finding.status = "confirmed"
+        previous = self.findings.get(finding.finding_id)
+        if previous:
+            finding.created_at = previous.created_at
+            finding.reopened_by = list(previous.reopened_by)
+            if previous.status in {"resolved", "invalidated"}:
+                finding.status = "reopened"
+                if record.candidate_id not in finding.reopened_by:
+                    finding.reopened_by.append(record.candidate_id)
+            for name in ("reason", "counterexample", "required_test", "evidence", "repair_group_id"):
+                if not getattr(finding, name):
+                    setattr(finding, name, getattr(previous, name))
+        finding.introduced_by = (previous.introduced_by if previous else "") or record.candidate_id
+        finding.updated_at = _utc_now()
+        self.findings[finding.finding_id] = finding
+        record.finding_states[finding.finding_id] = "confirmed"
+        for group in self.finding_groups:
+            if group.get("group_id") == finding.repair_group_id:
+                group["finding_ids"] = sorted(set(group.get("finding_ids", [])) | {finding.finding_id})
+                group["status"] = "pending"
+                break
+
     def register_candidate(
         self,
         record: SelfRepairCandidateRecord,
@@ -892,9 +932,7 @@ class SelfRepairExperiment:
                 continue
             if disposition == "candidate_regression":
                 candidate_regressions.append(finding.finding_id)
-                failure_id = f"candidate_regression:{finding.finding_id}"
-                if failure_id not in record.failed_obligations:
-                    record.failed_obligations.append(failure_id)
+                self.remember_candidate_regression(finding, record)
                 continue
             if disposition != "contract_violation" or causal_id not in contract_ids:
                 continue
@@ -935,8 +973,13 @@ class SelfRepairExperiment:
                 if causal_id not in record.failed_obligations:
                     record.failed_obligations.append(causal_id)
         for finding_id in record.resolved_finding_ids:
-            record.finding_states[finding_id] = "resolved"
             finding = self.findings.get(finding_id)
+            if finding is not None and finding.disposition == "candidate_regression":
+                if not record.review_completed or finding_id in candidate_regressions:
+                    continue
+                record.failed_obligations = [item for item in record.failed_obligations
+                                             if item != f"candidate_regression:{finding_id}"]
+            record.finding_states[finding_id] = "resolved"
             if finding is not None:
                 finding.status = "resolved"
                 finding.resolved_by = record.candidate_id
@@ -960,6 +1003,15 @@ class SelfRepairExperiment:
         record.passed_obligations = sorted(
             set(record.passed_obligations) - set(record.failed_obligations)
         )
+        # A change of component cannot erase an unresolved regression or turn
+        # its patch into a safe frontier candidate.
+        for finding in self.blocking_findings():
+            if finding.disposition == "candidate_regression":
+                failure_id = f"candidate_regression:{finding.finding_id}"
+                if failure_id not in record.failed_obligations:
+                    record.failed_obligations.append(failure_id)
+                if finding.finding_id not in candidate_regressions:
+                    candidate_regressions.append(finding.finding_id)
         current_blocking = {
             finding.finding_id for finding in self.blocking_findings()
         }

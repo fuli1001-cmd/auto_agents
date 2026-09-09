@@ -2836,6 +2836,13 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     )()
 
                 def _call_with_failover(self, request):
+                    if request.stage == "self_repair_failure_diagnosis":
+                        evidence = json.loads(request.prompt.rsplit("\n", 1)[-1])
+                        return AgentResult(True, [], request.output_path, summary=json.dumps({
+                            "kind": "repair_code", "cause": "required fixed.py is absent",
+                            "evidence_ids": evidence["action"]["evidence_ids"],
+                            "completion": "test -f fixed.py",
+                        }))
                     if request.stage == "self_repair_design_review":
                         self.design_requests.append(request)
                         contract = json.loads(

@@ -1,5 +1,7 @@
 """Serial, prerequisite-aware verification selection without deleting obligations."""
+import re
 import shlex
+from pathlib import PurePosixPath
 
 
 def pytest_parts(command):
@@ -18,6 +20,17 @@ def pytest_parts(command):
 
 def verification_plan(experiment, active):
     focused = list(active.get('focused_tests', []))
+    # A routed regression retains its concrete reproduction as required proof,
+    # even when the original component plan predates the review finding.
+    for finding in getattr(experiment, 'findings', {}).values():
+        if (finding.disposition != 'candidate_regression'
+                or finding.status not in {'confirmed', 'reopened'}
+                or finding.finding_id not in active.get('finding_ids', [])):
+            continue
+        targets = re.findall(r'tests/[^\s`"\x27,;]+\.py(?:::[\w\[\]./-]+)*', finding.required_test)
+        targets = [target for target in targets if '..' not in PurePosixPath(target.split('::', 1)[0]).parts]
+        if targets:
+            focused.insert(0, shlex.join(['python', '-m', 'pytest', '-q', *dict.fromkeys(targets)]))
     future_targets = set()
     for group in experiment.finding_groups:
         if group.get('status') != 'completed' and group.get('group_id') != active.get('group_id'):

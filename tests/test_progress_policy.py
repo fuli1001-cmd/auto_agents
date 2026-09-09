@@ -219,3 +219,33 @@ def test_loop_detection_checks_workspace_before_stopping_fast_edit_cycle(tmp_pat
         supervisor.observe_events([result])
         assert supervisor.poll() is None
         assert supervisor.workspace_fingerprint == "after"
+
+
+@pytest.mark.parametrize('different_edits', [False, True])
+def test_native_file_updates_use_actual_edit_identity_without_renewing_repair_lease(tmp_path, different_edits):
+    import subprocess
+    from auto_agents.adapters.codex import CodexProgressDecoder
+    from auto_agents.models import SmartTimeoutConfig
+    from auto_agents.supervision import ProgressSupervisor
+    root = tmp_path / 'source'
+    root.mkdir()
+    subprocess.run(['git', 'init', '-q', str(root)], check=True)
+    source = root / 'code.py'
+    source.write_text('value = 0\n')
+    request = AgentRequest('self_repair', 'deep', 'repair', root, tmp_path / 'out',
+                           purpose='self_repair', progress_lease_seconds=60)
+    clock = [100.0]
+    with patch('auto_agents.supervision.time.monotonic', side_effect=lambda: clock[0]):
+        supervisor = ProgressSupervisor(config=SmartTimeoutConfig(), request=request,
+            provider='codex', process_pid=99999999, decoder=CodexProgressDecoder())
+        for index in range(3):
+            clock[0] += 1
+            source.write_text(f'value = {index + 1 if different_edits else 1}\n')
+            item = dict(id=f'edit-{index}', type='file_change', changes=[{'path': str(source), 'kind': 'update'}])
+            for kind in ('item.started', 'item.completed'):
+                supervisor.observe_io('stdout', json.dumps({'type': kind, 'item': item}))
+        assert supervisor.last_semantic_progress == 100.0
+        assert supervisor.poll() == (None if different_edits else 'loop_detected')
+        if different_edits:
+            clock[0] = 161.0
+            assert supervisor.poll() == 'semantic_stall'

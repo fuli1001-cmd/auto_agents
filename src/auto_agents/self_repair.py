@@ -2654,6 +2654,10 @@ class AutoAgentsSelfRepairRunner:
             if not finding.finding_id:
                 continue
             causal_id = finding.causal_obligation_id or finding.obligation_id
+            if finding.disposition == "candidate_regression":
+                finding.causal_obligation_id = causal_id
+                experiment.remember_candidate_regression(finding, stored)
+                continue
             if (
                 finding.disposition != "contract_violation"
                 or causal_id not in set(experiment.contract_obligation_ids)
@@ -2682,8 +2686,13 @@ class AutoAgentsSelfRepairRunner:
             if causal_id not in stored.failed_obligations:
                 stored.failed_obligations.append(causal_id)
         for finding_id in result.resolved_finding_ids:
-            stored.finding_states[finding_id] = "resolved"
             finding = experiment.findings.get(finding_id)
+            if finding is not None and finding.disposition == "candidate_regression":
+                if not result.review_completed or finding_id in result.finding_ids:
+                    continue
+                stored.failed_obligations = [item for item in stored.failed_obligations
+                                             if item != f"candidate_regression:{finding_id}"]
+            stored.finding_states[finding_id] = "resolved"
             if finding is not None:
                 finding.status = "resolved"
                 finding.resolved_by = result.candidate_id
@@ -3559,6 +3568,28 @@ class AutoAgentsSelfRepairRunner:
         )
         return result
 
+    def _use_regression_owner_correction(self, experiment, candidate):
+        """Use the one strategy adjustment to route known work, without replanning."""
+        group = experiment.next_finding_group()
+        regressions = [finding for finding in experiment.blocking_findings()
+                       if finding.disposition == "candidate_regression"]
+        if (not group or group.get("group_id") == candidate.finding_group_id
+                or not any(finding.repair_group_id == group.get("group_id")
+                           or finding.finding_id in group.get("finding_ids", []) for finding in regressions)):
+            return False
+        anchor = experiment.accepted_progress_anchor()
+        if any(item.get("progress_anchor") == anchor for item in experiment.automatic_corrections):
+            return False
+        event = {"event": "automatic_correction", "kind": "regression_owner_route",
+                 "candidate_id": candidate.candidate_id, "from_group": candidate.finding_group_id,
+                 "to_group": group["group_id"], "progress_anchor": anchor, "at": _utc_now_iso()}
+        experiment.automatic_corrections.append(event)
+        experiment.design_history.append(dict(event))
+        experiment.consecutive_non_improvements = 0
+        self._experiment_store.save(experiment)
+        self._report_candidate_phase("routing_regression_owner", "repair the blocking regression in " + group["group_id"])
+        return True
+
     def _run_search(self) -> SelfRepairResult:
         autonomy = self._autonomy_config()
         mode = str(
@@ -3588,7 +3619,7 @@ class AutoAgentsSelfRepairRunner:
             store.save(experiment)
         experiment_id = experiment.experiment_id
         seen_fingerprints = {
-            item.patch_fingerprint
+            (item.patch_fingerprint, item.finding_group_id)
             for item in experiment.candidates.values()
             if item.patch_fingerprint and not item.infrastructure_failure
         }
@@ -3767,11 +3798,11 @@ class AutoAgentsSelfRepairRunner:
                               parent=reported_parent,
                               component=active_group.get("group_id", ""),
                               remaining=len(experiment.blocking_findings()))
-            recent_records = [
+            recent_records = sorted((
                 item
                 for candidate_id, item in experiment.candidates.items()
                 if candidate_id != "base"
-            ][-3:]
+            ), key=lambda item: item.created_at)[-3:]
             prior_failures = [
                 (
                     f"candidate={record.candidate_id} status={record.status} "
@@ -3909,6 +3940,8 @@ class AutoAgentsSelfRepairRunner:
                 stalled = self._stalled_search_result(experiment, candidate)
                 if stalled is not None:
                     return stalled
+                if self._use_regression_owner_correction(experiment, candidate):
+                    continue
                 if self._continuous_mode():
                     write_json(Path(self._continuous_workspace) / "fallback.json", {
                         "reason": "three non-improving continuous attempts; deepen diagnosis without discarding evidence",
@@ -4430,7 +4463,7 @@ class AutoAgentsSelfRepairRunner:
         attempt: int,
         deadline: Optional[float],
         prior_failures: list[str],
-        seen_fingerprints: set[str],
+        seen_fingerprints: set[tuple[str, str]],
     ) -> SelfRepairResult:
         reporter = getattr(getattr(self, "target_orchestrator", None), "reporter", None)
         if reporter is not None:
@@ -4603,7 +4636,7 @@ class AutoAgentsSelfRepairRunner:
                 if not changed and self._continuous_mode():
                     changed = subprocess.run(["git", "diff", "--name-only", self._experiment.base_commit, "HEAD"],
                         cwd=repair_root, capture_output=True, text=True, check=True).stdout.splitlines()
-                if not changed:
+                if not changed and not getattr(self, "_candidate_group", {}):
                     return SelfRepairResult(
                         ok=False,
                         status="candidate_noop",
@@ -4726,7 +4759,11 @@ class AutoAgentsSelfRepairRunner:
                         diff_line_count += int(added) + int(removed)
                     except ValueError:
                         diff_line_count += 1
-                if fingerprint in seen_fingerprints:
+                # Reuse the same source for a different component's proof. A
+                # scope change is not code progress; verified achievements are
+                # independently deduplicated by the experiment ledger.
+                verification_key = (fingerprint, str(getattr(self, "_candidate_group", {}).get("group_id", "")))
+                if verification_key in seen_fingerprints:
                     return SelfRepairResult(
                         ok=False,
                         status="candidate_duplicate",
@@ -4739,7 +4776,7 @@ class AutoAgentsSelfRepairRunner:
                         patch_fingerprint=fingerprint,
                         diff_line_count=diff_line_count,
                     )
-                seen_fingerprints.add(fingerprint)
+                seen_fingerprints.add(verification_key)
                 target_after = capture_repository_guard(
                     self.target_project_root,
                     ignore_run_artifacts=True,
@@ -4762,7 +4799,7 @@ class AutoAgentsSelfRepairRunner:
                         fatal_candidate=True,
                         diff_line_count=diff_line_count,
                     )
-                candidate_commit = (head_ref(repair_root) if self._continuous_mode() and not changed_paths(repair_root)
+                candidate_commit = (head_ref(repair_root) if not changed_paths(repair_root)
                                     else commit_all(repair_root, self._commit_message(summary)))
                 frozen_for_validation = bool(getattr(self, "_real_project_root", None) is not None
                                              and getattr(self, "_candidate_is_final_group", True))
@@ -5770,6 +5807,31 @@ class AutoAgentsSelfRepairRunner:
         if changed:
             store.save(experiment)
 
+    def _regression_repair_group(self, finding, active_group, experiment):
+        """Choose a ready correction owner; never defer an introduced regression."""
+        active_id = str(active_group.get("group_id", ""))
+        if not isinstance(experiment, SelfRepairExperiment):
+            return active_id
+        if (finding.get("causal_obligation_id") or finding.get("obligation_id")) not in experiment.contract_obligation_ids:
+            return active_id
+        previous = experiment.findings.get(str(finding.get("finding_id", "")))
+        requested = (finding.get("repair_group_id") or finding.get("defer_until")
+                     or (previous.repair_group_id if previous else ""))
+        if requested == active_id:
+            return active_id
+        owner = self._deferred_finding_group(
+            {**finding, "disposition": "contract_violation", "defer_until": requested},
+            active_group=active_group, experiment=experiment)
+        completed = {group.get("group_id") for group in experiment.finding_groups
+                     if group.get("status") == "completed"}
+        for group in experiment.finding_groups:
+            if group.get("group_id") == owner and set(group.get("depends_on", [])).issubset(completed):
+                return owner
+        # A downstream owner awaiting the active component would create a
+        # dependency cycle. Its minimal regression correction remains part of
+        # the active candidate's explicit repair scope.
+        return active_id
+
     def _candidate_review_identity(self, repair_root: Path) -> str:
         experiment = getattr(self, "_experiment", None)
         if not isinstance(experiment, SelfRepairExperiment):
@@ -5866,6 +5928,10 @@ class AutoAgentsSelfRepairRunner:
                 ),
                 "If a contract finding belongs to a pending dependent component, set defer_until "
                 "to that component's group_id; it must not reject the active component.",
+                "Introduced regressions still block delivery. If a regression belongs to another "
+                "approved component, identify its repair_group_id (legacy defer_until is also accepted). "
+                "The controller will schedule its correction without waiving the regression. "
+                "Distinguish the cumulative diff from this attempt's parent when identifying its origin.",
                 "Focused checks already passed. Whole-repair boundary proof belongs to "
                 "integration, and the full suite runs after semantic review; absence of "
                 "proof belonging to a future component or gate is not a finding.",
@@ -5980,6 +6046,12 @@ class AutoAgentsSelfRepairRunner:
                 for item in finding.get("affected_paths", []) or []
                 if str(item).strip()
             }
+            previous = experiment.findings.get(finding_id) if isinstance(experiment, SelfRepairExperiment) else None
+            if finding_id in prior_ids and causal_id in contract_ids:
+                disposition = previous.disposition if previous else "contract_violation"
+            finding["disposition"] = disposition
+            if disposition == "candidate_regression":
+                finding["repair_group_id"] = self._regression_repair_group(finding, active_group, experiment)
             defer_until = self._deferred_finding_group(
                 finding,
                 active_group=active_group,
@@ -5990,15 +6062,13 @@ class AutoAgentsSelfRepairRunner:
                 ),
             )
             finding["defer_until"] = defer_until
-            if finding_id in prior_ids and causal_id in contract_ids:
-                disposition = "contract_violation"
             accepted = bool(
                 finding_id
                 and (
                     (disposition == "contract_violation" and causal_id in contract_ids)
                     or (
                         disposition == "candidate_regression"
-                        and bool(affected_paths & changed)
+                        and (finding_id in prior_ids or bool(affected_paths & changed))
                     )
                 )
             )
@@ -8382,6 +8452,11 @@ class AutoAgentsSelfRepairRunner:
             "- Do not hard-code the target project path, task id, spec path, or one-off failure strings.",
             "- Implement a general fix for the auto_agents behavior that produced this error.",
             "- Do not implement excluded work, future components, or unrelated hardening.",
+            "- Minimal corrections for candidate regressions assigned to the active component are "
+            "part of its repair scope, including compatibility with retained earlier work. "
+            "A different repair_group_id belongs to that component's turn.",
+            "- If the active criteria already hold, retain the current code and report the evidence; "
+            "do not invent changes to obtain a new patch. The controller verifies each component.",
             "- Add or update focused auto_agents tests that prove the generic behavior.",
             "- Preserve existing public CLI behavior except for the new self-repair recovery path.",
             "",
