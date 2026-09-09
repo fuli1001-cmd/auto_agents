@@ -432,7 +432,7 @@ def validate_binding(session, state):
         # Retained inventories may have been sealed by the old untyped
         # command matcher. A valid fingerprint cannot supply a missing proof.
         from .models import GateConfig
-        _owned_inventory(state, GateConfig.from_dict(_complete_gates(state)))
+        _owned_inventory(state, GateConfig.from_dict(_complete_gates(state)), session)
 
 
 def _validate_task_authority(state):
@@ -560,7 +560,7 @@ def _owned_tasks(state):
              or (task.get('workflow_id') or binding.get('plan_workflow_id')) == state.workflow_id)]
 
 
-def _owned_inventory(state, gates):
+def _owned_inventory(state, gates, session=None):
     """Task refs are mandatory; unlabelled gates remain impact regressions."""
     refs = _mandatory_refs(state)
     for task in _owned_tasks(state):
@@ -573,7 +573,7 @@ def _owned_inventory(state, gates):
             for proof in task.get('requirement_proofs', []):
                 if proof.get('requirement_id') == requirement_id:
                     requirement_refs.update(proof.get('evidence_refs', []))
-            if not any(_reference_kind(ref, gates, commands=[state.fix_verify_command]) != 'artifact'
+            if not any(_session_reference_kind(session, state, gates, ref) != 'artifact'
                        for ref in requirement_refs) and not state.fix_verify_command.strip():
                 missing_requirements.append(requirement_id)
         if missing_requirements:
@@ -583,7 +583,7 @@ def _owned_inventory(state, gates):
     required = []
     owners = {}
     for ref in sorted(refs):
-        kind = _reference_kind(ref, gates, commands=[state.fix_verify_command])
+        kind = _session_reference_kind(session, state, gates, ref)
         matches = [step for step in gates.steps if (
             step.proof_id == ref if kind == 'proof' else _ref_covered(ref, step))]
         command_covered = kind in {'command', 'selector'} and (
@@ -620,7 +620,45 @@ def _owned_inventory(state, gates):
     return required, owners
 
 
-def _reference_kind(ref, gates, *, commands=()):
+def _retained_reference_exists(session, state, ref):
+    """Disambiguate command-only paths using retained source, not argument text."""
+    if session is None:
+        return False
+    root = getattr(session, '_retained_source_root', None)
+    if root is None:
+        from .session_source import resolve_source
+        root = resolve_source(getattr(session, '_custody_control_root', session.project_root), state)
+    revision = _contract_source_revision(session, state)
+    if not revision and state.candidate_custody.get('initial_source'):
+        from .execution_binding import _session_source_revision
+        from .session_source import validate_checkout
+        root = Path(state.candidate_custody['checkout'])
+        validate_checkout(getattr(session, '_custody_control_root', session.project_root), state, root)
+        revision = _session_source_revision(state)
+        if not revision:
+            return False
+    # References are repository-relative, even when the command changes cwd.
+    try:
+        relative = (session.project_root / ref).absolute().relative_to(session.project_root.absolute())
+    except ValueError:
+        return False
+    if '..' in relative.parts:
+        return False
+    if not revision:
+        # Initial admission precedes freezing an unborn repository's source.
+        return not head_ref(root) and ((root / relative).is_file() or (root / relative).is_dir())
+    object_name = f'{revision}:{relative.as_posix()}' if relative.parts else f'{revision}^{{tree}}'
+    result = subprocess.run(['git', 'cat-file', '-t', object_name],
+                            cwd=root, capture_output=True, text=True)
+    return result.returncode == 0 and result.stdout.strip() in {'blob', 'tree'}
+
+
+def _session_reference_kind(session, state, gates, ref):
+    return _reference_kind(ref, gates, commands=[state.fix_verify_command],
+                           source_exists=lambda value: _retained_reference_exists(session, state, value))
+
+
+def _reference_kind(ref, gates, *, commands=(), source_exists=None):
     """An extension is not an artifact declaration: proof IDs can end in .json."""
     from fnmatch import fnmatchcase
 
@@ -641,7 +679,8 @@ def _reference_kind(ref, gates, *, commands=()):
            and step.runner.strip().lower() in {'pytest', 'vitest'}
            and _ref_covered(ref, step) for step in gates.steps):
         return 'selector'
-    if any(_command_covers(command, ref) for command in [*_legacy_commands(gates), *commands]):
+    if (any(_command_covers(command, ref) for command in [*_legacy_commands(gates), *commands])
+            and source_exists is not None and source_exists(ref)):
         return 'selector'
     return 'proof'
 
@@ -654,11 +693,10 @@ def _seal_inventory(session, state):
     binding.setdefault('plan_fingerprint', fingerprint(binding.get('tasks', [])))
     _seal_proof_graph(session, state)
     complete = GateConfig.from_dict(binding['proof_graph']['gates'])
-    required, _ = _owned_inventory(state, complete)
+    required, _ = _owned_inventory(state, complete, session)
     owners = binding['proof_graph']['proof_owners']
     owned_refs = _mandatory_refs(state)
-    binding['required_references'] = {ref: {'kind': _reference_kind(
-        ref, complete, commands=[state.fix_verify_command]),
+    binding['required_references'] = {ref: {'kind': _session_reference_kind(session, state, complete, ref),
         'owners': diagnostic_owners(state, ref)} for ref in sorted(owned_refs)}
     gates = session_gates(session, state)
     required_commands = {command: [owner for ref in sorted(owned_refs) if _command_covers(command, ref)

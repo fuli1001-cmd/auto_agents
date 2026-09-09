@@ -1409,7 +1409,7 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
         (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
         command = 'conda run -p ./.conda python -m pytest -q tests/test_control.py ' + report_option + ' ' + reference
         if runner == 'vitest':
-            command = 'npx --no-install vitest run tests/control.test.ts --outputFile ' + reference
+            command = 'npx --no-install vitest run tests/control.test.ts ' + report_option + ' ' + reference
         if command_source == 'legacy':
             config.gates.commands = [command]
         elif command_source == 'manual':
@@ -1445,16 +1445,40 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
     assert {path: (root / path).read_bytes() for path in ambient} == ambient
 
 
-def test_public_resume_rechecks_retained_unresolved_proof_inventory(tmp_path, monkeypatch):
+@pytest.mark.parametrize('command_source', ['legacy', 'manual', 'fix'])
+@pytest.mark.parametrize('runner', ['pytest', 'vitest'])
+@pytest.mark.parametrize('reference', ['owned.contract', 'owned.report.json'])
+@pytest.mark.parametrize('passing_proof', [False, True])
+def test_public_resume_blocks_positional_owned_proof_id(
+        tmp_path, monkeypatch, command_source, runner, reference, passing_proof):
+    test_public_resume_blocks_unresolved_owned_proof_id(
+        tmp_path, monkeypatch, passing_proof, reference, command_source, runner, '')
+
+
+@pytest.mark.parametrize('command_source,runner,report_option', [
+    ('legacy', 'pytest', '--junitxml'),
+    *((source, runner, '') for source in ('legacy', 'manual', 'fix') for runner in ('pytest', 'vitest')),
+])
+def test_public_resume_rechecks_retained_unresolved_proof_inventory(
+        tmp_path, monkeypatch, command_source, runner, report_option):
     from copy import deepcopy
     import auto_agents.session_verification as verification
+    from auto_agents.models import GateParallelGroup
 
     root, child = project(tmp_path)
     (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
     config = load_project_config(root)
     config.gates.steps = []
-    command = './.conda/bin/python -m pytest -q tests/test_control.py --junitxml owned.contract'
-    config.gates.commands = [command]
+    command = './.conda/bin/python -m pytest -q tests/test_control.py ' + report_option + ' owned.contract'
+    if runner == 'vitest':
+        command = 'npx --no-install vitest run tests/control.test.ts owned.contract'
+    config.gates.commands = []
+    if command_source == 'legacy':
+        config.gates.commands = [command]
+    elif command_source == 'manual':
+        config.gates.parallel_groups = [GateParallelGroup(name='manual', commands=[command])]
+    else:
+        child.fix_verify_command = command
     plan = {'tasks': [{'task_id': 'task-owned', 'title': 'Retained unresolved proof',
                       'requirement_ids': ['REQ-owned'], 'verification_refs': ['owned.contract']}],
             'verification_steps': []}
@@ -1473,7 +1497,10 @@ def test_public_resume_rechecks_retained_unresolved_proof_inventory(tmp_path, mo
     retained = deepcopy(child.verification_binding)
     assert retained['required_references']['owned.contract']['kind'] == 'proof'
     assert retained['required_proof_ids'] == []
-    assert command in retained['required_commands']
+    if command_source == 'fix':
+        assert retained['fix_verify_command'] == command
+    else:
+        assert command in retained['required_commands']
     save_session_state(root, child)
     ambient = _switch_ambient_binding_plan(root)
     def reject_execution(*args, **kwargs):
