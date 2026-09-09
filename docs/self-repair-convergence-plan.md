@@ -43,6 +43,20 @@ latest checkpoint transactionally; exhausted state and historical credits surviv
 proof invalidation. The last completed review has a separate receipt so later
 pre-review failures cannot overwrite it.
 
+Introduced regressions remain blocking across component transitions. A completed
+review can identify another approved component as their repair owner; the serial
+scheduler prioritizes that owner when its prerequisites are complete. If the owner
+depends on the blocked component, the minimal regression correction remains in
+the active scope to avoid a dependency cycle. Routing never approves the rejected
+candidate, expands the frozen contract, or earns progress credit. A known owner
+can consume the one strategy-adjustment window without regenerating the design.
+Its required reproduction is included in focused verification, and the regression
+must be explicitly resolved by a completed review.
+
+An unchanged candidate can undergo a different component's verification; it does
+not need a fabricated code edit. Duplicate attempts in the same component are
+still rejected, and equivalent checks cannot earn credit again after regrouping.
+
 Unknown execution failures receive bounded read-only diagnosis of the latest
 retained candidate, not the original engine base. Diagnosis reuse is bound to the
 source, environment and evidence artifacts. Provider errors are not cached as
@@ -54,6 +68,10 @@ Repeated output, CPU activity or rewriting files cannot renew a self-repair
 provider's semantic progress lease. Registered verification reports are written
 outside candidate storage, and only the selected check identities qualify.
 Ordinary workflow timeout policy remains compatible.
+
+Native file-update events can omit patch contents. Their actual workspace state
+distinguishes different edits for loop detection, while neither those edits nor
+ordinary output renews the trusted semantic-progress lease.
 
 ## Candidate ownership and source delivery
 
