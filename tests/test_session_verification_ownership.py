@@ -2707,6 +2707,8 @@ def test_expired_legacy_baseline_cannot_adopt_migrated_ambient_lineage(tmp_path,
 @pytest.mark.parametrize('initial_layout', ['plain', 'file', 'symlink'])
 def test_unborn_session_freezes_initial_source_without_shared_publication(
         tmp_path, monkeypatch, baseline_ref, initial_layout):
+    from copy import deepcopy
+    import auto_agents.session_verification as verification
     import os
     import shutil
     import stat
@@ -2778,9 +2780,39 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(
                            summary=content, stdout=content, returncode=0)
     orch = Orchestrator(root)
     monkeypatch.setattr(orch, '_call_with_failover', provider)
-    result = Session(orch, mode='fix', auto_approve=True).resume(state.session_id)
+    with monkeypatch.context() as old:
+        old.setattr(verification, '_PROOF_INVENTORY_VERSION', 2)
+        result = Session(orch, mode='fix', auto_approve=True).resume(state.session_id)
     assert result.status == 'completed', result.to_dict()
     assert len(calls) == 1
+    authority = deepcopy(result.verification_binding)
+    retained = deepcopy(result.candidate_custody)
+    assert authority['contract_revision'] == ''
+    assert authority['proof_inventory_version'] == 2
+    contexts = []
+    executor = Orchestrator._gate_executor_context
+    def observe(self, *args, **kwargs):
+        contexts.append(kwargs.get('contract_fingerprint'))
+        return executor(self, *args, **kwargs)
+    monkeypatch.setattr(Orchestrator, '_gate_executor_context', observe)
+    for _ in range(2):
+        before_log = len(result.execution_log)
+        result = Session(orch, mode='fix', auto_approve=True).resume(state.session_id)
+        assert result.status == 'completed', result.to_dict()
+        assert len(calls) == 1, 'inventory recovery must reuse the frozen candidate'
+        binding = result.verification_binding
+        assert binding['proof_inventory_version'] == 3
+        for key in ('repository', 'authorization', 'tasks', 'task_scope', 'contract_revision',
+                    'original_handoff_id', 'baseline_identity', 'execution_environment'):
+            assert binding[key] == authority[key]
+        assert {key: value for key, value in result.candidate_custody.items()
+                if key != 'binding_migration'} == retained
+        assert result.candidate_custody['binding_migration']['receipt'] == retained['receipt']
+        assert any(entry['action'] == 'inventory_migration_verify' and entry['result'] == 'pass'
+                   for entry in result.execution_log[before_log:])
+        expected = verification.fingerprint([binding['binding_fingerprint'], retained['receipt']['fingerprint']])
+        assert contexts and all(identity == expected for identity in contexts)
+        assert binding['proof_sources']['tests/test_initial.py'] == (root / 'tests/test_initial.py').read_text()
     custody = result.candidate_custody
     private = Path(custody['checkout'])
     assert custody['initial_source'] is True

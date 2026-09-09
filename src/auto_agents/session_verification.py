@@ -75,6 +75,7 @@ def bind_session(session, state) -> None:
     from .session_source import resolve_source
     had_source = hasattr(session, "_retained_source_root")
     previous_source = getattr(session, '_retained_source_root', session.project_root)
+    previous_revision = getattr(session, '_retained_source_revision', None)
     control_root = getattr(session, '_custody_control_root', session.project_root)
     session._retained_source_root = resolve_source(control_root, state)
     original = state.verification_binding
@@ -92,6 +93,10 @@ def bind_session(session, state) -> None:
             session._retained_source_root = previous_source
         else:
             del session._retained_source_root
+        if previous_revision is not None:
+            session._retained_source_revision = previous_revision
+        elif hasattr(session, '_retained_source_revision'):
+            del session._retained_source_revision
 
 
 def _bind_session(session, state) -> None:
@@ -108,11 +113,24 @@ def _bind_session(session, state) -> None:
             from .session_candidate import validate_receipt
             validate_receipt(state)
         if state.verification_binding.get('schema_version', 1) < 12 or upgrade_inventory:
+            if state.candidate_custody.get('initial_source') and not original['contract_revision']:
+                # An unborn session froze its initial inputs in private custody.
+                # Resolve that authenticated source without changing the empty
+                # original contract revision or consulting today's shared index.
+                from .execution_binding import _session_source_revision
+                from .session_source import validate_checkout
+                source = Path(state.candidate_custody['checkout'])
+                validate_checkout(getattr(session, '_custody_control_root', session.project_root), state, source)
+                revision = _session_source_revision(state)
+                if not revision:
+                    raise ownership_error(state, 'retained initial contract source is unavailable')
+                session._retained_source_root = source
+                session._retained_source_revision = revision
             _recover_retained_plan(session, state)
             if state.candidate_custody:
                 for path, expected in ((task_plan_path(session.project_root), state.verification_binding['plan']),
                                        (config_path(session.project_root), None)):
-                    source = _historical_source(session, original['contract_revision'],
+                    source = _historical_source(session, _contract_source_revision(session, state),
                                                 path.relative_to(session.project_root).as_posix())
                     retained = json.loads(source) if source is not None else None
                     if (retained != expected if expected is not None else
@@ -226,12 +244,16 @@ def _seal_authority(session, state):
                                                  if key != 'binding_fingerprint'})
 
 
+def _contract_source_revision(session, state):
+    return getattr(session, '_retained_source_revision', state.verification_binding.get('contract_revision'))
+
+
 def _recover_retained_plan(session, state):
     """Upgrade an old receipt from its historical revision, never ambient state."""
     binding = state.verification_binding
     if 'plan' in binding:
         return
-    revision = binding.get('contract_revision')
+    revision = _contract_source_revision(session, state)
     if not revision:
         raise ownership_error(state, 'retained plan history is unavailable for binding upgrade')
     path = task_plan_path(session.project_root).relative_to(session.project_root).as_posix()
@@ -349,7 +371,7 @@ def _future_foreign_step(session, state, step, excluded):
         return False
     if _step_affected(session, state, step):
         return False
-    revision = state.verification_binding.get('contract_revision')
+    revision = _contract_source_revision(session, state)
     if not revision:
         return False
     for target in targets:
@@ -674,7 +696,7 @@ def _seal_inventory(session, state):
     # Command-only structured proofs, manual checks and explicit fix checks
     # execute the same pytest discovery rules as ordinary steps.
     config_controls = set()
-    revision = binding.get('contract_revision') or 'HEAD'
+    revision = _contract_source_revision(session, state) or 'HEAD'
     for command in [*(step.command or command_from_verification_step(step, session.project_root)
                       for step in gates.steps), *_legacy_commands(gates), state.fix_verify_command]:
         targets.update(_command_source_targets(command, session=session, revision=revision,
