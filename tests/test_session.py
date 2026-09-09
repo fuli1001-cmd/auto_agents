@@ -459,16 +459,23 @@ class SessionFixFlowTests(unittest.TestCase):
             state = SessionState(
                 session_id="inconclusive-fix",
                 mode="fix",
-                status="executing",
+                status="failed",
             )
+
+            save_session_state(project_root, state)
+            def provider(request):
+                content = "Applied the targeted fix."
+                write_text(request.output_path, content)
+                return AgentResult(ok=True, command=["mock"], output_path=request.output_path,
+                                   summary=content, stdout=content, returncode=0)
 
             with (
                 patch.object(orchestrator, "_apply_generated_verification_config"),
                 patch.object(session, "_ensure_baseline"),
                 patch.object(
-                    session,
-                    "_call_agent",
-                    return_value="Applied the targeted fix.",
+                    orchestrator,
+                    "_call_with_failover",
+                    side_effect=provider,
                 ) as call_agent,
                 patch.object(
                     orchestrator,
@@ -487,7 +494,7 @@ class SessionFixFlowTests(unittest.TestCase):
                 ),
                 patch.object(session, "_compute_diff_hash") as diff_hash,
             ):
-                result = session._phase_fix_execute(state)
+                result = session.resume(state.session_id)
 
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.resolution, "verification_inconclusive")
@@ -5263,7 +5270,7 @@ class BaselineDiffVerifyTests(unittest.TestCase):
             self.assertIn("conda run -p ./.conda python -m pytest -q tests", prompt)
 
     def test_baseline_snapshot_on_resume_stale(self) -> None:
-        """If git HEAD changes between sessions, baseline should be re-captured."""
+        """An unborn legacy session can refresh a stale baseline reference."""
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             _configure_git_identity(project_root)
@@ -5299,6 +5306,7 @@ class BaselineDiffVerifyTests(unittest.TestCase):
             result = session.resume(state.session_id)
 
             self.assertEqual(result.status, "completed")
+            self.assertEqual(call_count["n"], 1)
             # baseline_git_ref should have been updated (no longer "stale_ref_000")
             self.assertNotEqual(result.baseline_git_ref, "stale_ref_000")
 

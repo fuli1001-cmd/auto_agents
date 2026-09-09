@@ -2150,3 +2150,65 @@ def test_expired_legacy_baseline_cannot_adopt_migrated_ambient_lineage(tmp_path,
         assert not result.lineage_head_ref
         assert head_ref(root) == before
         assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+@pytest.mark.parametrize('baseline_ref', ['', 'refs/auto-agents/gate-snapshots/expired'])
+def test_unborn_session_freezes_initial_source_without_shared_publication(tmp_path, monkeypatch, baseline_ref):
+    root = _make_project(str(tmp_path))
+    (root / '.conda').symlink_to(sys.prefix, target_is_directory=True)
+    (root / 'value.py').write_text('VALUE = 0\n')
+    (root / 'foreign.txt').write_bytes(b'initial staged\x00bytes')
+    git(root, 'add', 'value.py', 'foreign.txt')
+    (root / 'foreign.txt').write_bytes(b'initial worktree\x00bytes')
+    (root / 'tests').mkdir()
+    (root / 'tests/test_initial.py').write_text(
+        'from pathlib import Path\n'
+        'def test_repair():\n'
+        '    assert Path("value.py").read_text() == "VALUE = 1\\n"\n'
+        '    assert Path("foreign.txt").read_bytes() == b"initial worktree\\x00bytes"\n'
+        '    assert not Path("late-foreign.txt").exists()\n')
+    config = load_project_config(root)
+    config.gates.steps = [VerificationStep(runner='pytest', targets=['tests/test_initial.py::test_repair'],
+        proof_id='initial.repair', levels=['affected', 'release'], impact_paths=['value.py'])]
+    config.gates.verification_policy_version = 4
+    config.gates.release_worker.enabled = False
+    config.gates.release_worker.auto_start = False
+    save_project_config(root, config)
+    state = SessionState(session_id='initial-child', mode='fix', status='failed',
+                         goal='Repair the existing value', auto_approve=True, baseline_git_ref=baseline_ref)
+    save_session_state(root, state)
+    initial_index = (root / '.git/index').read_bytes()
+    initial_head = (root / '.git/HEAD').read_bytes()
+    original_config = (root / '.auto-agents/config.json').read_bytes()
+    calls = []
+    def provider(request):
+        calls.append(request.cwd)
+        assert request.cwd != root
+        assert (request.cwd / 'value.py').read_text() == 'VALUE = 0\n'
+        assert (request.cwd / '.git').is_dir()
+        assert not (request.cwd / '.git/objects/info/alternates').exists()
+        (request.cwd / 'value.py').write_text('VALUE = 1\n')
+        (root / 'late-foreign.txt').write_bytes(b'concurrent\x00bytes')
+        content = 'Repaired value.\nCOMMIT_MESSAGE: Repair initial value'
+        request.output_path.write_text(content)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=content, stdout=content, returncode=0)
+    orch = Orchestrator(root)
+    monkeypatch.setattr(orch, '_call_with_failover', provider)
+    result = Session(orch, mode='fix', auto_approve=True).resume(state.session_id)
+    assert result.status == 'completed', result.to_dict()
+    assert len(calls) == 1
+    custody = result.candidate_custody
+    private = Path(custody['checkout'])
+    assert custody['initial_source'] is True
+    assert list(custody['receipt']['manifest']) == ['value.py']
+    assert git(private, 'show', custody['base_revision'] + ':value.py') == 'VALUE = 0\n'
+    assert git(private, 'show', custody['delivered_revision'] + ':value.py') == 'VALUE = 1\n'
+    assert result.baseline_git_ref != baseline_ref
+    assert not head_ref(root)
+    assert (root / '.git/HEAD').read_bytes() == initial_head
+    assert (root / '.git/index').read_bytes() == initial_index
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+    assert (root / 'foreign.txt').read_bytes() == b'initial worktree\x00bytes'
+    assert (root / 'late-foreign.txt').read_bytes() == b'concurrent\x00bytes'
+    assert (root / '.auto-agents/config.json').read_bytes() == original_config

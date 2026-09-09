@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 import os
+import shutil
 import stat
 import subprocess
 from uuid import uuid4
@@ -16,7 +17,7 @@ def _git(root, *args):
     result = subprocess.run(['git', *args], cwd=root, capture_output=True, text=True)
     if result.returncode:
         raise RuntimeError(result.stderr.strip())
-    return result.stdout.strip()
+    return result.stdout.rstrip('\n')
 
 
 def _image(path):
@@ -49,12 +50,36 @@ def _inventory(root):
 def _clone(source, revision, destination):
     # A clone owns its object database, refs, config and index. Git worktrees
     # would still mutate the shared repository's metadata during verification.
+    initial_paths = []
+    if not revision:
+        from .git_ops import head_ref
+        if head_ref(source):
+            raise RuntimeError('initial candidate source requires an unborn repository')
+        # Enumerate before creating storage inside the source tree. An unborn
+        # standalone session has live initial inputs but no commit to fetch.
+        initial_paths = [path for path in _git(source, 'ls-files', '--cached', '--others',
+                                              '--exclude-standard', '-z').split('\0') if path]
     _git(source, 'clone', '--no-local', '--no-checkout', str(source), str(destination))
-    _git(destination, 'fetch', '--no-tags', str(source), revision)
-    _git(destination, 'checkout', '--detach', 'FETCH_HEAD')
     _git(destination, 'config', 'user.name', 'auto_agents')
     _git(destination, 'config', 'user.email', 'auto-agents@localhost')
+    if revision:
+        _git(destination, 'fetch', '--no-tags', str(source), revision)
+        _git(destination, 'checkout', '--detach', 'FETCH_HEAD')
+    else:
+        for relative in initial_paths:
+            path = source / relative
+            if path.is_file() or path.is_symlink():
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target, follow_symlinks=False)
+        # Only private metadata is written. Initial inputs become the retained
+        # baseline, never part of the subsequent writer's candidate delta.
+        snapshot = GateSnapshotManager(destination, 'initial-' + uuid4().hex).create()
+        _git(destination, 'read-tree', snapshot.commit_sha)
+        _git(destination, 'checkout', '--detach', snapshot.commit_sha)
+        revision = snapshot.commit_sha
     install_dependency_links(destination, discover_dependency_links(source))
+    return revision
 
 
 @contextmanager
@@ -76,11 +101,12 @@ def execution_checkout(session, state):
         revision = state.verification_binding['contract_revision']
         destination = root / '.auto-agents' / 'candidate-custody' / uuid4().hex / 'project'
         destination.parent.mkdir(parents=True)
-        _clone(root, revision, destination)
+        revision = _clone(root, revision, destination)
         state.candidate_custody = {'schema_version': 1, 'checkout': str(destination),
             'repository': state.verification_binding['repository'], 'session_id': state.session_id,
             'binding_fingerprint': state.verification_binding['binding_fingerprint'],
-            'base_revision': revision, 'preimages': _inventory(destination)}
+            'base_revision': revision, 'initial_source': not state.verification_binding['contract_revision'],
+            'preimages': _inventory(destination)}
         session._save(state)
     custody = state.candidate_custody
     destination = Path(custody['checkout'])
@@ -92,7 +118,9 @@ def execution_checkout(session, state):
     context = (SessionExecutionBinding.for_checkout(session, state, destination)
                if state.verification_binding else None)
     previous = session.orch
-    execution = Orchestrator(destination)
+    execution = Orchestrator(destination, agent_output_stream=previous.agent_output_stream,
+                             user_input_fn=previous._user_input_fn)
+    execution.adapter = previous.adapter
     # Instance-installed provider transports are also used by embedders.
     if '_call_with_failover' in previous.__dict__:
         execution._call_with_failover = previous.__dict__['_call_with_failover']

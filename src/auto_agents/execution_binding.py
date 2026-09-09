@@ -34,7 +34,19 @@ class SessionExecutionBinding:
         validate_binding(session, state)
         binding = state.verification_binding
         return cls(binding['repository'], str(execution_root.resolve()), state.session_id,
-                   binding['binding_fingerprint'], binding['contract_revision'])
+                   binding['binding_fingerprint'], _session_source_revision(state))
+
+
+def _session_source_revision(state) -> str:
+    binding = state.verification_binding
+    revision = binding.get('contract_revision', '')
+    if not revision:
+        custody = state.candidate_custody
+        if (custody.get('initial_source') and custody.get('session_id') == state.session_id
+                and custody.get('repository') == binding.get('repository')
+                and custody.get('binding_fingerprint') == binding.get('binding_fingerprint')):
+            revision = custody.get('base_revision', '')
+    return revision
 
 
 def session_execution_error(session, state) -> str:
@@ -51,7 +63,8 @@ def session_execution_error(session, state) -> str:
             or context.execution_root != root
             or context.session_id != state.session_id
             or context.binding_fingerprint != binding.get('binding_fingerprint')
-            or context.source_revision != binding.get('contract_revision')):
+            or not context.source_revision
+            or context.source_revision != _session_source_revision(state)):
         return 'private execution context conflicts with session verification binding'
     import subprocess
 

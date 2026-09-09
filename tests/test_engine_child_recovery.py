@@ -47,9 +47,11 @@ def parent_workflow(root, child, *, engine=False):
     return store, snapshot, handoff
 
 
-def resume_to_observation(root, monkeypatch, action):
+def resume_to_observation(root, monkeypatch, action, *, observe=None):
     def agent(self, request):
         if request.purpose.startswith('collab'):
+            if observe is not None:
+                observe(request)
             raise ObservationBoundary()
         state = load_session_state(root, 'owned-child')
         reply = action(state, request.prompt, request.cwd)
@@ -282,13 +284,29 @@ def test_resumed_child_delivers_snapshot_matching_retained_provider_semantics(tm
     receipt.write_text(json.dumps({'route_digest': digest(handoff.payload)}))
     monkeypatch.setenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE', str(receipt))
     reference = (root / 'provider.md').read_bytes()
+    original = (root / 'capabilities.json').read_bytes()
+    shared_head = head_ref(root)
+    shared_index = git(root, 'ls-files', '--stage', '-z')
+    observed = []
     def action(state, prompt, candidate_root):
         assert 'preserve provenance' in state.goal
         (candidate_root / 'capabilities.json').write_text(json.dumps({'request_frame_rate': False, 'source_sha256': provenance}))
         return 'Matched capability snapshot to retained official semantics.\nCOMMIT_MESSAGE: Align provider capability snapshot'
-    resume_to_observation(root, monkeypatch, action)
+    def observe(request):
+        observed.append(request.cwd)
+        assert request.cwd != root
+        assert json.loads((request.cwd / 'capabilities.json').read_text()) == {
+            'request_frame_rate': False, 'source_sha256': provenance}
+        assert (request.cwd / 'provider.md').read_bytes() == reference
+        result = store.load_handoff(handoff.handoff_id).result
+        assert head_ref(request.cwd) == result['candidate_delivery']['delivered_revision']
+        assert list(result['candidate_delivery']['receipt']['manifest']) == ['capabilities.json']
+    resume_to_observation(root, monkeypatch, action, observe=observe)
     assert load_session_state(root, child.session_id).status == 'completed'
-    assert json.loads((root / 'capabilities.json').read_text()) == {'request_frame_rate': False, 'source_sha256': provenance}
+    assert len(observed) == 1
+    assert (root / 'capabilities.json').read_bytes() == original
+    assert head_ref(root) == shared_head
+    assert git(root, 'ls-files', '--stage', '-z') == shared_index
     assert (root / 'provider.md').read_bytes() == reference
     assert store.load_handoff(handoff.handoff_id).result['changed_paths'] == ['capabilities.json']
 
