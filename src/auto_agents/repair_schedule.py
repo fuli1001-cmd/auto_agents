@@ -1,7 +1,7 @@
 """Serial, prerequisite-aware verification selection without deleting obligations."""
-import re
 import shlex
-from pathlib import PurePosixPath
+
+from .repair_test_refs import pytest_targets
 
 
 def pytest_parts(command):
@@ -27,8 +27,7 @@ def verification_plan(experiment, active):
                 or finding.status not in {'confirmed', 'reopened'}
                 or finding.finding_id not in active.get('finding_ids', [])):
             continue
-        targets = re.findall(r'tests/[^\s`"\x27,;]+\.py(?:::[\w\[\]./-]+)*', finding.required_test)
-        targets = [target for target in targets if '..' not in PurePosixPath(target.split('::', 1)[0]).parts]
+        targets = pytest_targets(finding.required_test)
         if targets:
             focused.insert(0, shlex.join(['python', '-m', 'pytest', '-q', *dict.fromkeys(targets)]))
     future_targets = set()

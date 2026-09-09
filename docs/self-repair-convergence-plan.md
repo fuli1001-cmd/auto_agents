@@ -53,6 +53,11 @@ can consume the one strategy-adjustment window without regenerating the design.
 Its required reproduction is included in focused verification, and the regression
 must be explicitly resolved by a completed review.
 
+Executable references extracted from review prose exclude sentence punctuation.
+Quoted IDs and parameter contents remain literal, including spaces and periods;
+incomplete parameter selections cannot broaden into whole-function checks.
+Scheduling and progress identities share the same extraction rules.
+
 An unchanged candidate can undergo a different component's verification; it does
 not need a fabricated code edit. Duplicate attempts in the same component are
 still rejected, and equivalent checks cannot earn credit again after regrouping.

@@ -1,8 +1,7 @@
 """Historical achievement is independent of candidate selection and proof reuse."""
-import re
-
 from .repair_control import digest
 from .repair_feedback import normalized_failure
+from .repair_test_refs import pytest_targets
 
 
 def canonical_obligation(experiment, key):
@@ -18,7 +17,7 @@ def canonical_obligation(experiment, key):
 
 def finding_identity(finding, experiment):
     obligation = canonical_obligation(experiment, finding.causal_obligation_id or finding.obligation_id)
-    checks = re.findall(r'tests/[^\s`\"\x27,;]+\.py(?:::[\w\[\]./-]+)*', finding.required_test)
+    checks = pytest_targets(finding.required_test)
     return digest([obligation, sorted(checks) if checks else
                    normalized_failure(finding.counterexample or finding.required_test or finding.reason)])
 
@@ -37,7 +36,7 @@ def achievements(experiment, record):
         for key in record.resolved_finding_ids:
             finding = experiment.findings.get(key)
             if finding and finding.disposition == 'contract_violation':
-                checks = re.findall(r'tests/[^\s`"\x27,;]+\.py(?:::[\w\[\]./-]+)*', finding.required_test)
+                checks = pytest_targets(finding.required_test)
                 if checks and set(checks).issubset(record.verified_check_ids):
                     result.add('finding:' + finding_identity(finding, experiment))
     for group in experiment.finding_groups:
@@ -46,7 +45,7 @@ def achievements(experiment, record):
             obligations = sorted({canonical_obligation(experiment, key) for key in group.get('contract_obligation_ids', [])})
             for command in group.get('focused_tests', []):
                 # Split the stable, explicit check identities, not group labels.
-                checks = re.findall(r'tests/[^\s`\"\x27,;]+\.py(?:::[\w\[\]./-]+)*', command)
+                checks = pytest_targets(command, prose=False)
                 for check in checks or [normalized_failure(command)]:
                     result.add('check:' + digest([obligations, check]))
     return result
