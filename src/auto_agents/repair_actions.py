@@ -38,7 +38,8 @@ def prepare_action(runner, experiment):
                      key=lambda item: item.created_at)
     record = records[-1] if records else None
     evidence = record.failure_evidence if record else []
-    action = next_action(evidence)
+    from .repair_test_refs import review_action
+    action = review_action(experiment, next_action(evidence))
     if action['kind'] not in {'diagnose_failure', 'diagnose_execution'}:
         return action
     try:
