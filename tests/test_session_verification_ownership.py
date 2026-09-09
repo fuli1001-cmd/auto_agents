@@ -1729,7 +1729,8 @@ def test_public_legacy_resume_without_history_rejects_ambient_plan(tmp_path, mon
     assert (root / 'value.py').read_text() == 'VALUE = 0\n'
 
 
-@pytest.mark.parametrize('conflict', ['issue_handoff', 'foreign_task', 'foreign_requirement'])
+@pytest.mark.parametrize('conflict', ['issue_handoff', 'issue_handoff_requirements',
+                                     'nested_issue', 'foreign_task', 'foreign_requirement'])
 def test_public_child_binding_rejects_conflicting_task_authority(tmp_path, monkeypatch, conflict):
     from auto_agents.config import load_task_plan
     from test_engine_child_recovery import parent_workflow
@@ -1743,7 +1744,14 @@ def test_public_child_binding_rejects_conflicting_task_authority(tmp_path, monke
     store, snapshot, handoff = parent_workflow(root, child)
     handoff.payload['task_id'] = 'task-owned' if conflict == 'issue_handoff' else 'task-foreign'
     issue_scope = {'task_id': 'task-foreign'}
-    if conflict == 'foreign_requirement':
+    if conflict == 'issue_handoff_requirements':
+        handoff.payload.pop('task_id')
+        handoff.payload['requirement_ids'] = ['REQ-owned']
+        issue_scope = {'requirement_ids': ['REQ-foreign']}
+    elif conflict == 'nested_issue':
+        handoff.payload['task_id'] = 'task-owned'
+        issue_scope = {'task_id': 'task-owned', 'issue_seed': {'task_id': 'task-foreign'}}
+    elif conflict == 'foreign_requirement':
         handoff.payload.pop('task_id')
         handoff.payload['requirement_ids'] = ['REQ-foreign']
         issue_scope = {'requirement_ids': ['REQ-foreign']}
@@ -1755,6 +1763,15 @@ def test_public_child_binding_rejects_conflicting_task_authority(tmp_path, monke
     saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
     assert saved.verification_binding == {}
     assert 'conflict' in saved.execution_log[-1]['result']
+    diagnostic = saved.execution_log[-1]['diagnostic']
+    assert diagnostic['handoff_id'] == handoff.handoff_id
+    if conflict in {'foreign_task', 'foreign_requirement'}:
+        assert diagnostic['conflicting_task_id'] == 'task-foreign'
+        assert diagnostic['task_workflow_id'] == 'foreign-workflow'
+    elif conflict in {'issue_handoff', 'issue_handoff_requirements'}:
+        prefix = 'REQ-' if conflict == 'issue_handoff_requirements' else 'task-'
+        assert diagnostic['retained_scope'] == [prefix + 'foreign']
+        assert diagnostic['conflicting_scope'] == [prefix + 'owned']
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
