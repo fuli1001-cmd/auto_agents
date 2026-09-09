@@ -19,7 +19,7 @@ from .git_ops import head_ref
 from .io_utils import read_json
 
 
-_PROOF_INVENTORY_VERSION = 2
+_PROOF_INVENTORY_VERSION = 3
 
 _PYTEST_CONFIG_NAMES = ('pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
                         'pyproject.toml', 'tox.ini', 'setup.cfg')
@@ -542,11 +542,21 @@ def _owned_inventory(state, gates):
     """Task refs are mandatory; unlabelled gates remain impact regressions."""
     refs = _mandatory_refs(state)
     for task in _owned_tasks(state):
-        executable_refs = [ref for ref in _task_refs(task)
-                           if _reference_kind(ref, gates, commands=[state.fix_verify_command]) != 'artifact']
-        if task.get('requirement_ids') and not executable_refs and not state.fix_verify_command.strip():
+        missing_requirements = []
+        for requirement_id in task.get('requirement_ids', []):
+            # Task-level references are shared evidence in legacy contracts.
+            # Requirement-specific evidence belongs only to its named owner;
+            # another requirement's proof cannot fill an empty inventory.
+            requirement_refs = set(task.get('verification_refs', []))
+            for proof in task.get('requirement_proofs', []):
+                if proof.get('requirement_id') == requirement_id:
+                    requirement_refs.update(proof.get('evidence_refs', []))
+            if not any(_reference_kind(ref, gates, commands=[state.fix_verify_command]) != 'artifact'
+                       for ref in requirement_refs) and not state.fix_verify_command.strip():
+                missing_requirements.append(requirement_id)
+        if missing_requirements:
             raise ownership_error(state, 'owned requirement has no executable verification evidence',
-                                  task_id=task['task_id'], requirement_ids=task['requirement_ids'],
+                                  task_id=task['task_id'], requirement_ids=missing_requirements,
                                   owners=[_task_owner(task)])
     required = []
     owners = {}

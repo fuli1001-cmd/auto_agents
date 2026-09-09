@@ -359,13 +359,14 @@ def test_overlapping_or_unknown_ownership_blocks_destructive_rollback(tmp_path, 
         test_child_resume_without_contract_history_blocks_before_agent_work(tmp_path, monkeypatch)
 
 
-@pytest.mark.parametrize('waiver', ['reference_deletion', 'cached_success', 'empty_owned', 'artifact_only'])
+@pytest.mark.parametrize('waiver', ['reference_deletion', 'cached_success', 'empty_owned', 'artifact_only',
+                                  'sibling_evidence', 'retained_sibling_evidence'])
 def test_missing_owned_proof_cannot_be_waived_by_reference_deletion_or_cached_success(tmp_path, monkeypatch, waiver):
     from auto_agents.models import CommandResult, GateResult
     import auto_agents.session as session_module
 
     root, child = project(tmp_path, missing=True)
-    if waiver in {'empty_owned', 'artifact_only'}:
+    if waiver in {'empty_owned', 'artifact_only', 'sibling_evidence', 'retained_sibling_evidence'}:
         from auto_agents.config import requirements_trace_path
         from auto_agents.requirements import requirement_contract_sha256
         config = load_project_config(root)
@@ -379,17 +380,47 @@ def test_missing_owned_proof_cannot_be_waived_by_reference_deletion_or_cached_su
             'requirement_ids': ['REQ-owned'], 'verification_refs': refs,
             'requirement_proofs': [{'requirement_id': 'REQ-owned',
                 'requirement_contract_sha256': requirement_contract_sha256(row), 'evidence_refs': []}]}]}
+        if waiver.endswith('sibling_evidence'):
+            # One task's evidence union must not discharge its empty sibling.
+            sibling = {'id': 'REQ-empty', 'text': 'A separate owned obligation', 'source': 'spec'}
+            requirements_trace_path(root).write_text(json.dumps({'requirements': [row, sibling]}))
+            (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
+            config.gates.steps = [VerificationStep(proof_id='one.proof', runner='pytest',
+                targets=['tests/test_control.py'], levels=['affected', 'release'])]
+            task = plan['tasks'][0]
+            task['requirement_ids'].append('REQ-empty')
+            task['requirement_proofs'][0]['evidence_refs'] = ['one.proof']
+            task['requirement_proofs'].append({'requirement_id': 'REQ-empty',
+                'requirement_contract_sha256': requirement_contract_sha256(sibling), 'evidence_refs': []})
+            plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
         _retain_contract(root, child, config, plan)
         issue = root / '.auto-agents/state/sessions' / child.session_id / 'issue.json'
         issue.write_text(json.dumps({'task_id': 'task-owned'}))
+        retained = {}
+        if waiver == 'retained_sibling_evidence':
+            from copy import deepcopy
+            import auto_agents.session_verification as verification
+            # Reconstruct the old task-wide admission without changing the
+            # retained requirement records or their valid contract hashes.
+            with monkeypatch.context() as old:
+                old.setattr(verification, '_owned_inventory', lambda *_: (['one.proof'], {}))
+                old.setattr(verification, '_PROOF_INVENTORY_VERSION', 2)
+                _binding_fixture(root, child)
+            retained = deepcopy(child.verification_binding)
+            save_session_state(root, child)
         ambient = _switch_ambient_binding_plan(root)
+        def reject_gate(*args, **kwargs):
+            pytest.fail('Empty requirement evidence must block before collection or cached execution')
+        monkeypatch.setattr(session_module, 'run_gate_plan', reject_gate)
         saved = _assert_binding_blocked_before_execution(root, monkeypatch)
         diagnostic = saved.execution_log[-1]['diagnostic']
         assert diagnostic['task_id'] == 'task-owned'
-        assert diagnostic['requirement_ids'] == ['REQ-owned']
+        assert diagnostic['requirement_ids'] == (['REQ-empty'] if waiver.endswith('sibling_evidence')
+                                                 else ['REQ-owned'])
         assert diagnostic['owners'][0]['task_id'] == 'task-owned'
         assert diagnostic['task_scope'] == {'task_ids': ['task-owned'], 'requirement_ids': []}
         assert diagnostic['contract_fingerprint'] and diagnostic['retry_fix'] is False
+        assert saved.verification_binding == retained, 'rejection must preserve the prior binding'
         assert {name: (root / name).read_bytes() for name in ambient} == ambient
         return
     if waiver == 'reference_deletion':
@@ -419,6 +450,40 @@ def test_missing_owned_proof_cannot_be_waived_by_reference_deletion_or_cached_su
     assert failure['failure_kind'] == 'verification_entry_unavailable'
     assert 'tests/test_owned.py::test_missing' in failure['diagnostic']['command']
     assert cache_hits == [], 'cached execution must not bypass missing-entry preflight'
+
+
+@pytest.mark.parametrize('evidence_source', ['requirement', 'task', 'explicit_fix'])
+def test_public_resume_accepts_evidence_for_each_owned_requirement(tmp_path, monkeypatch, evidence_source):
+    from auto_agents.config import requirements_trace_path
+    from auto_agents.requirements import requirement_contract_sha256
+
+    root, child = project(tmp_path)
+    config = load_project_config(root)
+    rows = [{'id': key, 'text': 'Retain ' + key, 'source': 'spec'}
+            for key in ('REQ-one', 'REQ-two')]
+    requirements_trace_path(root).write_text(json.dumps({'requirements': rows}))
+    task = {'task_id': 'task-owned', 'title': 'Two owned requirements',
+            'requirement_ids': [row['id'] for row in rows],
+            'verification_refs': ['owned.contract'] if evidence_source == 'task' else [],
+            'requirement_proofs': [{'requirement_id': row['id'],
+                'requirement_contract_sha256': requirement_contract_sha256(row),
+                'evidence_refs': ['owned.contract'] if evidence_source == 'requirement' else []}
+                for row in rows]}
+    if evidence_source == 'explicit_fix':
+        child.fix_verify_command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned'
+    _retain_contract(root, child, config, {'tasks': [task],
+        'verification_steps': [step.to_dict() for step in config.gates.steps]})
+    ambient = _switch_ambient_binding_plan(root)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed', saved.to_dict()
+    assert calls == ['fix']
+    assert saved.verification_binding['requirement_ids'] == ['REQ-one', 'REQ-two']
+    assert saved.verification_binding['tasks'][0]['requirement_proofs'] == task['requirement_proofs']
+    assert saved.verification_binding['required_proof_ids'] == ['owned.contract']
+    custody = saved.candidate_custody
+    assert git(Path(custody['checkout']), 'show', custody['delivered_revision'] + ':value.py') == 'VALUE = 1\n'
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
 @pytest.mark.parametrize('shape', ['empty_impact', 'final_only', 'overlapping_release', 'deduplicated'])
@@ -3166,7 +3231,7 @@ def _retain_candidate_binding_identity(state):
     receipt['fingerprint'] = fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'})
 
 
-@pytest.mark.parametrize('inventory_version', [None, 1])
+@pytest.mark.parametrize('inventory_version', [None, 1, 2])
 def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_path, monkeypatch, inventory_version):
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
@@ -3203,14 +3268,17 @@ def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_pat
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
-@pytest.mark.parametrize('intermediate_writer', [False, True])
-def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_path, monkeypatch, intermediate_writer):
+@pytest.mark.parametrize('previous_version,intermediate_writer', [
+    pytest.param(1, False, id='False'), pytest.param(1, True, id='True'),
+    pytest.param(2, False, id='v2-False'), pytest.param(2, True, id='v2-True'),
+])
+def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_path, monkeypatch, intermediate_writer, previous_version):
     from copy import deepcopy
     import auto_agents.session_verification as verification
 
     root, child = project(tmp_path)
     with monkeypatch.context() as old:
-        old.setattr(verification, '_PROOF_INVENTORY_VERSION', 1)
+        old.setattr(verification, '_PROOF_INVENTORY_VERSION', previous_version)
         child, calls, _ = run_session(root, old)
         assert child.status == 'completed' and calls == ['fix']
         child.verification_binding.pop('proof_inventory_version')
@@ -3222,8 +3290,8 @@ def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_p
         assert child.status == 'completed' and calls == []
         assert child.candidate_custody['binding_migration']
         if intermediate_writer:
-            # A fresh writer runs under v1 after the original custody upgrade.
-            # v2 must accept this exact receipt through the extended bridge.
+            # A fresh writer runs after the original custody upgrade.
+            # The new inventory must accept its receipt through the bridge.
             child.status = 'failed'
             child.candidate_custody.pop('delivered_revision')
             save_session_state(root, child)
@@ -3236,7 +3304,7 @@ def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_p
     ambient = _switch_ambient_binding_plan(root)
     saved, calls, _ = run_session(root, monkeypatch)
     assert saved.status == 'completed' and calls == []
-    assert saved.verification_binding['proof_inventory_version'] == 2
+    assert saved.verification_binding['proof_inventory_version'] == 3
     assert saved.verification_binding['binding_fingerprint'] != authority['binding_fingerprint']
     for key in ('authorization', 'tasks', 'task_scope', 'contract_revision', 'original_handoff_id'):
         assert saved.verification_binding[key] == authority[key]
