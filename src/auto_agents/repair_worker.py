@@ -235,8 +235,9 @@ def repair(request):
     carry_continuous_work(runner, revision)
     result = runner.run()
     if not result.ok:
-        return {**getattr(runner, "_verification_dependency_failure", {}),
-                "ok": False, "error": result.reason, "result": result.to_dict()}
+        return {"ok": False, "status": getattr(result, "status", "failed"), "next_action": getattr(result, "next_action", {}),
+                **getattr(runner, "_verification_dependency_failure", {}),
+                "error": result.reason, "result": result.to_dict()}
     candidate = result.candidate_commit or result.commit_sha
     if not candidate:
         return {"ok": False, "error": "approved repair has no immutable candidate revision"}

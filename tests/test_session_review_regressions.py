@@ -3,6 +3,7 @@ import json
 import shlex
 import shutil
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -71,6 +72,8 @@ def test_resumed_snapshot_repair_excludes_foreign_pending_gates_already_in_basel
     child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
     child.fix_verify_command = shlex.join([sys.executable, '-m', 'pytest', '-q', 'tests/test_owned.py::test_owned'])
     save_session_state(root, child)
+    (root / '.auto-agents/state/sessions' / child.session_id / 'issue.json').write_text(
+        json.dumps({'task_id': 'task-owned', 'requirement_ids': ['REQ-snapshot']}))
     before = {path: (root / path).read_bytes() for path in ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
     plans = []
     resolve = Session._session_gate_plan
@@ -149,13 +152,16 @@ def test_concurrent_provider_window_changes_are_never_claimed_or_rolled_back(tmp
     saved = load_session_state(root, child.session_id)
     returned = store.load_handoff(handoff.handoff_id)
     assert saved.status == ('failed' if failure else 'completed'), saved.to_dict()
-    assert returned.result.get('rolled_back_paths', []) == (['value.py'] if failure else [])
+    assert returned.result.get('rolled_back_paths', []) == []
     assert not {'foreign.py', 'foreign-unstaged.txt', 'late-foreign.txt'} & set(saved.candidate_paths)
     assert git(root, 'show', ':foreign.py') == 'VALUE = 8\n'
     assert (root / 'foreign.py').read_text() == 'VALUE = 9\n'
     assert (root / 'foreign-unstaged.txt').read_text() == 'concurrent unstaged\n'
     assert (root / 'late-foreign.txt').read_bytes() == b'concurrent\x00untracked'
-    assert (root / 'value.py').read_text() == ('VALUE = 0\n' if failure else 'VALUE = 1\n')
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+    if not failure:
+        assert git(Path(saved.candidate_custody['checkout']), 'show',
+                   saved.candidate_custody['delivered_revision'] + ':value.py') == 'VALUE = 1\n'
 
 
 @pytest.mark.parametrize('launcher', ['python', 'conda'])

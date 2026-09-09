@@ -15,6 +15,7 @@ import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
@@ -138,6 +139,18 @@ SELF_REPAIR_TRIAGE_OWNERS = {
 }
 
 
+_verification_role = ContextVar("repair_verification_role", default="candidate")
+
+
+@contextmanager
+def _verification_phase(role):
+    token = _verification_role.set(role)
+    try:
+        yield
+    finally:
+        _verification_role.reset(token)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -169,6 +182,8 @@ class SelfRepairResult:
     commit_sha: str = ""
     summary: str = ""
     verification: str = ""
+    failure_evidence: list[dict[str, object]] = field(default_factory=list)
+    next_action: dict[str, object] = field(default_factory=dict)
     experiment_id: str = ""
     candidate_id: str = ""
     base_commit: str = ""
@@ -1691,7 +1706,13 @@ def _timed_repair_phase(phase: str):
                 if phase == "review" else phase
             )
             with self._phase_timer(label):
-                return method(self, *args, **kwargs)
+                if phase == "boundary_replay":
+                    self._replay_diagnostic_artifacts = []
+                result = method(self, *args, **kwargs)
+                if phase in {"boundary_replay", "diagnosis_differential", "focused_verification", "integration_verification", "full_suite"} and isinstance(result, _VerificationResult):
+                    from .repair_feedback import record_stage_failure
+                    record_stage_failure(self, phase, result, _verification_role.get())
+                return result
         return measured
     return decorate
 
@@ -1720,6 +1741,7 @@ class AutoAgentsSelfRepairRunner:
         self._base_full_verification: dict[str, _VerificationResult] = {}
         self._verification_python_cache = ""
         self._verification_dependency_lock = threading.Lock()
+        self._feedback_lock = threading.RLock()
         self._base_prewarm_lock = threading.Lock()
         self._base_prewarm_thread: Optional[threading.Thread] = None
         self._base_prewarm_ref = ""
@@ -1972,7 +1994,11 @@ class AutoAgentsSelfRepairRunner:
         self,
         result: SelfRepairResult,
     ) -> str:
+        from .repair_feedback import next_action
         experiment = self._experiment
+        result.review_completed = result.review_completed or bool(getattr(self, "_candidate_review_completed", False))
+        result.failure_evidence = list(getattr(self, "_candidate_failure_evidence", []))
+        result.next_action = next_action(result.failure_evidence)
         findings = [
             SelfRepairFinding.from_dict(item)
             for item in result.review_findings
@@ -2004,6 +2030,10 @@ class AutoAgentsSelfRepairRunner:
             finding_group_id=result.finding_group_id,
             summary=result.summary,
             verification=result.verification,
+            failure_evidence=result.failure_evidence,
+            review_completed=result.review_completed,
+            verified_check_ids=sorted(getattr(self, "_candidate_verified_check_ids", set())),
+            prepared_dependencies=sorted(getattr(self, "_candidate_prepared_dependencies", set())),
             reason=result.reason,
             duration_seconds=max(0.0, time.monotonic() - getattr(self, "_candidate_started_at", time.monotonic())),
             provider_session_id=str(getattr(provider_result, "provider_session_id", "")),
@@ -2345,15 +2375,15 @@ class AutoAgentsSelfRepairRunner:
                     self.target_project_root,
                     ignore_run_artifacts=True,
                 )
-                replay = self._replay_candidate(
-                    candidate_root,
-                    candidate_commit,
-                    candidate_id,
-                )
-                differential = self._diagnosis_differential(
-                    base_head,
-                    candidate_root,
-                )
+                focused = self._run_verification(candidate_root)
+                if not focused.ok:
+                    rejected_ref = self._reject_pending_validation_ref(candidate_ref, candidate_commit, candidate_id)
+                    return SelfRepairResult(False, "candidate_verification_failed",
+                        "pending candidate focused verification failed", category=self.decision.category,
+                        verification=focused.summary, experiment_id=experiment_id, candidate_id=candidate_id,
+                        candidate_commit=candidate_commit, base_commit=base_head, candidate_ref=rejected_ref)
+                replay, differential = self._candidate_boundary_checks(
+                    candidate_root, candidate_commit, candidate_id, final_group=True, base_ref=base_head)
                 health_case = bool(
                     self.repair_case is not None
                     and self.repair_case.source == "health_watch"
@@ -2402,7 +2432,6 @@ class AutoAgentsSelfRepairRunner:
                         candidate_commit=candidate_commit,
                         candidate_ref=rejected_ref,
                     )
-                focused = self._run_verification(candidate_root)
                 autonomy = self._autonomy_config()
                 review = self._review_candidate(
                     candidate_root,
@@ -2588,6 +2617,10 @@ class AutoAgentsSelfRepairRunner:
         self,
         result: SelfRepairResult,
     ) -> None:
+        from .repair_feedback import next_action
+        result.review_completed = result.review_completed or bool(getattr(self, "_candidate_review_completed", False))
+        result.failure_evidence = list(getattr(self, "_candidate_failure_evidence", []))
+        result.next_action = next_action(result.failure_evidence)
         experiment = self._experiment
         stored = experiment.candidates.get(result.candidate_id)
         if stored is None:
@@ -2603,6 +2636,8 @@ class AutoAgentsSelfRepairRunner:
         stored.infrastructure_failure = False
         stored.summary = result.summary
         stored.verification = result.verification
+        stored.failure_evidence = result.failure_evidence
+        stored.review_completed = result.review_completed
         stored.reason = result.reason
         stored.finding_ids = sorted(
             set(stored.finding_ids).union(result.finding_ids)
@@ -3388,7 +3423,7 @@ class AutoAgentsSelfRepairRunner:
                 "ROOT_CAUSE:",
                 json.dumps(self._compact_diagnosis_payload(), ensure_ascii=False),
                 "STALL_EVIDENCE:",
-                " ".join(candidate.verification.split())[-2000:],
+                json.dumps({"failures": candidate.failure_evidence, "summary": verification_failure_excerpt(candidate.verification)}, ensure_ascii=False),
             ]
         )
         lease = max(
@@ -3656,20 +3691,21 @@ class AutoAgentsSelfRepairRunner:
                 store.save(experiment)
                 continue
             self._candidate_group = dict(active_group)
+            from .repair_actions import prepare_action
+            self._candidate_next_action = prepare_action(self, experiment)
+            if self._candidate_next_action.get("kind") == "blocked":
+                store.save(experiment)
+                return SelfRepairResult(False, "diagnosis_blocked", self._candidate_next_action["cause"],
+                    experiment_id=experiment_id, next_action=self._candidate_next_action)
             self._candidate_is_final_group = sum(
                 1
                 for item in experiment.finding_groups
                 if str(item.get("status", "")) != "completed"
             ) == 1
             self._migrate_recoverable_candidate_to_pending(experiment)
-            if self._latest_pending_validation_ref(experiment.base_commit):
-                self._start_base_full_suite_prewarm(experiment.base_commit)
             pending = self._resume_pending_validation_candidate(
                 experiment_id=experiment_id,
-                deadline=(
-                    time.monotonic()
-                    + SELF_REPAIR_FULL_SUITE_SAFETY_CEILING_SECONDS
-                ),
+                deadline=None,
             )
             if pending is not None:
                 pending.attempt = experiment.attempt_count
@@ -3751,6 +3787,10 @@ class AutoAgentsSelfRepairRunner:
                 status="self_repairing",
                 detail=f"starting candidate attempt {attempt}",
             )
+            self._candidate_failure_evidence = []
+            self._candidate_verified_check_ids = set()
+            self._candidate_prepared_dependencies = set()
+            self._pending_prepared_dependencies = set()
             self._candidate_partial_fingerprint = ""
             self._candidate_partial_diff_line_count = 0
             self._candidate_partial_path = ""
@@ -3805,6 +3845,9 @@ class AutoAgentsSelfRepairRunner:
                               status=candidate.status, reason=redact_incident_text(candidate.reason)[:400],
                               duration=f"{record.duration_seconds / 60:.1f} min",
                               total=f"{sum(item.duration_seconds for item in experiment.candidates.values()) / 60:.1f} min")
+                reporter.emit("repair.progress", gained=len(record.progress_keys),
+                              total=len(experiment.progress_credits),
+                              action=candidate.next_action.get("kind", "implement"))
             correction_cutoff = experiment.automatic_corrections[-1].get("at", "") if experiment.automatic_corrections else ""
             semantic_repeat = bool(
                 not candidate.ok
@@ -3883,7 +3926,7 @@ class AutoAgentsSelfRepairRunner:
                             else "semantic net progress stalled; "
                         )
                         + "regenerate the design, "
-                        "split the active finding group, and avoid the failed strategy. "
+                        "merge or split affected groups by verified shared causes, preserve all original check identities, and avoid the failed strategy. "
                         + " ".join(candidate.verification.split())[-1200:]
                     ),
                     candidate_id=candidate.candidate_id,
@@ -4202,6 +4245,16 @@ class AutoAgentsSelfRepairRunner:
             except (OSError, ValueError):
                 result = {}
             record = getattr(experiment, "candidates", {}).get(review_id)
+            if isinstance(result, Mapping) and not result.get("review_completed") and not result.get("review_findings"):
+                receipt_path = store.candidate_root(review_id) / "review-receipt.json"
+                try:
+                    receipt = read_json(receipt_path, default={})
+                except (OSError, ValueError):
+                    receipt = {}
+                if (record and isinstance(receipt, Mapping) and receipt.get("candidate_id") == review_id
+                        and receipt.get("experiment_id") == experiment.experiment_id
+                        and receipt.get("candidate_commit") == record.candidate_commit):
+                    result, path = receipt, receipt_path
             if (
                 not record or not isinstance(result, Mapping)
                 or result.get("candidate_id") != review_id
@@ -4270,6 +4323,7 @@ class AutoAgentsSelfRepairRunner:
         context = experiment.prompt_context() if experiment is not None else {}
         evidence = {
             "attempt": getattr(self, "_candidate_attempt", 1),
+            "next_action": getattr(self, "_candidate_next_action", context.get("next_action", {})),
             **self._candidate_review_feedback(context),
             "active_component": dict(getattr(self, "_candidate_group", {}) or {}),
             "recent_candidates": context.get("recent_candidates", [])[-3:],
@@ -4459,6 +4513,8 @@ class AutoAgentsSelfRepairRunner:
                     cwd=repair_root,
                     sandbox_mode="workspace-write",
                     output_path=output_path,
+                    progress_expected_checks=[target for command in getattr(self, "_candidate_group", {}).get("focused_tests", [])
+                        for target in shlex.split(command) if target.startswith("tests/") and ".py" in target],
                     # The configured duration is an inactivity lease, not a total budget.
                     progress_lease_seconds=candidate_timeout,
                     progress_report_path=(
@@ -4768,7 +4824,7 @@ class AutoAgentsSelfRepairRunner:
                         patch_fingerprint=fingerprint, strategy_fingerprint=strategy_fingerprint,
                         diff_line_count=diff_line_count,
                     )
-                if (final_group and self.diagnosis is not None and self._acceleration_enabled()
+                if (final_group and self.diagnosis is not None
                         and (not replay.ok or not differential.ok)):
                     return SelfRepairResult(
                         ok=False, status="candidate_replay_failed", category=self.decision.category,
@@ -5816,7 +5872,7 @@ class AutoAgentsSelfRepairRunner:
                 "Return exactly JSON with decision, reason, findings, and resolved_finding_ids. "
                 "Each finding must contain finding_id, severity=fatal|hard|repairable, "
                 "disposition=contract_violation|candidate_regression|unrelated_observation, "
-                "causal_obligation_id, affected_paths, reason, counterexample, required_test, "
+                "causal_obligation_id, affected_paths, reason, counterexample, required_test (include exact executable pytest node IDs when applicable), "
                 "evidence, and defer_until. defer_until is empty for an active-component blocker, "
                 "a pending group_id for downstream-owned work, or post_full_suite for deferred "
                 "full-suite evidence. "
@@ -6133,6 +6189,9 @@ class AutoAgentsSelfRepairRunner:
                     "invalid" if not comparable_base.ok and not reproduced else "failed"
                 ),
                 "base_reproduced": reproduced,
+                "source_commands": commands,
+                "base": base.to_dict(), "candidate": candidate.to_dict(),
+                "test_only_base": test_only_base.to_dict() if test_only_base is not None else None,
             },
         )
 
@@ -6462,7 +6521,8 @@ class AutoAgentsSelfRepairRunner:
 
         def execute(shard: _FullSuiteShard, resources: tuple[str, ...]) -> _VerificationResult:
             try:
-                return self._execute_full_suite_shard(verification_root, shard)
+                with _verification_phase("baseline" if suite_kind == "base" else "candidate"):
+                    return self._execute_full_suite_shard(verification_root, shard)
             finally:
                 slots.release(resources)
 
@@ -7481,6 +7541,34 @@ class AutoAgentsSelfRepairRunner:
             return None
         return store.root / "full-suite-checkpoints" / f"{suite_key}.json"
 
+    def _run_replay_process(self, arguments, *, cwd, env=None, input_text=None):
+        from contextlib import ExitStack
+        from .process_supervision import run_supervised_shell_command
+        from .repair_feedback import command_evidence
+        from .verification_ledger import ledger_root
+        with ExitStack() as stack:
+            command = shlex.join(arguments)
+            if input_text is not None:
+                stream = stack.enter_context(tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8"))
+                stream.write(input_text)
+                stream.flush()
+                command += " < " + shlex.quote(stream.name)
+            store = getattr(self, "_experiment_store", None)
+            evidence = (store.candidate_root(getattr(self, "_candidate_id", "") or "replay") / "verification-evidence"
+                        if store else ledger_root() / "repair-evidence" / "replay")
+            lease = getattr(self._autonomy_config(), "replay_timeout_seconds", 1200)
+            process = run_supervised_shell_command(command, cwd=cwd, env=env,
+                timeout_seconds=lease, idle_timeout_seconds=lease, timeout_policy="progress",
+                evidence_dir=evidence, kind="repair_replay")
+            self._replay_diagnostic_artifacts = [*getattr(self, "_replay_diagnostic_artifacts", []),
+                {"command": command, "cwd": str(cwd),
+                 "artifacts": process.process_snapshot.get("diagnostic_artifacts", {})}]
+            if process.returncode or process.termination_reason:
+                item = command_evidence(process, command, phase="replay", root=cwd,
+                                        candidate=getattr(self, "_candidate_id", ""))
+                self._candidate_failure_evidence = [*getattr(self, "_candidate_failure_evidence", []), item]
+            return process
+
     @_timed_repair_phase("boundary_replay")
     def _replay_candidate(
         self,
@@ -7546,19 +7634,7 @@ class AutoAgentsSelfRepairRunner:
                 "'blocked_tasks':[t.task_id for t in state.tasks if t.status in {'blocked','failed'}]},sort_keys=True))"
             )
             with self._verification_argv([self._verification_python(), "-c", runner, str(replay_root), candidate_commit], replay_root) as replay_command:
-                process = subprocess.run(
-                replay_command,
-                cwd=str(replay_root),
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                timeout=max(
-                    60,
-                    int(
-                        getattr(self._autonomy_config(), "replay_timeout_seconds", 1200)
-                    ),
-                ),
-            )
+                process = self._run_replay_process(replay_command, cwd=Path(str(replay_root)))
             detail = redact_incident_text(
                 (process.stdout or process.stderr).strip()
             )
@@ -7608,13 +7684,11 @@ class AutoAgentsSelfRepairRunner:
             # A diagnostic shared clone may refer to the frozen source's Git
             # objects. Keep that one input read-only in the private namespace.
             with self._verification_argv(arguments, target, read_roots=[source]) as replay_command:
-                process = subprocess.run(
-                replay_command,
-                cwd=target, capture_output=True, text=True, env=environment,
-                timeout=max(60, int(self._autonomy_config().replay_timeout_seconds)),
-            )
+                process = self._run_replay_process(replay_command, cwd=target, env=environment)
             try:
-                return json.loads(process.stdout.splitlines()[-1])
+                payload = json.loads(process.stdout.splitlines()[-1])
+                payload["diagnostic_artifacts"] = process.process_snapshot.get("diagnostic_artifacts", {})
+                return payload
             except (ValueError, IndexError):
                 return {"ok": False, "outcome": "invalid", "error": process.stderr[-2000:]}
 
@@ -7716,24 +7790,7 @@ class AutoAgentsSelfRepairRunner:
         )
         try:
             with self._verification_argv([self._verification_python(), "-c", runner], source_root) as arguments:
-                process = subprocess.run(
-                arguments,
-                input=payload,
-                cwd=str(source_root),
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                timeout=max(
-                    60,
-                    int(
-                        getattr(
-                            self._autonomy_config(),
-                            "replay_timeout_seconds",
-                            1200,
-                        )
-                    ),
-                ),
-            )
+                process = self._run_replay_process(arguments, cwd=Path(str(source_root)), input_text=payload)
         except (OSError, subprocess.SubprocessError) as error:
             return _VerificationResult(False, str(error))
         detail = (process.stdout or process.stderr).strip()
@@ -7779,7 +7836,26 @@ class AutoAgentsSelfRepairRunner:
                 / safe_root
                 / (result.candidate_id or f"attempt-{attempt}")
             )
-            write_json(root / "result.json", result.to_dict())
+            store = getattr(self, "_experiment_store", None)
+            if store is not None:
+                root = store.candidate_root(result.candidate_id or f"attempt-{attempt}")
+            value = result.to_dict()
+            try:
+                previous = read_json(root / "result.json", default={})
+            except (OSError, ValueError):
+                previous = {}
+            if not isinstance(previous, Mapping):
+                previous = {}
+            receipt = value if result.review_completed else previous
+            completed = receipt.get("review_completed", receipt.get("status") in {
+                "candidate_review_rejected", "candidate_group_completed", "approved_candidate",
+                "candidate_full_suite_failed", "candidate_full_suite_inconclusive",
+                "candidate_final_review_rejected", "candidate_proof_seal_failed"})
+            if (completed is True and receipt.get("candidate_id") == result.candidate_id
+                    and receipt.get("experiment_id") == result.experiment_id
+                    and receipt.get("candidate_commit") == result.candidate_commit):
+                write_json(root / "review-receipt.json", receipt)
+            write_json(root / "result.json", value)
             if not self._session_scoped:
                 save_run_state(self.target_project_root, state)
         except Exception:
@@ -8097,7 +8173,7 @@ class AutoAgentsSelfRepairRunner:
         *,
         command_timeout_seconds: int = SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS,
     ) -> "_VerificationResult":
-        with tempfile.TemporaryDirectory(
+        with _verification_phase("baseline"), tempfile.TemporaryDirectory(
             prefix="auto-agents-remote-repair-check-"
         ) as tmp:
             verification_root = Path(tmp) / "verification"
@@ -8227,6 +8303,7 @@ class AutoAgentsSelfRepairRunner:
         experiment = getattr(self, "_experiment", None)
         search_context = experiment.prompt_context() if experiment is not None else {}
         search_context.update(self._candidate_review_feedback(search_context))
+        search_context["next_action"] = getattr(self, "_candidate_next_action", search_context.get("next_action", {}))
         lines = [
             f"auto_agents repository root: {repair_root or self.repo_root}",
             *([
@@ -8351,17 +8428,14 @@ class AutoAgentsSelfRepairRunner:
             parts.append(f"summary={result.summary[:500]}")
         return "; ".join(parts) if parts else "self-repair agent failed without output"
 
-    def _candidate_boundary_checks(self, repair_root, candidate_commit, candidate_id, *, final_group):
+    def _candidate_boundary_checks(self, repair_root, candidate_commit, candidate_id, *, final_group, base_ref=None):
         if not final_group:
             return (
                 _VerificationResult(False, "root replay belongs to integration", payload={"outcome": "deferred"}),
                 _VerificationResult(False, "root differential belongs to integration", payload={"outcome": "deferred"}),
             )
         replay = self._replay_candidate(repair_root, candidate_commit, candidate_id)
-        if self.diagnosis is not None and (
-            replay.payload.get("outcome") == "invalid"
-            or (self._acceleration_enabled() and not replay.ok)
-        ):
+        if not replay.ok:
             return replay, _VerificationResult(
                 False, "diagnosis differential deferred until boundary replay passes",
                 payload={"outcome": "deferred"},
@@ -8370,7 +8444,8 @@ class AutoAgentsSelfRepairRunner:
             "validating_diagnosis_differential",
             "boundary replay completed; running diagnosis-specific proof",
         )
-        return replay, self._diagnosis_differential(self._experiment.base_commit, repair_root)
+        return replay, self._diagnosis_differential(
+            self._experiment.base_commit if base_ref is None else base_ref, repair_root)
 
     @_timed_repair_phase("focused_verification")
     def _run_active_group_verification(
@@ -8378,48 +8453,17 @@ class AutoAgentsSelfRepairRunner:
         verification_root: Path,
     ) -> "_VerificationResult":
         group = dict(getattr(self, "_candidate_group", {}) or {})
-        commands: list[str] = []
+        from .repair_schedule import verification_plan
         experiment = getattr(self, "_experiment", None)
-        if isinstance(experiment, SelfRepairExperiment):
-            for command in experiment.sticky_verification_commands:
-                normalized = " ".join(str(command).split())
-                if (
-                    normalized
-                    and normalized not in commands
-                    and not _supplemental_verification_skip_reason(
-                        normalized,
-                        repository_aliases={
-                            self.repo_root.name,
-                            verification_root.name,
-                        },
-                    )
-                ):
-                    commands.append(normalized)
-        for command in group.get("focused_tests", []) or []:
-            normalized = " ".join(str(command).split())
-            if not normalized or normalized in commands:
-                continue
-            if _supplemental_verification_skip_reason(
-                normalized,
-                repository_aliases={self.repo_root.name, verification_root.name},
-            ):
-                continue
-            commands.append(normalized)
+        plan = (verification_plan(experiment, group) if isinstance(experiment, SelfRepairExperiment)
+                else {"commands": list(group.get("focused_tests", [])), "deferred": []})
+        commands = [command for command in plan["commands"] if not _supplemental_verification_skip_reason(
+            command, repository_aliases={self.repo_root.name, verification_root.name})]
+        self._candidate_verification_plan = plan
         if not commands and self.diagnosis is not None:
-            for command in self.diagnosis.final.verification_commands:
-                normalized = " ".join(str(command).split())
-                if (
-                    normalized
-                    and normalized not in commands
-                    and not _supplemental_verification_skip_reason(
-                        normalized,
-                        repository_aliases={
-                            self.repo_root.name,
-                            verification_root.name,
-                        },
-                    )
-                ):
-                    commands.append(normalized)
+            commands = [command for command in self.diagnosis.final.verification_commands
+                        if not _supplemental_verification_skip_reason(command,
+                            repository_aliases={self.repo_root.name, verification_root.name})]
         if not commands:
             commands = ["git diff --check"]
         result = self._run_verification_commands(commands, verification_root)
@@ -8532,7 +8576,9 @@ class AutoAgentsSelfRepairRunner:
         adaptive_timeout_enabled: bool = False,
         command_idle_timeout_seconds: int = SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS,
     ) -> "_VerificationResult":
+        from .repair_feedback import prompt_evidence
         summaries = []
+        command_failures = []
         rendered_commands: list[str] = []
         returncodes: list[int] = []
         termination_reasons: list[str] = []
@@ -8542,6 +8588,7 @@ class AutoAgentsSelfRepairRunner:
         executed_tests = []
         certificate_hits = 0
         for command in commands:
+            source_command = command
             from .repair_dependencies import verification_dependency_state
             dependency_state = verification_dependency_state(self._verification_python())
             managed = getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled()
@@ -8563,10 +8610,25 @@ class AutoAgentsSelfRepairRunner:
                     python_executable=self._verification_python())
             reporter = getattr(getattr(self, "target_orchestrator", None), "reporter", None)
             def diagnostic_progress(event, command, elapsed):
-                pass
+                progress_path = getattr(diagnostic_progress, "progress_path", None)
+                if progress_path is not None:
+                    try:
+                        from .verification_progress import publish
+                        publish(read_json(progress_path, default={}).get("checkpoints", []))
+                    except (OSError, ValueError):
+                        pass
             diagnostic_progress.reporter = reporter
             diagnostic_progress.context = "self_repair"
             diagnostic_progress.stage = "self_repair_validation"
+            diagnostic_progress.timeout_policy = "progress"
+            store = getattr(self, "_experiment_store", None)
+            if store:
+                evidence_root = store.candidate_root(getattr(self, "_candidate_id", "") or "diagnostic") / "verification-evidence"
+            else:
+                from .verification_ledger import ledger_root
+                evidence_root = ledger_root() / "repair-evidence" / (getattr(self, "_verification_evidence_id", "") or uuid.uuid4().hex)
+                self._verification_evidence_id = evidence_root.name
+            diagnostic_progress.evidence_dir = evidence_root
             def execute():
                 from contextlib import nullcontext
                 from .verification_runtime import verification_resources
@@ -8589,6 +8651,7 @@ class AutoAgentsSelfRepairRunner:
                         actual_command = (shlex.join([self._verification_python(),
                             str(Path(__file__).with_name("verification_pytest.py")), str(verification_root), str(receipt), *args[3:]])
                             if profiled else verification_command)
+                        diagnostic_progress.progress_path = Path(str(receipt) + ".progress.json") if profiled else None
                         with self._verification_argv(["/bin/sh", "-c", actual_command], verification_root,
                                                      dependency_state=dependency_state) as arguments:
                             executed_command = actual_command if getattr(self, "_real_project_root", None) is None else shlex.join(arguments)
@@ -8597,12 +8660,13 @@ class AutoAgentsSelfRepairRunner:
                                 command_timeout_seconds=max(60, int(command_timeout_seconds)),
                                 adaptive_timeout_enabled=adaptive_timeout_enabled,
                                 command_idle_timeout_seconds=max(60, int(command_idle_timeout_seconds)),
-                                **({"progress": diagnostic_progress} if reporter is not None else {}))
+                                progress=diagnostic_progress)
                         process = gate.commands[0]
                         process.queue_seconds = queued
                         if profiled and receipt.exists():
                             recorded = read_json(receipt, default={})
                             process.executed_tests = list(recorded.get("passed", []))
+                            process.process_snapshot["verification_failures"] = recorded.get("failures", [])
                             process.phase_seconds = dict(recorded.get("phases", {}))
                             process.test_timings = list(recorded.get("slowest", []))
                             observed = recorded.get("inputs", {})
@@ -8630,7 +8694,20 @@ class AutoAgentsSelfRepairRunner:
                                       result_cache_scope="observed_inputs",
                                       input_mode=getattr(getattr(self.target_orchestrator.config.execution, "acceleration", None), "verification_input_mode", "observe"))
                        if ledger is not None else execute())
+            if (_verification_role.get() != "baseline"
+                    and not process.termination_reason and not process.infrastructure_error
+                    and not process.cleanup_incomplete):
+                with self._feedback_lock:
+                    self._candidate_verified_check_ids = (getattr(self, "_candidate_verified_check_ids", set())
+                                                           | set(process.executed_tests))
             if not process.ok:
+                from .repair_feedback import command_evidence
+                evidence = command_evidence(process, source_command,
+                    phase=_verification_role.get(), root=verification_root,
+                    candidate=getattr(self, "_candidate_id", ""), environment=dependency_state.get("fingerprint", ""))
+                command_failures.append(evidence)
+                with self._feedback_lock:
+                    self._candidate_failure_evidence = [*getattr(self, "_candidate_failure_evidence", []), evidence]
                 if self._handle_verification_dependencies(process.stdout + "\n" + process.stderr, verification_root,
                         structured=process.process_snapshot.get("verification_missing_dependencies"), dependency_state=dependency_state):
                     # The candidate and its proof obligations stay identical. A
@@ -8641,6 +8718,13 @@ class AutoAgentsSelfRepairRunner:
                         adaptive_timeout_enabled=adaptive_timeout_enabled,
                         command_idle_timeout_seconds=command_idle_timeout_seconds,
                     )
+            if process.ok and _verification_role.get() != "baseline":
+                for evidence in getattr(self, "_candidate_failure_evidence", []):
+                    if evidence.get("command") == source_command and evidence.get("phase") == "candidate":
+                        evidence["resolved"] = True
+                self._candidate_prepared_dependencies = (getattr(self, "_candidate_prepared_dependencies", set())
+                    | getattr(self, "_pending_prepared_dependencies", set()))
+                self._pending_prepared_dependencies = set()
             duration_seconds += float(process.duration_seconds)
             if getattr(process, "proof_ref", ""):
                 proof_refs.append(process.proof_ref)
@@ -8670,6 +8754,8 @@ class AutoAgentsSelfRepairRunner:
                 and process.returncode == 5
                 and _is_pytest_verification_command(command)
             ):
+                if command_failures:
+                    command_failures[-1].update(nonfatal=True, resolved=True)
                 nonfatal_source_commands.append(
                     " ".join(str(command).split())
                 )
@@ -8686,6 +8772,7 @@ class AutoAgentsSelfRepairRunner:
                     termination_reasons=tuple(termination_reasons),
                     duration_seconds=duration_seconds,
                     payload={
+                        "failure_evidence": prompt_evidence(command_failures),
                         "source_commands": list(commands[: len(returncodes)]),
                         "nonfatal_source_commands": nonfatal_source_commands,
                         "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
@@ -8699,6 +8786,7 @@ class AutoAgentsSelfRepairRunner:
             termination_reasons=tuple(termination_reasons),
             duration_seconds=duration_seconds,
             payload={
+                "failure_evidence": prompt_evidence(command_failures),
                 "source_commands": list(commands[: len(returncodes)]),
                 "nonfatal_source_commands": nonfatal_source_commands,
                 "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
@@ -8735,8 +8823,6 @@ class AutoAgentsSelfRepairRunner:
                        if dependency.kind in {"executable", "shared_library"} else dependency.key)
         if attempt_key in attempted:
             raise VerificationDependencyError(dependency, "still unavailable after preparation; " + detail)
-        if len(attempted) >= 32:
-            raise VerificationDependencyError(dependency, "verification prerequisite preparation limit reached")
         attempted.add(attempt_key)
         self._verification_dependency_attempts = attempted
         config_path = os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_CONFIG")
@@ -8757,6 +8843,7 @@ class AutoAgentsSelfRepairRunner:
                 setup_output = "\n".join(value.decode(errors="replace") if isinstance(value, bytes) else str(value) for value in streams)
                 missing = detect_verification_dependencies(setup_output)
                 raise VerificationDependencyError(missing[0] if missing else dependency, str(failure["error"]), error) from error
+        self._pending_prepared_dependencies = getattr(self, "_pending_prepared_dependencies", set()) | {attempt_key}
         self._report_candidate_phase("validating_focused_tests", "environment prepared; retrying retained candidate verification")
 
     @staticmethod

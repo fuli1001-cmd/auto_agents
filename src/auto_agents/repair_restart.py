@@ -12,7 +12,7 @@ from .repair_control import alive, atomic_json, digest, git
 from .self_repair_search import SelfRepairCandidateRecord, SelfRepairExperimentStore
 
 RESTART_QUIESCENCE_SECONDS = 15
-_HISTORY_FILES = ("result.json", "candidate.diff", "partial-candidate.json", "partial-candidate.diff")
+_HISTORY_FILES = ("result.json", "review-receipt.json", "candidate.diff", "partial-candidate.json", "partial-candidate.diff")
 
 
 def _identity(payload):
@@ -96,6 +96,9 @@ def _discard_incomplete_import(marker, destination, retained, repository):
         with repository.locked():
             git(repository.cache, "worktree", "remove", "--force", str(retained))
     for candidate_id in pending["candidate_ids"]:
+        artifacts = destination.candidate_root(candidate_id) / "verification-evidence"
+        if artifacts.is_dir() and not artifacts.is_symlink():
+            shutil.rmtree(artifacts)
         for name in _HISTORY_FILES:
             (destination.candidate_root(candidate_id) / name).unlink(missing_ok=True)
     if pending["previous_experiment"] is None:
@@ -116,7 +119,7 @@ def _wait_for_quiescence(source):
 
 
 def import_cancelled_repair(store, job, working, repository, *, revision=None):
-    """Seed fresh work only; never reactivate the cancelled job or its receipts."""
+    """Seed stopped work only; never reactivate the prior job or its receipts."""
     payload = job["payload"]
     invocation = payload.get("invocation", {})
     subject = ("session-" + invocation["session_id"] if invocation.get("session_id")
@@ -140,7 +143,7 @@ def import_cancelled_repair(store, job, working, repository, *, revision=None):
     if retained.exists() or (current and current.attempt_count):
         return False
     with store.connect() as db:
-        rows = db.execute("SELECT id,payload FROM jobs WHERE state='cancelled' AND id!=? ORDER BY updated DESC",
+        rows = db.execute("SELECT id,payload FROM jobs WHERE state IN ('cancelled','failed') AND id!=? ORDER BY updated DESC",
                           (job["id"],)).fetchall()
     for row in rows:
         if _identity(json.loads(row["payload"])) != _identity(payload):
@@ -180,13 +183,30 @@ def import_cancelled_repair(store, job, working, repository, *, revision=None):
             # approval, provider-session and full-suite receipts do not.
             for candidate_id in candidate_ids:
                 candidate = source_store.candidate_root(candidate_id)
+                artifacts = candidate / "verification-evidence"
+                copied = destination.candidate_root(candidate.name) / "verification-evidence"
+                if artifacts.is_dir() and not artifacts.is_symlink():
+                    shutil.copytree(artifacts, copied, dirs_exist_ok=True, symlinks=True)
+                    for attached in copied.rglob("*.json"):
+                        if not attached.is_symlink():
+                            value = read_json(attached)
+                            _rebind_evidence(value, artifacts, copied)
+                            atomic_json(attached, value)
+                for record in experiment.candidates.values():
+                    if record.candidate_id == candidate.name:
+                        _rebind_evidence(record.failure_evidence, artifacts, copied)
                 for name in _HISTORY_FILES:
                     old = candidate / name
                     if old.is_file() and not old.is_symlink():
                         new = destination.candidate_root(candidate.name) / name
                         new.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(old, new)
-            experiment.status = "active"
+                        if name == "result.json":
+                            value = read_json(new)
+                            _rebind_evidence(value.get("failure_evidence", []), artifacts, copied)
+                            atomic_json(new, value)
+            if experiment.status != "stalled":
+                experiment.status = "active"
             experiment.current_candidate_id = ""
             experiment.base_commit = revision or payload["base"]
             experiment.candidates["base"] = SelfRepairCandidateRecord(
@@ -211,7 +231,7 @@ def import_cancelled_repair(store, job, working, repository, *, revision=None):
             experiment.active_finding_group_id = ""
             experiment.completed_contract_obligation_ids = []
             experiment.completed_finding_ids = []
-            experiment.consecutive_non_improvements = 0
+            # Historical progress and the exhausted window survive proof invalidation.
             for record in experiment.candidates.values():
                 record.component_receipts = {}
                 record.provider_session_id = record.provider_prompt_hash = ""
@@ -247,3 +267,17 @@ def import_cancelled_repair(store, job, working, repository, *, revision=None):
                 _discard_incomplete_import(marker, destination, retained, repository)
             raise
     return False
+
+
+def _rebind_evidence(evidence, source, destination):
+    if isinstance(evidence, list):
+        for item in evidence:
+            _rebind_evidence(item, source, destination)
+    elif isinstance(evidence, dict):
+        for key, value in evidence.items():
+            if key in {"artifacts", "diagnostic_artifacts"} and isinstance(value, dict):
+                for name, path in list(value.items()):
+                    if isinstance(path, str) and Path(path).is_relative_to(source):
+                        value[name] = str(destination / Path(path).relative_to(source))
+            else:
+                _rebind_evidence(value, source, destination)

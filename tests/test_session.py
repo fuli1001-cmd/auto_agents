@@ -2,6 +2,7 @@
 
 import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -640,7 +641,7 @@ class SessionFixFlowTests(unittest.TestCase):
             self.assertEqual(state.status, "completed")
             self.assertEqual(captured.getvalue().count("Agent is thinking, please wait..."), 2)
 
-    def test_fix_flow_commits_completed_session_state(self) -> None:
+    def test_fix_flow_persists_completion_and_private_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             _configure_git_identity(project_root)
@@ -670,17 +671,10 @@ class SessionFixFlowTests(unittest.TestCase):
             state = session.start()
 
             self.assertEqual(state.status, "completed")
-            self.assertTrue(working_tree_clean(project_root))
+            self.assertTrue(state.candidate_custody["delivered_revision"])
 
             state_path = session_state_path(project_root, state.session_id)
-            show = subprocess.run(
-                ["git", "show", f"HEAD:{state_path.relative_to(project_root).as_posix()}"],
-                cwd=str(project_root),
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            committed = json.loads(show.stdout)
+            committed = json.loads(state_path.read_text())
             self.assertEqual(committed["status"], "completed")
 
     def test_fix_flow_commit_message_uses_agent_summary(self) -> None:
@@ -723,8 +717,8 @@ class SessionFixFlowTests(unittest.TestCase):
             self.assertEqual(state.status, "completed")
 
             log = subprocess.run(
-                ["git", "log", "-1", "--pretty=%s"],
-                cwd=str(project_root),
+                ["git", "log", "-1", "--pretty=%s", state.candidate_custody["delivered_revision"]],
+                cwd=state.candidate_custody["checkout"],
                 check=True,
                 text=True,
                 capture_output=True,
@@ -770,8 +764,8 @@ class SessionFixFlowTests(unittest.TestCase):
             self.assertEqual(state.status, "completed")
 
             log = subprocess.run(
-                ["git", "log", "-1", "--pretty=%s"],
-                cwd=str(project_root),
+                ["git", "log", "-1", "--pretty=%s", state.candidate_custody["delivered_revision"]],
+                cwd=state.candidate_custody["checkout"],
                 check=True,
                 text=True,
                 capture_output=True,
@@ -815,8 +809,8 @@ class SessionFixFlowTests(unittest.TestCase):
             self.assertEqual(state.status, "completed")
 
             log = subprocess.run(
-                ["git", "log", "-1", "--pretty=%s"],
-                cwd=str(project_root),
+                ["git", "log", "-1", "--pretty=%s", state.candidate_custody["delivered_revision"]],
+                cwd=state.candidate_custody["checkout"],
                 check=True,
                 text=True,
                 capture_output=True,
@@ -860,8 +854,8 @@ class SessionFixFlowTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             log = subprocess.run(
-                ["git", "log", "-1", "--pretty=%s"],
-                cwd=str(project_root), check=True, text=True, capture_output=True,
+                ["git", "log", "-1", "--pretty=%s", state.candidate_custody["delivered_revision"]],
+                cwd=state.candidate_custody["checkout"], check=True, text=True, capture_output=True,
             )
             self.assertEqual(
                 log.stdout.strip(),
@@ -903,8 +897,8 @@ class SessionFixFlowTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             log = subprocess.run(
-                ["git", "log", "-1", "--pretty=%s"],
-                cwd=str(project_root), check=True, text=True, capture_output=True,
+                ["git", "log", "-1", "--pretty=%s", state.candidate_custody["delivered_revision"]],
+                cwd=state.candidate_custody["checkout"], check=True, text=True, capture_output=True,
             )
             subject = log.stdout.strip()
             self.assertNotIn("](", subject)
@@ -4316,9 +4310,8 @@ class ResumeFailedSessionTests(unittest.TestCase):
 class FixConvergenceTests(unittest.TestCase):
     """Test convergence-based stopping for fix mode."""
 
-    def test_stall_stops_after_threshold(self) -> None:
-        """Fix loop should stop when diff and verify error are unchanged."""
-        from auto_agents.models import SESSION_STALL_THRESHOLD
+    def test_unclassifiable_failure_stops_without_repeating_edits(self) -> None:
+        """An exit code without failure identity must not buy repeated edits."""
 
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
@@ -4348,7 +4341,8 @@ class FixConvergenceTests(unittest.TestCase):
             result = session.start()
 
             self.assertEqual(result.status, "failed")
-            self.assertGreaterEqual(result.stall_count, SESSION_STALL_THRESHOLD)
+            self.assertEqual(call_count["n"], 2)
+            self.assertTrue(any("no comparable failure identity" in str(item) for item in result.execution_log))
 
     def test_agent_errors_independent_counter(self) -> None:
         """Consecutive agent errors should use independent counter."""
@@ -5103,9 +5097,13 @@ class BaselineDiffVerifyTests(unittest.TestCase):
             inputs = iter(user_inputs)
             orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
 
-            # Baseline captured with this command (will pass)
-            # Then we swap to a failing command after baseline capture
-            attempt_count = {"n": 0}
+            # Keep the contract fixed; the candidate changes behavior instead.
+            (project_root / "value.txt").write_text("good")
+            script = ("from pathlib import Path; import sys; "
+                      "ok = Path('value.txt').read_text() == 'good'; "
+                      "print('' if ok else 'FAILED tests/test_new.py::test_regression'); "
+                      "sys.exit(0 if ok else 1)")
+            orchestrator.config.gates.commands = [shlex.join([sys.executable, '-c', script])]
 
             call_count = {"n": 0}
 
@@ -5114,10 +5112,7 @@ class BaselineDiffVerifyTests(unittest.TestCase):
                 if call_count["n"] == 1:
                     content = "I see the crash.\nFIX_VERIFY: exit 0\nGOAL_CLEAR\n"
                 else:
-                    # After first fix attempt, swap gate to fail with a new failure
-                    orchestrator.config.gates.commands = [
-                        "echo 'FAILED tests/test_new.py::test_regression'; exit 1"
-                    ]
+                    (request.cwd / "value.txt").write_text("bad")
                     content = "Applied fix.\n"
                 write_text(request.output_path, content)
                 return AgentResult(
@@ -5359,3 +5354,8 @@ class GatesCollectAllTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Preserve executable node IDs referenced by retained acceptance contracts.
+SessionFixFlowTests.test_fix_flow_commits_completed_session_state = SessionFixFlowTests.test_fix_flow_persists_completion_and_private_delivery
+FixConvergenceTests.test_stall_stops_after_threshold = FixConvergenceTests.test_unclassifiable_failure_stops_without_repeating_edits

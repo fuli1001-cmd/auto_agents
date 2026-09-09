@@ -162,6 +162,12 @@ class VerificationLedger:
             # Execution must bind an unchanged snapshot. Writes to ordinary
             # inputs cannot be hidden by a reported successful exit status.
             unchanged = source_identity(self.source) == source
+            if not unchanged:
+                result.process_snapshot["execution_returncode"] = result.returncode
+                result.ok, result.returncode = False, 125
+                result.infrastructure_error = True
+                result.infrastructure_failure_id = "verification_source_changed"
+                result.stderr += "\nverification source changed during execution; proof is invalid"
             valid = (result.ok and result.returncode == 0 and not result.cleanup_incomplete
                      and not result.termination_reason and not result.infrastructure_error and unchanged)
             if cached is not None and audit and (not valid or (cached.executed_tests and cached.executed_tests != result.executed_tests)):

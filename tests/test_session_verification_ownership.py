@@ -440,7 +440,7 @@ def test_public_resume_executes_complete_owned_proof_inventory(tmp_path, monkeyp
     assert marker.read_text() == 'executed'
     binding = saved.verification_binding
     assert binding['repository'] == str(root.resolve())
-    assert binding['schema_version'] == 12
+    assert binding['schema_version'] == 13
     assert binding['baseline_identity']['head_ref'] == child.baseline_head_ref
     assert binding['authorization'] == saved.authorization_policy
     required = {'owned.contract'}
@@ -588,7 +588,8 @@ def test_public_resume_keeps_foreign_completed_proof_as_regression(tmp_path, mon
     assert saved.verification_binding['required_proof_ids'] == ['owned.contract']
     assert 'foreign.completed' in {step['proof_id'] for step in saved.verification_binding['gates']['steps']}
     assert load_project_config(root).gates.steps[-1].targets == ['tests/test_foreign.py']
-    release = current_release_attestation(root)['latest']
+    release = current_release_attestation(Path(saved.candidate_custody['checkout']))['latest']
+    assert current_release_attestation(root)['latest'] == {}
     assert release['status'] == 'pending'
     assert release['affected_proof_ids'] == []
 

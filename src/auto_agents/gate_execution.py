@@ -1426,7 +1426,10 @@ class LocalGatePlanExecutor:
             if progress is not None:
                 progress("start", command, 0.0)
             trace_path: Optional[Path] = None
-            traced_command = isolated_command(command)
+            from .pytest_invocation import compile_ini_overrides
+            compiled = compile_ini_overrides(command, sandbox,
+                {**os.environ, **self.environment_overrides, **dict(environment_overrides or {})})
+            traced_command = isolated_command(compiled)
             if (
                 result_cache_scope in {"observed_inputs", "auto"}
                 and shutil.which("strace")

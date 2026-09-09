@@ -16,17 +16,14 @@ from .execution_recovery import redact_incident_text
 from .io_utils import read_json
 
 
-SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 4
+SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 5
+# Adding progress metadata does not change what existing proof establishes.
+SELF_REPAIR_PROOF_SCHEMA_VERSION = 4
 
 
 def verification_failure_excerpt(value: str, limit: int = 2400) -> str:
-    """Retain the primary failure and final assertions, after redaction."""
-    text = redact_incident_text(value)
-    if len(text) <= limit:
-        return text
-    marker = "\n[... diagnostic middle omitted ...]\n"
-    head = (limit - len(marker)) // 2
-    return text[:head] + marker + text[-(limit - len(marker) - head):]
+    from .repair_feedback import failure_excerpt
+    return failure_excerpt(value, limit)
 
 
 def _utc_now() -> str:
@@ -164,13 +161,18 @@ class SelfRepairCandidateRecord:
     diff_line_count: int = 0
     finding_group_id: str = ""
     net_progress: int = 0
+    progress_keys: list[str] = field(default_factory=list)
+    verified_check_ids: list[str] = field(default_factory=list)
+    prepared_dependencies: list[str] = field(default_factory=list)
+    review_completed: bool = False
     semantic_state_fingerprint: str = ""
     summary: str = ""
     verification: str = ""
+    failure_evidence: list[Dict[str, object]] = field(default_factory=list)
     reason: str = ""
     component_receipts: Dict[str, str] = field(default_factory=dict)
     finding_states: Dict[str, str] = field(default_factory=dict)
-    proof_version: int = SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION
+    proof_version: int = SELF_REPAIR_PROOF_SCHEMA_VERSION
     duration_seconds: float = 0.0
     provider_session_id: str = ""
     provider_kind: str = ""
@@ -189,6 +191,9 @@ class SelfRepairCandidateRecord:
             "failed_obligations",
             "finding_ids",
             "resolved_finding_ids",
+            "progress_keys",
+            "verified_check_ids",
+            "prepared_dependencies",
         ):
             raw = values.get(key, [])
             values[key] = [
@@ -197,6 +202,8 @@ class SelfRepairCandidateRecord:
         for key in ("component_receipts", "finding_states"):
             raw = values.get(key, {})
             values[key] = dict(raw) if isinstance(raw, Mapping) else {}
+        raw_evidence = values.get("failure_evidence", [])
+        values["failure_evidence"] = [dict(item) for item in raw_evidence if isinstance(item, Mapping)] if isinstance(raw_evidence, list) else []
         return cls(**values)  # type: ignore[arg-type]
 
     @property
@@ -241,6 +248,8 @@ class SelfRepairExperiment:
     finding_groups: list[Dict[str, object]] = field(default_factory=list)
     active_finding_group_id: str = ""
     sticky_verification_commands: list[str] = field(default_factory=list)
+    progress_credits: Dict[str, str] = field(default_factory=dict)
+    diagnostic_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
     completed_contract_obligation_ids: list[str] = field(default_factory=list)
     completed_finding_ids: list[str] = field(default_factory=list)
     strategy_blacklist: list[str] = field(default_factory=list)
@@ -396,7 +405,7 @@ class SelfRepairExperiment:
         }
         if "base" not in candidates:
             raise ValueError("self-repair experiment is missing its base candidate")
-        if int(payload.get("schema_version", 3)) < SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION:
+        if int(payload.get("schema_version", 3)) < SELF_REPAIR_PROOF_SCHEMA_VERSION:
             for record in candidates.values():
                 record.proof_version = 0
                 record.passed_obligations = [
@@ -408,7 +417,7 @@ class SelfRepairExperiment:
                 if finding.status == "resolved":
                     finding.status = "confirmed"
                     finding.resolved_by = ""
-        return cls(
+        experiment = cls(
             experiment_id=str(payload.get("experiment_id", "")),
             run_id=str(payload.get("run_id", "")),
             root_fingerprint=str(payload.get("root_fingerprint", "")),
@@ -455,6 +464,8 @@ class SelfRepairExperiment:
             active_finding_group_id=str(
                 payload.get("active_finding_group_id", "")
             ),
+            progress_credits=dict(payload.get("progress_credits", {})),
+            diagnostic_actions=dict(payload.get("diagnostic_actions", {})),
             sticky_verification_commands=[
                 str(item)
                 for item in payload.get("sticky_verification_commands", []) or []
@@ -506,6 +517,11 @@ class SelfRepairExperiment:
             created_at=str(payload.get("created_at", "")) or _utc_now(),
             updated_at=str(payload.get("updated_at", "")) or _utc_now(),
         )
+
+        from .repair_progress import remember_history
+        if "progress_credits" not in payload:
+            remember_history(experiment)
+        return experiment
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -613,18 +629,19 @@ class SelfRepairExperiment:
             for item in self.finding_groups
             if str(item.get("status", "")) == "completed"
         }
-        for group in self.finding_groups:
-            group_id = str(group.get("group_id", ""))
-            dependencies = {
-                str(item) for item in group.get("depends_on", []) or []
-            }
-            if (
-                group_id
-                and group_id not in completed
-                and dependencies.issubset(completed)
-            ):
-                self.active_finding_group_id = group_id
-                return group
+        ready = [group for group in self.finding_groups
+                 if group.get("group_id") and group["group_id"] not in completed
+                 and set(group.get("depends_on", [])).issubset(completed)]
+        if ready:
+            def priority(group):
+                identity = group["group_id"]
+                return (identity == self.active_finding_group_id,
+                        sum(identity in item.get("depends_on", []) for item in self.finding_groups
+                            if item.get("group_id") not in completed),
+                        len(group.get("finding_ids", [])))
+            group = max(ready, key=priority)
+            self.active_finding_group_id = group["group_id"]
+            return group
         self.active_finding_group_id = ""
         return None
 
@@ -978,15 +995,8 @@ class SelfRepairExperiment:
             }
             - known_safety
         )
-        record.net_progress = (
-            root_gain
-            + safety_gain
-            + resolved_blocking
-            + validation_gain
-            + group_gain
-            - len(candidate_regressions)
-            - len(current_blocking - previous_blocking)
-        )
+        from .repair_progress import credit
+        record.net_progress = credit(self, record, regressions=candidate_regressions)
         record.semantic_state_fingerprint = _stable_hash(
             sorted(
                 item for item in record.passed_obligations if item.startswith("root:")
@@ -1043,6 +1053,8 @@ class SelfRepairExperiment:
                 continue
             if record.finding_group_id != self.active_finding_group_id or record.status in {"candidate_group_completed", "approved_candidate"}:
                 break
+            if record.progress_keys:
+                break
             if record.status in {"candidate_review_rejected", "candidate_final_review_rejected"}:
                 rejected += 1
                 if rejected >= self.max_consecutive_non_improvements:
@@ -1050,15 +1062,10 @@ class SelfRepairExperiment:
         return False
 
     def accepted_progress_anchor(self) -> str:
-        return _stable_hash(
-            self.base_commit, self.contract_fingerprint,
-            sorted(self.completed_contract_obligation_ids),
-            sorted({key for item in self.candidates.values() if not item.fatal
-                    for key in item.passed_obligations if key.startswith("root:")}),
-            sorted({key for item in self.candidates.values() if not item.fatal for key in item.component_receipts}),
-        )
+        return _stable_hash(self.base_commit, self.root_fingerprint, sorted(self.progress_credits))
 
     def prompt_context(self) -> Dict[str, object]:
+        from .repair_feedback import next_action, prompt_evidence
         open_findings = [
             item.to_dict()
             for item in self.blocking_findings()
@@ -1114,6 +1121,7 @@ class SelfRepairExperiment:
                     "reason": redact_incident_text(item.reason)[-2400:],
                     "component_receipts": item.component_receipts,
                     "duration_seconds": item.duration_seconds,
+                    "failure_evidence": prompt_evidence(item.failure_evidence),
                     "verification_failure": (
                         verification_failure_excerpt(item.verification)
                         if item.status not in {"approved_candidate", "candidate_group_completed"}
@@ -1122,6 +1130,9 @@ class SelfRepairExperiment:
                 }
                 for item in recent
             ],
+            "verified_progress_count": len(self.progress_credits),
+            "next_action": next_action(
+                recent[-1].failure_evidence if recent else []),
             "recent_automatic_corrections": self.automatic_corrections[-3:],
         }
 

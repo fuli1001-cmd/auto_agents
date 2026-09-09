@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 import errno
 from pathlib import Path
 import re
+import shutil
 from urllib.parse import unquote, urlsplit
 
 
@@ -49,6 +50,17 @@ class VerificationDependencyError(RuntimeError):
                 "missing_dependencies": [requirement],
                 **{name: getattr(self, name) for name in ("environment_diagnostics", "environment_diagnostics_error")
                    if hasattr(self, name)}}
+
+
+def require_verification_executable(name):
+    """Declare an external verification prerequisite without choosing an installer."""
+    binary = shutil.which(name)
+    if binary:
+        return binary
+    dependency = _requirement('executable', name, 'required verification executable is unavailable')
+    if dependency is None:
+        raise ValueError('invalid verification executable name')
+    raise VerificationDependencyError(dependency, 'required verification executable is unavailable')
 
 
 def _owned_python_module(name, workspace):
@@ -104,7 +116,14 @@ def exception_dependencies(error, workspace=None):
     while error is not None and id(error) not in seen:
         seen.add(id(error))
         dependency = None
-        if isinstance(error, ModuleNotFoundError) and error.name:
+        declared = getattr(error, 'requirement', None)
+        if declared is not None:
+            # The trusted standalone launcher and package may load separate
+            # copies of this module. Consume the bounded declaration protocol;
+            # it cannot provide installer commands or grant arbitrary setup.
+            dependency = _requirement(getattr(declared, 'kind', ''), getattr(declared, 'name', ''),
+                                      str(error), workspace)
+        elif isinstance(error, ModuleNotFoundError) and error.name:
             dependency = _requirement("python", error.name, f"ModuleNotFoundError: {error}", workspace)
         elif isinstance(error, OSError) and error.filename and error.errno in {errno.ENOENT, errno.EACCES, errno.ENOEXEC}:
             trace = error.__traceback__

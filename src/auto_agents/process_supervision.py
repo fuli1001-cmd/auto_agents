@@ -316,8 +316,14 @@ def run_supervised_shell_command(
     progress: Optional[Callable[[str, float], None]] = None,
     on_start: Optional[Callable[[int, int], None]] = None,
     diagnostic_output: object = None,
+    timeout_policy: str = "deadline",
+    evidence_dir: Optional[Path] = None,
+    progress_path: Optional[Path] = None,
 ) -> SupervisedCommandResult:
     """Run one shell command with an absolute ceiling and optional activity lease."""
+    if timeout_policy not in {"deadline", "progress"}:
+        raise ValueError("unknown command timeout policy")
+    artifacts = {}
     started = time.monotonic()
     if diagnostic_output is None:
         from .reporting import find_reporter
@@ -332,6 +338,16 @@ def run_supervised_shell_command(
             pass
 
     def capture_files(stdout_file, stderr_file, **metadata: object) -> None:
+        if evidence_dir is not None:
+            from .execution_recovery import redact_incident_text
+            from uuid import uuid4
+            directory = Path(evidence_dir) / uuid4().hex
+            directory.mkdir(parents=True, exist_ok=True)
+            for name, stream in (("stdout", stdout_file), ("stderr", stderr_file)):
+                stream.seek(0)
+                path = directory / (name + ".log")
+                path.write_text(redact_incident_text(stream.read().decode("utf-8", errors="replace")))
+                artifacts[name] = str(path)
         if diagnostic_output is not None:
             try:
                 diagnostic_output.file("stdout", stdout_file)
@@ -372,7 +388,11 @@ def run_supervised_shell_command(
             pgid = record.pgid
             if on_start is not None:
                 on_start(process.pid, pgid)
-            deadline = started + max(0.001, float(timeout_seconds))
+            deadline = (started + max(0.001, float(timeout_seconds))
+                        if timeout_policy == "deadline" else float("inf"))
+            observed_progress = set()
+            last_semantic_progress = started
+            diagnosed_stall = False
             idle_budget = max(0.001, float(idle_timeout_seconds or timeout_seconds))
             last_activity = started
             activity_kind = "started"
@@ -407,9 +427,31 @@ def run_supervised_shell_command(
                         activity_kind = "cpu"
                     last_output_sizes = output_sizes
                     last_cpu_ticks = cpu_ticks
-                    process_snapshot = snapshot
+                    process_snapshot = {**snapshot, **({"stall_diagnostic": process_snapshot["stall_diagnostic"]}
+                        if "stall_diagnostic" in process_snapshot else {})}
                     next_activity_probe = now + min(0.5, max(0.05, idle_budget / 4.0))
-                if adaptive_timeout_enabled and now - last_activity >= idle_budget:
+                if timeout_policy == "progress":
+                    if progress_path is not None:
+                        try:
+                            payload = json.loads(Path(progress_path).read_text())
+                            checkpoints = set(payload.get("checkpoints", []))
+                            if checkpoints - observed_progress:
+                                observed_progress.update(checkpoints)
+                                last_semantic_progress = now
+                                diagnosed_stall = False
+                        except (OSError, ValueError, TypeError):
+                            pass
+                    if now - last_semantic_progress >= idle_budget:
+                        # Capture a second observation before terminating, even
+                        # if repeated output or CPU work keeps the process busy.
+                        if not diagnosed_stall:
+                            process_snapshot["stall_diagnostic"] = _process_group_snapshot(record.pgid)
+                            diagnosed_stall = True
+                            last_semantic_progress = now - idle_budget + min(5.0, idle_budget)
+                        else:
+                            termination_reason = "stalled"
+                            break
+                if timeout_policy == "deadline" and adaptive_timeout_enabled and now - last_activity >= idle_budget:
                     termination_reason = "stalled"
                     break
                 if now >= next_heartbeat:
@@ -455,6 +497,7 @@ def run_supervised_shell_command(
 
         capture_files(stdout_file, stderr_file, returncode=int(returncode),
                       termination_reason=termination_reason, cleanup_incomplete=cleanup_incomplete)
+        process_snapshot["diagnostic_artifacts"] = artifacts
         stdout = _bounded_output(stdout_file).strip()
         stderr = _bounded_output(stderr_file).strip()
         elapsed = time.monotonic() - started
@@ -462,7 +505,8 @@ def run_supervised_shell_command(
             diagnostic = (
                 f"command timed out after {float(timeout_seconds):g}s"
                 if termination_reason == "timeout"
-                else f"command stalled with no observed activity for {idle_budget:g}s"
+                else (f"command stalled with no new verified stage progress for {idle_budget:g}s"
+                      if timeout_policy == "progress" else f"command stalled with no observed activity for {idle_budget:g}s")
             )
             if cleanup_incomplete:
                 diagnostic += "; process group cleanup is incomplete"

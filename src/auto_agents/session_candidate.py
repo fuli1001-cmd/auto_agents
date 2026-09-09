@@ -119,10 +119,15 @@ def execution_checkout(session, state):
         revision = state.verification_binding['contract_revision']
         destination = root / '.auto-agents' / 'candidate-custody' / uuid4().hex / 'project'
         destination.parent.mkdir(parents=True)
-        revision = _clone(root, revision, destination)
+        from .session_source import resolve_source
+        source = resolve_source(root, state)
+        code_revision = state.source_descriptor.get('revision', revision)
+        revision = _clone(source, code_revision, destination)
         state.candidate_custody = {'schema_version': 1, 'checkout': str(destination),
             'repository': state.verification_binding['repository'], 'session_id': state.session_id,
             'binding_fingerprint': state.verification_binding['binding_fingerprint'],
+            'source_id': state.source_descriptor.get('source_id', ''),
+            'contract_revision': state.verification_binding['contract_revision'],
             'base_revision': revision, 'initial_source': not state.verification_binding['contract_revision'],
             'preimages': _inventory(destination)}
         session._save(state)
@@ -283,5 +288,6 @@ def consume_delivery(root, state, delivery, *, child_id):
     state.candidate_custody = {'schema_version': 1, 'checkout': str(destination),
         'repository': str(root.resolve()), 'session_id': state.session_id,
         'binding_fingerprint': state.verification_binding.get('binding_fingerprint', ''),
+        'contract_revision': delivery.get('contract_revision', delivery['base_revision']),
         'base_revision': revision, 'preimages': _inventory(destination),
         'consumed_delivery': {'revision': revision, 'receipt_fingerprint': receipt['fingerprint']}}

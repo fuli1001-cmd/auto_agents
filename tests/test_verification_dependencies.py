@@ -9,6 +9,23 @@ from unittest.mock import patch
 
 import pytest
 
+
+def test_explicit_requirement_survives_separate_launcher_module_identity():
+    from types import SimpleNamespace
+    from auto_agents.verification_dependencies import exception_dependencies
+    error = RuntimeError('verification prerequisite missing')
+    error.requirement = SimpleNamespace(kind='executable', name='another-build-tool')
+    assert [item.key for item in exception_dependencies(error)] == ['executable:another-build-tool']
+
+
+@pytest.mark.parametrize('name', ['vitest', 'another-build-tool'])
+def test_required_executable_reports_a_typed_prerequisite(name, monkeypatch):
+    from auto_agents.verification_dependencies import require_verification_executable, VerificationDependencyError
+    monkeypatch.setattr('auto_agents.verification_dependencies.shutil.which', lambda _name: None)
+    with pytest.raises(VerificationDependencyError) as failure:
+        require_verification_executable(name)
+    assert failure.value.requirement.key == 'executable:' + name
+
 from auto_agents.verification_dependencies import (
     MissingDependency, VerificationDependencyError, detect_verification_dependencies,
 )

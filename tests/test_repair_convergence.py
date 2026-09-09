@@ -21,12 +21,15 @@ def test_rebuilding_old_parent_does_not_repeatedly_credit_the_same_resolutions()
     parent = SelfRepairCandidateRecord("parent", candidate_ref="parent", validation_rank=75)
     state.register_candidate(parent, findings=[SelfRepairFinding(
         key, status="confirmed", disposition="contract_violation", causal_obligation_id=obligation,
+        required_test=f"tests/test_contract.py::test_{key}",
     ) for key in ["a", "b"]])
     outcomes = []
     for number in range(4):
         candidate = SelfRepairCandidateRecord(
             f"candidate-{number}", parent_candidate_id="parent", candidate_ref=f"ref-{number}",
             validation_rank=75, status="candidate_review_rejected", resolved_finding_ids=["a", "b"],
+            review_completed=True,
+            verified_check_ids=["tests/test_contract.py::test_a", "tests/test_contract.py::test_b"],
         )
         outcomes.append(state.register_candidate(candidate, findings=[SelfRepairFinding(
             "guard", status="confirmed", disposition="contract_violation",
@@ -119,7 +122,10 @@ def test_review_rejections_are_bounded_even_with_different_finding_ids_and_posit
 def test_accepted_component_allows_a_new_correction_window():
     state = experiment()
     before = state.accepted_progress_anchor()
-    state.candidates["accepted"] = SelfRepairCandidateRecord(
-        "accepted", status="candidate_group_completed", component_receipts={"first": "commit"},
-    )
+    state.finding_groups = [{"group_id": "first", "contract_obligation_ids": ["root:first"],
+                            "focused_tests": ["python -m pytest -q tests/test_first.py::test_contract"]}]
+    state.register_candidate(SelfRepairCandidateRecord(
+        "accepted", status="candidate_group_completed", finding_group_id="first",
+        candidate_commit="commit",
+    ))
     assert state.accepted_progress_anchor() != before

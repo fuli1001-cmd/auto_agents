@@ -70,6 +70,11 @@ def engine_verification_refs(command: str, project_root: Path, payload: dict) ->
 def bind_session(session, state) -> None:
     # Upgrades and initial sealing are transactional: a rejected authority must
     # not leave a partially rewritten inventory in the durable session.
+    from .session_source import resolve_source
+    had_source = hasattr(session, "_retained_source_root")
+    previous_source = getattr(session, '_retained_source_root', session.project_root)
+    control_root = getattr(session, '_custody_control_root', session.project_root)
+    session._retained_source_root = resolve_source(control_root, state)
     original = state.verification_binding
     state.verification_binding = deepcopy(original)
     try:
@@ -77,6 +82,11 @@ def bind_session(session, state) -> None:
     except Exception:
         state.verification_binding = original
         raise
+    finally:
+        if had_source:
+            session._retained_source_root = previous_source
+        else:
+            del session._retained_source_root
 
 
 def _bind_session(session, state) -> None:
@@ -95,39 +105,43 @@ def _bind_session(session, state) -> None:
             session._save(state)
         return
     root = session.project_root
+    source_root = getattr(session, "_retained_source_root", root)
     task_scope = _task_scope(session, state)
     gates = session.config.gates.to_dict()
     tasks = read_json(task_plan_path(root), default={})
     run = read_json(run_state_path(root), default={})
     revision = state.baseline_git_ref or state.baseline_head_ref or state.lineage_head_ref
+    if state.source_descriptor:
+        revision = state.source_descriptor['contract_revision']
     resumed = getattr(session, '_resumed_verification_state', None)
     if resumed is not None and resumed.session_id == state.session_id:
         # Workflow migration may populate lineage with today's HEAD. That is
         # not evidence of the contract authorized by a legacy session.
         revision = resumed.baseline_git_ref or resumed.baseline_head_ref or resumed.lineage_head_ref
-        if not revision and head_ref(root):
+        if not revision and head_ref(source_root):
             raise ownership_error(state, 'session verification contract revision is unavailable')
     if state.parent_handoff_id and not revision:
         raise ownership_error(state, 'session verification contract revision is unavailable')
     if (not state.parent_handoff_id and not state.baseline_head_ref
-            and not state.lineage_head_ref and not head_ref(root)):
+            and not state.lineage_head_ref and not head_ref(source_root)):
         # An unborn legacy standalone repository has no historical contract
         # to recover. Preserve its normal first-baseline capture behavior.
         revision = ""
     if revision and (resumed is not None or state.parent_handoff_id or state.baseline_git_ref or state.baseline_head_ref
-                     or state.current_attempt or revision != head_ref(root)):
+                     or state.current_attempt or revision != head_ref(source_root)):
         # Baseline snapshot refs are disposable. Recover from the recorded
         # source HEAD (or workflow lineage) if the snapshot has disappeared,
         # before _ensure_baseline refreshes the comparison snapshot. Legacy
         # standalone resumes acquire their lineage during workflow migration;
         # routed children must retain their own recorded contract history.
         for candidate in dict.fromkeys(filter(None, (
+            state.source_descriptor.get("contract_revision", ""),
             (resumed or state).baseline_git_ref, (resumed or state).baseline_head_ref,
             (resumed or state).lineage_head_ref,
         ))):
             probe = subprocess.run(
                 ["git", "rev-parse", "--verify", f"{candidate}^{{commit}}"],
-                cwd=root, capture_output=True, text=True,
+                cwd=source_root, capture_output=True, text=True,
             )
             if probe.returncode == 0:
                 revision = probe.stdout.strip()
@@ -138,7 +152,7 @@ def _bind_session(session, state) -> None:
         for path in (config_path(root), task_plan_path(root), run_state_path(root)):
             result = subprocess.run(
                 ["git", "show", f"{revision}:{path.relative_to(root).as_posix()}"],
-                cwd=root, capture_output=True, text=True,
+                cwd=source_root, capture_output=True, text=True,
             )
             if result.returncode and path == task_plan_path(root) and state.parent_handoff_id:
                 raise ownership_error(state, 'retained task plan ownership is unavailable',
@@ -163,7 +177,7 @@ def _bind_session(session, state) -> None:
         "plan": deepcopy(tasks),
         "task_scope": task_scope,
         "plan_workflow_id": plan_workflow,
-        "contract_revision": revision or head_ref(root),
+        "contract_revision": revision or head_ref(source_root),
         "contract_fingerprint": fingerprint([gates, tasks, task_scope, plan_workflow]),
         "plan_fingerprint": fingerprint(tasks),
     }
@@ -199,7 +213,7 @@ def _recover_retained_plan(session, state):
         raise ownership_error(state, 'retained plan history is unavailable for binding upgrade')
     path = task_plan_path(session.project_root).relative_to(session.project_root).as_posix()
     result = subprocess.run(['git', 'show', f'{revision}:{path}'],
-                            cwd=session.project_root, capture_output=True, text=True)
+                            cwd=getattr(session, "_retained_source_root", session.project_root), capture_output=True, text=True)
     if result.returncode:
         raise ownership_error(state, 'retained plan history is unavailable for binding upgrade')
     plan = json.loads(result.stdout)
@@ -265,7 +279,7 @@ def _future_foreign_step(session, state, step, excluded):
         if len(parts) > 2 or not parts[0].endswith('.py'):
             return False
         result = subprocess.run(['git', 'show', f'{revision}:{parts[0]}'],
-                                cwd=session.project_root, capture_output=True, text=True)
+                                cwd=getattr(session, "_retained_source_root", session.project_root), capture_output=True, text=True)
         if result.returncode:
             continue
         if len(parts) == 1:
@@ -339,7 +353,7 @@ def _validate_task_authority(state):
         explicit = (task.get('task_id') in scope.get('task_ids', [])
                     or set(scope.get('requirement_ids', [])).intersection(task.get('requirement_ids', [])))
         owner = task.get('workflow_id') or binding.get('plan_workflow_id')
-        if explicit and owner and owner != state.workflow_id:
+        if explicit and task.get('workflow_id') and owner != state.workflow_id:
             raise ownership_error(state, 'task authority conflicts with retained workflow owner',
                                   conflicting_task_id=task.get('task_id'), task_workflow_id=owner)
 
@@ -535,7 +549,7 @@ def _seal_inventory(session, state):
                                for parent in (directory, *directory.parents)
                                for name in _PYTEST_CONFIG_NAMES)
         entries = subprocess.run(['git', 'ls-tree', '-r', '--name-only', revision, '--', relative],
-                                 cwd=session.project_root, capture_output=True, text=True)
+                                 cwd=getattr(session, "_retained_source_root", session.project_root), capture_output=True, text=True)
         for path in entries.stdout.splitlines():
             # Implicit pytest discovery starts at cwd. Protect its retained
             # tests without turning ordinary implementation files into proofs.
@@ -768,7 +782,7 @@ def _pytest_selection_restricted(args):
 
 def _historical_source(session, revision, path):
     result = subprocess.run(['git', 'show', f'{revision}:{path}'],
-                            cwd=session.project_root, capture_output=True, text=True)
+                            cwd=getattr(session, "_retained_source_root", session.project_root), capture_output=True, text=True)
     return result.stdout if result.returncode == 0 else None
 
 

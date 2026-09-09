@@ -76,6 +76,7 @@ _MESSAGES = {
     "capture.failed": ("诊断记录不完整：{error}", "Diagnostic recording is incomplete: {error}"),
     "repair.phase": ("正在修复 auto_agents：{phase}", "Repairing auto_agents: {phase}"),
     "repair.candidate_started": ("修复候选 {candidate}：沿用 {parent}，组件 {component}，剩余问题 {remaining}", "Repair candidate {candidate}: parent={parent}, component={component}, remaining findings={remaining}"),
+    "repair.progress": ("本轮新增验证进展 {gained} 项，历史累计 {total} 项；下一步：{action}", "Verified progress: {gained} new, {total} historical; next action: {action}"),
     "repair.candidate_result": ("修复候选 {candidate}：{status}；{reason}（本轮 {duration}，累计 {total}）", "Repair candidate {candidate}: {status}; {reason} (attempt {duration}, total {total})"),
     "session.restored": ("已恢复 {mode} 会话 {session_id}；恢复记录：{receipt}", "Restored {mode} session {session_id}; restoration receipt: {receipt}"),
     "repair.checks": ("修复验证：{suite}，已执行 {completed}/{total} 组检查", "Repair validation: {suite}, {completed}/{total} check groups executed"),

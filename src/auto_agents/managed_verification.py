@@ -201,4 +201,6 @@ def attach_context(orchestrator, request):
     if spec:
         spec = replace(spec, blocks=(*spec.blocks, PromptBlock(guide, "verification.managed")))
     return replace(request, prompt=str(request.prompt) + "\n" + guide, prompt_spec=spec,
+                   progress_evidence_path=(Path(config["root"]) / "verification-progress" / (reply["context"] + ".json")
+                                           if request.purpose == "self_repair" else request.progress_evidence_path),
                    prompt_metadata={**request.prompt_metadata, "verification_context": True})

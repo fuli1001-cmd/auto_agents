@@ -59,7 +59,11 @@ def test_same_candidate_proof_is_retried_after_dependency_preparation(tmp_path):
     assert prepare.call_args.args[0].key == "node:vitest"
     assert prepare.call_args.args[1] == MISSING + "\n"
     assert execute.call_count == 2
-    assert execute.call_args_list[0] == execute.call_args_list[1]
+    before, after = execute.call_args_list
+    assert before.args == after.args
+    assert {k: v for k, v in before.kwargs.items() if k != 'progress'} == {
+        k: v for k, v in after.kwargs.items() if k != 'progress'}
+    assert before.kwargs['progress'].evidence_dir == after.kwargs['progress'].evidence_dir
 
 
 def test_preparation_is_bounded_and_requires_supervisor_interpreter(tmp_path, monkeypatch):

@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -469,9 +470,11 @@ class Session:
 
     @reporting_scope
     def _drive_local(self, state: SessionState) -> SessionState:
-        if state.candidate_custody:
+        if state.candidate_custody or state.source_descriptor:
             from .session_candidate import execution_checkout
             try:
+                if state.source_descriptor and not state.verification_binding:
+                    bind_session(self, state)
                 with execution_checkout(self, state):
                     return self._drive_local_owned(state)
             except SessionOwnershipError as error:
@@ -2008,6 +2011,9 @@ class Session:
             reason=reason,
             payload=handoff_payload,
         )
+        from .session_source import register_source
+        register_source(Path(getattr(self, '_custody_control_root', self.project_root)), state, handoff)
+        store.save_handoff(handoff)
         state.active_handoff_id = handoff.handoff_id
         state.status = "waiting_child"
         state.return_phase = ""
@@ -2046,13 +2052,17 @@ class Session:
 
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
         from .session_candidate import execution_checkout
+        from .execution_binding import ExecutionBindingError
         self._current_state = state
         try:
+            self._fix_verify_command_for_execution(state.fix_verify_command)
             bind_session(self, state)
             with execution_checkout(self, state):
                 return self._phase_fix_execute_owned(state)
         except SessionOwnershipError as error:
             return self._block_execution_binding(state, error, "verification_ownership")
+        except ExecutionBindingError as error:
+            return self._block_execution_binding(state, str(error), "verification_execution_binding")
 
     def _phase_fix_execute_owned(self, state: SessionState) -> SessionState:
         self._current_state = state
@@ -2091,6 +2101,9 @@ class Session:
             )
             restore_root = Path(restore_guard.name)
             self._capture_collab_restore_point(restore_root, before_snapshot)
+            from copy import deepcopy
+            prior_receipt = deepcopy(state.candidate_custody.get("receipt"))
+            prior_candidate_paths = dict(state.candidate_paths)
             try:
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
             except SessionOwnershipError as error:
@@ -2154,10 +2167,19 @@ class Session:
                     restore_root,
                     only_paths=set(state.candidate_paths),
                 )
-                state.candidate_paths = {
-                    path: digest for path, digest in state.candidate_paths.items()
-                    if path not in restored
-                }
+                if state.candidate_custody:
+                    from .session_candidate import validate_receipt
+                    state.candidate_paths = prior_candidate_paths
+                    if prior_receipt is None:
+                        state.candidate_custody.pop("receipt", None)
+                    else:
+                        state.candidate_custody["receipt"] = prior_receipt
+                    validate_receipt(state)
+                else:
+                    state.candidate_paths = {
+                        path: digest for path, digest in state.candidate_paths.items()
+                        if path not in restored
+                    }
                 restore_guard.cleanup()
                 raw_spec_seed = disposition.get("spec_seed")
                 if not isinstance(raw_spec_seed, dict) or not raw_spec_seed:
@@ -4506,6 +4528,14 @@ class Session:
         if not stripped:
             return stripped
         validate_verification_binding(stripped, self.project_root)
+        try:
+            first = shlex.split(stripped)[0]
+        except (ValueError, IndexError):
+            return stripped
+        if Path(first).is_absolute():
+            # An explicit interpreter is already selected; do not add another
+            # launcher with different activation and temporary-file semantics.
+            return stripped
         conda_meta = self.project_root / ".conda" / "conda-meta"
         if not conda_meta.exists():
             return stripped

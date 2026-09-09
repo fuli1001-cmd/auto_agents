@@ -103,6 +103,9 @@ class ProgressSupervisor:
         self.repeat_count = 0
         self.last_loop_fingerprint = ""
         self.seen_semantic_fingerprints: set[str] = set()
+        self.trusted_progress = (request.purpose == "self_repair"
+                                 or bool(request.progress_evidence_path and request.progress_expected_checks))
+        self.seen_verified_checkpoints = self._trusted_checkpoints() if self.trusted_progress else set()
         self.forced_reason = ""
         self.events: Deque[Dict[str, object]] = deque(maxlen=50)
         self._events_lock = Lock()
@@ -110,6 +113,30 @@ class ProgressSupervisor:
         self._process_snapshot: Dict[int, Tuple[int, int, str]] = {}
         self._record("supervision_started", detail=request.attempt_id)
         self.write_checkpoint("running", force=True)
+
+    def _trusted_checkpoints(self):
+        try:
+            payload = json.loads(self.request.progress_evidence_path.read_text())
+            if payload.get("context") != self.request.progress_evidence_path.stem:
+                return set()
+            allowed = self.request.progress_expected_checks
+            observed = set()
+            for checkpoint in payload.get("checkpoints", []):
+                if checkpoint.startswith("start:"):
+                    identity, phase = checkpoint[6:], "start"
+                else:
+                    parts = checkpoint.rsplit(":", 2)
+                    if len(parts) != 3:
+                        continue
+                    identity, phase = parts[0], ":".join(parts[1:])
+                for target in allowed:
+                    if identity == target or identity.startswith((target + "::", target + "[")):
+                        # A broad file check cannot renew a lease forever by
+                        # adding unrelated test names inside that same file.
+                        observed.add(target + ":" + phase)
+            return observed
+        except (OSError, ValueError, TypeError, AttributeError):
+            return set()
 
     def observe_io(self, stream_name: str, chunk: str) -> List[AgentProgressEvent]:
         if chunk:
@@ -135,6 +162,12 @@ class ProgressSupervisor:
                 self._record("protocol_error", detail=str(exc)[:300])
 
         self._sample_process_group(now)
+        if self.trusted_progress:
+            checkpoints = self._trusted_checkpoints()
+            if checkpoints - self.seen_verified_checkpoints:
+                self.seen_verified_checkpoints.update(checkpoints)
+                self.last_semantic_progress = now
+                self._record("verified_stage_progress", semantic=True)
         if now - self.last_workspace_poll >= WORKSPACE_POLL_SECONDS:
             self.last_workspace_poll = now
             self._sample_workspace(now)
@@ -154,7 +187,7 @@ class ProgressSupervisor:
         if self.active_tools and now - self.last_tool_activity >= self.config.tool_idle_seconds:
             return "tool_stalled"
         if (
-            not self.active_tools
+            (not self.active_tools or self.trusted_progress)
             and now - self.last_semantic_progress
             >= self._effective_progress_lease_seconds()
         ):
@@ -194,7 +227,7 @@ class ProgressSupervisor:
             elif event.kind == "error":
                 self.forced_reason = "provider_error"
             new_progress = False
-            if event.semantic:
+            if event.semantic and not self.trusted_progress:
                 semantic_fingerprint = self._semantic_fingerprint(event)
                 if semantic_fingerprint not in self.seen_semantic_fingerprints:
                     self.seen_semantic_fingerprints.add(semantic_fingerprint)
@@ -282,7 +315,7 @@ class ProgressSupervisor:
         basis = "\0".join(
             (
                 self.request.stage,
-                self.workspace_fingerprint,
+                "" if self.trusted_progress else self.workspace_fingerprint,
                 event.fingerprint,
                 self._normalize_detail(event.detail),
             )
@@ -306,10 +339,11 @@ class ProgressSupervisor:
         if workspace != self.workspace_fingerprint or output != self.output_fingerprint:
             self.workspace_fingerprint = workspace
             self.output_fingerprint = output
-            self.last_semantic_progress = now
-            self.repeat_count = 0
-            self.last_loop_fingerprint = ""
-            self._record("workspace_changed", fingerprint=workspace, semantic=True)
+            if not self.trusted_progress:
+                self.last_semantic_progress = now
+                self.repeat_count = 0
+                self.last_loop_fingerprint = ""
+            self._record("workspace_changed", fingerprint=workspace, semantic=not self.trusted_progress)
 
     def _sample_process_group(self, now: float) -> None:
         snapshot = self._read_process_group(self.process_pid)

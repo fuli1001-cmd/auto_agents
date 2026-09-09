@@ -4508,7 +4508,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertIn("test -f remote_fix.py", result.verification)
             self.assertIn("skipped=supplemental", result.verification)
 
-    def test_sticky_regressions_run_before_active_component_checks(self):
+    def test_active_component_checks_run_before_retained_regressions(self):
         experiment = SelfRepairExperiment.create(
             run_id="run",
             root_fingerprint="root",
@@ -4544,8 +4544,8 @@ class RootCauseCoordinatorTests(unittest.TestCase):
         self.assertEqual(
             captured,
             [
-                "python -m pytest -q tests/test_previous.py::test_regression",
                 "python -m pytest -q tests/test_current.py::test_contract",
+                "python -m pytest -q tests/test_previous.py::test_regression",
             ],
         )
 
@@ -4789,3 +4789,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Preserve executable node IDs referenced by retained acceptance contracts.
+RootCauseCoordinatorTests.test_sticky_regressions_run_before_active_component_checks = RootCauseCoordinatorTests.test_active_component_checks_run_before_retained_regressions

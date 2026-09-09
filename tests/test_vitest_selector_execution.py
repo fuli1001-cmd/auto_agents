@@ -45,8 +45,8 @@ def _prepare_real_vitest(tmp_path, monkeypatch):
     tools = Path(sys.prefix) / 'verification-tools'
     roots = [p.parent.parent for p in tools.glob('*/node_modules/vitest/package.json')]
     if not roots:
-        binary = shutil.which('vitest')
-        assert binary, 'trusted environment must provide real Vitest'
+        from auto_agents.verification_dependencies import require_verification_executable
+        binary = require_verification_executable('vitest')
         roots = [Path(binary).resolve().parent.parent]
     (tmp_path / 'node_modules').symlink_to(roots[0], target_is_directory=True)
     (tmp_path / 'package.json').write_text('{"type":"module"}')

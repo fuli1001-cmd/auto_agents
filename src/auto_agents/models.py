@@ -1967,6 +1967,7 @@ class SessionState:
     verification_binding: Dict[str, object] = field(default_factory=dict)
     candidate_paths: Dict[str, str] = field(default_factory=dict)
     candidate_custody: Dict[str, object] = field(default_factory=dict)
+    source_descriptor: Dict[str, object] = field(default_factory=dict)
     verification_diagnostics: Dict[str, object] = field(default_factory=dict)
     mode: str = "fix"
     status: str = "conversing"
@@ -2024,6 +2025,7 @@ class SessionState:
             verification_binding=dict(data.get("verification_binding", {})),
             candidate_paths=dict(data.get("candidate_paths", {})),
             candidate_custody=dict(data.get("candidate_custody", {})),
+            source_descriptor=dict(data.get("source_descriptor", {})),
             verification_diagnostics=dict(data.get("verification_diagnostics", {})),
             mode=str(data.get("mode", "fix")),
             status=str(data.get("status", "conversing")),
@@ -2112,6 +2114,7 @@ class SessionState:
             "verification_binding": dict(self.verification_binding),
             "candidate_paths": dict(self.candidate_paths),
             "candidate_custody": dict(self.candidate_custody),
+            "source_descriptor": dict(self.source_descriptor),
             "verification_diagnostics": dict(self.verification_diagnostics),
             "mode": self.mode,
             "status": self.status,
@@ -2167,6 +2170,8 @@ class AgentRequest:
     attachments: List[Path] = field(default_factory=list)
     attempt_id: str = ""
     progress_report_path: Optional[Path] = None
+    progress_evidence_path: Optional[Path] = None
+    progress_expected_checks: List[str] = field(default_factory=list)
     resume_session_id: str = ""
     resume_provider: str = ""
     sandbox_mode: str = ""

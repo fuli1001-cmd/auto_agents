@@ -227,6 +227,10 @@ class WorkflowCoordinator:
         session._auto_approve = self.auto_approve
         state.workflow_id = snapshot.workflow_id
         state.parent_handoff_id = handoff.handoff_id
+        source = dict(handoff.payload.get('source_descriptor', {}))
+        if state.source_descriptor and state.source_descriptor != source:
+            raise RuntimeError('retained child source conflicts with handoff')
+        state.source_descriptor = source
         state.goal = handoff.goal
         self._apply_authorization_policy(
             state,
@@ -853,15 +857,24 @@ class WorkflowCoordinator:
         ]
         owned = None
         if handoff.child is not None and handoff.child.kind == "fix":
-            from .session_verification import owned_paths
-            child_state = load_session_state(self.project_root, handoff.child.native_id)
+            from .session_verification import owned_paths, SessionOwnershipError
+            try:
+                child_state = load_session_state(self.project_root, handoff.child.native_id)
+            except (OSError, ValueError) as error:
+                raise SessionOwnershipError("child ownership is unavailable; refusing shared rollback",
+                    diagnostic={"session_id": handoff.child.native_id, "handoff_id": handoff.handoff_id,
+                                "retry_fix": False}) from error
             if child_state.candidate_custody:
                 return []
             if child_state.verification_binding:
                 owned = set(owned_paths(self.orch, child_state))
                 current = sorted(owned & {path for _, path in changed_entries(self.project_root, ignored_prefixes=())})
-        if not current:
+        if not current or handoff.child is None:
             return []
+        if owned is None:
+            from .session_verification import SessionOwnershipError
+            raise SessionOwnershipError("no child-owned receipt authorizes shared rollback",
+                diagnostic={"handoff_id": handoff.handoff_id, "retry_fix": False})
         failure_root = root / "failed-candidate"
         for relative in current:
             _copy_path(self.project_root / relative, failure_root / relative)

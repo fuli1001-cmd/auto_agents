@@ -1337,8 +1337,10 @@ def _run_command_once(
                                context=getattr(progress, "context", ""), cwd=str(cwd)) if reporter is not None else None
     if progress is not None:
         progress("start", command, 0.0)
+    from .pytest_invocation import compile_ini_overrides
+    actual_command = compile_ini_overrides(command, cwd, env)
     process = run_supervised_shell_command(
-        command,
+        actual_command,
         cwd=cwd,
         env=env,
         timeout_seconds=timeout_seconds,
@@ -1352,6 +1354,10 @@ def _run_command_once(
             else None
         ),
         diagnostic_output=capture,
+        **({"timeout_policy": progress.timeout_policy,
+            "evidence_dir": getattr(progress, "evidence_dir", None),
+            "progress_path": getattr(progress, "progress_path", None)}
+           if hasattr(progress, "timeout_policy") else {}),
     )
     result = CommandResult(
         command=command,
@@ -1367,6 +1373,7 @@ def _run_command_once(
         activity_kind=process.activity_kind,
         process_snapshot=process.process_snapshot,
     )
+    result.process_snapshot["compiled_command"] = actual_command
     reject_empty_vitest_selection(result, cwd)
     if progress is not None:
         progress("finish", command, result.duration_seconds)
