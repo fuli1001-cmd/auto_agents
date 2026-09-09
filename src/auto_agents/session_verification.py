@@ -602,6 +602,13 @@ def _seal_inventory(session, state):
     bound_owners = [owner for key in required for owner in owners.get(key, [])]
     bound_owners.extend(owner for rows in required_commands.values() for owner in rows)
     bound_owners.extend(binding['proof_graph']['commands'].get(state.fix_verify_command, []))
+    # Capture provenance once. Baseline capture and refresh update the live
+    # session references after binding; inventory enrichment must not replace
+    # the original identity sealed into candidate custody.
+    binding.setdefault('baseline_identity', {
+        'git_ref': state.baseline_git_ref, 'head_ref': state.baseline_head_ref,
+        'lineage_head_ref': state.lineage_head_ref,
+    })
     binding.update({
         'schema_version': 12, 'repository': str(session.project_root.resolve()),
         'original_handoff_id': state.parent_handoff_id,
@@ -614,8 +621,6 @@ def _seal_inventory(session, state):
                                     for step in _complete_gates(state)['steps']},
         'verification_policy': {key: value for key, value in binding['gates'].items()
                                 if key not in {'steps', 'commands', 'parallel_groups'}},
-        'baseline_identity': {'git_ref': state.baseline_git_ref, 'head_ref': state.baseline_head_ref,
-                              'lineage_head_ref': state.lineage_head_ref},
         'fix_verify_command': state.fix_verify_command,
     })
     proof_sources = {}

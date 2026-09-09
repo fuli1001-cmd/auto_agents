@@ -1941,10 +1941,18 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
 
     root, child = project(tmp_path)
     child.goal_execution_environment = {'mode': 'real', 'confirmed': True, 'source': 'explicit_goal'}
+    if legacy == 'custody':
+        child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/retained-baseline'
+        git(root, 'update-ref', child.baseline_git_ref, child.baseline_head_ref)
     _binding_fixture(root, child)
     if legacy == 'custody':
+        original_baseline = deepcopy(child.verification_binding['baseline_identity'])
+        git(root, 'update-ref', '-d', child.baseline_git_ref)
         child, calls, _ = run_session(root, monkeypatch)
         assert child.status == 'completed' and calls == ['fix']
+        assert child.baseline_git_ref and child.baseline_git_ref != original_baseline['git_ref']
+        assert child.verification_binding['baseline_identity'] == original_baseline
+        refreshed_baseline = child.baseline_git_ref
     if legacy:
         child.verification_binding['schema_version'] = 11
         for key in ('execution_environment', 'source_provenance', 'session_mode'):
@@ -1963,12 +1971,13 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
     assert calls == ([] if legacy == 'custody' else ['fix'])
     binding = saved.verification_binding
     for key in ('repository', 'contract_revision', 'authorization', 'gates', 'plan', 'required_proof_ids',
-                'session_id', 'workflow_id', 'original_handoff_id', 'task_scope'):
+                'session_id', 'workflow_id', 'original_handoff_id', 'task_scope', 'baseline_identity'):
         assert binding[key] == retained[key]
     assert binding['schema_version'] == 13
     assert binding['execution_environment'] == child.goal_execution_environment
     assert binding['source_provenance']['revision'] == child.baseline_head_ref
     if legacy == 'custody':
+        assert saved.baseline_git_ref == refreshed_baseline
         _assert_migrated_candidate_reused(root, monkeypatch, saved, retained_custody)
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
@@ -2672,8 +2681,16 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
     plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
     _retain_contract(root, child, config, plan)
     if legacy == 'custody':
+        child.lineage_head_ref = child.baseline_head_ref
+        child.baseline_git_ref = child.baseline_head_ref = ''
+        _binding_fixture(root, child)
+        original_baseline = deepcopy(child.verification_binding['baseline_identity'])
+        assert original_baseline['git_ref'] == original_baseline['head_ref'] == ''
         child, calls, _ = run_session(root, monkeypatch)
         assert child.status == 'completed' and calls == ['fix']
+        assert child.baseline_git_ref and child.baseline_head_ref
+        assert child.verification_binding['baseline_identity'] == original_baseline
+        captured_baseline = child.baseline_git_ref
     if legacy:
         _binding_fixture(root, child)
         for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
@@ -2707,6 +2724,8 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
     assert binding['required_references']['tests/test_owned.py::test_owned']['kind'] == 'selector'
     assert not (root / 'tests/test_future.py').exists()
     if legacy == 'custody':
+        assert binding['baseline_identity'] == original_baseline
+        assert saved.baseline_git_ref == captured_baseline
         _assert_migrated_candidate_reused(root, monkeypatch, saved, retained_custody)
     assert (root / '.git/index').read_bytes() == index
     assert (root / 'foreign.py').read_text() == 'VALUE = 99\n'
@@ -2781,6 +2800,9 @@ def _assert_migrated_candidate_reused(root, monkeypatch, saved, retained):
     assert repeated.status == 'completed' and calls == []
     assert repeated.candidate_custody == custody
     expected = fingerprint([bridge['inventory_fingerprint'], retained['receipt']['fingerprint']])
+    assert repeated.verification_binding == saved.verification_binding
+    assert repeated.baseline_git_ref == saved.baseline_git_ref
+    assert repeated.baseline_head_ref == saved.baseline_head_ref
     assert contexts and all(identity == expected for identity in contexts)
     assert git(Path(custody['checkout']), 'show', custody['receipt']['source_revision'] + ':value.py') == 'VALUE = 1\n'
 
