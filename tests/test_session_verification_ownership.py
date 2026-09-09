@@ -1163,7 +1163,8 @@ def test_public_resume_rejects_pytest_control_file_weakening(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize('passing_proof', [False, True])
-def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof):
+@pytest.mark.parametrize('reference', ['owned.contract', 'owned.report.json'])
+def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference):
     import auto_agents.session as session_module
 
     root, child = project(tmp_path)
@@ -1175,7 +1176,7 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
         config.gates.steps = [VerificationStep(proof_id='unrelated.control', runner='pytest',
             targets=['tests/test_control.py'], levels=['affected', 'release'], impact_paths=['**'])]
     plan = {'tasks': [{'task_id': 'task-owned', 'title': 'Missing owned proof',
-                      'requirement_ids': ['REQ-owned'], 'verification_refs': ['owned.contract']}],
+                      'requirement_ids': ['REQ-owned'], 'verification_refs': [reference]}],
             'verification_steps': [step.to_dict() for step in config.gates.steps]}
     _retain_contract(root, child, config, plan)
     dispatched = []
@@ -1189,7 +1190,7 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
     assert calls == []
     assert dispatched == [], 'missing proof definitions must block before baseline or certificate lookup'
     diagnostic = saved.execution_log[-1]['diagnostic']
-    assert diagnostic['verification_ref'] == 'owned.contract'
+    assert diagnostic['verification_ref'] == reference
     assert diagnostic['session_id'] == child.session_id
     assert diagnostic['owners'][0]['task_id'] == 'task-owned'
     assert diagnostic['owners'][0]['requirement_ids'] == ['REQ-owned']
@@ -2575,3 +2576,75 @@ def test_directory_symlink_receipt_never_claims_or_chmods_foreign_descendants(
     assert (root / 'assets/late.txt').read_bytes() == b'late foreign untracked'
     assert old.read_bytes() == b'late foreign worktree'
     assert stat.S_IMODE(old.stat().st_mode) == 0o711
+
+
+@pytest.mark.parametrize('field,value', [
+    ('kind', 'lint'), ('requires', ['network']),
+    ('operator_input_bindings', [{'name': 'retained-input', 'value': 'different'}]),
+    ('command', 'python -m pytest tests/test_owned.py --strict-markers'),
+])
+def test_public_resume_rejects_conflicting_retained_proof_definitions(tmp_path, monkeypatch, field, value):
+    from auto_agents.config import load_task_plan
+
+    root, child = project(tmp_path)
+    config = load_project_config(root)
+    plan = load_task_plan(root)
+    plan['verification_steps'][0][field] = value
+    _retain_contract(root, child, config, plan)
+    ambient = _switch_ambient_binding_plan(root)
+    saved = _assert_binding_blocked_before_execution(root, monkeypatch)
+    assert saved.verification_binding == {}, 'rejected inventory must not be partially persisted'
+    assert saved.execution_log[-1]['diagnostic']['proof_id'] == 'owned.contract'
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, legacy):
+    from auto_agents.config import load_task_plan
+    from auto_agents.models import GateParallelGroup
+    from auto_agents.session_verification import fingerprint
+
+    root, child = project(tmp_path)
+    config = load_project_config(root)
+    future = VerificationStep(proof_id='foreign.future', runner='pytest',
+        targets=['tests/test_future.py::test_future'], levels=['release'])
+    config.gates.steps.append(future)
+    command = './.conda/bin/python -m pytest -q tests/test_owned.py'
+    config.gates.parallel_groups = [GateParallelGroup(name='manual-retained', commands=[command])]
+    child.fix_verify_command = command
+    plan = load_task_plan(root)
+    plan['tasks'].append({'task_id': 'task-foreign', 'title': 'Foreign pending obligation',
+        'workflow_id': 'foreign-workflow', 'status': 'pending', 'requirement_ids': ['REQ-foreign'],
+        'verification_refs': ['foreign.future']})
+    plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
+    _retain_contract(root, child, config, plan)
+    if legacy:
+        _binding_fixture(root, child)
+        for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
+            child.verification_binding.pop(key, None)
+        child.verification_binding['binding_fingerprint'] = fingerprint({
+            key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+        save_session_state(root, child)
+    ambient = _switch_ambient_binding_plan(root)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed', saved.to_dict()
+    assert calls == ['fix']
+    binding = saved.verification_binding
+    graph = binding['proof_graph']
+    assert graph['source']['revision'] == child.baseline_head_ref
+    assert {step['proof_id'] for step in graph['gates']['steps']} == {'owned.contract', 'foreign.future'}
+    assert graph['proof_owners']['foreign.future'][0]['task_id'] == 'task-foreign'
+    assert graph['commands'][command][0]['task_id'] == 'task-owned'
+    assert binding['required_proof_ids'] == ['owned.contract']
+    assert binding['task_ids'] == ['task-owned']
+    assert binding['required_references']['tests/test_owned.py::test_owned']['kind'] == 'selector'
+    assert not (root / 'tests/test_future.py').exists()
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+# These frozen g04 entrypoints reuse the complete public-resume regressions.
+test_selection_binds_authorization_owned_candidate_and_current_contract = test_session_gate_selection_binds_authorization_candidate_and_contract
+test_resumed_fix_uses_owned_contract_after_global_plan_switch = test_resumed_fix_ignores_foreign_pending_plan_without_weakening_its_gates
+test_public_legacy_resume_requires_resolved_contract_ownership = test_public_resume_before_first_baseline_uses_child_history
+test_retained_plan_proofs_survive_generated_gate_overlap = test_public_resume_recovers_release_proof_removed_from_generated_config
+test_covering_commands_validate_bound_requirement_hashes = test_public_resume_validates_contract_owners_after_command_expansion

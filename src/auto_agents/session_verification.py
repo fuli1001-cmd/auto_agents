@@ -97,10 +97,11 @@ def _bind_session(session, state) -> None:
             state.verification_binding['task_scope'] = scope
         elif any(scope.values()) and scope != state.verification_binding['task_scope']:
             raise ownership_error(state, 'retained task authority conflicts with session evidence')
-        if state.verification_binding.get('schema_version', 1) < 12:
+        upgrade_inventory = state.verification_binding.get('proof_inventory_version', 0) < 1
+        if state.verification_binding.get('schema_version', 1) < 12 or upgrade_inventory:
             _recover_retained_plan(session, state)
             _seal_inventory(session, state)
-        if state.verification_binding.get('schema_version', 1) < 13:
+        if state.verification_binding.get('schema_version', 1) < 13 or upgrade_inventory:
             _seal_authority(session, state)
             session._save(state)
         return
@@ -154,7 +155,7 @@ def _bind_session(session, state) -> None:
                 ["git", "show", f"{revision}:{path.relative_to(root).as_posix()}"],
                 cwd=source_root, capture_output=True, text=True,
             )
-            if result.returncode and path == task_plan_path(root) and state.parent_handoff_id:
+            if result.returncode and path == task_plan_path(root):
                 raise ownership_error(state, 'retained task plan ownership is unavailable',
                                       task_scope=task_scope, contract_revision=revision)
             if result.returncode and path != config_path(root):
@@ -227,6 +228,8 @@ def _complete_gates(state):
     """Union generated configuration with its original, unabridged plan."""
     from .models import VerificationStep
     binding = state.verification_binding
+    if 'proof_graph' in binding:
+        return deepcopy(binding['proof_graph']['gates'])
     gates = deepcopy(binding['gates'])
     indexed = {}
     for raw in [*gates.get('steps', []), *binding.get('plan', {}).get('verification_steps', [])]:
@@ -236,7 +239,9 @@ def _complete_gates(state):
         if key in indexed:
             existing = indexed[key]
             # The same proof id cannot identify two different invocations.
-            for field in ('runner', 'command', 'targets', 'args', 'cwd'):
+            # Keep resource/input and cache policy too: a matching target is
+            # not enough to make two definitions interchangeable.
+            for field in step.keys() - {'depends_on_proofs', 'levels', 'impact_paths', 'purpose'}:
                 if existing.get(field) != step.get(field):
                     raise ownership_error(state, f'retained proof {key} has conflicting {field}', proof_id=key)
             for field in ('depends_on_proofs', 'levels', 'impact_paths'):
@@ -245,6 +250,57 @@ def _complete_gates(state):
             indexed[key] = step
     gates['steps'] = list(indexed.values())
     return gates
+
+
+def _seal_proof_graph(session, state):
+    """Seal definitions and owners before selection can project any of them out."""
+    from .gates import command_from_verification_step
+    from .models import GateConfig, VerificationStep
+
+    binding = state.verification_binding
+    gates = _complete_gates(state)
+    # VerificationStep's legacy serializer/compiler does not execute command
+    # overrides. Do not let a retained override disappear into default pytest.
+    for raw in [*binding['gates'].get('steps', []),
+                *binding.get('plan', {}).get('verification_steps', [])]:
+        if raw.get('command') and raw['command'].strip() != command_from_verification_step(
+                VerificationStep.from_dict(raw), session.project_root):
+            raise ownership_error(state, 'retained proof command cannot be compiled without changing its contract',
+                                  proof_id=raw.get('proof_id', ''), command=raw['command'])
+    owners = {}
+    for step in gates['steps']:
+        owners[step['proof_id']] = []
+        for task in binding['tasks']:
+            if any(_ref_covered(ref, VerificationStep.from_dict(step)) for ref in _task_refs(task)):
+                owners[step['proof_id']].append(_task_owner(task))
+    # Prerequisite evidence inherits the complete owner set, including cycles.
+    changed = True
+    while changed:
+        changed = False
+        for step in gates['steps']:
+            for dependency in step.get('depends_on_proofs', []):
+                if dependency not in owners:
+                    continue  # Mandatory closure diagnoses missing definitions.
+                for owner in owners[step['proof_id']]:
+                    if owner not in owners[dependency]:
+                        owners[dependency].append(owner)
+                        changed = True
+    commands = list(dict.fromkeys([*_legacy_commands(GateConfig.from_dict(gates)),
+                                  *([state.fix_verify_command] if state.fix_verify_command else [])]))
+    binding['proof_graph'] = {
+        'gates': gates, 'proof_owners': owners,
+        'commands': {command: diagnostic_owners(state, command) for command in commands},
+        'source': {'repository': str(session.project_root.resolve()),
+                   'revision': binding['contract_revision'],
+                   'plan_fingerprint': binding['plan_fingerprint']},
+    }
+    binding['proof_inventory_version'] = 1
+
+
+def _task_owner(task):
+    return {'task_id': task.get('task_id', task.get('id', '')),
+            'requirement_ids': task.get('requirement_ids', []),
+            'verification_refs': sorted(_task_refs(task))}
 
 
 def _step_affected(session, state, step):
@@ -455,14 +511,7 @@ def _owned_inventory(state, gates):
     owners = {}
     for ref in sorted(refs):
         matches = [step for step in gates.steps if _ref_covered(ref, step)]
-        # Supporting artifacts are not executable references. They remain in
-        # the retained task proof, whose runner must produce them.
-        # Only recognizable artifact paths are supporting evidence. An opaque
-        # identifier is a required proof, even when its definition is missing.
-        artifact = (Path(ref).suffix in {
-            '.md', '.json', '.jsonl', '.txt', '.log', '.xml', '.html', '.png', '.jpg', '.pdf', '.csv',
-        } and not ref.startswith('cmd:') and '::' not in ref)
-        executable = not artifact
+        executable = _reference_kind(ref, gates) != 'artifact'
         if (not matches and executable and not _command_covers(state.fix_verify_command, ref)
                 and not any(_command_covers(command, ref) for command in _legacy_commands(gates))):
             raise ownership_error(state, f'required verification reference has no executable proof: {ref}',
@@ -495,28 +544,52 @@ def _owned_inventory(state, gates):
     return required, owners
 
 
+def _reference_kind(ref, gates):
+    """An extension is not an artifact declaration: proof IDs can end in .json."""
+    from fnmatch import fnmatchcase
+
+    if any(step.proof_id == ref for step in gates.steps):
+        return 'proof'
+    if ref.startswith('cmd:'):
+        return 'command'
+    if ref.startswith('artifact:') or any(
+        fnmatchcase(ref, pattern) for step in gates.steps for pattern in step.artifact_globs
+    ):
+        return 'artifact'
+    if '::' in ref or ref.endswith('.py'):
+        return 'selector'
+    return 'proof'
+
+
 def _seal_inventory(session, state):
     from .gates import command_from_verification_step
+    from .models import GateConfig
 
     binding = state.verification_binding
     binding.setdefault('plan_fingerprint', fingerprint(binding.get('tasks', [])))
-    gates = session_gates(session, state)
-    required, owners = _owned_inventory(state, gates)
+    _seal_proof_graph(session, state)
+    complete = GateConfig.from_dict(binding['proof_graph']['gates'])
+    required, _ = _owned_inventory(state, complete)
+    owners = binding['proof_graph']['proof_owners']
     owned_refs = _mandatory_refs(state)
+    binding['required_references'] = {ref: {'kind': _reference_kind(ref, complete),
+        'owners': diagnostic_owners(state, ref)} for ref in sorted(owned_refs)}
+    gates = session_gates(session, state)
     required_commands = {command: [owner for ref in sorted(owned_refs) if _command_covers(command, ref)
                                    for owner in diagnostic_owners(state, ref)]
                          for command in _legacy_commands(gates)
                          if any(_command_covers(command, ref) for ref in owned_refs)}
+    bound_owners = [owner for key in required for owner in owners.get(key, [])]
+    bound_owners.extend(owner for rows in required_commands.values() for owner in rows)
+    bound_owners.extend(binding['proof_graph']['commands'].get(state.fix_verify_command, []))
     binding.update({
         'schema_version': 12, 'repository': str(session.project_root.resolve()),
         'original_handoff_id': state.parent_handoff_id,
         'required_proof_ids': required, 'proof_owners': owners,
         'required_commands': required_commands,
-        'task_ids': sorted({owner['task_id'] for rows in [*owners.values(), *required_commands.values()]
-                            for owner in rows}),
-        'requirement_ids': sorted({key for rows in [*owners.values(), *required_commands.values()]
-                                   for owner in rows for key in owner['requirement_ids']}),
-        'required_proofs': [step.to_dict() for step in gates.steps if step.proof_id in required],
+        'task_ids': sorted({owner['task_id'] for owner in bound_owners}),
+        'requirement_ids': sorted({key for owner in bound_owners for key in owner['requirement_ids']}),
+        'required_proofs': [step.to_dict() for step in complete.steps if step.proof_id in required],
         'regression_dependencies': {step['proof_id']: list(step.get('depends_on_proofs', []))
                                     for step in _complete_gates(state)['steps']},
         'verification_policy': {key: value for key, value in binding['gates'].items()
@@ -1242,6 +1315,9 @@ def diagnostic_owners(state, command: str, *, proof_ids=()) -> list[dict[str, ob
         for owner in state.verification_binding.get('proof_owners', {}).get(key, []):
             if owner not in owners:
                 owners.append(owner)
+    for owner in state.verification_binding.get('proof_graph', {}).get('commands', {}).get(command, []):
+        if owner not in owners:
+            owners.append(owner)
     # Broader file/directory invocations still carry the node's owner. This
     # also supplies diagnostics for legacy commands without proof metadata.
     try:
@@ -1256,9 +1332,7 @@ def diagnostic_owners(state, command: str, *, proof_ids=()) -> list[dict[str, ob
             refs.extend(proof.get("evidence_refs", []))
         if any(str(ref) == command or _command_covers(command, str(ref))
                or (not str(ref).startswith('cmd:') and _ref_covered(str(ref), evidence)) for ref in refs):
-            owner = {"task_id": task.get("task_id", task.get("id", "")),
-                     "requirement_ids": task.get("requirement_ids", []),
-                     "verification_refs": refs}
+            owner = _task_owner(task)
             if owner not in owners:
                 owners.append(owner)
     return owners
