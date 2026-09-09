@@ -123,6 +123,8 @@ def run_subprocess_with_optional_streaming(
     ``None`` (the default) ``request.prompt`` is used.  Pass ``""`` to
     send nothing (e.g. when the prompt is passed via command-line args).
     """
+    if request.writer_boundary is not None:
+        command, env = request.writer_boundary.dispatch(command, env, request.cwd)
     actual_stdin = stdin_input if stdin_input is not None else request.prompt
     observer = request.diagnostic_output
     if observer is None:

@@ -3203,7 +3203,8 @@ def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_pat
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
-def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_path, monkeypatch):
+@pytest.mark.parametrize('intermediate_writer', [False, True])
+def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_path, monkeypatch, intermediate_writer):
     from copy import deepcopy
     import auto_agents.session_verification as verification
 
@@ -3220,6 +3221,16 @@ def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_p
         child, calls, _ = run_session(root, old)
         assert child.status == 'completed' and calls == []
         assert child.candidate_custody['binding_migration']
+        if intermediate_writer:
+            # A fresh writer runs under v1 after the original custody upgrade.
+            # v2 must accept this exact receipt through the extended bridge.
+            child.status = 'failed'
+            child.candidate_custody.pop('delivered_revision')
+            save_session_state(root, child)
+            child, calls, _ = run_session(root, old)
+            assert child.status == 'completed' and calls == ['fix']
+            assert child.candidate_custody['receipt']['binding_fingerprint'] == child.verification_binding['binding_fingerprint']
+            assert child.candidate_custody['receipt']['binding_fingerprint'] != child.candidate_custody['binding_fingerprint']
     retained = deepcopy(child.candidate_custody)
     authority = deepcopy(child.verification_binding)
     ambient = _switch_ambient_binding_plan(root)

@@ -43678,6 +43678,7 @@ class Orchestrator:
             first = request.resume_provider
         elif (
             self.config.active_provider in health
+            and request.writer_boundary is None
             and self._probe_active_provider(request)
         ):
             first = self.config.active_provider

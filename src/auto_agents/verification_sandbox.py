@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,17 @@ from auto_agents import artifact_temp as tempfile
 import sys
 import ctypes
 
+
+_active_writer_boundary = ContextVar('auto_agents_writer_boundary', default=None)
+
+def provider_probe_command(argv):
+    # Capability probes execute the same provider binary as a writer. Keep
+    # them within the active boundary even when no AgentRequest is accepted.
+    boundary = _active_writer_boundary.get()
+    if boundary is None:
+        return argv, {}
+    command, env = boundary.dispatch(argv, dict(os.environ), boundary.root)
+    return command, {'cwd': boundary.root, 'env': env}
 
 def landlock_abi():
     libc = ctypes.CDLL(None, use_errno=True)
@@ -58,6 +70,41 @@ def restrict_nested_writes(roots):
         os.close(fd)
 
 
+
+def restrict_writer_metadata():
+    """Close Landlock's metadata gap when nesting inside an existing sandbox.
+
+    Landlock covers content, links, renames and deletion, but not chmod/chown
+    or timestamps/xattrs. A nested writer conservatively cannot alter these
+    metadata fields, even on private files; creation modes remain supported.
+    The filter is inherited across exec and by every tool descendant.
+    """
+    import errno
+    library = ctypes.CDLL('libseccomp.so.2', use_errno=True)
+    library.seccomp_init.argtypes = [ctypes.c_uint32]
+    library.seccomp_init.restype = ctypes.c_void_p
+    library.seccomp_release.argtypes = [ctypes.c_void_p]
+    library.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    library.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]
+    library.seccomp_load.argtypes = [ctypes.c_void_p]
+    context = library.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW
+    if not context:
+        raise RuntimeError('writer metadata confinement is unavailable')
+    try:
+        for name in ('chmod', 'fchmod', 'fchmodat', 'fchmodat2', 'chown', 'lchown',
+                     'fchown', 'fchownat', 'utime', 'utimes', 'futimesat', 'utimensat',
+                     'setxattr', 'lsetxattr', 'fsetxattr', 'removexattr', 'lremovexattr', 'fremovexattr'):
+            number = library.seccomp_syscall_resolve_name(name.encode())
+            if number < 0:
+                raise RuntimeError('writer metadata syscall is unavailable: ' + name)
+            if library.seccomp_rule_add(context, 0x00050000 | errno.EPERM, number, 0):
+                raise RuntimeError('could not bind writer metadata filter')
+        if library.seccomp_load(context):
+            raise RuntimeError('could not enforce writer metadata filter')
+    finally:
+        library.seccomp_release(context)
+
+
 def namespace_exec(payload):
     """Give tests a private /tmp as well as private PID/mount/network spaces."""
     kept = []
@@ -66,7 +113,8 @@ def namespace_exec(payload):
             path = Path(value).resolve()
             if str(path).startswith("/tmp/") and path.is_dir():
                 kept.append((str(path), os.open(path, os.O_PATH | os.O_CLOEXEC)))
-        subprocess.run([payload["ip"], "link", "set", "lo", "up"], check=True)
+        if payload.get("ip"):
+            subprocess.run([payload["ip"], "link", "set", "lo", "up"], check=True)
         subprocess.run([payload["mount"], "-t", "tmpfs", "-o", "mode=1777", "tmpfs", "/tmp"], check=True)
         for path, fd in kept:
             Path(path).mkdir(parents=True, exist_ok=True)
@@ -166,6 +214,152 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         yield ["env", "TMPDIR=" + temporary, *sandbox]
 
 
+
+class CandidateWriterBoundary:
+    """Use the verification sandbox's mount isolation for provider descendants.
+
+    Providers retain their inherited execution environment and network. Only
+    their state directories and temporary storage move into this private area.
+    The private /tmp is necessary for the sandbox launcher's mount registry.
+    """
+
+    def __init__(self, root, scratch, state):
+        from .session_verification import ownership_error
+        self.root, self.scratch, self.state = root.resolve(), scratch.resolve(), state
+        self.shared = Path(state.verification_binding['repository']).resolve()
+        if self.root == self.shared or self.root.is_relative_to(self.shared):
+            raise ownership_error(state, 'writer confinement requires a private candidate checkout')
+        self.nested = bool(os.environ.get('AUTO_AGENTS_VERIFICATION_SANDBOX'))
+        if self.nested and landlock_abi() < 3:
+            raise ownership_error(state, 'writer confinement is unavailable', detail='Landlock ABI 3 is required')
+        self.executables = {name: shutil.which(name) for name in (() if self.nested else ('codex', 'unshare', 'mount'))}
+        if not all(self.executables.values()):
+            raise ownership_error(state, 'writer confinement is unavailable',
+                                  missing_executables=[k for k, v in self.executables.items() if not v])
+        for name in ('home', 'codex', 'claude', 'tmp', 'cache', 'config', 'data', 'state'):
+            (scratch / name).mkdir()
+        self.prepared = False
+        self.read_roots = []
+
+    def _environment(self, env):
+        result = dict(env)
+        result.update(HOME=str(self.scratch / 'home'), CODEX_HOME=str(self.scratch / 'codex'),
+                      CLAUDE_CONFIG_DIR=str(self.scratch / 'claude'), TMPDIR=str(self.scratch / 'tmp'),
+                      XDG_CACHE_HOME=str(self.scratch / 'cache'), XDG_CONFIG_HOME=str(self.scratch / 'config'),
+                      XDG_DATA_HOME=str(self.scratch / 'data'), XDG_STATE_HOME=str(self.scratch / 'state'))
+        return result
+
+    def _command(self, argv, env):
+        if self.nested:
+            return [sys.executable, str(Path(__file__).resolve()), '--writer-landlock',
+                    json.dumps([str(self.root), str(self.scratch)]), *argv]
+        from .gate_execution import discover_dependency_links
+        entries = {':root': 'read', '/tmp': 'write', str(self.root): 'write',
+                   str(self.scratch): 'write'}
+        # /tmp is a fresh mount, not the host's temporary directory. Shared
+        # inputs restored below it are explicitly read-only, including metadata.
+        preserve = [self.root, self.scratch, self.shared, Path(__file__).resolve().parents[2]]
+        preserve.extend(self.read_roots)
+        preserve.extend(Path(value) for value in discover_dependency_links(self.root).values())
+        executable = shutil.which(argv[0], path=env.get('PATH'))
+        if executable:
+            preserve.append(Path(executable).resolve().parent)
+        for variable in ('PATH', 'PYTHONPATH', 'NODE_PATH', 'LD_LIBRARY_PATH'):
+            for value in env.get(variable, '').split(os.pathsep):
+                try:
+                    if value and Path(value).is_dir():
+                        preserve.append(Path(value).resolve())
+                except OSError:
+                    # Inherited PATH can include locations already denied by
+                    # an outer sandbox. Preserve the environment, not access.
+                    continue
+        for path in preserve:
+            path = path.resolve()
+            if path not in (self.root, self.scratch) and str(path).startswith('/tmp/'):
+                entries[str(path)] = 'read'
+        entries[str(self.root)] = entries[str(self.scratch)] = 'write'
+        profile = '{filesystem={' + ','.join(json.dumps(k) + '=' + json.dumps(v)
+                                             for k, v in entries.items()) + '},network={enabled=true}}'
+        sandbox = [self.executables['codex'], 'sandbox', '-c', 'features.network_proxy=false',
+                   '-c', 'permissions.autoagents_writer=' + profile, '-P', 'autoagents_writer',
+                   '-C', str(self.root), '--include-managed-config', '--', *argv]
+        payload = {'cwd': str(self.root), 'preserve': list(map(str, preserve)),
+                   'command': sandbox, 'mount': self.executables['mount']}
+        return [self.executables['unshare'], '--user', '--map-root-user', '--mount',
+                '--pid', '--fork', '--mount-proc', sys.executable, str(Path(__file__).resolve()),
+                '--namespace', json.dumps(payload)]
+
+    def check(self):
+        from .session_verification import ownership_error
+        # Probe both data and metadata denial through the very same launcher.
+        # No provider is invoked if the host cannot install the boundary.
+        outside = self.scratch.parent / (self.scratch.name + '-readonly')
+        outside.mkdir()
+        protected = outside / 'input'
+        protected.write_text('retained')
+        self.read_roots.append(outside)
+        try:
+            code = ("from pathlib import Path; import tempfile; "
+                    "f=tempfile.TemporaryFile(dir='.'); f.write(b'private'); f.close(); "
+                    f"p=Path({str(protected)!r}); assert p.read_text() == 'retained'\n"
+                    "for operation in (lambda: p.write_text('bad'), lambda: p.chmod(0o777)):\n"
+                    " try: operation()\n"
+                    " except OSError: pass\n"
+                    " else: raise RuntimeError('writer boundary allowed a shared write')\n")
+            env = self._environment(os.environ)
+            result = subprocess.run(self._command([sys.executable, '-I', '-c', code], env),
+                                    cwd=self.root, env=env, capture_output=True, text=True, timeout=30)
+            if result.returncode:
+                raise RuntimeError(result.stderr[-2000:])
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            raise ownership_error(self.state, 'writer confinement is unavailable', detail=str(error)) from error
+        finally:
+            self.read_roots.remove(outside)
+            shutil.rmtree(outside)
+
+    def dispatch(self, argv, env, cwd):
+        from .session_verification import ownership_error
+        if Path(cwd).resolve() != self.root:
+            raise ownership_error(self.state, 'writer dispatch left its private candidate checkout')
+        if not self.prepared:
+            # Copy only provider configuration/credentials, never session/cache
+            # trees or links granting write access back to shared provider state.
+            home = Path(env.get('HOME', str(Path.home())))
+            sources = [(Path(env.get('CODEX_HOME', str(home / '.codex'))), self.scratch / 'codex',
+                        ('config.toml', 'auth.json')),
+                       (Path(env.get('CLAUDE_CONFIG_DIR', str(home / '.claude'))), self.scratch / 'claude',
+                        ('settings.json', '.credentials.json')),
+                       (home, self.scratch / 'home', ('.claude.json', '.gitconfig'))]
+            for source, destination, names in sources:
+                for name in names:
+                    if (source / name).is_file():
+                        shutil.copyfile(source / name, destination / name)
+            # Profiles may carry the selected model/runtime settings.
+            source = sources[0][0]
+            for path in source.glob('*.config.toml'):
+                if path.is_file():
+                    shutil.copyfile(path, self.scratch / 'codex' / path.name)
+            self.prepared = True
+        environment = self._environment(env)
+        return self._command(argv, environment), environment
+
+
+@contextmanager
+def candidate_writer_boundary(root, state):
+    with tempfile.TemporaryDirectory(prefix='auto-agents-writer-') as temporary:
+        try:
+            boundary = CandidateWriterBoundary(Path(root), Path(temporary), state)
+            boundary.check()
+        except (OSError, subprocess.SubprocessError) as error:
+            from .session_verification import ownership_error
+            raise ownership_error(state, 'writer confinement is unavailable', detail=str(error)) from error
+        token = _active_writer_boundary.set(boundary)
+        try:
+            yield boundary
+        finally:
+            _active_writer_boundary.reset(token)
+
+
 def check_verification_sandbox(root: Path, python: str, real_project: Path):
     """Fail before generation when the host cannot enforce the write boundary."""
     if landlock_abi() < 3:
@@ -198,9 +392,11 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--namespace":
         namespace_exec(json.loads(sys.argv[2]))
         raise SystemExit(3)
-    if len(sys.argv) < 5 or sys.argv[1] != "--landlock":
+    if len(sys.argv) < 5 or sys.argv[1] not in {"--landlock", "--writer-landlock"}:
         raise SystemExit("internal verification launcher requires --landlock ROOTS COMMAND")
     roots = json.loads(sys.argv[2])
     restrict_nested_writes(roots)
+    if sys.argv[1] == "--writer-landlock":
+        restrict_writer_metadata()
     os.chdir(roots[0])
     os.execvp(sys.argv[3], sys.argv[3:])

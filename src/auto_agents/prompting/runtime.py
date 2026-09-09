@@ -38,8 +38,10 @@ def last_option(args: Sequence[str], *names: str) -> str:
 def _probe(path: str, mtime: int, size: int) -> tuple[str, tuple[str, ...]]:
     def call(flag):
         try:
-            result = subprocess.run([path, flag], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                    text=True, timeout=5, check=False)
+            from ..verification_sandbox import provider_probe_command
+            command, options = provider_probe_command([path, flag])
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, timeout=5, check=False, **options)
             return result.stdout[:100000] if result.returncode == 0 else ""
         except (OSError, subprocess.SubprocessError, UnicodeError):
             return ""

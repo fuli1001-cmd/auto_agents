@@ -216,8 +216,11 @@ def candidate_request(session, state, request):
     if not state.candidate_custody or Path(state.candidate_custody['checkout']) != session.project_root:
         raise ownership_error(state, 'bound writer requires its private execution checkout')
     source_head = _git(session.project_root, 'rev-parse', 'HEAD')
-    yield replace(request, resume_session_id='', resume_provider='',
-                  prompt_is_continuation=False, prompt_continuation='')
+    from .verification_sandbox import candidate_writer_boundary
+    with candidate_writer_boundary(session.project_root, state) as boundary:
+        yield replace(request, resume_session_id='', resume_provider='',
+                      prompt_is_continuation=False, prompt_continuation='',
+                      writer_boundary=boundary)
     if _git(session.project_root, 'rev-parse', 'HEAD') != source_head:
         raise ownership_error(state, 'isolated candidate changed its Git checkpoint')
     # Freeze before returning to ownership recording. Nothing is copied into
@@ -249,10 +252,16 @@ def validate_receipt(state):
         if state.candidate_paths:
             raise ownership_error(state, 'candidate receipt is unavailable')
         return
+    accepted_bindings = {custody['binding_fingerprint'],
+                         state.verification_binding.get('binding_fingerprint')}
+    # validate_custody_binding above authenticates the exact retained receipt,
+    # including a writer created between successive inventory upgrades.
+    bridge = custody.get('binding_migration', {})
+    if state.verification_binding and receipt == bridge.get('receipt'):
+        accepted_bindings.add(receipt.get('binding_fingerprint'))
     if (receipt.get('fingerprint') != fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'})
             or receipt['session_id'] != custody['session_id']
-            or receipt['binding_fingerprint'] not in {
-                custody['binding_fingerprint'], state.verification_binding.get('binding_fingerprint')}):
+            or receipt['binding_fingerprint'] not in accepted_bindings):
         raise ownership_error(state, 'candidate receipt identity changed')
     expected_paths = {path: fingerprint(entry['postimage']) for path, entry in receipt['manifest'].items()}
     if state.candidate_paths != expected_paths:

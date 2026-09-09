@@ -33,13 +33,16 @@ DEFAULT_PROFILES_ROOT = Path.home() / ".copilot" / "profiles"
 def _copilot_cli_supports_image_attachments(executable: str) -> bool:
     """Probe the configured CLI without starting an authenticated model turn."""
     try:
+        from ..verification_sandbox import provider_probe_command
+        command, options = provider_probe_command([executable, "--help"])
         result = subprocess.run(
-            [executable, "--help"],
+            command,
             capture_output=True,
             text=True,
             encoding="utf-8",
             timeout=5,
             check=False,
+            **options,
         )
     except (OSError, subprocess.SubprocessError):
         return False
