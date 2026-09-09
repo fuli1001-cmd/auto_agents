@@ -86,6 +86,17 @@ def _restart_snapshot(source, source_worktree, source_store, experiment, reposit
             return (commit, patch.decode("utf-8"), {}), current_id
     for record in sorted(experiment.candidates.values(), key=lambda item: item.created_at, reverse=True):
         if record.candidate_id != "base" and not record.fatal and record.candidate_commit:
+            # A stopped continuous checkout can contain a subsequent manual
+            # correction. Legacy fallback worktrees may instead be obsolete:
+            # preserve newer work only when Git proves the latest candidate
+            # is its ancestor. Pending deep checkpoints above take precedence.
+            snapshot = _worktree_snapshot(source_worktree)
+            descendant = git(repository.cache, "merge-base", "--is-ancestor",
+                             record.candidate_commit, snapshot[0], check=False)
+            if descendant.returncode == 0:
+                return snapshot, record.candidate_id
+            if descendant.returncode != 1:
+                raise RuntimeError("could not establish retained repair ancestry")
             return (record.candidate_commit, "", {}), record.candidate_id
     return _worktree_snapshot(source_worktree), ""
 

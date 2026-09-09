@@ -273,3 +273,38 @@ def test_restart_after_legacy_fallback_uses_newest_deep_candidate(restart, inter
     assert destination.load().finding_groups[0]["status"] == "pending"
     receipt = json.loads((working.parent / "prior-repair-import.json").read_text())
     assert receipt["source_candidate"] == ("c3" if interrupted else "c2")
+
+
+@pytest.mark.parametrize('pending', [False, True])
+def test_deep_restart_preserves_descendant_manual_correction_without_claiming_proof(restart, pending):
+    state = restart.evidence.load()
+    # The retained checkout starts at the latest recorded candidate, with a
+    # subsequent manual correction made after the stopped automatic attempt.
+    git(restart.source, 'add', '-A')
+    git(restart.source, 'commit', '-m', 'manual correction after cancellation')
+    corrected = git(restart.source, 'rev-parse', 'HEAD')
+    if pending:
+        (restart.source / 'bug.py').write_text('latest manual correction\n')
+        (restart.source / 'manual-test.py').write_text('new regression\n')
+    expected = (restart.source / 'bug.py').read_bytes()
+    atomic_json(restart.source.parent / 'fallback.json', {'reason': 'deep repair'})
+    state.status = 'stalled'
+    state.consecutive_non_improvements = 3
+    restart.evidence.save(state)
+    job, working = _new_job(restart, restart.payload)
+    assert import_cancelled_repair(restart.store, job, working, restart.repository)
+    retained = working.parent / 'continuous/repair'
+    assert git(retained, 'rev-parse', 'HEAD') == corrected
+    assert (retained / 'bug.py').read_bytes() == expected
+    if pending:
+        assert (retained / 'manual-test.py').read_text() == 'new regression\n'
+    copied = SelfRepairExperimentStore(working, 'session-session', 'root').load()
+    assert copied.status == 'stalled'
+    assert copied.consecutive_non_improvements == 3
+    assert copied.progress_credits == state.progress_credits
+    assert copied.candidates['c1'].fatal
+    assert not copied.candidates['c1'].component_receipts
+    receipt = json.loads((working.parent / 'prior-repair-import.json').read_text())
+    assert receipt['source_commit'] == corrected
+    assert receipt['source_candidate'] == 'c1'
+    assert receipt['verification_required']
