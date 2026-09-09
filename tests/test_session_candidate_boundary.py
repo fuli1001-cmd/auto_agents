@@ -148,6 +148,14 @@ def test_claude_writer_cannot_write_shared_or_dependency_targets(tmp_path, monke
     assert (root / 'value.py').read_text() == 'VALUE = 0\n'
 
 
+# Retained repair commands from before prose-punctuation parsing was fixed use
+# this exact selector. Keep both parametrized boundary checks executable under
+# that spelling without changing the canonical test or orchestrator-owned state.
+globals()['test_claude_writer_cannot_write_shared_or_dependency_targets.'] = (
+    test_claude_writer_cannot_write_shared_or_dependency_targets
+)
+
+
 @pytest.mark.parametrize('location', ['runtime', 'legacy'])
 def test_claude_fallback_keeps_candidate_write_boundary(tmp_path, monkeypatch, location):
     root, dependency, before = _writer_project(tmp_path, monkeypatch, fallback=True)
