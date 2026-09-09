@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from .gate_execution import GateSnapshotManager, discover_dependency_links, install_dependency_links
 from .session_verification import fingerprint, ownership_error, product_path
-from .execution_binding import anchored_parent, restore_private_modes
+from .execution_binding import anchored_parent, restore_private_modes, validate_custody_binding
 
 
 def _git(root, *args):
@@ -126,11 +126,11 @@ def execution_checkout(session, state):
         return
     from .execution_binding import SessionExecutionBinding
     from .orchestrator import Orchestrator
-    from .session_verification import validate_binding
+    from .session_verification import bind_session
 
     root = session.project_root
     if state.verification_binding:
-        validate_binding(session, state)
+        bind_session(session, state)
     if not state.candidate_custody:
         if state.candidate_paths:
             raise ownership_error(state, 'candidate ownership is unavailable without a frozen receipt')
@@ -151,9 +151,9 @@ def execution_checkout(session, state):
         session._save(state)
     custody = state.candidate_custody
     destination = Path(custody['checkout'])
-    if (custody['session_id'] != state.session_id
-            or custody['repository'] != (state.verification_binding.get('repository') or str(root.resolve()))
-            or (state.verification_binding and custody['binding_fingerprint'] != state.verification_binding['binding_fingerprint'])):
+    if state.verification_binding:
+        validate_custody_binding(state)
+    elif custody['session_id'] != state.session_id or custody['repository'] != str(root.resolve()):
         raise ownership_error(state, 'candidate custody conflicts with session authority')
     validate_receipt(state)
     context = (SessionExecutionBinding.for_checkout(session, state, destination)
@@ -173,6 +173,20 @@ def execution_checkout(session, state):
     session.orch = execution
     session._execution_binding = context
     try:
+        if custody.get('binding_migration') and custody.get('delivered_revision'):
+            # A retained completion predates the recovered proof inventory.
+            # Reuse its immutable candidate, but attest with the new binding
+            # identity (which is already part of the gate certificate key).
+            previous_state = session._current_state
+            session._current_state = state
+            try:
+                result = session._run_verify()
+                session._append_verification_log(state, 'inventory_migration_verify', result)
+                if not result['ok']:
+                    raise ownership_error(state, 'retained candidate failed upgraded inventory verification',
+                                          verification=result)
+            finally:
+                session._current_state = previous_state
         yield
     finally:
         session._save(state)
@@ -216,6 +230,8 @@ def candidate_request(session, state, request):
 
 def validate_receipt(state):
     custody = state.candidate_custody
+    if state.verification_binding:
+        validate_custody_binding(state)
     receipt = custody.get('receipt')
     if not receipt:
         if state.candidate_paths:
@@ -223,7 +239,8 @@ def validate_receipt(state):
         return
     if (receipt.get('fingerprint') != fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'})
             or receipt['session_id'] != custody['session_id']
-            or receipt['binding_fingerprint'] != custody['binding_fingerprint']):
+            or receipt['binding_fingerprint'] not in {
+                custody['binding_fingerprint'], state.verification_binding.get('binding_fingerprint')}):
         raise ownership_error(state, 'candidate receipt identity changed')
     expected_paths = {path: fingerprint(entry['postimage']) for path, entry in receipt['manifest'].items()}
     if state.candidate_paths != expected_paths:
@@ -285,9 +302,17 @@ def consume_delivery(root, state, delivery, *, child_id):
     """Materialize the child's revision for the parent's next public execution."""
     source = Path(delivery['checkout'])
     receipt = delivery['receipt']
+    receipt_binding = delivery['binding_fingerprint']
+    if delivery.get('binding_migration'):
+        from .config import load_session_state
+        child = load_session_state(root, child_id)
+        if child.candidate_custody != delivery:
+            raise ownership_error(state, 'delivered migration differs from retained child custody')
+        validate_receipt(child)
+        receipt_binding = receipt['binding_fingerprint']
     if (delivery['session_id'] != child_id or receipt['session_id'] != child_id
             or delivery['repository'] != str(root.resolve())
-            or delivery['binding_fingerprint'] != receipt['binding_fingerprint']):
+            or receipt_binding != receipt['binding_fingerprint']):
         raise ownership_error(state, 'delivered candidate belongs to another child or repository')
     if receipt['fingerprint'] != fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'}):
         raise ownership_error(state, 'delivered candidate receipt changed')

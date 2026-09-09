@@ -91,6 +91,9 @@ def resolve_source(root, state):
         raise ownership_error(state, 'private source parent is unavailable') from error
     if parent.workflow_id != state.workflow_id:
         raise ownership_error(state, 'private source parent belongs to another workflow')
+    from .execution_binding import validate_custody_binding
+    if parent.verification_binding:
+        validate_custody_binding(parent)
     custody = state.candidate_custody
     owned_copy = (custody.get('source_id') == source_id and custody.get('session_id') == state.session_id
                   and custody.get('repository') == str(root))

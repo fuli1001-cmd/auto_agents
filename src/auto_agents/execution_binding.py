@@ -15,6 +15,82 @@ class ExecutionBindingError(ValueError):
     """A command cannot be executed by the currently bound repository."""
 
 
+# Only these derived fields may change during this inventory transition.
+# Tasks (including requirement hashes), handoff and source authority stay fixed.
+_INVENTORY_FIELDS = frozenset({
+    'schema_version', 'binding_fingerprint', 'proof_inventory_version', 'proof_graph',
+    'required_references', 'required_proof_ids', 'proof_owners', 'required_commands',
+    'required_proofs', 'regression_dependencies', 'verification_policy',
+    'proof_control_paths', 'proof_config_paths', 'proof_sources',
+})
+
+
+def _custody_identity(custody):
+    return {key: value for key, value in custody.items()
+            if key not in {'binding_migration', 'receipt', 'delivered_revision'}}
+
+
+def _unchanged_authority(old, new):
+    return all(new.get(key) == value for key, value in old.items()
+               if key not in _INVENTORY_FIELDS)
+
+
+def bridge_inventory_upgrade(state, original):
+    """Seal one validated enrichment without rewriting custody or writer identity."""
+    from copy import deepcopy
+    from .session_verification import fingerprint, ownership_error
+
+    binding, custody = state.verification_binding, state.candidate_custody
+    if (original.get('binding_fingerprint') != custody.get('binding_fingerprint')
+            or custody.get('binding_migration') or not _unchanged_authority(original, binding)):
+        raise ownership_error(state, 'inventory migration changed retained candidate authority')
+    bridge = {'schema_version': 1, 'original_binding': deepcopy(original),
+              'inventory_fingerprint': binding['binding_fingerprint'],
+              'custody_identity': fingerprint(_custody_identity(custody)),
+              'receipt': deepcopy(custody.get('receipt'))}
+    bridge['fingerprint'] = fingerprint(bridge)
+    custody['binding_migration'] = bridge
+    validate_custody_binding(state)
+
+
+def validate_custody_binding(state):
+    """Shared admission check for execution, receipts, source and delivery."""
+    from .session_verification import fingerprint, ownership_error
+
+    binding, custody = state.verification_binding, state.candidate_custody
+    if not custody:
+        return
+    if (custody.get('session_id') != state.session_id
+            or custody.get('repository') != binding.get('repository')):
+        raise ownership_error(state, 'candidate custody conflicts with session authority')
+    current = binding.get('binding_fingerprint')
+    bridge = custody.get('binding_migration')
+    if not bridge:
+        if custody.get('binding_fingerprint') != current:
+            raise ownership_error(state, 'candidate custody conflicts with session authority')
+        return
+    old = bridge.get('original_binding', {})
+    if (bridge.get('schema_version') != 1
+            or bridge.get('fingerprint') != fingerprint({k: v for k, v in bridge.items() if k != 'fingerprint'})
+            or old.get('binding_fingerprint') != fingerprint({k: v for k, v in old.items() if k != 'binding_fingerprint'})
+            or old.get('binding_fingerprint') != custody.get('binding_fingerprint')
+            or bridge.get('inventory_fingerprint') != current
+            or current != fingerprint({k: v for k, v in binding.items() if k != 'binding_fingerprint'})
+            or any(binding.get(key) != expected for key, expected in (
+                ('session_id', state.session_id), ('workflow_id', state.workflow_id),
+                ('original_handoff_id', state.parent_handoff_id),
+                ('authorization', state.authorization_policy),
+                ('execution_environment', state.goal_execution_environment), ('session_mode', state.mode)))
+            or not _unchanged_authority(old, binding)
+            or bridge.get('custody_identity') != fingerprint(_custody_identity(custody))):
+        raise ownership_error(state, 'candidate inventory migration bridge conflicts with retained authority')
+    receipt = custody.get('receipt')
+    if bridge.get('receipt') and not receipt:
+        raise ownership_error(state, 'candidate inventory migration lost its retained receipt')
+    if receipt and receipt.get('binding_fingerprint') != current and receipt != bridge.get('receipt'):
+        raise ownership_error(state, 'candidate inventory migration bridge does not identify this receipt')
+
+
 @contextmanager
 def anchored_parent(root: Path, relative: str):
     """Open a repository path's parent without traversing any symlinks."""
@@ -69,6 +145,7 @@ class SessionExecutionBinding:
 
         bind_session(session, state)
         validate_binding(session, state)
+        validate_custody_binding(state)
         binding = state.verification_binding
         return cls(binding['repository'], str(execution_root.resolve()), state.session_id,
                    binding['binding_fingerprint'], _session_source_revision(state))
@@ -76,12 +153,12 @@ class SessionExecutionBinding:
 
 def _session_source_revision(state) -> str:
     binding = state.verification_binding
+    validate_custody_binding(state)
     revision = binding.get('contract_revision', '')
     if not revision:
         custody = state.candidate_custody
         if (custody.get('initial_source') and custody.get('session_id') == state.session_id
-                and custody.get('repository') == binding.get('repository')
-                and custody.get('binding_fingerprint') == binding.get('binding_fingerprint')):
+                and custody.get('repository') == binding.get('repository')):
             revision = custody.get('base_revision', '')
     return revision
 

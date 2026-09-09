@@ -76,11 +76,14 @@ def bind_session(session, state) -> None:
     control_root = getattr(session, '_custody_control_root', session.project_root)
     session._retained_source_root = resolve_source(control_root, state)
     original = state.verification_binding
+    original_custody = state.candidate_custody
     state.verification_binding = deepcopy(original)
+    state.candidate_custody = deepcopy(original_custody)
     try:
         _bind_session(session, state)
     except Exception:
         state.verification_binding = original
+        state.candidate_custody = original_custody
         raise
     finally:
         if had_source:
@@ -98,11 +101,28 @@ def _bind_session(session, state) -> None:
         elif any(scope.values()) and scope != state.verification_binding['task_scope']:
             raise ownership_error(state, 'retained task authority conflicts with session evidence')
         upgrade_inventory = state.verification_binding.get('proof_inventory_version', 0) < 1
+        original = deepcopy(state.verification_binding)
+        if state.candidate_custody:
+            from .session_candidate import validate_receipt
+            validate_receipt(state)
         if state.verification_binding.get('schema_version', 1) < 12 or upgrade_inventory:
             _recover_retained_plan(session, state)
+            if state.candidate_custody:
+                for path, expected in ((task_plan_path(session.project_root), state.verification_binding['plan']),
+                                       (config_path(session.project_root), None)):
+                    source = _historical_source(session, original['contract_revision'],
+                                                path.relative_to(session.project_root).as_posix())
+                    retained = json.loads(source) if source is not None else None
+                    if (retained != expected if expected is not None else
+                            not isinstance(retained, dict) or retained.get('gates') != original['gates']):
+                        raise ownership_error(state, 'inventory migration conflicts with retained contract source',
+                                              contract_path=path.relative_to(session.project_root).as_posix())
             _seal_inventory(session, state)
         if state.verification_binding.get('schema_version', 1) < 13 or upgrade_inventory:
             _seal_authority(session, state)
+            if state.candidate_custody:
+                from .execution_binding import bridge_inventory_upgrade
+                bridge_inventory_upgrade(state, original)
             session._save(state)
         return
     root = session.project_root

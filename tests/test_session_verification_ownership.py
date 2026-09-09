@@ -1934,7 +1934,7 @@ def test_public_legacy_upgrade_preserves_conflicting_retained_handoff(tmp_path, 
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
-@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('legacy', [False, True, 'custody'])
 def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_path, monkeypatch, legacy):
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
@@ -1942,19 +1942,25 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
     root, child = project(tmp_path)
     child.goal_execution_environment = {'mode': 'real', 'confirmed': True, 'source': 'explicit_goal'}
     _binding_fixture(root, child)
+    if legacy == 'custody':
+        child, calls, _ = run_session(root, monkeypatch)
+        assert child.status == 'completed' and calls == ['fix']
     if legacy:
         child.verification_binding['schema_version'] = 11
         for key in ('execution_environment', 'source_provenance', 'session_mode'):
             child.verification_binding.pop(key)
         child.verification_binding['binding_fingerprint'] = fingerprint({
             key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+    if legacy == 'custody':
+        _retain_candidate_binding_identity(child)
+    retained_custody = deepcopy(child.candidate_custody)
     retained = deepcopy(child.verification_binding)
     save_session_state(root, child)
     assert load_session_state(root, child.session_id).verification_binding == retained
     ambient = _switch_ambient_binding_plan(root)
     saved, calls, _ = run_session(root, monkeypatch)
     assert saved.status == 'completed', saved.to_dict()
-    assert calls == ['fix']
+    assert calls == ([] if legacy == 'custody' else ['fix'])
     binding = saved.verification_binding
     for key in ('repository', 'contract_revision', 'authorization', 'gates', 'plan', 'required_proof_ids',
                 'session_id', 'workflow_id', 'original_handoff_id', 'task_scope'):
@@ -1962,6 +1968,8 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
     assert binding['schema_version'] == 13
     assert binding['execution_environment'] == child.goal_execution_environment
     assert binding['source_provenance']['revision'] == child.baseline_head_ref
+    if legacy == 'custody':
+        _assert_migrated_candidate_reused(root, monkeypatch, saved, retained_custody)
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
@@ -2642,8 +2650,9 @@ def test_public_resume_rejects_conflicting_retained_proof_definitions(tmp_path, 
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
-@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('legacy', [False, True, 'custody'])
 def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, legacy):
+    from copy import deepcopy
     from auto_agents.config import load_task_plan
     from auto_agents.models import GateParallelGroup
     from auto_agents.session_verification import fingerprint
@@ -2662,18 +2671,32 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
         'verification_refs': ['foreign.future']})
     plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
     _retain_contract(root, child, config, plan)
+    if legacy == 'custody':
+        child, calls, _ = run_session(root, monkeypatch)
+        assert child.status == 'completed' and calls == ['fix']
     if legacy:
         _binding_fixture(root, child)
         for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
             child.verification_binding.pop(key, None)
         child.verification_binding['binding_fingerprint'] = fingerprint({
             key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+        if legacy == 'custody':
+            _retain_candidate_binding_identity(child)
         save_session_state(root, child)
+    retained_custody = deepcopy(child.candidate_custody)
     ambient = _switch_ambient_binding_plan(root)
+    (root / 'foreign.py').write_text('VALUE = 88\n')
+    git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 99\n')
+    (root / 'foreign.py').chmod(0o711)
+    (root / 'foreign-note.txt').write_bytes(b'foreign\x00untracked')
+    index = (root / '.git/index').read_bytes()
+    shared_head, shared_refs = head_ref(root), git(root, 'show-ref')
     saved, calls, _ = run_session(root, monkeypatch)
     assert saved.status == 'completed', saved.to_dict()
-    assert calls == ['fix']
+    assert calls == ([] if legacy == 'custody' else ['fix'])
     binding = saved.verification_binding
+    assert 'proof_graph' in binding, 'public resume must recover the retained proof inventory'
     graph = binding['proof_graph']
     assert graph['source']['revision'] == child.baseline_head_ref
     assert {step['proof_id'] for step in graph['gates']['steps']} == {'owned.contract', 'foreign.future'}
@@ -2683,7 +2706,136 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
     assert binding['task_ids'] == ['task-owned']
     assert binding['required_references']['tests/test_owned.py::test_owned']['kind'] == 'selector'
     assert not (root / 'tests/test_future.py').exists()
+    if legacy == 'custody':
+        _assert_migrated_candidate_reused(root, monkeypatch, saved, retained_custody)
+    assert (root / '.git/index').read_bytes() == index
+    assert (root / 'foreign.py').read_text() == 'VALUE = 99\n'
+    assert (root / 'foreign.py').stat().st_mode & 0o777 == 0o711
+    assert (root / 'foreign-note.txt').read_bytes() == b'foreign\x00untracked'
+    assert head_ref(root) == shared_head and git(root, 'show-ref') == shared_refs
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+def _retain_candidate_binding_identity(state):
+    """Represent a frozen writer receipt created with the older binding format."""
+    from auto_agents.session_verification import fingerprint
+    custody = state.candidate_custody
+    custody['binding_fingerprint'] = state.verification_binding['binding_fingerprint']
+    receipt = custody['receipt']
+    receipt['binding_fingerprint'] = custody['binding_fingerprint']
+    receipt['fingerprint'] = fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'})
+
+
+def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from auto_agents.session_verification import fingerprint
+
+    root, child = project(tmp_path)
+    child, _, _ = run_session(root, monkeypatch)
+    assert child.status == 'completed'
+    # Retain the same frozen candidate at an interrupted pre-delivery boundary.
+    child.status = 'failed'
+    child.candidate_custody.pop('delivered_revision')
+    for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
+        child.verification_binding.pop(key, None)
+    child.verification_binding['binding_fingerprint'] = fingerprint({
+        k: v for k, v in child.verification_binding.items() if k != 'binding_fingerprint'})
+    _retain_candidate_binding_identity(child)
+    retained = deepcopy(child.candidate_custody)
+    save_session_state(root, child)
+    ambient = _switch_ambient_binding_plan(root)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed', saved.to_dict()
+    assert calls == ['fix']
+    custody = saved.candidate_custody
+    assert custody['checkout'] == retained['checkout']
+    assert custody['base_revision'] == retained['base_revision']
+    assert custody['binding_fingerprint'] == retained['binding_fingerprint']
+    assert custody['binding_migration']['receipt'] == retained['receipt']
+    assert custody['receipt']['binding_fingerprint'] == saved.verification_binding['binding_fingerprint']
+    repeated, calls, _ = run_session(root, monkeypatch)
+    assert repeated.status == 'completed' and calls == []
+    assert repeated.candidate_custody == custody
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+def _assert_migrated_candidate_reused(root, monkeypatch, saved, retained):
+    from auto_agents.session_verification import fingerprint
+    custody = saved.candidate_custody
+    assert {k: v for k, v in custody.items() if k != 'binding_migration'} == retained
+    bridge = custody['binding_migration']
+    assert bridge['original_binding']['binding_fingerprint'] == retained['binding_fingerprint']
+    assert bridge['inventory_fingerprint'] == saved.verification_binding['binding_fingerprint']
+    assert bridge['inventory_fingerprint'] != retained['binding_fingerprint']
+    assert bridge['receipt'] == retained['receipt']
+    assert any(entry['action'] == 'inventory_migration_verify' and entry['result'] == 'pass'
+               for entry in saved.execution_log)
+    contexts = []
+    executor = Orchestrator._gate_executor_context
+    def observe(self, *args, **kwargs):
+        contexts.append(kwargs.get('contract_fingerprint'))
+        return executor(self, *args, **kwargs)
+    monkeypatch.setattr(Orchestrator, '_gate_executor_context', observe)
+    repeated, calls, _ = run_session(root, monkeypatch)
+    assert repeated.status == 'completed' and calls == []
+    assert repeated.candidate_custody == custody
+    expected = fingerprint([bridge['inventory_fingerprint'], retained['receipt']['fingerprint']])
+    assert contexts and all(identity == expected for identity in contexts)
+    assert git(Path(custody['checkout']), 'show', custody['receipt']['source_revision'] + ':value.py') == 'VALUE = 1\n'
+
+
+@pytest.mark.parametrize('conflict', ['receipt', 'custody', 'history', 'authority', 'bridge_source'])
+def test_public_inventory_migration_rejects_conflicts_without_partial_persistence(tmp_path, monkeypatch, conflict):
+    from copy import deepcopy
+    import auto_agents.session_verification as verification
+
+    root, child = project(tmp_path)
+    child, calls, _ = run_session(root, monkeypatch)
+    assert child.status == 'completed' and calls == ['fix']
+    for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
+        child.verification_binding.pop(key, None)
+    child.verification_binding['binding_fingerprint'] = verification.fingerprint({
+        k: v for k, v in child.verification_binding.items() if k != 'binding_fingerprint'})
+    _retain_candidate_binding_identity(child)
+    if conflict == 'receipt':
+        child.candidate_custody['receipt']['attempt_id'] = 'changed-writer'
+    elif conflict == 'custody':
+        child.candidate_custody['binding_fingerprint'] = 'another-binding'
+    elif conflict == 'history':
+        child.verification_binding['plan']['tasks'][0]['title'] = 'substituted retained history'
+        child.verification_binding['binding_fingerprint'] = verification.fingerprint({
+            k: v for k, v in child.verification_binding.items() if k != 'binding_fingerprint'})
+        _retain_candidate_binding_identity(child)
+    elif conflict == 'authority':
+        seal = verification._seal_inventory
+        def conflicting_upgrade(session, state):
+            seal(session, state)
+            state.verification_binding['authorization']['source'] = 'changed during enrichment'
+        monkeypatch.setattr(verification, '_seal_inventory', conflicting_upgrade)
+    else:
+        save_session_state(root, child)
+        child, calls, _ = run_session(root, monkeypatch)
+        assert child.status == 'completed' and calls == []
+        child.candidate_custody['base_revision'] = child.candidate_custody['receipt']['source_revision']
+    child.status = 'failed'
+    retained = deepcopy(child.verification_binding)
+    custody = deepcopy(child.candidate_custody)
+    save_session_state(root, child)
+    ambient = _switch_ambient_binding_plan(root)
+    (root / 'foreign.py').write_text('VALUE = 88\n')
+    git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 99\n')
+    (root / 'foreign-note.txt').write_bytes(b'foreign\x00untracked')
+    index = (root / '.git/index').read_bytes()
+    for _ in range(2):
+        saved = _assert_binding_blocked_before_execution(root, monkeypatch)
+        assert saved.verification_binding == retained
+        assert saved.candidate_custody == custody
+        assert (root / '.git/index').read_bytes() == index
+        assert (root / 'foreign.py').read_text() == 'VALUE = 99\n'
+        assert (root / 'foreign-note.txt').read_bytes() == b'foreign\x00untracked'
+        assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
 # These frozen g04 entrypoints reuse the complete public-resume regressions.
