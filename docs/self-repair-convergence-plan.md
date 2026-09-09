@@ -58,6 +58,12 @@ Quoted IDs and parameter contents remain literal, including spaces and periods;
 incomplete parameter selections cannot broaden into whole-function checks.
 Scheduling and progress identities share the same extraction rules.
 
+Previously generated commands retained in the regression list are migrated only
+when the retained review and a native collection failure establish their origin.
+The migration records the original command, corrected command, review digest and
+failure evidence IDs. Loading, selector preflight, execution and retry guidance
+use that correction; historical failure records and progress credits stay intact.
+
 An unchanged candidate can undergo a different component's verification; it does
 not need a fabricated code edit. Duplicate attempts in the same component are
 still rejected, and equivalent checks cannot earn credit again after regrouping.

@@ -1,7 +1,7 @@
 """Serial, prerequisite-aware verification selection without deleting obligations."""
 import shlex
 
-from .repair_test_refs import pytest_targets
+from .repair_test_refs import migrate_review_commands, pytest_targets
 
 
 def pytest_parts(command):
@@ -19,6 +19,7 @@ def pytest_parts(command):
 
 
 def verification_plan(experiment, active):
+    migrate_review_commands(experiment)
     focused = list(active.get('focused_tests', []))
     # A routed regression retains its concrete reproduction as required proof,
     # even when the original component plan predates the review finding.

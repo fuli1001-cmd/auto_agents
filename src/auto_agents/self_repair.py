@@ -5549,6 +5549,7 @@ class AutoAgentsSelfRepairRunner:
         commands: list[str] = []
         experiment = getattr(self, "_experiment", None)
         if isinstance(experiment, SelfRepairExperiment):
+            experiment.normalize_review_commands()
             commands.extend(experiment.sticky_verification_commands)
         commands.extend(
             str(command)

@@ -523,6 +523,7 @@ class SelfRepairExperiment:
         from .repair_progress import remember_history
         if "progress_credits" not in payload:
             remember_history(experiment)
+        experiment.normalize_review_commands()
         return experiment
 
     def to_dict(self) -> Dict[str, object]:
@@ -681,6 +682,10 @@ class SelfRepairExperiment:
         self.next_finding_group()
         self.updated_at = _utc_now()
 
+    def normalize_review_commands(self):
+        from .repair_test_refs import migrate_review_commands
+        return migrate_review_commands(self)
+
     def remember_sticky_verification_commands(
         self,
         commands: Iterable[str],
@@ -695,7 +700,8 @@ class SelfRepairExperiment:
         self.sticky_verification_commands = list(
             dict.fromkeys(command for command in combined if command)
         )[-64:]
-        changed = tuple(self.sticky_verification_commands) != previous
+        normalized = self.normalize_review_commands()
+        changed = normalized or tuple(self.sticky_verification_commands) != previous
         if changed:
             self.updated_at = _utc_now()
         return changed
@@ -1118,6 +1124,8 @@ class SelfRepairExperiment:
 
     def prompt_context(self) -> Dict[str, object]:
         from .repair_feedback import next_action, prompt_evidence
+        from .repair_test_refs import review_action
+        self.normalize_review_commands()
         open_findings = [
             item.to_dict()
             for item in self.blocking_findings()
@@ -1183,8 +1191,8 @@ class SelfRepairExperiment:
                 for item in recent
             ],
             "verified_progress_count": len(self.progress_credits),
-            "next_action": next_action(
-                recent[-1].failure_evidence if recent else []),
+            "next_action": review_action(self, next_action(
+                recent[-1].failure_evidence if recent else [])),
             "recent_automatic_corrections": self.automatic_corrections[-3:],
         }
 
