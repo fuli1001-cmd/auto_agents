@@ -2248,24 +2248,37 @@ def test_public_resume_validates_registered_runtime_and_retains_legacy_custody(t
     assert {name: (root / name).read_bytes() for name in before} == before
 
 
-@pytest.mark.parametrize('handoff_history', ['expired', 'absent'])
+@pytest.mark.parametrize('handoff_history', ['expired', 'absent', 'legacy_receipt_missing'])
 def test_public_unbound_handoff_preserves_foreign_work_after_checkpoint(tmp_path, monkeypatch, handoff_history):
     from auto_agents.workflow_runtime import WorkflowCoordinator
+    from auto_agents.session_verification import candidate_snapshot
     from test_engine_child_recovery import parent_workflow, ObservationBoundary
 
     root, child = project(tmp_path)
     store, snapshot, handoff = parent_workflow(root, child)
     WorkflowCoordinator(Orchestrator(root))._ensure_handoff_checkpoint(snapshot, handoff)
-    child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/expired'
-    child.baseline_head_ref = child.lineage_head_ref = ''
-    save_session_state(root, child)
-    handoff.payload['head_before'] = child.baseline_git_ref if handoff_history == 'expired' else ''
-    store.save_handoff(handoff)
+    if handoff_history == 'legacy_receipt_missing':
+        _binding_fixture(root, child)
+        assert child.verification_binding
+    else:
+        child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/expired'
+        child.baseline_head_ref = child.lineage_head_ref = ''
+        save_session_state(root, child)
+        handoff.payload['head_before'] = child.baseline_git_ref if handoff_history == 'expired' else ''
+        store.save_handoff(handoff)
     # The handoff predates these changes, and no writer has acquired ownership.
     (root / 'value.py').write_text('VALUE = 88\n')
     git(root, 'add', 'value.py')
     (root / 'value.py').write_text('VALUE = 99\n')
+    if handoff_history == 'legacy_receipt_missing':
+        child.candidate_paths = {'value.py': candidate_snapshot(Orchestrator(root))['value.py']}
+        assert not child.candidate_custody
+        save_session_state(root, child)
     (root / 'value.py').chmod(0o711)
+    if handoff_history == 'legacy_receipt_missing':
+        # Legacy hashes still match after foreign chmod; they cannot supply
+        # the missing frozen writer receipt or authorize shared rollback.
+        assert candidate_snapshot(Orchestrator(root))['value.py'] == child.candidate_paths['value.py']
     (root / 'late-foreign.txt').write_bytes(b'foreign\x00untracked')
     before = {name: (root / name).read_bytes() for name in (
         'value.py', 'late-foreign.txt', '.git/index',
@@ -2285,11 +2298,12 @@ def test_public_unbound_handoff_preserves_foreign_work_after_checkpoint(tmp_path
         saved = load_session_state(root, child.session_id)
         assert saved.status == 'blocked'
         assert saved.execution_log[-1]['diagnostic']['retry_fix'] is False
-        assert not saved.verification_binding
+        assert bool(saved.verification_binding) == (handoff_history == 'legacy_receipt_missing')
         assert not saved.candidate_custody
         assert store.load_handoff(handoff.handoff_id).result.get('rolled_back_paths', []) == []
         assert {name: (root / name).read_bytes() for name in before} == before
         assert (root / 'value.py').stat().st_mode & 0o7777 == 0o711
+        assert saved.candidate_paths == child.candidate_paths
         assert head_ref(root) == head
         assert git(root, 'show-ref') == refs
 

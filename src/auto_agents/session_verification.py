@@ -1240,13 +1240,13 @@ def owned_paths(orchestrator, state) -> list[str]:
         from .session_candidate import validate_receipt
         validate_receipt(state)
         return sorted(state.candidate_paths)
-    snapshot = candidate_snapshot(orchestrator)
-    conflicts = [path for path, digest in state.candidate_paths.items()
-                 if snapshot.get(path, "") != digest]
-    if conflicts:
-        raise ownership_error(state, "candidate ownership changed: " + ", ".join(sorted(conflicts)),
-                              conflicting_paths=sorted(conflicts))
-    return sorted(state.candidate_paths)
+    if state.candidate_paths:
+        # Legacy live-worktree hashes do not identify a writer or freeze its
+        # postimages (including modes). Matching them cannot authorize either
+        # verification or shared rollback without private receipt custody.
+        raise ownership_error(state, "candidate ownership requires a frozen private receipt",
+                              conflicting_paths=sorted(state.candidate_paths))
+    return []
 
 
 def candidate_snapshot(orchestrator) -> dict[str, str]:
