@@ -35244,54 +35244,12 @@ class Orchestrator:
     def _pytest_targets_from_command(command: str) -> List[str]:
         """Return positional targets from a direct pytest command."""
 
+        from .execution_binding import test_invocations
         try:
-            parts = shlex.split(command)
+            return [target for invocation in test_invocations(command)
+                    if invocation.runner == 'pytest' for target in invocation.repository_targets]
         except ValueError:
             return []
-        parts = _unwrap_conda_run(parts)
-        if not parts:
-            return []
-
-        executable = Path(parts[0]).name
-        if executable in {"pytest", "py.test"}:
-            args = parts[1:]
-        elif (
-            len(parts) >= 3
-            and re.fullmatch(
-                r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?",
-                Path(parts[0]).name.lower(),
-            )
-            and parts[1:3] == ["-m", "pytest"]
-        ):
-            args = parts[3:]
-        else:
-            return []
-
-        targets: List[str] = []
-        index = 0
-        options_done = False
-        while index < len(args):
-            arg = args[index]
-            if not options_done and arg == "--":
-                options_done = True
-                index += 1
-                continue
-            if not options_done and arg.startswith("-"):
-                option = arg.split("=", 1)[0]
-                if (
-                    (option in PYTEST_VALUE_OPTIONS or option == "-o")
-                    and "=" not in arg
-                ):
-                    if index + 1 >= len(args):
-                        return []
-                    index += 2
-                    continue
-                index += 1
-                continue
-            targets.append(arg)
-            index += 1
-
-        return targets
 
     @classmethod
     def _exact_pytest_node_from_command(cls, command: str) -> str:

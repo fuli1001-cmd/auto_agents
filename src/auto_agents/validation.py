@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List
 
 from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, run_state_path, task_plan_path
+from .execution_binding import PYTEST_VALUE_OPTIONS
 from .frontend_fidelity import validate_frontend_fidelity_task_plan
 from .frontend_design import (
     load_frontend_design_lock,
@@ -89,19 +90,7 @@ GLOBAL_INSTALL_PATTERNS = (
     (re.compile(r"(^|[\s;&|])go\s+install\b"), "avoid global go installs"),
 )
 CONDA_RUN_VALUE_OPTIONS = {"-n", "--name", "-p", "--prefix", "--cwd"}
-PYTEST_VALUE_OPTIONS = {
-    "-c",
-    "--confcutdir",
-    "--durations",
-    "--ignore",
-    "--ignore-glob",
-    "--junitxml",
-    "--log-file",
-    "--maxfail",
-    "--rootdir",
-    "-k",
-    "-m",
-}
+
 
 
 def _safe_project_relative_path(value: object) -> bool:
@@ -750,40 +739,13 @@ def _unwrap_conda_run(parts: List[str]) -> List[str]:
 
 
 def _pytest_target_candidates(command: str) -> List[str]:
+    from .execution_binding import test_invocations
     try:
-        parts = shlex.split(command)
+        return [target.split('::', 1)[0] for invocation in test_invocations(command)
+                if invocation.runner == 'pytest' for target in invocation.repository_targets
+                if target not in {'.', '..'}]
     except ValueError:
         return []
-
-    parts = _unwrap_conda_run(parts)
-    if not parts:
-        return []
-
-    executable = Path(parts[0]).name
-    args: List[str]
-    if executable in {"pytest", "py.test"}:
-        args = parts[1:]
-    elif len(parts) >= 3 and Path(parts[0]).name in {"python", "python3"} and parts[1] == "-m" and parts[2] == "pytest":
-        args = parts[3:]
-    else:
-        return []
-
-    targets: List[str] = []
-    skip_next = False
-    option_parsing_done = False
-    for arg in args:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg == "--":
-            option_parsing_done = True
-            continue
-        if not option_parsing_done and arg.startswith("-"):
-            if arg in PYTEST_VALUE_OPTIONS and "=" not in arg:
-                skip_next = True
-            continue
-        targets.append(arg.split("::", 1)[0])
-    return [target for target in targets if target and target not in {".", ".."}]
 
 
 def validate_verification_command_paths(commands: object, project_root: Path, field_name: str) -> List[str]:

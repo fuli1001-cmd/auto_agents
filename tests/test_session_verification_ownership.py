@@ -359,12 +359,39 @@ def test_overlapping_or_unknown_ownership_blocks_destructive_rollback(tmp_path, 
         test_child_resume_without_contract_history_blocks_before_agent_work(tmp_path, monkeypatch)
 
 
-@pytest.mark.parametrize('waiver', ['reference_deletion', 'cached_success'])
+@pytest.mark.parametrize('waiver', ['reference_deletion', 'cached_success', 'empty_owned', 'artifact_only'])
 def test_missing_owned_proof_cannot_be_waived_by_reference_deletion_or_cached_success(tmp_path, monkeypatch, waiver):
     from auto_agents.models import CommandResult, GateResult
     import auto_agents.session as session_module
 
-    root, _ = project(tmp_path, missing=True)
+    root, child = project(tmp_path, missing=True)
+    if waiver in {'empty_owned', 'artifact_only'}:
+        from auto_agents.config import requirements_trace_path
+        from auto_agents.requirements import requirement_contract_sha256
+        config = load_project_config(root)
+        config.gates.steps = []
+        config.gates.commands = []
+        config.gates.parallel_groups = []
+        row = {'id': 'REQ-owned', 'text': 'Repair the owned value', 'source': 'spec'}
+        requirements_trace_path(root).write_text(json.dumps({'requirements': [row]}))
+        refs = ['artifact:review.md'] if waiver == 'artifact_only' else []
+        plan = {'tasks': [{'task_id': 'task-owned', 'title': 'Owned requirement without evidence',
+            'requirement_ids': ['REQ-owned'], 'verification_refs': refs,
+            'requirement_proofs': [{'requirement_id': 'REQ-owned',
+                'requirement_contract_sha256': requirement_contract_sha256(row), 'evidence_refs': []}]}]}
+        _retain_contract(root, child, config, plan)
+        issue = root / '.auto-agents/state/sessions' / child.session_id / 'issue.json'
+        issue.write_text(json.dumps({'task_id': 'task-owned'}))
+        ambient = _switch_ambient_binding_plan(root)
+        saved = _assert_binding_blocked_before_execution(root, monkeypatch)
+        diagnostic = saved.execution_log[-1]['diagnostic']
+        assert diagnostic['task_id'] == 'task-owned'
+        assert diagnostic['requirement_ids'] == ['REQ-owned']
+        assert diagnostic['owners'][0]['task_id'] == 'task-owned'
+        assert diagnostic['task_scope'] == {'task_ids': ['task-owned'], 'requirement_ids': []}
+        assert diagnostic['contract_fingerprint'] and diagnostic['retry_fix'] is False
+        assert {name: (root / name).read_bytes() for name in ambient} == ambient
+        return
     if waiver == 'reference_deletion':
         save_task_plan(root, {'tasks': [{'task_id': 'task-owned', 'title': 'Owned contract',
                                        'requirement_ids': ['REQ-owned'], 'verification_refs': []}]})
@@ -643,7 +670,9 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
 
 @pytest.mark.parametrize('command_source', ['legacy', 'manual', 'fix'])
 @pytest.mark.parametrize('reference_kind', ['selector', 'proof', 'command', 'directory', 'vitest_file',
-                                           'command_directory', 'command_vitest_file'])
+                                           'command_directory', 'command_vitest_file', 'file', 'command_node',
+                                           'cwd_node', 'env_node', 'delimited_node', 'empty_fix',
+                                           'conda_node', 'nested_node', 'command_vitest_selector', 'expanded_report'])
 def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch, command_source, reference_kind):
     from auto_agents.models import GateParallelGroup
 
@@ -654,14 +683,51 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     command = './.conda/bin/python -m pytest -q tests/test_owned.py --junitxml report.xml'
     reference = {'selector': 'tests/test_owned.py::test_owned', 'proof': 'owned.contract',
                  'command': 'cmd:' + command, 'directory': 'tests',
-                 'vitest_file': 'tests/owned.test.ts'}[target_kind]
+                 'vitest_file': 'tests/owned.test.ts', 'file': 'tests/test_owned.py',
+                 'node': 'tests/test_owned.py::test_owned', 'cwd_node': 'tests/test_owned.py::test_owned',
+                 'env_node': 'tests/test_owned.py::test_owned',
+                 'delimited_node': 'tests/test_owned.py::test_owned', 'empty_fix': '',
+                 'conda_node': 'tests/test_owned.py::test_owned',
+                 'nested_node': 'tests/test_owned.py::test_owned',
+                 'vitest_selector': 'tests/owned.test.ts::owned value',
+                 'expanded_report': 'tests/test_owned.py::test_owned'}[target_kind]
+    if target_kind == 'node':
+        command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned --junit-prefix owned'
+    elif target_kind == 'cwd_node':
+        # Keep test-body cwd semantics while exercising an explicit shell transition.
+        command = 'cd tests/.. && ./.conda/bin/python -m pytest -q tests/test_owned.py::test_owned'
+    elif target_kind == 'env_node':
+        command = "PYTEST_ADDOPTS='--junit-xml report.xml' ./.conda/bin/python -m pytest -q tests/test_owned.py::test_owned"
+    elif target_kind == 'delimited_node':
+        command = './.conda/bin/python -m pytest -q -- tests/test_owned.py::test_owned'
+    elif target_kind == 'conda_node':
+        import shutil
+        conda = shutil.which('conda')
+        assert conda, 'the trusted test environment must provide Conda'
+        (root / '.conda').unlink()
+        (root / '.conda/conda-meta').mkdir(parents=True)
+        (root / '.conda/conda-meta/history').write_text('')
+        (root / '.conda/bin').mkdir()
+        (root / '.conda/bin/python').symlink_to(sys.executable)
+        command = shlex.join([conda, 'run', '-p', './.conda',
+                              'python', '-m', 'pytest', '-q', '--', 'tests/test_owned.py::test_owned'])
+    elif target_kind == 'nested_node':
+        proof = root / 'tests/test_owned.py'
+        proof.write_text(proof.read_text().replace('Path("', 'Path("../'))
+        command = 'cd tests && ../.conda/bin/python -m pytest -q test_owned.py::test_owned'
+    elif target_kind == 'expanded_report':
+        monkeypatch.setenv('OWNED_REPORT', 'owned report.log')
+        proof = root / 'tests/test_owned.py'
+        proof.write_text(proof.read_text().replace('from pathlib import Path',
+            'from pathlib import Path\nimport os\nassert Path(os.environ["OWNED_REPORT"]).is_file()'))
+        command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned --log-file "$OWNED_REPORT"'
     marker = tmp_path / 'vitest-executed'
     if target_kind == 'directory':
         config.gates.steps[0].targets = [reference]
-    elif target_kind == 'vitest_file':
+    elif target_kind in {'vitest_file', 'vitest_selector'}:
         from test_vitest_selector_execution import _prepare_real_vitest
         _prepare_real_vitest(root, monkeypatch)
-        (root / reference).write_text(
+        (root / reference.split('::', 1)[0]).write_text(
             'import { test, expect } from "vitest";\n'
             'import { readFileSync, appendFileSync } from "node:fs";\n'
             'test("owned value", () => {\n'
@@ -678,19 +744,23 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         config.gates.steps = []
         if target_kind == 'directory':
             command = './.conda/bin/python -m pytest -q tests --junitxml report.xml'
-        else:
+        elif target_kind in {'vitest_file', 'vitest_selector'}:
             launcher = 'npm exec --' if command_source == 'manual' else 'npx --no-install'
             command = launcher + ' vitest run tests/owned.test.ts --reporter=json --maxWorkers=1'
+            if target_kind == 'vitest_selector':
+                command += ' -t ' + shlex.quote('owned value')
     config.gates.commands = []
     config.gates.parallel_groups = []
-    if command_source == 'legacy':
+    if target_kind == 'empty_fix':
+        child.fix_verify_command = command
+    elif command_source == 'legacy':
         config.gates.commands = [command]
     elif command_source == 'manual':
         config.gates.parallel_groups = [GateParallelGroup(name='manual', commands=[command])]
     else:
         child.fix_verify_command = command
     plan = {'tasks': [{'task_id': 'task-owned', 'title': 'Executable owned proof',
-                      'requirement_ids': ['REQ-owned'], 'verification_refs': [reference]}],
+                      'requirement_ids': ['REQ-owned'], 'verification_refs': [reference] if reference else []}],
             'verification_steps': [step.to_dict() for step in config.gates.steps]}
     _retain_contract(root, child, config, plan)
     ambient = {path: (root / path).read_bytes() for path in
@@ -699,8 +769,12 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     assert saved.status == 'completed', saved.to_dict()
     assert calls == ['fix']
     binding = saved.verification_binding
-    assert binding['required_references'][reference]['kind'] == (
-        'selector' if target_kind in {'directory', 'vitest_file'} else reference_kind)
+    if reference:
+        assert binding['required_references'][reference]['kind'] == (
+            reference_kind if reference_kind in {'proof', 'command'} else 'selector')
+    else:
+        assert binding['required_references'] == {}
+        assert binding['fix_verify_command'] == command
     if command_only_target:
         assert binding['required_proof_ids'] == []
         assert binding['proof_graph']['gates']['steps'] == []
@@ -710,7 +784,7 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     elif reference_kind in {'directory', 'vitest_file'}:
         assert binding['required_proof_ids'] == ['owned.contract']
         assert binding['proof_owners']['owned.contract'][0]['task_id'] == 'task-owned'
-    if target_kind == 'vitest_file':
+    if target_kind in {'vitest_file', 'vitest_selector'}:
         assert 'VALUE = 1' in marker.read_text().splitlines(), 'the retained Vitest proof must execute'
     assert binding['task_ids'] == ['task-owned']
     assert binding['requirement_ids'] == ['REQ-owned']
@@ -1243,8 +1317,12 @@ def test_public_resume_rejects_pytest_control_file_weakening(tmp_path, monkeypat
 @pytest.mark.parametrize('reference', ['owned.contract', 'owned.report.json', 'tests/test_owned.py::test_owned',
                                      'tests/owned.test.ts'])
 @pytest.mark.parametrize('command_source', ['none', 'legacy', 'manual', 'fix'])
-@pytest.mark.parametrize('runner', ['pytest', 'vitest'])
-def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference, command_source, runner):
+@pytest.mark.parametrize('runner,report_option', [
+    ('pytest', '--junitxml'), ('pytest', '--junit-xml'), ('pytest', '--junit-prefix'),
+    ('pytest', '--override-ini'), ('pytest', '--unknown-plugin-option'), ('vitest', '--outputFile'),
+    ('pytest', '-r'), ('pytest', '>'), ('pytest', '2>'),
+])
+def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference, command_source, runner, report_option):
     import auto_agents.session as session_module
     from auto_agents.models import GateParallelGroup
 
@@ -1264,7 +1342,7 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
         (root / '.conda/bin').mkdir()
         (root / '.conda/bin/python').symlink_to(sys.executable)
         (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
-        command = 'conda run -p ./.conda python -m pytest -q tests/test_control.py --junitxml ' + reference
+        command = 'conda run -p ./.conda python -m pytest -q tests/test_control.py ' + report_option + ' ' + reference
         if runner == 'vitest':
             command = 'npx --no-install vitest run tests/control.test.ts --outputFile ' + reference
         if command_source == 'legacy':
@@ -1279,6 +1357,9 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
     _retain_contract(root, child, config, plan)
     ambient = {path: (root / path).read_bytes() for path in
                ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
+    def reject_baseline(*args, **kwargs):
+        pytest.fail('Unresolved references must be rejected before baseline admission')
+    monkeypatch.setattr(Session, '_ensure_baseline', reject_baseline)
     dispatched = []
     execute = session_module.run_gate_plan
     def observe(commands, *args, **kwargs):
@@ -3085,7 +3166,8 @@ def _retain_candidate_binding_identity(state):
     receipt['fingerprint'] = fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'})
 
 
-def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_path, monkeypatch):
+@pytest.mark.parametrize('inventory_version', [None, 1])
+def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_path, monkeypatch, inventory_version):
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
 
@@ -3097,6 +3179,8 @@ def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_pat
     child.candidate_custody.pop('delivered_revision')
     for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
         child.verification_binding.pop(key, None)
+    if inventory_version is not None:
+        child.verification_binding['proof_inventory_version'] = inventory_version
     child.verification_binding['binding_fingerprint'] = fingerprint({
         k: v for k, v in child.verification_binding.items() if k != 'binding_fingerprint'})
     _retain_candidate_binding_identity(child)
@@ -3116,6 +3200,41 @@ def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_pat
     assert repeated.status == 'completed' and calls == []
     assert repeated.candidate_custody == custody
     assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_path, monkeypatch):
+    from copy import deepcopy
+    import auto_agents.session_verification as verification
+
+    root, child = project(tmp_path)
+    with monkeypatch.context() as old:
+        old.setattr(verification, '_PROOF_INVENTORY_VERSION', 1)
+        child, calls, _ = run_session(root, old)
+        assert child.status == 'completed' and calls == ['fix']
+        child.verification_binding.pop('proof_inventory_version')
+        child.verification_binding['binding_fingerprint'] = verification.fingerprint({
+            k: v for k, v in child.verification_binding.items() if k != 'binding_fingerprint'})
+        _retain_candidate_binding_identity(child)
+        save_session_state(root, child)
+        child, calls, _ = run_session(root, old)
+        assert child.status == 'completed' and calls == []
+        assert child.candidate_custody['binding_migration']
+    retained = deepcopy(child.candidate_custody)
+    authority = deepcopy(child.verification_binding)
+    ambient = _switch_ambient_binding_plan(root)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed' and calls == []
+    assert saved.verification_binding['proof_inventory_version'] == 2
+    assert saved.verification_binding['binding_fingerprint'] != authority['binding_fingerprint']
+    for key in ('authorization', 'tasks', 'task_scope', 'contract_revision', 'original_handoff_id'):
+        assert saved.verification_binding[key] == authority[key]
+    assert {k: v for k, v in saved.candidate_custody.items() if k != 'binding_migration'} == {
+        k: v for k, v in retained.items() if k != 'binding_migration'}
+    assert saved.candidate_custody['binding_migration']['original_binding'] == retained['binding_migration']['original_binding']
+    new_entries = saved.execution_log[len(child.execution_log):]
+    assert any(entry['action'] == 'inventory_migration_verify' and entry['result'] == 'pass'
+               for entry in new_entries), 'the new inventory must obtain fresh verification evidence'
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 

@@ -14,10 +14,12 @@ from pathlib import Path
 from copy import deepcopy
 
 from .config import config_path, requirements_trace_path, run_state_path, task_plan_path
-from .execution_binding import command_spans, executable_tokens, route_sources
+from .execution_binding import command_spans, executable_tokens, route_sources, test_invocations
 from .git_ops import head_ref
 from .io_utils import read_json
 
+
+_PROOF_INVENTORY_VERSION = 2
 
 _PYTEST_CONFIG_NAMES = ('pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
                         'pyproject.toml', 'tox.ini', 'setup.cfg')
@@ -100,7 +102,7 @@ def _bind_session(session, state) -> None:
             state.verification_binding['task_scope'] = scope
         elif any(scope.values()) and scope != state.verification_binding['task_scope']:
             raise ownership_error(state, 'retained task authority conflicts with session evidence')
-        upgrade_inventory = state.verification_binding.get('proof_inventory_version', 0) < 1
+        upgrade_inventory = state.verification_binding.get('proof_inventory_version', 0) < _PROOF_INVENTORY_VERSION
         original = deepcopy(state.verification_binding)
         if state.candidate_custody:
             from .session_candidate import validate_receipt
@@ -314,7 +316,7 @@ def _seal_proof_graph(session, state):
                    'revision': binding['contract_revision'],
                    'plan_fingerprint': binding['plan_fingerprint']},
     }
-    binding['proof_inventory_version'] = 1
+    binding['proof_inventory_version'] = _PROOF_INVENTORY_VERSION
 
 
 def _task_owner(task):
@@ -470,69 +472,13 @@ def _effective_targets(step):
     return targets
 
 
-def _command_test_targets(raw):
-    """Read positional runner inputs; option values never declare test paths."""
-    from .orchestrator import Orchestrator
-
-    args = executable_tokens(raw)
-    if not args:
-        return []
-    pytest_targets = Orchestrator._pytest_targets_from_command(shlex.join(args))
-    if pytest_targets:
-        return pytest_targets
-    launcher = Path(args[0]).name
-    if launcher in {'npm', 'pnpm', 'yarn'} and args[1:2] in (['exec'], ['dlx']):
-        args = args[2:]
-        if args[:1] == ['--']:
-            args = args[1:]
-    elif launcher == 'npx':
-        args = args[1:]
-        while args[:1] in (['--yes'], ['-y'], ['--no-install'], ['--']):
-            args = args[1:]
-    elif launcher in {'pnpm', 'yarn'}:
-        args = args[1:]
-    if not args or Path(args[0]).name != 'vitest':
-        return []
-    args = args[1:]
-    if args[:1] == ['run']:
-        args = args[1:]
-    value_options = {
-        '-t', '--testNamePattern', '--test-name-pattern', '-c', '--config',
-        '-r', '--root', '--dir', '--reporter', '--outputFile', '--maxWorkers',
-        '--minWorkers', '--pool', '--environment', '--exclude', '--project',
-        '--testTimeout', '--hookTimeout', '--retry', '--bail', '--shard',
-    }
-    flags = {'--run', '--no-cache', '--no-file-parallelism', '--passWithNoTests'}
-    targets = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == '--':
-            return [*targets, *args[index + 1:]]
-        if arg.startswith('-'):
-            option, separator, _ = arg.partition('=')
-            if option in value_options or option.startswith('--outputFile.'):
-                if not separator:
-                    index += 1
-                    if index == len(args):
-                        return []
-            elif option not in flags:
-                # An unknown option's arity cannot establish ownership of its
-                # following argument. Preserve the original execution text.
-                return []
-        else:
-            targets.append(arg)
-        index += 1
-    return targets
-
-
 def _command_covers(command, ref):
     if ref.startswith('cmd:'):
-        return command.strip() == ref[4:].strip()
+        return bool(ref[4:].strip()) and command.strip() == ref[4:].strip()
     try:
         from .models import VerificationStep
-        for start, end in command_spans(command):
-            targets = _command_test_targets(command[start:end])
+        for invocation in test_invocations(command):
+            targets = invocation.repository_targets
             if targets and _ref_covered(ref, VerificationStep(targets=targets)):
                 # This establishes ownership, not selection evidence. The
                 # mandatory node guard validates actual selection separately.
@@ -581,9 +527,27 @@ def _mandatory_refs(state):
     return refs
 
 
+def _owned_tasks(state):
+    binding = state.verification_binding
+    scope = binding.get('task_scope', {})
+    task_ids, requirements = set(scope.get('task_ids', [])), set(scope.get('requirement_ids', []))
+    return [task for task in binding.get('tasks', []) if
+            task.get('task_id') in task_ids or requirements.intersection(task.get('requirement_ids', []))
+            or not (task_ids or requirements) and
+            (not (task.get('workflow_id') or binding.get('plan_workflow_id'))
+             or (task.get('workflow_id') or binding.get('plan_workflow_id')) == state.workflow_id)]
+
+
 def _owned_inventory(state, gates):
     """Task refs are mandatory; unlabelled gates remain impact regressions."""
     refs = _mandatory_refs(state)
+    for task in _owned_tasks(state):
+        executable_refs = [ref for ref in _task_refs(task)
+                           if _reference_kind(ref, gates, commands=[state.fix_verify_command]) != 'artifact']
+        if task.get('requirement_ids') and not executable_refs and not state.fix_verify_command.strip():
+            raise ownership_error(state, 'owned requirement has no executable verification evidence',
+                                  task_id=task['task_id'], requirement_ids=task['requirement_ids'],
+                                  owners=[_task_owner(task)])
     required = []
     owners = {}
     for ref in sorted(refs):
@@ -669,7 +633,8 @@ def _seal_inventory(session, state):
                                    for owner in diagnostic_owners(state, ref)]
                          for command in _legacy_commands(gates)
                          if any(_command_covers(command, ref) for ref in owned_refs)}
-    bound_owners = [owner for key in required for owner in owners.get(key, [])]
+    bound_owners = [_task_owner(task) for task in _owned_tasks(state)]
+    bound_owners.extend(owner for key in required for owner in owners.get(key, []))
     bound_owners.extend(owner for rows in required_commands.values() for owner in rows)
     bound_owners.extend(binding['proof_graph']['commands'].get(state.fix_verify_command, []))
     # Capture provenance once. Baseline capture and refresh update the live
@@ -756,8 +721,6 @@ def _validate_required_node_selection(session, state, commands):
     without that evidence they cannot establish coverage. Keep the retained
     command intact and report ambiguity instead of stripping its options.
     """
-    from .orchestrator import Orchestrator
-
     refs = sorted(ref for ref in _mandatory_refs(state)
                   if not ref.startswith('cmd:') and '.py::' in ref)
     if not refs:
@@ -775,27 +738,14 @@ def _validate_required_node_selection(session, state, commands):
                                   verification_ref=path)
     covered = set()
     for command in commands:
-        cwd = session.project_root
         try:
-            for start, end in command_spans(command):
-                raw = command[start:end]
-                args = executable_tokens(raw)
-                if not args:
+            for invocation in test_invocations(command):
+                if invocation.runner != 'pytest' or invocation.targets is None:
                     continue
-                if args[0] == 'cd' and len(args) == 2:
-                    cwd = (cwd / args[1]).resolve()
-                    continue
-                if Path(args[0]).name in {'pytest', 'py.test'}:
-                    options = args[1:]
-                elif Path(args[0]).name.startswith('python') and args[1:3] == ['-m', 'pytest']:
-                    options = args[3:]
-                else:
-                    continue
-                # Inline addopts are runner selection inputs too, even though
-                # executable_tokens removes environment assignment wrappers.
-                env_args = _inline_pytest_addopts(raw, args)
-                targets = Orchestrator._pytest_targets_from_command(shlex.join(args))
-                settings = _pytest_selection_config(session.project_root, cwd, [*env_args, *options],
+                cwd = (session.project_root / invocation.cwd).resolve()
+                options = list(invocation.arguments)
+                targets = list(invocation.targets)
+                settings = _pytest_selection_config(session.project_root, cwd, options,
                                                     targets, configurations)
                 addopts = settings.get('addopts', [])
                 config_args = shlex.split(addopts) if isinstance(addopts, str) else list(addopts)
@@ -812,7 +762,7 @@ def _validate_required_node_selection(session, state, commands):
                         contains = (absolute == selected and (not target_node or node == target_node
                                     or node.startswith(target_node + '::')))
                         contains |= (not target_node and not selected.suffix and selected in absolute.parents)
-                        selection_args = [*config_args, *env_args, *options]
+                        selection_args = [*config_args, *options]
                         if (contains and not _pytest_selection_restricted(selection_args)
                                 and not _pytest_discovery_excludes(selection_args, ref,
                                                                  directory=absolute != selected,
@@ -970,32 +920,27 @@ def _inline_pytest_addopts(raw, args):
 
 def _command_source_targets(command, *, session, revision, config_paths):
     """Inventory command inputs without running candidate configuration/hooks."""
-    from .orchestrator import Orchestrator
-
     targets = set()
-    cwd = Path('.')
     try:
-        for start, end in command_spans(command):
-            args = executable_tokens(command[start:end])
-            if not args:
-                continue
-            if args[0] == 'cd' and len(args) == 2:
-                cwd = cwd / args[1]
-                continue
-            pytest = Path(args[0]).name in {'pytest', 'py.test'} or (
-                Path(args[0]).name.startswith('python') and args[1:3] == ['-m', 'pytest'])
-            if pytest:
-                # Pytest parses config addopts, environment addopts, then CLI
-                # options. Preserve that order for discovery and explicit
-                # targets without changing the retained execution command.
-                prefix = 1 if Path(args[0]).name in {'pytest', 'py.test'} else 3
-                args = [*args[:prefix], *_inline_pytest_addopts(command[start:end], args), *args[prefix:]]
+        for invocation in test_invocations(command):
+            cwd = Path(invocation.cwd)
+            if invocation.runner == 'pytest':
+                args = ['pytest', *invocation.arguments]
                 patterns = _pytest_discovery_patterns(session, revision, cwd, args, config_paths)
-                paths = Orchestrator._pytest_targets_from_command(shlex.join(args))
-                targets.update(((cwd / path.split('::', 1)[0]).as_posix(), ()) for path in paths)
-                if not paths:
+                targets.update((path.split('::', 1)[0], ()) for path in invocation.repository_targets)
+                if not invocation.targets:
                     targets.add((cwd.as_posix(), patterns))
             else:
+                targets.update((path.split('::', 1)[0], ()) for path in invocation.repository_targets)
+        # Retain source protection for explicit non-runner scripts as well.
+        parsed = {invocation.raw for invocation in test_invocations(command)}
+        cwd = Path('.')
+        for start, end in command_spans(command):
+            raw = command[start:end].strip()
+            args = executable_tokens(raw)
+            if args[:1] == ['cd'] and len(args) == 2:
+                cwd = cwd / args[1]
+            elif raw not in parsed:
                 targets.update(((cwd / arg.split('::', 1)[0]).as_posix(), ()) for arg in args
                                if arg.split('::', 1)[0].endswith(('.py', '.js', '.ts', '.tsx', '.jsx')))
     except ValueError:
@@ -1365,33 +1310,21 @@ def record_candidate(session, state, before: dict[str, str]) -> None:
 def collection_command(command: str) -> str:
     """Preserve shell/launcher arguments, adding collection only to pytest."""
     try:
-        spans = command_spans(command)
         collected = []
         has_pytest = False
-        for start, end in spans:
+        parsed = {invocation.raw: invocation for invocation in test_invocations(command)}
+        for start, end in command_spans(command):
             raw = command[start:end].strip()
-            args = executable_tokens(command[start:end])
-            if not args:
-                continue
-            if args[0] == 'cd':
+            args = executable_tokens(raw)
+            if args[:1] == ['cd']:
                 collected.append(raw)
                 continue
-            is_pytest = Path(args[0]).name in {"pytest", "py.test"} or (
-                len(args) > 2 and Path(args[0]).name.startswith("python") and args[1:3] == ["-m", "pytest"]
-            )
-            if not is_pytest:
-                # A different runner or shell action does not waive pytest
-                # entries elsewhere in the chain. Do not execute that action
-                # during preflight; retain it in the original execution only.
+            invocation = parsed.get(raw)
+            if invocation is None or invocation.runner != 'pytest':
                 continue
             has_pytest = True
-            # Place before the explicit end-of-options delimiter, if present.
-            tokens = shlex.split(raw)
-            if "--" in tokens:
-                tokens.insert(tokens.index("--"), "--collect-only")
-                collected.append(shlex.join(tokens))
-            else:
-                collected.append(raw + " --collect-only")
+            offset = invocation.option_offset
+            collected.append(raw[:offset] + ' --collect-only ' + raw[offset:])
         if has_pytest:
             # Each referenced required entry must collect, even when the
             # execution command uses ';' or a conditional fallback. The

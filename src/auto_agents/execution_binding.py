@@ -5,6 +5,7 @@ import re
 import shlex
 import os
 import stat
+import posixpath
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,9 +45,16 @@ def bridge_inventory_upgrade(state, original):
     from .session_verification import fingerprint, ownership_error
 
     binding, custody = state.verification_binding, state.candidate_custody
-    if (original.get('binding_fingerprint') != custody.get('binding_fingerprint')
-            or custody.get('binding_migration') or not _unchanged_authority(original, binding)):
+    if not _unchanged_authority(original, binding):
         raise ownership_error(state, 'inventory migration changed retained candidate authority')
+    # A later parser inventory can follow an earlier recovery. Validate that
+    # bridge against its original binding before extending the same custody.
+    from copy import copy
+    previous = copy(state)
+    previous.verification_binding = original
+    validate_custody_binding(previous)
+    if custody.get('binding_migration'):
+        original = custody['binding_migration']['original_binding']
     bridge = {'schema_version': 1, 'original_binding': deepcopy(original),
               'inventory_fingerprint': binding['binding_fingerprint'],
               'custody_identity': fingerprint(_custody_identity(custody)),
@@ -255,11 +263,186 @@ def executable_tokens(command: str) -> list[str]:
             tokens = tokens[2:]
             while tokens and tokens[0].startswith("-"):
                 option = tokens.pop(0)
+                if option == "--":
+                    break
                 if option in {"-p", "--prefix", "-n", "--name", "--cwd"}:
                     tokens = tokens[1:]
         else:
             break
     return tokens
+
+
+# Selection is admitted only for options whose arity is known. Keep this
+# inventory shared by reference resolution, path validation and diagnostics.
+PYTEST_VALUE_OPTIONS = frozenset({
+    '-c', '--inifilename', '--config-file', '-o', '--override-ini', '-k', '-m', '-p',
+    '--confcutdir', '--durations', '--durations-min', '--ignore', '--ignore-glob',
+    '--deselect', '--junitxml', '--junit-xml', '--junit-prefix', '--log-file',
+    '--maxfail', '--rootdir', '--basetemp', '--import-mode', '--assert', '--tb',
+    '--capture', '--color', '--code-highlight', '--show-capture', '--verbosity',
+    '--log-level', '--log-format', '--log-date-format', '--log-cli-level',
+    '--log-cli-format', '--log-cli-date-format', '--log-file-level',
+    '--log-file-format', '--log-file-date-format', '--log-file-mode', '--log-disable',
+    '--override-toml', '-W', '--pythonwarnings', '--doctest-glob', '--doctest-report',
+    '--pastebin', '-r', '--debug',
+})
+_PYTEST_FLAGS = frozenset({
+    '-q', '--quiet', '-v', '--verbose', '-s', '-x', '--exitfirst', '-l', '--showlocals',
+    '--no-showlocals', '--collect-only', '--co', '--continue-on-collection-errors',
+    '--pyargs', '--noconftest', '--keep-duplicates', '--keepduplicates',
+    '--collect-in-virtualenv', '--doctest-modules', '--doctest-ignore-import-errors',
+    '--doctest-continue-on-failure', '--strict', '--strict-config', '--strict-markers',
+    '--disable-warnings', '--disable-pytest-warnings', '--no-header', '--no-summary',
+    '--full-trace', '--pdb', '--trace', '--runxfail', '--stepwise', '--sw',
+    '--stepwise-skip', '--sw-skip', '--lf', '--last-failed', '--ff', '--failed-first',
+    '--nf', '--new-first', '--cache-clear', '--setup-only', '--setup-show',
+    '--setup-plan', '--fixtures', '--fixtures-per-test', '--funcargs', '--version',
+    '--help', '-h', '--trace-config',
+})
+_VITEST_VALUES = frozenset({
+    '-t', '--testNamePattern', '--test-name-pattern', '-c', '--config', '-r', '--root',
+    '--dir', '--reporter', '--outputFile', '--maxWorkers', '--minWorkers', '--pool',
+    '--environment', '--exclude', '--project', '--testTimeout', '--hookTimeout',
+    '--retry', '--bail', '--shard',
+})
+_VITEST_FLAGS = frozenset({'--run', '--no-cache', '--no-file-parallelism', '--passWithNoTests'})
+
+
+def _runner_targets(runner, args, redirections=()):
+    values = PYTEST_VALUE_OPTIONS if runner == 'pytest' else _VITEST_VALUES
+    flags = _PYTEST_FLAGS if runner == 'pytest' else _VITEST_FLAGS
+    # Shell redirection destinations are not passed to the runner. Remove
+    # their known syntax before interpreting the runner's '--' delimiter.
+    positional_args = []
+    shell_index = 0
+    while shell_index < len(args):
+        arg = args[shell_index]
+        if shell_index in redirections:
+            if re.fullmatch(r'\d*(?:[<>]|>>|<>|>&|<&)', arg):
+                shell_index += 1
+                if shell_index == len(args):
+                    return None
+        else:
+            positional_args.append(arg)
+        shell_index += 1
+    args = positional_args
+    targets = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == '--':
+            return [*targets, *args[index + 1:]]
+        if not arg.startswith('-'):
+            targets.append(arg)
+        else:
+            option, equals, _ = arg.partition('=')
+            if runner == 'pytest' and option in {'-r', '--debug', '--cache-show'}:
+                if not equals and index + 1 < len(args) and not args[index + 1].startswith('-'):
+                    index += 1
+            elif option in values or runner == 'vitest' and option.startswith('--outputFile.'):
+                if not equals:
+                    index += 1
+                    if index == len(args):
+                        return None
+            elif runner == 'pytest' and len(arg) > 2 and arg[:2] in {'-k', '-m', '-o', '-c', '-p', '-W'}:
+                pass  # Attached single-value short options.
+            elif runner == 'pytest' and re.fullmatch(r'-[qvsxl]+', arg):
+                pass
+            elif runner == 'pytest' and arg.startswith('-r') and not arg.startswith('--'):
+                pass  # Pytest's optional, attached report selector.
+            elif option not in flags:
+                return None  # Unknown arity cannot establish executable coverage.
+        index += 1
+    return targets
+
+
+@dataclass(frozen=True)
+class TestInvocation:
+    raw: str
+    runner: str
+    arguments: tuple[str, ...]
+    targets: tuple[str, ...] | None
+    cwd: str
+    option_offset: int
+
+    @property
+    def repository_targets(self):
+        return [posixpath.normpath(posixpath.join(self.cwd, target.split('::', 1)[0]))
+                + ('::' + target.split('::', 1)[1] if '::' in target else '')
+                for target in self.targets or ()]
+
+
+def test_invocations(command: str) -> list[TestInvocation]:
+    """Parse retained shell context without evaluating shell or runner code.
+
+    None targets means unknown option arity, distinct from default discovery.
+    option_offset addresses the runner boundary in the original shell text,
+    so preflight preserves quoting and distinguishes launcher and runner '--'.
+    """
+    invocations = []
+    cwd = '.'
+    for start, end in command_spans(command):
+        raw = command[start:end].strip()
+        tokens = shlex.split(raw)
+        args = executable_tokens(raw)
+        if not args:
+            continue
+        if args[:1] == ['cd'] and len(args) == 2:
+            cwd = posixpath.normpath(posixpath.join(cwd, args[1]))
+            continue
+        invocation_cwd = cwd
+        prefix = tokens[:len(tokens) - len(args)]
+        for index, token in enumerate(prefix):
+            if token == '--cwd' and index + 1 < len(prefix):
+                invocation_cwd = posixpath.normpath(posixpath.join(cwd, prefix[index + 1]))
+            elif token.startswith('--cwd='):
+                invocation_cwd = posixpath.normpath(posixpath.join(cwd, token.partition('=')[2]))
+        name = Path(args[0]).name
+        if name in {'pytest', 'py.test'}:
+            runner, options = 'pytest', args[1:]
+        elif re.fullmatch(r'python(?:\d+(?:\.\d+)*)?(?:\.exe)?', name) and args[1:3] == ['-m', 'pytest']:
+            runner, options = 'pytest', args[3:]
+        else:
+            if name in {'npm', 'pnpm', 'yarn'} and args[1:2] in (['exec'], ['dlx']):
+                args = args[2:]
+                if args[:1] == ['--']:
+                    args = args[1:]
+            elif name == 'npx':
+                args = args[1:]
+                while args[:1] in (['--yes'], ['-y'], ['--no-install'], ['--']):
+                    args = args[1:]
+            elif name in {'pnpm', 'yarn'}:
+                args = args[1:]
+            if not args or Path(args[0]).name != 'vitest':
+                continue
+            runner, options = 'vitest', args[1:]
+            if options[:1] == ['run']:
+                options = options[1:]
+        lexer = shlex.shlex(raw, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        option_start = len(tokens) - len(options)
+        raw_words, word_ends = [], []
+        previous_offset = 0
+        for _ in tokens:
+            lexer.get_token()
+            end_offset = lexer.instream.tell()
+            raw_words.append(raw[previous_offset:end_offset].strip())
+            word_ends.append(end_offset)
+            previous_offset = end_offset
+        offset = word_ends[option_start - 1]
+        env_args = []
+        if runner == 'pytest':
+            for token in prefix:
+                if token.startswith('PYTEST_ADDOPTS='):
+                    env_args = shlex.split(token.partition('=')[2])
+        arguments = [*env_args, *options]
+        redirections = {len(env_args) + index for index, word in enumerate(raw_words[option_start:])
+                        if re.match(r'^\d*[<>]', word)}
+        targets = _runner_targets(runner, arguments, redirections)
+        invocations.append(TestInvocation(raw, runner, tuple(arguments),
+                           None if targets is None else tuple(targets), invocation_cwd, offset))
+    return invocations
 
 
 def disable_vitest_cache(command: str) -> str:
