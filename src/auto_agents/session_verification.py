@@ -621,12 +621,7 @@ def _owned_inventory(state, gates, session=None):
 
 
 def _retained_vitest_filter_sources(session, revision, invocation, *, root=None, reference=None):
-    """Resolve filename filters to retained source inputs, not live files.
-
-    Vitest filters are case-insensitive substrings, rather than literal Git
-    paths. This supplies source provenance only; the unchanged invocation
-    still has to establish executable selection through gate verification.
-    """
+    """Resolve filename filters under the retained runner's discovery rules."""
     import re
 
     if invocation.runner != 'vitest' or not invocation.targets:
@@ -643,7 +638,7 @@ def _retained_vitest_filter_sources(session, revision, invocation, *, root=None,
         return []
     sources = []
     for path in entries.stdout.split('\0'):
-        if not re.search(r'\.(?:test|spec)\.[cm]?[jt]sx?$', path, re.IGNORECASE):
+        if not re.search(r'\.[cm]?[jt]sx?$', path, re.IGNORECASE):
             continue
         try:
             relative = Path(path).relative_to(invocation.cwd).as_posix()
@@ -651,7 +646,81 @@ def _retained_vitest_filter_sources(session, revision, invocation, *, root=None,
             continue
         if any(value.lower() in relative.lower() for value in filters):
             sources.append(path)
-    return sources
+    if not sources:
+        return []
+    # Filename overlap alone cannot discharge an undefined proof: the same
+    # invocation may exclude every matching source and run a passing control.
+    selectable = _retained_vitest_discovery(session, root, revision, invocation)
+    return [path for path in sources if path in selectable]
+
+
+def _retained_vitest_discovery(session, root, revision, invocation):
+    """List files in a disposable retained checkout without collecting tests.
+
+    Keep runner config, cwd, environment assignments, and option order intact.
+    Discovery is bounded and never reads or writes verification certificates.
+    """
+    import os
+    import re
+    from . import artifact_temp as tempfile
+    from .gate_execution import discover_dependency_links
+    from .session_candidate import _clone
+    from .verification_sandbox import verification_argv
+
+    key = fingerprint([str(root), revision, invocation.raw, invocation.cwd, dict(os.environ)])
+    cache = getattr(session, '_retained_vitest_discovery_cache', None)
+    if cache is None:
+        cache = session._retained_vitest_discovery_cache = {}
+    if key in cache:
+        return cache[key]
+    prefix = invocation.raw[:invocation.option_offset].rstrip()
+    if shlex.split(prefix)[-1] == 'run':
+        prefix, count = re.subn(r'''(?:\brun|'run'|"run")$''', '', prefix)
+        if not count:
+            return []  # An unresolved launcher cannot establish selection.
+    # Put boolean flags before the original args so '--' keeps its meaning.
+    command = (prefix + ' list --filesOnly --json --no-cache '
+               + invocation.raw[invocation.option_offset:])
+    selected = []
+    try:
+        with tempfile.TemporaryDirectory(prefix='auto-agents-vitest-discovery-') as temporary:
+            checkout = Path(temporary) / 'project'
+            _clone(root, revision, checkout)
+            dependencies = discover_dependency_links(root)
+            for relative, source in dependencies.items():
+                link = checkout / relative
+                if link.name != 'node_modules' or not link.is_symlink():
+                    continue
+                # Vite bundles retained configuration into node_modules/.vite-temp.
+                # Keep that scratch space private instead of writing through
+                # the shared dependency link; package contents stay read-only.
+                link.unlink()
+                link.mkdir()
+                for package in source.iterdir():
+                    if package.name != '.vite-temp':
+                        (link / package.name).symlink_to(package, target_is_directory=package.is_dir())
+            cwd = (checkout / invocation.cwd).resolve()
+            if not cwd.is_relative_to(checkout):
+                return []
+            shell = 'cd ' + shlex.quote(str(cwd)) + ' && ' + command
+            with verification_argv(['sh', '-c', shell], checkout, root,
+                    read_roots=list(dependencies.values())) as argv:
+                result = subprocess.run(argv, cwd=checkout, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                payload = json.loads(result.stdout)
+                if isinstance(payload, list):
+                    for item in payload:
+                        if not isinstance(item, dict) or not isinstance(item.get('file'), str):
+                            continue
+                        path = (cwd / item['file']).resolve()
+                        if path.is_relative_to(checkout):
+                            selected.append(path.relative_to(checkout).as_posix())
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        # Missing tooling, ambiguous configuration, and failed discovery must
+        # leave the reference unresolved, never fall back to filename overlap.
+        selected = []
+    cache[key] = selected
+    return selected
 
 
 def _retained_reference_exists(session, state, ref, *, commands=()):

@@ -738,7 +738,8 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
                                            'command_directory', 'command_vitest_file', 'file', 'command_node',
                                            'cwd_node', 'env_node', 'delimited_node', 'empty_fix',
                                            'conda_node', 'nested_node', 'command_vitest_selector', 'expanded_report',
-                                           'command_vitest_basename', 'command_vitest_filter'])
+                                           'command_vitest_basename', 'command_vitest_filter',
+                                           'command_vitest_configured_filter'])
 def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch, command_source, reference_kind):
     from auto_agents.models import GateParallelGroup
 
@@ -757,6 +758,7 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
                  'nested_node': 'tests/test_owned.py::test_owned',
                  'vitest_selector': 'tests/owned.test.ts::owned value',
                  'vitest_basename': 'owned.test.ts', 'vitest_filter': 'OWNED.TEST',
+                 'vitest_configured_filter': 'owned.check',
                  'expanded_report': 'tests/test_owned.py::test_owned'}[target_kind]
     if target_kind == 'node':
         command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned --junit-prefix owned'
@@ -789,12 +791,25 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
             'from pathlib import Path\nimport os\nassert Path(os.environ["OWNED_REPORT"]).is_file()'))
         command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned --log-file "$OWNED_REPORT"'
     marker = tmp_path / 'vitest-executed'
+    vitest_source = 'tests/owned.check.ts' if target_kind == 'vitest_configured_filter' else 'tests/owned.test.ts'
     if target_kind == 'directory':
         config.gates.steps[0].targets = [reference]
-    elif target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter'}:
+    elif target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter', 'vitest_configured_filter'}:
         from test_vitest_selector_execution import _prepare_real_vitest
         _prepare_real_vitest(root, monkeypatch)
-        (root / 'tests/owned.test.ts').write_text(
+        if target_kind == 'vitest_configured_filter':
+            # Model a local installation with writable bundler scratch while
+            # reusing the provisioned packages without changing their bytes.
+            modules = root / 'node_modules'
+            packages = modules.resolve()
+            modules.unlink()
+            modules.mkdir()
+            for package in packages.iterdir():
+                if package.name != '.vite-temp':
+                    (modules / package.name).symlink_to(package, target_is_directory=package.is_dir())
+            (root / 'vitest.config.js').write_text('export default ' + json.dumps(
+                {'test': {'include': ['tests/*.check.ts'], 'exclude': ['**/control*']}}) + ';\n')
+        (root / vitest_source).write_text(
             'import { test, expect } from "vitest";\n'
             'import { readFileSync, appendFileSync } from "node:fs";\n'
             'test("owned value", () => {\n'
@@ -811,9 +826,9 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         config.gates.steps = []
         if target_kind == 'directory':
             command = './.conda/bin/python -m pytest -q tests --junitxml report.xml'
-        elif target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter'}:
+        elif target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter', 'vitest_configured_filter'}:
             launcher = 'npm exec --' if command_source == 'manual' else 'npx --no-install'
-            selector = reference if target_kind in {'vitest_basename', 'vitest_filter'} else 'tests/owned.test.ts'
+            selector = reference if target_kind in {'vitest_basename', 'vitest_filter', 'vitest_configured_filter'} else 'tests/owned.test.ts'
             command = launcher + ' vitest run ' + selector + ' --reporter=json --maxWorkers=1'
             if target_kind == 'vitest_selector':
                 command += ' -t ' + shlex.quote('owned value')
@@ -852,9 +867,9 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     elif reference_kind in {'directory', 'vitest_file'}:
         assert binding['required_proof_ids'] == ['owned.contract']
         assert binding['proof_owners']['owned.contract'][0]['task_id'] == 'task-owned'
-    if target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter'}:
+    if target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter', 'vitest_configured_filter'}:
         assert 'VALUE = 1' in marker.read_text().splitlines(), 'the retained Vitest proof must execute'
-        assert 'tests/owned.test.ts' in binding['proof_sources']
+        assert vitest_source in binding['proof_sources']
     assert binding['task_ids'] == ['task-owned']
     assert binding['requirement_ids'] == ['REQ-owned']
     assert any(entry.get('result') == 'pass' for entry in saved.execution_log)
@@ -1391,7 +1406,7 @@ def test_public_resume_rejects_pytest_control_file_weakening(tmp_path, monkeypat
     ('pytest', '--override-ini'), ('pytest', '--unknown-plugin-option'), ('vitest', '--outputFile'),
     ('pytest', '-r'), ('pytest', '>'), ('pytest', '2>'),
 ])
-def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference, command_source, runner, report_option):
+def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference, command_source, runner, report_option, source_case='absent'):
     import auto_agents.session as session_module
     from auto_agents.models import GateParallelGroup
 
@@ -1414,6 +1429,21 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
         command = 'conda run -p ./.conda python -m pytest -q tests/test_control.py ' + report_option + ' ' + reference
         if runner == 'vitest':
             command = 'npx --no-install vitest run tests/control.test.ts ' + report_option + ' ' + reference
+            if source_case != 'absent':
+                from test_vitest_selector_execution import _prepare_real_vitest
+                _prepare_real_vitest(root, monkeypatch)
+                owned_source = 'tests/' + reference + '.test.ts'
+                (root / owned_source).write_text('import { test, expect } from "vitest";\n'
+                    'test("owned failure", () => expect(false).toBe(true));\n')
+                (root / 'tests/control.test.ts').write_text('import { test, expect } from "vitest";\n'
+                    'test("passing control", () => expect(true).toBe(true));\n')
+                if source_case == 'config_excluded':
+                    (root / 'vitest.config.js').write_text('export default ' + json.dumps(
+                        {'test': {'exclude': [owned_source]}}) + ';\n')
+                else:
+                    pattern = '**/' + reference + '.*' if source_case == 'excluded_glob' else owned_source
+                    command += (' --exclude=' if source_case == 'excluded_equals' else ' --exclude ') + shlex.quote(pattern)
+                command += ' --reporter=json'
         if command_source == 'legacy':
             config.gates.commands = [command]
         elif command_source == 'manual':
@@ -1424,8 +1454,17 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
                       'requirement_ids': ['REQ-owned'], 'verification_refs': [reference]}],
             'verification_steps': [step.to_dict() for step in config.gates.steps]}
     _retain_contract(root, child, config, plan)
+    if source_case == 'config_excluded':
+        # Ambient discovery would admit this reference. Recovery must use the
+        # retained exclusion, and leave the other workflow's config intact.
+        (root / 'vitest.config.js').write_text('export default {test: {exclude: []}};\n')
     ambient = {path: (root / path).read_bytes() for path in
                ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
+    if source_case != 'absent':
+        ambient.update({path: (root / path).read_bytes() for path in
+                        ('.git/index', owned_source, 'tests/control.test.ts')})
+    if source_case == 'config_excluded':
+        ambient['vitest.config.js'] = (root / 'vitest.config.js').read_bytes()
     def reject_baseline(*args, **kwargs):
         pytest.fail('Unresolved references must be rejected before baseline admission')
     monkeypatch.setattr(Session, '_ensure_baseline', reject_baseline)
@@ -1450,13 +1489,15 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
 
 
 @pytest.mark.parametrize('command_source', ['legacy', 'manual', 'fix'])
-@pytest.mark.parametrize('runner', ['pytest', 'vitest'])
+@pytest.mark.parametrize('runner,source_case', [('pytest', 'absent'), ('vitest', 'absent'),
+    ('vitest', 'excluded'), ('vitest', 'excluded_equals'), ('vitest', 'excluded_glob'),
+    ('vitest', 'config_excluded')])
 @pytest.mark.parametrize('reference', ['owned.contract', 'owned.report.json'])
 @pytest.mark.parametrize('passing_proof', [False, True])
 def test_public_resume_blocks_positional_owned_proof_id(
-        tmp_path, monkeypatch, command_source, runner, reference, passing_proof):
+        tmp_path, monkeypatch, command_source, runner, source_case, reference, passing_proof):
     test_public_resume_blocks_unresolved_owned_proof_id(
-        tmp_path, monkeypatch, passing_proof, reference, command_source, runner, '')
+        tmp_path, monkeypatch, passing_proof, reference, command_source, runner, '', source_case)
 
 
 @pytest.mark.parametrize('command_source,runner,report_option', [
