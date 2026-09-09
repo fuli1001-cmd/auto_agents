@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import stat
 import subprocess
+import tempfile
 from uuid import uuid4
 
 from .gate_execution import GateSnapshotManager, discover_dependency_links, install_dependency_links
@@ -118,6 +119,17 @@ def _clone(source, revision, destination):
     return revision
 
 
+def _runtime_checkout(root, state, source, revision):
+    from .session_source import register_checkout
+    runtime = Path(tempfile.gettempdir()).resolve()
+    if runtime.is_relative_to(Path(root).resolve()):
+        raise ownership_error(state, 'candidate runtime storage must be outside the shared repository')
+    destination = Path(tempfile.mkdtemp(prefix='auto-agents-candidate-', dir=runtime)) / 'project'
+    revision = _clone(source, revision, destination)
+    register_checkout(root, state, destination)
+    return destination, revision
+
+
 @contextmanager
 def execution_checkout(session, state):
     """Keep session control records durable while all product work is private."""
@@ -135,12 +147,10 @@ def execution_checkout(session, state):
         if state.candidate_paths:
             raise ownership_error(state, 'candidate ownership is unavailable without a frozen receipt')
         revision = state.verification_binding['contract_revision']
-        destination = root / '.auto-agents' / 'candidate-custody' / uuid4().hex / 'project'
-        destination.parent.mkdir(parents=True)
         from .session_source import resolve_source
         source = resolve_source(root, state)
         code_revision = state.source_descriptor.get('revision', revision)
-        revision = _clone(source, code_revision, destination)
+        destination, revision = _runtime_checkout(root, state, source, code_revision)
         state.candidate_custody = {'schema_version': 1, 'checkout': str(destination),
             'repository': state.verification_binding['repository'], 'session_id': state.session_id,
             'binding_fingerprint': state.verification_binding['binding_fingerprint'],
@@ -151,6 +161,8 @@ def execution_checkout(session, state):
         session._save(state)
     custody = state.candidate_custody
     destination = Path(custody['checkout'])
+    from .session_source import validate_checkout
+    validate_checkout(root, state, destination)
     if state.verification_binding:
         validate_custody_binding(state)
     elif custody['session_id'] != state.session_id or custody['repository'] != str(root.resolve()):
@@ -319,9 +331,9 @@ def consume_delivery(root, state, delivery, *, child_id):
     revision = delivery['delivered_revision']
     if _git(source, 'rev-parse', revision + '^{tree}') != _git(source, 'rev-parse', receipt['source_revision'] + '^{tree}'):
         raise ownership_error(state, 'delivered revision differs from verified candidate')
-    destination = root / '.auto-agents' / 'candidate-custody' / uuid4().hex / 'project'
-    destination.parent.mkdir(parents=True)
-    _clone(source, revision, destination)
+    from .session_source import validate_checkout
+    validate_checkout(root, state, source, owner_id=child_id)
+    destination, _ = _runtime_checkout(root, state, source, revision)
     restore_private_modes(destination, {
         path: entry['postimage']['worktree']['mode']
         for path, entry in receipt['manifest'].items()

@@ -2168,6 +2168,7 @@ def test_verification_snapshot_contains_only_owned_candidate_changes(tmp_path, m
         # This public boundary assertion also runs against the base engine:
         # it requires no new custody implementation symbols or state fields.
         assert request.cwd != root, 'the child writer must own a private repository'
+        assert not request.cwd.is_relative_to(root), 'new custody must use external managed runtime storage'
         writer_roots.append(request.cwd)
         assert (request.cwd / '.git').is_dir()
         assert (request.cwd / 'foreign.py').read_text() == 'VALUE = 7\n'
@@ -2188,6 +2189,109 @@ def test_verification_snapshot_contains_only_owned_candidate_changes(tmp_path, m
     assert (root / '.git/index').read_bytes() == index
     assert head_ref(root) == shared_head
     assert git(root, 'show-ref') == refs
+    registrations = list((root / '.auto-agents/state/custody').glob('*.json'))
+    assert len(registrations) == 1
+    registration = json.loads(registrations[0].read_text())
+    assert registration['checkout'] == str(writer_roots[0])
+    assert registration['repository'] == str(root)
+    assert registration['session_id'] == child.session_id
+    assert registration['inode'] == writer_roots[0].stat().st_ino
+
+
+@pytest.mark.parametrize('candidate', ['product', 'provider_doc'])
+def test_child_rollback_preserves_concurrent_foreign_index_worktree_and_untracked_bytes(
+        tmp_path, monkeypatch, candidate):
+    test_child_rollback_preserves_foreign_index_worktree_and_untracked_bytes(tmp_path, monkeypatch, candidate)
+
+
+@pytest.mark.parametrize('location', ['runtime', 'legacy', 'unregistered', 'replaced'])
+def test_public_resume_validates_registered_runtime_and_retains_legacy_custody(tmp_path, monkeypatch, location):
+    import shutil
+
+    root, child = project(tmp_path)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed' and calls == ['fix']
+    checkout = Path(saved.candidate_custody['checkout'])
+    assert not checkout.is_relative_to(root)
+    receipt = saved.candidate_custody['receipt']
+    registration = next((root / '.auto-agents/state/custody').glob('*.json'))
+    if location == 'legacy':
+        legacy = root / '.auto-agents/candidate-custody/retained/project'
+        legacy.parent.mkdir(parents=True)
+        shutil.move(checkout, legacy)
+        saved.candidate_custody['checkout'] = str(legacy)
+        registration.unlink()
+    elif location == 'unregistered':
+        registration.unlink()
+    elif location == 'replaced':
+        previous = checkout.with_name('retained-original')
+        checkout.rename(previous)
+        shutil.copytree(previous, checkout, symlinks=True)
+    saved.status = 'failed'
+    save_session_state(root, saved)
+    before = {name: (root / name).read_bytes() for name in (
+        '.git/index', 'value.py', 'foreign.py', '.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
+    if location in {'unregistered', 'replaced'}:
+        def forbidden(*args, **kwargs):
+            pytest.fail('Unregistered custody must block before baseline or writer')
+        monkeypatch.setattr(Session, '_ensure_baseline', forbidden)
+    resumed, calls, _ = run_session(root, monkeypatch)
+    if location in {'runtime', 'legacy'}:
+        assert resumed.status == 'completed', resumed.to_dict()
+        assert calls == ['fix']
+        assert resumed.candidate_custody['checkout'] == saved.candidate_custody['checkout']
+    else:
+        assert resumed.status == 'blocked', resumed.to_dict()
+        assert calls == []
+        assert resumed.execution_log[-1]['diagnostic']['retry_fix'] is False
+        assert resumed.candidate_custody['receipt'] == receipt
+    assert {name: (root / name).read_bytes() for name in before} == before
+
+
+@pytest.mark.parametrize('handoff_history', ['expired', 'absent'])
+def test_public_unbound_handoff_preserves_foreign_work_after_checkpoint(tmp_path, monkeypatch, handoff_history):
+    from auto_agents.workflow_runtime import WorkflowCoordinator
+    from test_engine_child_recovery import parent_workflow, ObservationBoundary
+
+    root, child = project(tmp_path)
+    store, snapshot, handoff = parent_workflow(root, child)
+    WorkflowCoordinator(Orchestrator(root))._ensure_handoff_checkpoint(snapshot, handoff)
+    child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/expired'
+    child.baseline_head_ref = child.lineage_head_ref = ''
+    save_session_state(root, child)
+    handoff.payload['head_before'] = child.baseline_git_ref if handoff_history == 'expired' else ''
+    store.save_handoff(handoff)
+    # The handoff predates these changes, and no writer has acquired ownership.
+    (root / 'value.py').write_text('VALUE = 88\n')
+    git(root, 'add', 'value.py')
+    (root / 'value.py').write_text('VALUE = 99\n')
+    (root / 'value.py').chmod(0o711)
+    (root / 'late-foreign.txt').write_bytes(b'foreign\x00untracked')
+    before = {name: (root / name).read_bytes() for name in (
+        'value.py', 'late-foreign.txt', '.git/index',
+        '.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
+    head, refs = head_ref(root), git(root, 'show-ref')
+    def forbidden(*args, **kwargs):
+        pytest.fail('Unbound recovery must block before baseline or provider execution')
+    monkeypatch.setattr(Session, '_ensure_baseline', forbidden)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', forbidden)
+    def parent_observation(self, state):
+        assert state.session_id == 'parent'
+        raise ObservationBoundary()
+    monkeypatch.setattr(Session, '_phase_collab_loop', parent_observation)
+    for _ in range(2):
+        with pytest.raises(ObservationBoundary):
+            Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
+        saved = load_session_state(root, child.session_id)
+        assert saved.status == 'blocked'
+        assert saved.execution_log[-1]['diagnostic']['retry_fix'] is False
+        assert not saved.verification_binding
+        assert not saved.candidate_custody
+        assert store.load_handoff(handoff.handoff_id).result.get('rolled_back_paths', []) == []
+        assert {name: (root / name).read_bytes() for name in before} == before
+        assert (root / 'value.py').stat().st_mode & 0o7777 == 0o711
+        assert head_ref(root) == head
+        assert git(root, 'show-ref') == refs
 
 
 @pytest.mark.parametrize('change', ['content', 'index', 'unknown_receipt'])

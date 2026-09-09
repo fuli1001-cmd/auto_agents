@@ -6,14 +6,42 @@ from .io_utils import read_json
 from .repair_control import atomic_json
 
 
+def register_checkout(root, state, checkout):
+    """Retain runtime identity independently of temporary-directory settings."""
+    from .session_verification import fingerprint
+    checkout = Path(checkout).resolve()
+    info = checkout.stat()
+    record = {'repository': str(Path(root).resolve()), 'session_id': state.session_id,
+              'checkout': str(checkout), 'device': info.st_dev, 'inode': info.st_ino}
+    atomic_json(Path(root) / '.auto-agents/state/custody' / (fingerprint(str(checkout)) + '.json'), record)
+    from .artifact_runtime import track
+    track(checkout.parent, 'recovery', project=root,
+          reference='session:' + str(Path(root).resolve()) + ':' + state.session_id)
+
+
+def validate_checkout(root, state, checkout, *, owner_id=None):
+    from .session_verification import fingerprint, ownership_error
+    root, checkout = Path(root).resolve(), Path(checkout)
+    if checkout.resolve() != checkout or not (checkout / '.git').is_dir() or (checkout / '.git').is_symlink():
+        raise ownership_error(state, 'private source checkout was replaced')
+    # Existing durable sessions predate external runtime registration. Retain
+    # their original independent repositories without relocating their receipts.
+    if checkout.is_relative_to(root / '.auto-agents/candidate-custody'):
+        return
+    info = checkout.stat()
+    expected = {'repository': str(root), 'session_id': owner_id or state.session_id,
+                'checkout': str(checkout), 'device': info.st_dev, 'inode': info.st_ino}
+    stored = read_json(root / '.auto-agents/state/custody' / (fingerprint(str(checkout)) + '.json'), default={})
+    if checkout.is_relative_to(root) or stored != expected:
+        raise ownership_error(state, 'private source checkout is not registered to this session')
+
+
 def _identity(root, state, handoff):
     from .session_candidate import _git, validate_receipt, completed_delivery
     from .session_verification import fingerprint, ownership_error, product_path
     custody = state.candidate_custody
     source = Path(custody['checkout'])
-    managed = root / '.auto-agents' / 'candidate-custody'
-    if source.resolve() != source or not source.is_relative_to(managed.resolve()):
-        raise ownership_error(state, 'source checkout is outside managed custody')
+    validate_checkout(root, state, source)
     validate_receipt(state)
     revision = custody.get('delivered_revision') or custody.get('base_revision')
     head = _git(source, 'rev-parse', 'HEAD')
@@ -98,8 +126,8 @@ def resolve_source(root, state):
     owned_copy = (custody.get('source_id') == source_id and custody.get('session_id') == state.session_id
                   and custody.get('repository') == str(root))
     path = Path(custody['checkout'] if owned_copy else source['checkout'])
-    if path.resolve() != path or not path.is_relative_to(root / '.auto-agents/candidate-custody'):
-        raise ownership_error(state, 'private source checkout was replaced')
+    validate_checkout(root, state, path,
+                      owner_id=state.session_id if owned_copy else source['session_id'])
     try:
         tree = _git(path, 'rev-parse', source['revision'] + '^{tree}')
         _git(path, 'cat-file', '-e', source['contract_revision'] + '^{commit}')

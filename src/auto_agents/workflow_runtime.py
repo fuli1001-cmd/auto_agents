@@ -210,9 +210,11 @@ class WorkflowCoordinator:
         handoff: WorkflowHandoff,
     ):
         child_id = str(handoff.payload.get("child_session_id", "")).strip()
+        retained_child = False
         if child_id:
             try:
                 state = load_session_state(self.project_root, child_id)
+                retained_child = True
             except FileNotFoundError:
                 state = self._create_session(session)
                 handoff.payload["child_session_id"] = state.session_id
@@ -246,9 +248,11 @@ class WorkflowCoordinator:
             state.conversation.append({"role": "user", "content": state.goal})
         state.auto_approve = bool(self.auto_approve)
         state.full_verify = bool(session._full_verify)
-        state.lineage_head_ref = str(handoff.payload.get("head_before", "")) or head_ref(
-            self.project_root
-        )
+        if not state.lineage_head_ref:
+            # A retained handoff checkpoint is recovery evidence; today's
+            # ambient HEAD is not provenance for an existing child.
+            state.lineage_head_ref = str(handoff.payload.get("head_before", "")) or (
+                "" if retained_child else head_ref(self.project_root))
         state.protected_preexisting_paths = [
             str(item) for item in handoff.payload.get("protected_preexisting_paths", [])
         ]
