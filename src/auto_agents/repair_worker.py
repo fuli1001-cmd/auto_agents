@@ -225,7 +225,7 @@ def repair(request):
     if payload.get("autonomy") != "max":
         return {"ok": False, "error": "latest revision did not prove recovery; guarded mode will not generate code", "proof": proof}
     from auto_agents.repair_restart import import_cancelled_repair
-    import_cancelled_repair(store, job, working, repository)
+    import_cancelled_repair(store, job, working, repository, revision=revision)
     runner = make_runner(payload, checkout, working, python)
     restart_receipt = directory / "prior-repair-import.json"
     if restart_receipt.exists():

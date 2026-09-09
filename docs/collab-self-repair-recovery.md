@@ -46,11 +46,13 @@ retains the worktree. A compatible interrupted patch can seed the next candidate
 Legacy v3 records and patches remain available; their unbound proof is rechecked,
 and the original experiment is backed up before writing v4.
 
-Three consecutive non-improving candidates or rejected designs trigger strategy
-correction. Verified components survive compatible redesign; merely rewording a
-summary or discovering another defect is not repair progress. There is no total
-candidate or wall-clock ceiling. Infrastructure interruptions and operator stops
-retain resumable evidence instead of manufacturing successful proof.
+Three consecutive non-improving candidates, rejected component reviews, or rejected
+designs trigger strategy correction. The retained workspace survives this transition.
+Verified components survive compatible redesign, and repeated resolution of the same
+historical finding does not earn new progress. Another exhausted attempt window with
+no accepted component or root-proof gain returns `search_stalled`, preserving code and
+diagnostics. Infrastructure interruptions and operator stops also retain resumable
+evidence instead of manufacturing successful proof.
 
 ## Isolated operational check
 

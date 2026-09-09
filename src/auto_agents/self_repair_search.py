@@ -680,6 +680,7 @@ class SelfRepairExperiment:
         reason: str,
         candidate_id: str = "",
         strategy_fingerprint: str = "",
+        progress_anchor: str = "",
     ) -> None:
         """Reset design state after semantic non-progress without human routing."""
 
@@ -694,6 +695,7 @@ class SelfRepairExperiment:
                 "reason": str(reason)[:2000],
                 "candidate_id": candidate_id,
                 "strategy_fingerprint": strategy_fingerprint,
+                "progress_anchor": progress_anchor,
                 "at": _utc_now(),
             }
         )
@@ -821,6 +823,12 @@ class SelfRepairExperiment:
             record.parent_candidate_id,
             self.candidates["base"],
         )
+        history = [item for item in self.candidates.values() if not item.fatal]
+        known_resolved = {key for item in history for key, value in item.finding_states.items() if value == "resolved"}
+        known_roots = {key for item in history for key in item.passed_obligations if key.startswith("root:")}
+        known_safety = {key for item in history for key in item.passed_obligations if key.startswith("safety:")}
+        known_components = {key for item in history for key in item.component_receipts}
+        best_validation_rank = max((item.validation_rank for item in history), default=0)
         record.component_receipts = {**parent.component_receipts, **record.component_receipts}
         record.finding_states = {**parent.finding_states, **record.finding_states}
         if record.status == "candidate_group_completed" and record.finding_group_id:
@@ -938,23 +946,24 @@ class SelfRepairExperiment:
         current_blocking = {
             finding.finding_id for finding in self.blocking_findings()
         }
-        resolved_blocking = len(previous_blocking - current_blocking)
+        # Rebuilding a sibling from an old parent can close the same findings
+        # repeatedly. Credit only previously unachieved evidence, not the
+        # selected frontier's repeatedly reopened display state.
+        resolved_blocking = len((previous_blocking - current_blocking) - known_resolved)
         root_gain = len(
             {
                 item for item in record.passed_obligations if item.startswith("root:")
             }
-            - {
-                item for item in parent.passed_obligations if item.startswith("root:")
-            }
+            - known_roots
         )
         validation_gain = int(
             bool(record.candidate_ref)
-            and record.validation_rank > parent.validation_rank
+            and record.validation_rank > best_validation_rank
         )
         group_gain = int(
             record.status == "candidate_group_completed"
             and bool(record.finding_group_id)
-            and record.finding_group_id != parent.finding_group_id
+            and record.finding_group_id not in known_components
         )
         safety_gain = len(
             {
@@ -967,6 +976,7 @@ class SelfRepairExperiment:
                 for item in record.failed_obligations
                 if item.startswith("safety:")
             }
+            - known_safety
         )
         record.net_progress = (
             root_gain
@@ -1020,6 +1030,32 @@ class SelfRepairExperiment:
         return (
             self.consecutive_non_improvements
             >= self.max_consecutive_non_improvements
+        )
+
+    @property
+    def review_patience_exhausted(self) -> bool:
+        rejected = 0
+        cutoff = self.automatic_corrections[-1].get("at", "") if self.automatic_corrections else ""
+        for record in sorted(self.candidates.values(), key=lambda item: item.created_at, reverse=True):
+            if cutoff and record.created_at <= cutoff:
+                break
+            if record.fatal or record.candidate_id == "base":
+                continue
+            if record.finding_group_id != self.active_finding_group_id or record.status in {"candidate_group_completed", "approved_candidate"}:
+                break
+            if record.status in {"candidate_review_rejected", "candidate_final_review_rejected"}:
+                rejected += 1
+                if rejected >= self.max_consecutive_non_improvements:
+                    return True
+        return False
+
+    def accepted_progress_anchor(self) -> str:
+        return _stable_hash(
+            self.base_commit, self.contract_fingerprint,
+            sorted(self.completed_contract_obligation_ids),
+            sorted({key for item in self.candidates.values() if not item.fatal
+                    for key in item.passed_obligations if key.startswith("root:")}),
+            sorted({key for item in self.candidates.values() if not item.fatal for key in item.component_receipts}),
         )
 
     def prompt_context(self) -> Dict[str, object]:
@@ -1150,6 +1186,10 @@ class SelfRepairExperimentStore:
         detail: str = "",
     ) -> Dict[str, object]:
         strategies = list(experiment.strategy_history)
+        if experiment.automatic_corrections:
+            cutoff = experiment.automatic_corrections[-1].get("at", "")
+            strategies = [record.strategy_fingerprint for record in sorted(experiment.candidates.values(), key=lambda item: item.created_at)
+                          if record.created_at > cutoff and record.strategy_fingerprint]
         anomaly = ""
         for cycle_length in range(1, 5):
             required = cycle_length * 3

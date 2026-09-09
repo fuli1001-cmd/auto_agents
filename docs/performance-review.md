@@ -120,3 +120,24 @@ Separate replay of both failed boundary diagnostics confirmed that their primary
 errors survive both retry excerpt limits. Outstanding candidate correctness still
 requires review; these checks establish recovery continuity and failure delivery,
 not a guaranteed wall-clock completion time.
+
+## September 9 convergence audit
+
+The subsequent overnight job reached candidate 24 without completing a component.
+Completed spans included about 201 minutes of generation, 153 minutes of review,
+62 minutes of focused verification, and 57 minutes of differential proof. Candidates
+9–19 repeatedly started from candidate 6 after the fallback flag disabled workspace
+retention. Closing the same historical findings from that old branch repeatedly earned
+positive progress, preventing the non-improvement counter from converging.
+
+Deep design now changes planning without changing workspace retention. Progress credits
+previously unachieved evidence, and rejected component reviews have their own attempt
+window. One redesign is allowed per accepted-progress state; another exhausted window
+reports `search_stalled`. Replaying the saved outcomes with these controls reports the
+plateau at candidate 11, rather than continuing through candidate 24. This is an offline
+controller replay, not a prediction of provider behavior under different candidate code.
+
+Recovery was also exercised using the actual interrupted candidate 25: its 31,372-byte
+patch, 24 registered candidates, and compatible approved design were restored in a
+private checkout and merged with the updated engine. The original job was cancelled
+after its candidate refs and evidence were backed up; its target project was untouched.
