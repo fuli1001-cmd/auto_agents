@@ -2100,6 +2100,76 @@ def test_candidate_publication_preserves_foreign_edit_after_final_snapshot(tmp_p
         tmp_path, monkeypatch, 'after_snapshot', False)
 
 
+def test_verification_snapshot_contains_only_owned_candidate_changes(tmp_path, monkeypatch):
+    root, child = project(tmp_path)
+    (root / 'foreign.py').write_text('VALUE = 88\n')
+    git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 99\n')
+    index = (root / '.git/index').read_bytes()
+    shared_head, refs = head_ref(root), git(root, 'show-ref')
+    writer_roots = []
+    def writer(self, request):
+        # This public boundary assertion also runs against the base engine:
+        # it requires no new custody implementation symbols or state fields.
+        assert request.cwd != root, 'the child writer must own a private repository'
+        writer_roots.append(request.cwd)
+        assert (request.cwd / '.git').is_dir()
+        assert (request.cwd / 'foreign.py').read_text() == 'VALUE = 7\n'
+        (request.cwd / 'value.py').write_text('VALUE = 1\n')
+        (root / 'foreign-note.txt').write_bytes(b'concurrent foreign bytes')
+        reply = 'Fixed value.\nCOMMIT_MESSAGE: Repair owned value'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', writer)
+    result = Session(Orchestrator(root), mode='fix', auto_approve=True).resume(child.session_id)
+    assert result.status == 'completed', result.to_dict()
+    assert len(writer_roots) == 1
+    assert set(result.candidate_custody['receipt']['manifest']) == {'value.py'}
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+    assert (root / 'foreign.py').read_text() == 'VALUE = 99\n'
+    assert (root / 'foreign-note.txt').read_bytes() == b'concurrent foreign bytes'
+    assert (root / '.git/index').read_bytes() == index
+    assert head_ref(root) == shared_head
+    assert git(root, 'show-ref') == refs
+
+
+@pytest.mark.parametrize('change', ['content', 'index', 'unknown_receipt'])
+def test_overlapping_or_unknown_ownership_blocks_without_overwriting_foreign_work(
+        tmp_path, monkeypatch, change):
+    import auto_agents.session as session_module
+
+    root, child = project(tmp_path)
+    (root / 'foreign.py').write_text('VALUE = 88\n')
+    git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 99\n')
+    (root / 'foreign-note.txt').write_bytes(b'foreign untracked')
+    shared = {path: (root / path).read_bytes() for path in (
+        '.git/index', 'value.py', 'foreign.py', 'foreign-note.txt',
+        '.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
+    shared_head = head_ref(root)
+    record = session_module.record_candidate
+    def overlap(session, state, before):
+        assert session.project_root != root
+        if change == 'unknown_receipt':
+            session._candidate_receipt = None
+        elif change == 'index':
+            git(session.project_root, 'add', 'value.py')
+        else:
+            (session.project_root / 'value.py').write_text('VALUE = 44\n')
+        record(session, state, before)
+    monkeypatch.setattr(session_module, 'record_candidate', overlap)
+    result, calls, _ = run_session(root, monkeypatch)
+    assert result.status == 'blocked', result.to_dict()
+    assert result.resolution == 'verification_ownership'
+    diagnostic = result.execution_log[-1]['diagnostic']
+    assert diagnostic['session_id'] == child.session_id
+    assert diagnostic['retry_fix'] is False
+    assert len(calls) == 1
+    assert head_ref(root) == shared_head
+    assert {path: (root / path).read_bytes() for path in shared} == shared
+
+
 def test_parent_consumes_delivered_child_revision_without_shared_copyback(tmp_path, monkeypatch):
     from test_engine_child_recovery import parent_workflow, ObservationBoundary
     root, child = project(tmp_path)
@@ -2353,3 +2423,121 @@ def test_public_child_receipt_materializes_directory_to_file_replacement(tmp_pat
     assert (root / '.git/index').read_bytes() == shared_index
     assert (root / 'assets').is_dir()
     assert (root / 'assets/old.json').read_bytes() == b'foreign worktree'
+
+
+@pytest.mark.parametrize('staged', [False, True])
+@pytest.mark.parametrize('boundary', ['after_record', 'before_verify', 'before_consume'])
+def test_directory_symlink_receipt_never_claims_or_chmods_foreign_descendants(
+        tmp_path, monkeypatch, staged, boundary):
+    import base64
+    import os
+    import shutil
+    import stat
+    import auto_agents.session_candidate as custody
+    import auto_agents.gate_execution as gates
+    from test_engine_child_recovery import parent_workflow, resume_to_observation
+
+    root, child = project(tmp_path)
+    (root / 'assets/nested').mkdir(parents=True)
+    old = root / 'assets/nested/old.json'
+    old.write_bytes(b'retained private entry')
+    check = root / 'tests/test_owned.py'
+    check.write_text(check.read_text() +
+        '    assert Path("assets").is_symlink()\n')
+    git(root, 'add', '-A')
+    git(root, 'commit', '-m', 'retain directory to symlink contract')
+    child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
+    save_session_state(root, child)
+    store, _, handoff = parent_workflow(root, child)
+    old.write_bytes(b'foreign staged')
+    git(root, 'add', 'assets/nested/old.json')
+    old.write_bytes(b'foreign worktree')
+    old.chmod(0o600)
+    shared_head, shared_refs = head_ref(root), git(root, 'show-ref')
+    shared_index = (root / '.git/index').read_bytes()
+    injections = []
+    def late_foreign_edit():
+        if injections:
+            return
+        old.write_bytes(b'late foreign worktree')
+        old.chmod(0o711)
+        (root / 'assets/late.txt').write_bytes(b'late foreign untracked')
+        injections.append(True)
+
+    validate = custody.validate_receipt
+    def validation(state):
+        validate(state)
+        if boundary == 'after_record' and state.candidate_custody.get('receipt'):
+            late_foreign_edit()
+    monkeypatch.setattr(custody, 'validate_receipt', validation)
+    install = gates.install_dependency_links
+    def prepare_sandbox(sandbox, dependencies):
+        install(sandbox, dependencies)
+        if boundary == 'before_verify' and (sandbox / 'assets').is_symlink():
+            late_foreign_edit()
+    monkeypatch.setattr(gates, 'install_dependency_links', prepare_sandbox)
+    clone = custody._clone
+    def clone_for_consumption(source, revision, destination):
+        result = clone(source, revision, destination)
+        if boundary == 'before_consume' and (destination / 'assets').is_symlink():
+            late_foreign_edit()
+        return result
+    monkeypatch.setattr(custody, '_clone', clone_for_consumption)
+
+    # Observe the real chmod operations as well as final bytes: restoring a
+    # mode and changing it back would still violate private custody.
+    chmod, fchmod = os.chmod, os.fchmod
+    foreign_inode = (old.stat().st_dev, old.stat().st_ino)
+    def assert_private(info):
+        assert (info.st_dev, info.st_ino) != foreign_inode
+    def checked_chmod(path, mode, *args, **kwargs):
+        if path != old:
+            assert_private(os.stat(path, dir_fd=kwargs.get('dir_fd'),
+                                   follow_symlinks=kwargs.get('follow_symlinks', True)))
+        return chmod(path, mode, *args, **kwargs)
+    def checked_fchmod(descriptor, mode):
+        assert_private(os.fstat(descriptor))
+        return fchmod(descriptor, mode)
+    monkeypatch.setattr(os, 'chmod', checked_chmod)
+    monkeypatch.setattr(os, 'fchmod', checked_fchmod)
+
+    def writer(state, prompt, candidate_root):
+        assert (candidate_root / 'assets/nested/old.json').read_bytes() == b'retained private entry'
+        shutil.rmtree(candidate_root / 'assets')
+        (candidate_root / 'assets').symlink_to(root / 'assets', target_is_directory=True)
+        (candidate_root / 'value.py').write_text('VALUE = 1\n')
+        if staged:
+            git(candidate_root, 'add', '-A', '--', 'assets')
+        return 'Replaced owned directory.\nCOMMIT_MESSAGE: Replace owned assets'
+    observed = []
+    def observe(request):
+        observed.append(request.cwd)
+        assert request.cwd != root
+        assert (request.cwd / 'assets').is_symlink()
+        assert os.readlink(request.cwd / 'assets') == str(root / 'assets')
+        assert old.read_bytes() == b'late foreign worktree'
+        assert stat.S_IMODE(old.stat().st_mode) == 0o711
+    resume_to_observation(root, monkeypatch, writer, observe=observe)
+    saved = load_session_state(root, child.session_id)
+    assert saved.status == 'completed', saved.to_dict()
+    assert len(observed) == len(injections) == 1
+    receipt = saved.candidate_custody['receipt']
+    manifest = receipt['manifest']
+    assert set(manifest) == {'assets', 'assets/nested', 'assets/nested/old.json', 'value.py'}
+    assert manifest['assets']['preimage']['worktree']['kind'] == 'directory'
+    assert manifest['assets']['postimage']['worktree']['target'] == str(root / 'assets')
+    for path in ('assets/nested', 'assets/nested/old.json'):
+        assert manifest[path]['postimage']['worktree'] == {'kind': 'absent'}
+    removed = manifest['assets/nested/old.json']
+    assert base64.b64decode(removed['preimage']['worktree']['bytes']) == b'retained private entry'
+    assert bool(removed['postimage']['index']) != staged
+    assert bool(manifest['assets']['postimage']['index']) == staged
+    assert git(Path(saved.candidate_custody['checkout']), 'ls-tree', '-r',
+               receipt['source_revision'], '--', 'assets').split()[0] == '120000'
+    assert store.load_handoff(handoff.handoff_id).result['status'] == 'completed'
+    assert head_ref(root) == shared_head
+    assert git(root, 'show-ref') == shared_refs
+    assert (root / '.git/index').read_bytes() == shared_index
+    assert (root / 'assets/late.txt').read_bytes() == b'late foreign untracked'
+    assert old.read_bytes() == b'late foreign worktree'
+    assert stat.S_IMODE(old.stat().st_mode) == 0o711

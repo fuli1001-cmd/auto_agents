@@ -2085,7 +2085,7 @@ class Session:
             try:
                 owned_paths(self.orch, state)
             except SessionOwnershipError as error:
-                return self._block_execution_binding(state, str(error), "verification_ownership")
+                return self._block_execution_binding(state, error, "verification_ownership")
             restore_guard = tempfile.TemporaryDirectory(
                 prefix="auto-agents-fix-route-"
             )
@@ -2095,7 +2095,7 @@ class Session:
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
             except SessionOwnershipError as error:
                 restore_guard.cleanup()
-                return self._block_execution_binding(state, str(error), "verification_ownership")
+                return self._block_execution_binding(state, error, "verification_ownership")
             except ProviderCleanupIncompleteError:
                 restore_guard.cleanup()
                 raise
@@ -2104,7 +2104,7 @@ class Session:
                     record_candidate(self, state, before_snapshot)
                 except SessionOwnershipError as error:
                     restore_guard.cleanup()
-                    return self._block_execution_binding(state, str(error), "verification_ownership")
+                    return self._block_execution_binding(state, error, "verification_ownership")
                 restore_guard.cleanup()
                 err_msg = str(exc)
                 state.consecutive_agent_errors += 1
@@ -2127,7 +2127,7 @@ class Session:
                 record_candidate(self, state, before_snapshot)
             except SessionOwnershipError as error:
                 restore_guard.cleanup()
-                return self._block_execution_binding(state, str(error), "verification_ownership")
+                return self._block_execution_binding(state, error, "verification_ownership")
 
             # Successful agent call resets transient error counter
             state.consecutive_agent_errors = 0

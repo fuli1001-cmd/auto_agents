@@ -1,5 +1,6 @@
 """Private candidate custody: writer receipts never authorize shared copy-back."""
 import base64
+import errno
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -11,6 +12,7 @@ from uuid import uuid4
 
 from .gate_execution import GateSnapshotManager, discover_dependency_links, install_dependency_links
 from .session_verification import fingerprint, ownership_error, product_path
+from .execution_binding import anchored_parent, restore_private_modes
 
 
 def _git(root, *args):
@@ -20,18 +22,30 @@ def _git(root, *args):
     return result.stdout.rstrip('\n')
 
 
-def _image(path):
+def _image(root, relative):
     try:
-        info = path.lstat()
-    except (FileNotFoundError, NotADirectoryError):
+        with anchored_parent(root, relative) as (parent, name):
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISLNK(info.st_mode):
+                return {'kind': 'symlink', 'mode': mode,
+                        'target': os.readlink(name, dir_fd=parent)}
+            if stat.S_ISREG(info.st_mode):
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                     dir_fd=parent)
+                with os.fdopen(descriptor, 'rb') as stream:
+                    opened = os.fstat(stream.fileno())
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        raise RuntimeError('candidate entry changed during capture')
+                    return {'kind': 'file', 'mode': stat.S_IMODE(opened.st_mode),
+                            'bytes': base64.b64encode(stream.read()).decode('ascii')}
+            return {'kind': 'directory' if stat.S_ISDIR(info.st_mode) else 'special', 'mode': mode}
+    except OSError as error:
+        if error.errno not in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+            raise
+        # Indexed descendants displaced by a link are deletions, not images
+        # of entries in the link's (possibly shared) target directory.
         return {'kind': 'absent'}
-    mode = stat.S_IMODE(info.st_mode)
-    if stat.S_ISLNK(info.st_mode):
-        return {'kind': 'symlink', 'mode': mode, 'target': os.readlink(path)}
-    if stat.S_ISREG(info.st_mode):
-        return {'kind': 'file', 'mode': mode,
-                'bytes': base64.b64encode(path.read_bytes()).decode('ascii')}
-    return {'kind': 'directory' if stat.S_ISDIR(info.st_mode) else 'special', 'mode': mode}
 
 
 def _inventory(root):
@@ -46,7 +60,7 @@ def _inventory(root):
     paths.update(parent.as_posix() for path in list(paths) if path
                  for parent in Path(path).parents if parent != Path('.'))
     dependencies = discover_dependency_links(root)
-    return {path: {'worktree': _image(root / path), 'index': index.get(path, [])}
+    return {path: {'worktree': _image(root, path), 'index': index.get(path, [])}
             for path in sorted(paths) if path and product_path(path)
             and path not in dependencies}
 
@@ -197,7 +211,7 @@ def validate_receipt(state):
         postimage = entry['postimage']
         # Delivery intentionally commits the worktree, so its index then has
         # the delivered tree semantics. Before delivery the writer index is exact.
-        if _image(root / path) != postimage['worktree'] or (
+        if _image(root, path) != postimage['worktree'] or (
                 not custody.get('delivered_revision') and actual.get(path, {}).get('index', []) != postimage['index']):
             raise ownership_error(state, 'private candidate changed after receipt', conflicting_paths=[path])
     _git(root, 'cat-file', '-e', receipt['source_revision'] + '^{commit}')
@@ -260,10 +274,10 @@ def consume_delivery(root, state, delivery, *, child_id):
     destination = root / '.auto-agents' / 'candidate-custody' / uuid4().hex / 'project'
     destination.parent.mkdir(parents=True)
     _clone(source, revision, destination)
-    for path, entry in receipt['manifest'].items():
-        image = entry['postimage']['worktree']
-        if image['kind'] in {'file', 'directory'}:
-            (destination / path).chmod(image['mode'])
+    restore_private_modes(destination, {
+        path: entry['postimage']['worktree']['mode']
+        for path, entry in receipt['manifest'].items()
+        if entry['postimage']['worktree']['kind'] in {'file', 'directory'}})
     state.lineage_changed_paths = sorted(set(state.lineage_changed_paths) | set(state.candidate_paths))
     state.candidate_paths = {}
     state.candidate_custody = {'schema_version': 1, 'checkout': str(destination),

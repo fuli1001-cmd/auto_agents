@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import re
 import shlex
+import os
+import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -10,6 +13,40 @@ from typing import Callable, Mapping
 
 class ExecutionBindingError(ValueError):
     """A command cannot be executed by the currently bound repository."""
+
+
+@contextmanager
+def anchored_parent(root: Path, relative: str):
+    """Open a repository path's parent without traversing any symlinks."""
+    parts = relative.split('/')
+    if not parts or any(part in {'', '.', '..'} for part in parts):
+        raise ExecutionBindingError('invalid private repository path')
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, parts[-1]
+    finally:
+        os.close(descriptor)
+
+
+def restore_private_modes(root: Path, modes: Mapping[str, int]) -> None:
+    """Restore snapshot permissions only on freshly materialized private inodes."""
+    for relative, mode in modes.items():
+        with anchored_parent(root, relative) as (parent, name):
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=parent)
+            try:
+                info = os.fstat(descriptor)
+                if not (stat.S_ISDIR(info.st_mode) or
+                        (stat.S_ISREG(info.st_mode) and info.st_nlink == 1)):
+                    raise ExecutionBindingError('snapshot mode target is not a private inode')
+                os.fchmod(descriptor, mode)
+            finally:
+                os.close(descriptor)
 
 
 @dataclass(frozen=True)
