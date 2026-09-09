@@ -2265,13 +2265,35 @@ def test_expired_legacy_baseline_cannot_adopt_migrated_ambient_lineage(tmp_path,
 
 
 @pytest.mark.parametrize('baseline_ref', ['', 'refs/auto-agents/gate-snapshots/expired'])
-def test_unborn_session_freezes_initial_source_without_shared_publication(tmp_path, monkeypatch, baseline_ref):
+@pytest.mark.parametrize('initial_layout', ['plain', 'file', 'symlink'])
+def test_unborn_session_freezes_initial_source_without_shared_publication(
+        tmp_path, monkeypatch, baseline_ref, initial_layout):
+    import os
+    import shutil
+    import stat
+
     root = _make_project(str(tmp_path))
     (root / '.conda').symlink_to(sys.prefix, target_is_directory=True)
     (root / 'value.py').write_text('VALUE = 0\n')
     (root / 'foreign.txt').write_bytes(b'initial staged\x00bytes')
     git(root, 'add', 'value.py', 'foreign.txt')
     (root / 'foreign.txt').write_bytes(b'initial worktree\x00bytes')
+    (root / 'foreign.txt').chmod(0o640)
+    foreign = tmp_path / 'foreign-assets'
+    foreign.mkdir()
+    (foreign / 'old.bin').write_bytes(b'foreign target\x00never seed')
+    (foreign / 'old.bin').chmod(0o711)
+    if initial_layout != 'plain':
+        (root / 'assets').mkdir()
+        (root / 'assets/old.bin').write_bytes(b'initial staged descendant')
+        git(root, 'add', 'assets/old.bin')
+        shutil.rmtree(root / 'assets')
+        if initial_layout == 'symlink':
+            (root / 'assets').symlink_to(foreign, target_is_directory=True)
+        else:
+            (root / 'assets').write_bytes(b'initial replacement\x00bytes')
+            (root / 'assets').chmod(0o750)
+    foreign_before = ((foreign / 'old.bin').read_bytes(), (foreign / 'old.bin').stat().st_mode)
     (root / 'tests').mkdir()
     (root / 'tests/test_initial.py').write_text(
         'from pathlib import Path\n'
@@ -2299,6 +2321,16 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(tmp_pa
         assert (request.cwd / 'value.py').read_text() == 'VALUE = 0\n'
         assert (request.cwd / '.git').is_dir()
         assert not (request.cwd / '.git/objects/info/alternates').exists()
+        assert stat.S_IMODE((request.cwd / 'foreign.txt').stat().st_mode) == 0o640
+        if initial_layout == 'symlink':
+            assert (request.cwd / 'assets').is_symlink()
+            assert os.readlink(request.cwd / 'assets') == str(foreign)
+            assert git(request.cwd, 'ls-tree', 'HEAD', '--', 'assets').startswith('120000 blob ')
+        elif initial_layout == 'file':
+            assert (request.cwd / 'assets').read_bytes() == b'initial replacement\x00bytes'
+            assert stat.S_IMODE((request.cwd / 'assets').stat().st_mode) == 0o750
+        if initial_layout != 'plain':
+            assert git(request.cwd, 'ls-tree', '-r', 'HEAD', '--', 'assets/old.bin') == ''
         (request.cwd / 'value.py').write_text('VALUE = 1\n')
         (root / 'late-foreign.txt').write_bytes(b'concurrent\x00bytes')
         content = 'Repaired value.\nCOMMIT_MESSAGE: Repair initial value'
@@ -2314,6 +2346,10 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(tmp_pa
     private = Path(custody['checkout'])
     assert custody['initial_source'] is True
     assert list(custody['receipt']['manifest']) == ['value.py']
+    assert custody['preimages']['foreign.txt']['worktree']['mode'] == 0o640
+    if initial_layout != 'plain':
+        assert 'assets/old.bin' not in custody['preimages']
+        assert custody['preimages']['assets']['worktree']['kind'] == initial_layout
     assert git(private, 'show', custody['base_revision'] + ':value.py') == 'VALUE = 0\n'
     assert git(private, 'show', custody['delivered_revision'] + ':value.py') == 'VALUE = 1\n'
     assert result.baseline_git_ref != baseline_ref
@@ -2324,6 +2360,14 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(tmp_pa
     assert (root / 'foreign.txt').read_bytes() == b'initial worktree\x00bytes'
     assert (root / 'late-foreign.txt').read_bytes() == b'concurrent\x00bytes'
     assert (root / '.auto-agents/config.json').read_bytes() == original_config
+    assert ((foreign / 'old.bin').read_bytes(), (foreign / 'old.bin').stat().st_mode) == foreign_before
+    assert stat.S_IMODE((root / 'foreign.txt').stat().st_mode) == 0o640
+    if initial_layout == 'symlink':
+        assert (root / 'assets').is_symlink()
+        assert os.readlink(root / 'assets') == str(foreign)
+    elif initial_layout == 'file':
+        assert (root / 'assets').read_bytes() == b'initial replacement\x00bytes'
+        assert stat.S_IMODE((root / 'assets').stat().st_mode) == 0o750
 
 
 @pytest.mark.parametrize('entrypoint', ['session', 'workflow'])

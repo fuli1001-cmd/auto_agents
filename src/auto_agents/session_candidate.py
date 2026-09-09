@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 import os
-import shutil
 import stat
 import subprocess
 from uuid import uuid4
@@ -68,15 +67,21 @@ def _inventory(root):
 def _clone(source, revision, destination):
     # A clone owns its object database, refs, config and index. Git worktrees
     # would still mutate the shared repository's metadata during verification.
-    initial_paths = []
+    initial_images = {}
     if not revision:
         from .git_ops import head_ref
         if head_ref(source):
             raise RuntimeError('initial candidate source requires an unborn repository')
         # Enumerate before creating storage inside the source tree. An unborn
         # standalone session has live initial inputs but no commit to fetch.
-        initial_paths = [path for path in _git(source, 'ls-files', '--cached', '--others',
-                                              '--exclude-standard', '-z').split('\0') if path]
+        initial_paths = {path for path in _git(source, 'ls-files', '--cached', '--others',
+                                              '--exclude-standard', '-z').split('\0') if path}
+        initial_paths.update(parent.as_posix() for path in list(initial_paths)
+                             for parent in Path(path).parents if parent != Path('.'))
+        # Capture through directory descriptors before materializing anything.
+        # The index may still name descendants of a replaced directory; those
+        # names must never cause a read through its new symlink target.
+        initial_images = {path: _image(source, path) for path in sorted(initial_paths)}
     _git(source, 'clone', '--no-local', '--no-checkout', str(source), str(destination))
     _git(destination, 'config', 'user.name', 'auto_agents')
     _git(destination, 'config', 'user.email', 'auto-agents@localhost')
@@ -84,17 +89,30 @@ def _clone(source, revision, destination):
         _git(destination, 'fetch', '--no-tags', str(source), revision)
         _git(destination, 'checkout', '--detach', 'FETCH_HEAD')
     else:
-        for relative in initial_paths:
-            path = source / relative
-            if path.is_file() or path.is_symlink():
-                target = destination / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, target, follow_symlinks=False)
+        for relative, entry in initial_images.items():
+            if entry['kind'] == 'absent':
+                continue
+            with anchored_parent(destination, relative) as (parent, name):
+                if entry['kind'] == 'directory':
+                    os.mkdir(name, dir_fd=parent)
+                elif entry['kind'] == 'symlink':
+                    os.symlink(entry['target'], name, dir_fd=parent)
+                elif entry['kind'] == 'file':
+                    descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                         0o600, dir_fd=parent)
+                    with os.fdopen(descriptor, 'wb') as stream:
+                        stream.write(base64.b64decode(entry['bytes']))
+                        os.fchmod(stream.fileno(), entry['mode'])
+                else:
+                    raise RuntimeError('initial candidate source contains an unsupported entry kind')
         # Only private metadata is written. Initial inputs become the retained
         # baseline, never part of the subsequent writer's candidate delta.
         snapshot = GateSnapshotManager(destination, 'initial-' + uuid4().hex).create()
         _git(destination, 'read-tree', snapshot.commit_sha)
         _git(destination, 'checkout', '--detach', snapshot.commit_sha)
+        restore_private_modes(destination, {
+            path: entry['mode'] for path, entry in reversed(list(initial_images.items()))
+            if entry['kind'] in {'file', 'directory'}})
         revision = snapshot.commit_sha
     install_dependency_links(destination, discover_dependency_links(source))
     return revision
