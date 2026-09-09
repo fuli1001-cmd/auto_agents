@@ -1942,6 +1942,7 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
     root, child = project(tmp_path)
     child.goal_execution_environment = {'mode': 'real', 'confirmed': True, 'source': 'explicit_goal'}
     if legacy == 'custody':
+        prerequisite_marker = _retain_foreign_prerequisite(root, child)
         child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/retained-baseline'
         git(root, 'update-ref', child.baseline_git_ref, child.baseline_head_ref)
     _binding_fixture(root, child)
@@ -1960,7 +1961,9 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
         child.verification_binding['binding_fingerprint'] = fingerprint({
             key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
     if legacy == 'custody':
-        _retain_candidate_binding_identity(child)
+        _retain_legacy_prerequisite_owners(child)
+        assert prerequisite_marker.read_text() == 'VALUE = 1\n'
+        prerequisite_marker.unlink()
     retained_custody = deepcopy(child.candidate_custody)
     retained = deepcopy(child.verification_binding)
     save_session_state(root, child)
@@ -1971,13 +1974,14 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
     assert calls == ([] if legacy == 'custody' else ['fix'])
     binding = saved.verification_binding
     for key in ('repository', 'contract_revision', 'authorization', 'gates', 'plan', 'required_proof_ids',
-                'session_id', 'workflow_id', 'original_handoff_id', 'task_scope', 'baseline_identity'):
+                'session_id', 'workflow_id', 'original_handoff_id', 'task_scope', 'baseline_identity', 'tasks'):
         assert binding[key] == retained[key]
     assert binding['schema_version'] == 13
     assert binding['execution_environment'] == child.goal_execution_environment
     assert binding['source_provenance']['revision'] == child.baseline_head_ref
     if legacy == 'custody':
         assert saved.baseline_git_ref == refreshed_baseline
+        _assert_prerequisite_owner_enrichment(saved, prerequisite_marker)
         _assert_migrated_candidate_reused(root, monkeypatch, saved, retained_custody)
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
@@ -2681,6 +2685,7 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
     plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
     _retain_contract(root, child, config, plan)
     if legacy == 'custody':
+        prerequisite_marker = _retain_foreign_prerequisite(root, child)
         child.lineage_head_ref = child.baseline_head_ref
         child.baseline_git_ref = child.baseline_head_ref = ''
         _binding_fixture(root, child)
@@ -2698,7 +2703,9 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
         child.verification_binding['binding_fingerprint'] = fingerprint({
             key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
         if legacy == 'custody':
-            _retain_candidate_binding_identity(child)
+            _retain_legacy_prerequisite_owners(child)
+            assert prerequisite_marker.read_text() == 'VALUE = 1\n'
+            prerequisite_marker.unlink()
         save_session_state(root, child)
     retained_custody = deepcopy(child.candidate_custody)
     ambient = _switch_ambient_binding_plan(root)
@@ -2716,16 +2723,20 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
     assert 'proof_graph' in binding, 'public resume must recover the retained proof inventory'
     graph = binding['proof_graph']
     assert graph['source']['revision'] == child.baseline_head_ref
-    assert {step['proof_id'] for step in graph['gates']['steps']} == {'owned.contract', 'foreign.future'}
+    assert {step['proof_id'] for step in graph['gates']['steps']} == (
+        {'owned.contract', 'foreign.future', 'shared.setup'} if legacy == 'custody'
+        else {'owned.contract', 'foreign.future'})
     assert graph['proof_owners']['foreign.future'][0]['task_id'] == 'task-foreign'
     assert graph['commands'][command][0]['task_id'] == 'task-owned'
-    assert binding['required_proof_ids'] == ['owned.contract']
-    assert binding['task_ids'] == ['task-owned']
+    assert binding['required_proof_ids'] == (['owned.contract', 'shared.setup'] if legacy == 'custody'
+                                             else ['owned.contract'])
+    assert binding['task_ids'] == (['task-foreign', 'task-owned'] if legacy == 'custody' else ['task-owned'])
     assert binding['required_references']['tests/test_owned.py::test_owned']['kind'] == 'selector'
     assert not (root / 'tests/test_future.py').exists()
     if legacy == 'custody':
         assert binding['baseline_identity'] == original_baseline
         assert saved.baseline_git_ref == captured_baseline
+        _assert_prerequisite_owner_enrichment(saved, prerequisite_marker)
         _assert_migrated_candidate_reused(root, monkeypatch, saved, retained_custody)
     assert (root / '.git/index').read_bytes() == index
     assert (root / 'foreign.py').read_text() == 'VALUE = 99\n'
@@ -2733,6 +2744,63 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
     assert (root / 'foreign-note.txt').read_bytes() == b'foreign\x00untracked'
     assert head_ref(root) == shared_head and git(root, 'show-ref') == shared_refs
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+def _retain_foreign_prerequisite(root, child):
+    from auto_agents.config import load_task_plan
+
+    marker = root.parent / 'shared-prerequisite-executed'
+    (root / 'tests/test_shared.py').write_text(
+        'from pathlib import Path\ndef test_setup():\n'
+        '    value = Path("value.py").read_text()\n'
+        '    assert value == "VALUE = 1\\n"\n'
+        f'    Path({str(marker)!r}).write_text(value)\n')
+    config, plan = load_project_config(root), load_task_plan(root)
+    config.gates.steps[0].depends_on_proofs = ['shared.setup']
+    config.gates.steps.append(VerificationStep(proof_id='shared.setup', runner='pytest',
+        targets=['tests/test_shared.py::test_setup'], levels=['affected', 'release']))
+    foreign = next((task for task in plan['tasks'] if task['task_id'] == 'task-foreign'), None)
+    if foreign is None:
+        foreign = {'task_id': 'task-foreign', 'title': 'Existing shared prerequisite',
+                   'workflow_id': 'foreign-workflow', 'status': 'pending',
+                   'requirement_ids': ['REQ-foreign'], 'verification_refs': []}
+        plan['tasks'].append(foreign)
+    foreign['verification_refs'].append('shared.setup')
+    plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
+    _retain_contract(root, child, config, plan)
+    issue = root / '.auto-agents/state/sessions' / child.session_id / 'issue.json'
+    issue.write_text(json.dumps({'task_id': 'task-owned'}))
+    return marker
+
+
+def _retain_legacy_prerequisite_owners(state):
+    """The original inventory required prerequisites without propagating owners."""
+    from auto_agents.session_verification import fingerprint
+
+    binding = state.verification_binding
+    assert binding['required_proof_ids'] == ['owned.contract', 'shared.setup']
+    for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
+        binding.pop(key, None)
+    binding['proof_owners'] = {'owned.contract': binding['proof_owners']['owned.contract']}
+    binding['task_ids'], binding['requirement_ids'] = ['task-owned'], ['REQ-owned']
+    binding['binding_fingerprint'] = fingerprint({k: v for k, v in binding.items() if k != 'binding_fingerprint'})
+    _retain_candidate_binding_identity(state)
+
+
+def _assert_prerequisite_owner_enrichment(saved, marker):
+    binding = saved.verification_binding
+    original = saved.candidate_custody['binding_migration']['original_binding']
+    assert original['task_ids'] == ['task-owned']
+    assert original['requirement_ids'] == ['REQ-owned']
+    assert binding['task_ids'] == ['task-foreign', 'task-owned']
+    assert binding['requirement_ids'] == ['REQ-foreign', 'REQ-owned']
+    assert binding['required_proof_ids'] == original['required_proof_ids'] == ['owned.contract', 'shared.setup']
+    assert binding['regression_dependencies']['owned.contract'] == ['shared.setup']
+    assert {owner['task_id'] for owner in binding['proof_owners']['shared.setup']} == {'task-owned', 'task-foreign'}
+    assert binding['task_scope'] == original['task_scope'] == {'task_ids': ['task-owned'], 'requirement_ids': []}
+    for key in ('tasks', 'plan', 'gates', 'authorization', 'original_handoff_id', 'contract_revision'):
+        assert binding[key] == original[key]
+    assert marker.read_text() == 'VALUE = 1\n', 'recovered prerequisite must execute on the retained candidate'
 
 
 def _retain_candidate_binding_identity(state):
@@ -2807,7 +2875,8 @@ def _assert_migrated_candidate_reused(root, monkeypatch, saved, retained):
     assert git(Path(custody['checkout']), 'show', custody['receipt']['source_revision'] + ':value.py') == 'VALUE = 1\n'
 
 
-@pytest.mark.parametrize('conflict', ['receipt', 'custody', 'history', 'authority', 'bridge_source'])
+@pytest.mark.parametrize('conflict', ['receipt', 'custody', 'history', 'authority',
+                                     'task_scope', 'task_contract', 'bridge_source'])
 def test_public_inventory_migration_rejects_conflicts_without_partial_persistence(tmp_path, monkeypatch, conflict):
     from copy import deepcopy
     import auto_agents.session_verification as verification
@@ -2829,11 +2898,16 @@ def test_public_inventory_migration_rejects_conflicts_without_partial_persistenc
         child.verification_binding['binding_fingerprint'] = verification.fingerprint({
             k: v for k, v in child.verification_binding.items() if k != 'binding_fingerprint'})
         _retain_candidate_binding_identity(child)
-    elif conflict == 'authority':
+    elif conflict in {'authority', 'task_scope', 'task_contract'}:
         seal = verification._seal_inventory
         def conflicting_upgrade(session, state):
             seal(session, state)
-            state.verification_binding['authorization']['source'] = 'changed during enrichment'
+            if conflict == 'authority':
+                state.verification_binding['authorization']['source'] = 'changed during enrichment'
+            elif conflict == 'task_scope':
+                state.verification_binding['task_scope']['task_ids'] = ['task-foreign']
+            else:
+                state.verification_binding['tasks'][0]['requirement_ids'] = ['REQ-replaced']
         monkeypatch.setattr(verification, '_seal_inventory', conflicting_upgrade)
     else:
         save_session_state(root, child)

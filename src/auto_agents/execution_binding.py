@@ -16,12 +16,15 @@ class ExecutionBindingError(ValueError):
 
 
 # Only these derived fields may change during this inventory transition.
-# Tasks (including requirement hashes), handoff and source authority stay fixed.
+# Tasks (including requirement hashes), task_scope, handoff and source authority
+# stay fixed. task_ids/requirement_ids summarize proof owners, including retained
+# prerequisites; enriching those summaries does not grant new task authority.
 _INVENTORY_FIELDS = frozenset({
     'schema_version', 'binding_fingerprint', 'proof_inventory_version', 'proof_graph',
     'required_references', 'required_proof_ids', 'proof_owners', 'required_commands',
     'required_proofs', 'regression_dependencies', 'verification_policy',
     'proof_control_paths', 'proof_config_paths', 'proof_sources',
+    'task_ids', 'requirement_ids',
 })
 
 
