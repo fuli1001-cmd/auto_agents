@@ -642,20 +642,23 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
 
 
 @pytest.mark.parametrize('command_source', ['legacy', 'manual', 'fix'])
-@pytest.mark.parametrize('reference_kind', ['selector', 'proof', 'command', 'directory', 'vitest_file'])
+@pytest.mark.parametrize('reference_kind', ['selector', 'proof', 'command', 'directory', 'vitest_file',
+                                           'command_directory', 'command_vitest_file'])
 def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch, command_source, reference_kind):
     from auto_agents.models import GateParallelGroup
 
     root, child = project(tmp_path)
     config = load_project_config(root)
+    command_only_target = reference_kind.startswith('command_')
+    target_kind = reference_kind.removeprefix('command_')
     command = './.conda/bin/python -m pytest -q tests/test_owned.py --junitxml report.xml'
     reference = {'selector': 'tests/test_owned.py::test_owned', 'proof': 'owned.contract',
                  'command': 'cmd:' + command, 'directory': 'tests',
-                 'vitest_file': 'tests/owned.test.ts'}[reference_kind]
+                 'vitest_file': 'tests/owned.test.ts'}[target_kind]
     marker = tmp_path / 'vitest-executed'
-    if reference_kind == 'directory':
+    if target_kind == 'directory':
         config.gates.steps[0].targets = [reference]
-    elif reference_kind == 'vitest_file':
+    elif target_kind == 'vitest_file':
         from test_vitest_selector_execution import _prepare_real_vitest
         _prepare_real_vitest(root, monkeypatch)
         (root / reference).write_text(
@@ -671,6 +674,13 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         config.gates.steps[0].args = ['--reporter=json', '--maxWorkers=1']
     elif reference_kind != 'proof':
         config.gates.steps = []
+    if command_only_target:
+        config.gates.steps = []
+        if target_kind == 'directory':
+            command = './.conda/bin/python -m pytest -q tests --junitxml report.xml'
+        else:
+            launcher = 'npm exec --' if command_source == 'manual' else 'npx --no-install'
+            command = launcher + ' vitest run tests/owned.test.ts --reporter=json --maxWorkers=1'
     config.gates.commands = []
     config.gates.parallel_groups = []
     if command_source == 'legacy':
@@ -690,11 +700,17 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     assert calls == ['fix']
     binding = saved.verification_binding
     assert binding['required_references'][reference]['kind'] == (
-        'selector' if reference_kind in {'directory', 'vitest_file'} else reference_kind)
-    if reference_kind in {'directory', 'vitest_file'}:
+        'selector' if target_kind in {'directory', 'vitest_file'} else reference_kind)
+    if command_only_target:
+        assert binding['required_proof_ids'] == []
+        assert binding['proof_graph']['gates']['steps'] == []
+        assert binding['proof_graph']['commands'][command][0]['task_id'] == 'task-owned'
+        if command_source != 'fix':
+            assert command in binding['required_commands']
+    elif reference_kind in {'directory', 'vitest_file'}:
         assert binding['required_proof_ids'] == ['owned.contract']
         assert binding['proof_owners']['owned.contract'][0]['task_id'] == 'task-owned'
-    if reference_kind == 'vitest_file':
+    if target_kind == 'vitest_file':
         assert 'VALUE = 1' in marker.read_text().splitlines(), 'the retained Vitest proof must execute'
     assert binding['task_ids'] == ['task-owned']
     assert binding['requirement_ids'] == ['REQ-owned']
@@ -1224,9 +1240,11 @@ def test_public_resume_rejects_pytest_control_file_weakening(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize('passing_proof', [False, True])
-@pytest.mark.parametrize('reference', ['owned.contract', 'owned.report.json', 'tests/test_owned.py::test_owned'])
+@pytest.mark.parametrize('reference', ['owned.contract', 'owned.report.json', 'tests/test_owned.py::test_owned',
+                                     'tests/owned.test.ts'])
 @pytest.mark.parametrize('command_source', ['none', 'legacy', 'manual', 'fix'])
-def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference, command_source):
+@pytest.mark.parametrize('runner', ['pytest', 'vitest'])
+def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, passing_proof, reference, command_source, runner):
     import auto_agents.session as session_module
     from auto_agents.models import GateParallelGroup
 
@@ -1247,6 +1265,8 @@ def test_public_resume_blocks_unresolved_owned_proof_id(tmp_path, monkeypatch, p
         (root / '.conda/bin/python').symlink_to(sys.executable)
         (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
         command = 'conda run -p ./.conda python -m pytest -q tests/test_control.py --junitxml ' + reference
+        if runner == 'vitest':
+            command = 'npx --no-install vitest run tests/control.test.ts --outputFile ' + reference
         if command_source == 'legacy':
             config.gates.commands = [command]
         elif command_source == 'manual':
@@ -1296,10 +1316,13 @@ def test_public_resume_rechecks_retained_unresolved_proof_inventory(tmp_path, mo
     # Encode the old inventory, where argument equality removed the mandatory
     # ID. Restore production resolution before exercising public resume.
     covers = verification._command_covers
+    classify = verification._reference_kind
     with monkeypatch.context() as legacy:
         legacy.setattr(verification, '_owned_inventory', lambda *_: ([], {}))
         legacy.setattr(verification, '_command_covers',
                        lambda command, ref: ref in shlex.split(command) or covers(command, ref))
+        legacy.setattr(verification, '_reference_kind', lambda ref, gates, **kwargs:
+                       'proof' if ref == 'owned.contract' else classify(ref, gates, **kwargs))
         _binding_fixture(root, child)
     retained = deepcopy(child.verification_binding)
     assert retained['required_references']['owned.contract']['kind'] == 'proof'

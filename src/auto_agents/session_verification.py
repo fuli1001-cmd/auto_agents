@@ -470,17 +470,69 @@ def _effective_targets(step):
     return targets
 
 
+def _command_test_targets(raw):
+    """Read positional runner inputs; option values never declare test paths."""
+    from .orchestrator import Orchestrator
+
+    args = executable_tokens(raw)
+    if not args:
+        return []
+    pytest_targets = Orchestrator._pytest_targets_from_command(shlex.join(args))
+    if pytest_targets:
+        return pytest_targets
+    launcher = Path(args[0]).name
+    if launcher in {'npm', 'pnpm', 'yarn'} and args[1:2] in (['exec'], ['dlx']):
+        args = args[2:]
+        if args[:1] == ['--']:
+            args = args[1:]
+    elif launcher == 'npx':
+        args = args[1:]
+        while args[:1] in (['--yes'], ['-y'], ['--no-install'], ['--']):
+            args = args[1:]
+    elif launcher in {'pnpm', 'yarn'}:
+        args = args[1:]
+    if not args or Path(args[0]).name != 'vitest':
+        return []
+    args = args[1:]
+    if args[:1] == ['run']:
+        args = args[1:]
+    value_options = {
+        '-t', '--testNamePattern', '--test-name-pattern', '-c', '--config',
+        '-r', '--root', '--dir', '--reporter', '--outputFile', '--maxWorkers',
+        '--minWorkers', '--pool', '--environment', '--exclude', '--project',
+        '--testTimeout', '--hookTimeout', '--retry', '--bail', '--shard',
+    }
+    flags = {'--run', '--no-cache', '--no-file-parallelism', '--passWithNoTests'}
+    targets = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == '--':
+            return [*targets, *args[index + 1:]]
+        if arg.startswith('-'):
+            option, separator, _ = arg.partition('=')
+            if option in value_options or option.startswith('--outputFile.'):
+                if not separator:
+                    index += 1
+                    if index == len(args):
+                        return []
+            elif option not in flags:
+                # An unknown option's arity cannot establish ownership of its
+                # following argument. Preserve the original execution text.
+                return []
+        else:
+            targets.append(arg)
+        index += 1
+    return targets
+
+
 def _command_covers(command, ref):
     if ref.startswith('cmd:'):
         return command.strip() == ref[4:].strip()
-    if '::' not in ref and not ref.endswith('.py'):
-        return False  # Opaque proof IDs require definitions, not shell arguments.
     try:
         from .models import VerificationStep
-        from .orchestrator import Orchestrator
         for start, end in command_spans(command):
-            args = executable_tokens(command[start:end])
-            targets = Orchestrator._pytest_targets_from_command(shlex.join(args))
+            targets = _command_test_targets(command[start:end])
             if targets and _ref_covered(ref, VerificationStep(targets=targets)):
                 # This establishes ownership, not selection evidence. The
                 # mandatory node guard validates actual selection separately.
@@ -535,7 +587,7 @@ def _owned_inventory(state, gates):
     required = []
     owners = {}
     for ref in sorted(refs):
-        kind = _reference_kind(ref, gates)
+        kind = _reference_kind(ref, gates, commands=[state.fix_verify_command])
         matches = [step for step in gates.steps if (
             step.proof_id == ref if kind == 'proof' else _ref_covered(ref, step))]
         command_covered = kind in {'command', 'selector'} and (
@@ -572,7 +624,7 @@ def _owned_inventory(state, gates):
     return required, owners
 
 
-def _reference_kind(ref, gates):
+def _reference_kind(ref, gates, *, commands=()):
     """An extension is not an artifact declaration: proof IDs can end in .json."""
     from fnmatch import fnmatchcase
 
@@ -593,6 +645,8 @@ def _reference_kind(ref, gates):
            and step.runner.strip().lower() in {'pytest', 'vitest'}
            and _ref_covered(ref, step) for step in gates.steps):
         return 'selector'
+    if any(_command_covers(command, ref) for command in [*_legacy_commands(gates), *commands]):
+        return 'selector'
     return 'proof'
 
 
@@ -607,7 +661,8 @@ def _seal_inventory(session, state):
     required, _ = _owned_inventory(state, complete)
     owners = binding['proof_graph']['proof_owners']
     owned_refs = _mandatory_refs(state)
-    binding['required_references'] = {ref: {'kind': _reference_kind(ref, complete),
+    binding['required_references'] = {ref: {'kind': _reference_kind(
+        ref, complete, commands=[state.fix_verify_command]),
         'owners': diagnostic_owners(state, ref)} for ref in sorted(owned_refs)}
     gates = session_gates(session, state)
     required_commands = {command: [owner for ref in sorted(owned_refs) if _command_covers(command, ref)
