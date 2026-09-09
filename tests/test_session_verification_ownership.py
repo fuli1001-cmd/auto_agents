@@ -1791,6 +1791,39 @@ def test_public_child_binding_rejects_conflicting_task_authority(tmp_path, monke
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
+@pytest.mark.parametrize('binding_version', [None, 11, 13])
+def test_public_resume_rejects_conflicting_handoff_child_identities(tmp_path, monkeypatch, binding_version):
+    from copy import deepcopy
+    from auto_agents.session_verification import fingerprint
+    from test_engine_child_recovery import parent_workflow
+
+    root, child = project(tmp_path)
+    store, snapshot, handoff = parent_workflow(root, child)
+    if binding_version is not None:
+        _binding_fixture(root, child)
+        child.verification_binding['schema_version'] = binding_version
+        child.verification_binding['binding_fingerprint'] = fingerprint({
+            key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+        save_session_state(root, child)
+    retained = deepcopy(child.verification_binding)
+    # The bound child ref agrees, but the same handoff names another child
+    # in its payload. Neither representation may silently override the other.
+    handoff.payload['child_session_id'] = 'another-child'
+    store.save_handoff(handoff)
+    _prepare_binding_child_resume(root, store, snapshot, handoff)
+    ambient = _switch_ambient_binding_plan(root)
+    handoff_path = root / '.auto-agents/state/handoffs' / (handoff.handoff_id + '.json')
+    handoff_bytes = handoff_path.read_bytes()
+    saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
+    assert saved.verification_binding == retained
+    diagnostic = saved.execution_log[-1]['diagnostic']
+    assert diagnostic['handoff_id'] == handoff.handoff_id
+    assert diagnostic['child_session_ids'] == [child.session_id, 'another-child']
+    assert handoff_path.read_bytes() == handoff_bytes
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
 @pytest.mark.parametrize('reverse', [False, True])
 @pytest.mark.parametrize('matching', [False, True])
 @pytest.mark.parametrize('binding_version', [None, 11, 13])

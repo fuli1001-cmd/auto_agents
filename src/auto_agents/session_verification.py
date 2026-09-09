@@ -986,11 +986,15 @@ def _task_scope(session, state):
     if state.parent_handoff_id:
         handoff = read_json(control_root / '.auto-agents/state/handoffs' / (state.parent_handoff_id + '.json'), default={})
         child = handoff.get('child', {}) or {}
-        child_id = child.get('native_id') or handoff.get('payload', {}).get('child_session_id')
-        if (not handoff or (child_id and child_id != state.session_id)
+        # Both records describe the same authority. A matching bound child
+        # must not hide a contradictory retained payload during recovery.
+        child_ids = [value for value in (child.get('native_id'),
+                     handoff.get('payload', {}).get('child_session_id')) if value]
+        if (not handoff or any(child_id != state.session_id for child_id in child_ids)
                 or (handoff.get('workflow_id') and handoff['workflow_id'] != state.workflow_id)
                 or (handoff.get('handoff_id') and handoff['handoff_id'] != state.parent_handoff_id)):
-            raise ownership_error(state, 'original child handoff ownership is unavailable or conflicting')
+            raise ownership_error(state, 'original child handoff ownership is unavailable or conflicting',
+                                  child_session_ids=child_ids)
         for key, expected in (('authorization_policy', state.authorization_policy),
                               ('goal_execution_environment', state.goal_execution_environment)):
             if key in handoff.get('payload', {}) and handoff['payload'][key] != expected:
