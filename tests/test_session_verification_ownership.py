@@ -642,7 +642,7 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
 
 
 @pytest.mark.parametrize('command_source', ['legacy', 'manual', 'fix'])
-@pytest.mark.parametrize('reference_kind', ['selector', 'proof', 'command'])
+@pytest.mark.parametrize('reference_kind', ['selector', 'proof', 'command', 'directory', 'vitest_file'])
 def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch, command_source, reference_kind):
     from auto_agents.models import GateParallelGroup
 
@@ -650,8 +650,26 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     config = load_project_config(root)
     command = './.conda/bin/python -m pytest -q tests/test_owned.py --junitxml report.xml'
     reference = {'selector': 'tests/test_owned.py::test_owned', 'proof': 'owned.contract',
-                 'command': 'cmd:' + command}[reference_kind]
-    if reference_kind != 'proof':
+                 'command': 'cmd:' + command, 'directory': 'tests',
+                 'vitest_file': 'tests/owned.test.ts'}[reference_kind]
+    marker = tmp_path / 'vitest-executed'
+    if reference_kind == 'directory':
+        config.gates.steps[0].targets = [reference]
+    elif reference_kind == 'vitest_file':
+        from test_vitest_selector_execution import _prepare_real_vitest
+        _prepare_real_vitest(root, monkeypatch)
+        (root / reference).write_text(
+            'import { test, expect } from "vitest";\n'
+            'import { readFileSync, appendFileSync } from "node:fs";\n'
+            'test("owned value", () => {\n'
+            '  const value = readFileSync("value.py", "utf8");\n'
+            f'  appendFileSync({json.dumps(str(marker))}, value);\n'
+            '  expect(value).toBe("VALUE = 1\\n");\n'
+            '});\n')
+        config.gates.steps[0].runner = 'vitest'
+        config.gates.steps[0].targets = [reference]
+        config.gates.steps[0].args = ['--reporter=json', '--maxWorkers=1']
+    elif reference_kind != 'proof':
         config.gates.steps = []
     config.gates.commands = []
     config.gates.parallel_groups = []
@@ -665,14 +683,23 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
                       'requirement_ids': ['REQ-owned'], 'verification_refs': [reference]}],
             'verification_steps': [step.to_dict() for step in config.gates.steps]}
     _retain_contract(root, child, config, plan)
+    ambient = {path: (root / path).read_bytes() for path in
+               ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
     saved, calls, _ = run_session(root, monkeypatch)
     assert saved.status == 'completed', saved.to_dict()
     assert calls == ['fix']
     binding = saved.verification_binding
-    assert binding['required_references'][reference]['kind'] == reference_kind
+    assert binding['required_references'][reference]['kind'] == (
+        'selector' if reference_kind in {'directory', 'vitest_file'} else reference_kind)
+    if reference_kind in {'directory', 'vitest_file'}:
+        assert binding['required_proof_ids'] == ['owned.contract']
+        assert binding['proof_owners']['owned.contract'][0]['task_id'] == 'task-owned'
+    if reference_kind == 'vitest_file':
+        assert 'VALUE = 1' in marker.read_text().splitlines(), 'the retained Vitest proof must execute'
     assert binding['task_ids'] == ['task-owned']
     assert binding['requirement_ids'] == ['REQ-owned']
     assert any(entry.get('result') == 'pass' for entry in saved.execution_log)
+    assert {path: (root / path).read_bytes() for path in ambient} == ambient
 
 
 @pytest.mark.parametrize('edit', ['delete', 'skip', 'replace', 'independent_addition'])

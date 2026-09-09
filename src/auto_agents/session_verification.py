@@ -586,6 +586,13 @@ def _reference_kind(ref, gates):
         return 'artifact'
     if '::' in ref or ref.endswith('.py'):
         return 'selector'
+    # Retained test definitions establish executable path roles independently
+    # of filename suffixes, including directories and whole-file Vitest tests.
+    # Consult only compiled target declarations, never arbitrary option values.
+    if any((step.kind.strip().lower() or 'test') == 'test'
+           and step.runner.strip().lower() in {'pytest', 'vitest'}
+           and _ref_covered(ref, step) for step in gates.steps):
+        return 'selector'
     return 'proof'
 
 
