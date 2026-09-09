@@ -188,8 +188,11 @@ in-process path for compatibility and isolated tests.
    and an original-boundary replay must both pass to reuse a remote fix.
    Collection/import/setup failure is not proof that the engine is repaired.
 4. Otherwise retain one repair workspace and provider continuation for focused
-   edits and tests. Three non-improving attempts enter the existing deeper
-   search without erasing the retained workspace or experiment. Approved proofs,
+   edits and tests. Three non-improving attempts or rejected reviews of the same
+   component enter deeper design review while continuing the same workspace.
+   Repeated resolution of old findings cannot reset the progress counter. A second
+   exhausted attempt window without accepted component/root progress returns a
+   `search_stalled` blocker with the candidates and evidence intact. Approved proofs,
    reviews, full-suite checks and resumable validation retain their existing gates.
 5. Independently validate each subscribing project, then launch its original
    invocation against the approved runtime. Native gate/stage/engine-route
@@ -197,6 +200,12 @@ in-process path for compatibility and isolated tests.
    Unknown boundaries conservatively require successful workflow completion.
 6. Publish only after recovery confirmation. Source developer files, index and
    unrelated local commits are not promoted or pushed by this path.
+
+When recovering cancelled jobs from older engines that abandoned their continuous
+workspace during deep search, import the latest candidate or its verified interrupted
+patch instead of the stale continuous HEAD. Resolve recorded parent refs to immutable
+commits before applying patches. A compatible approved design is retained as a plan,
+with all components pending fresh validation against the selected engine revision.
 
 Explicit engine routes use a separate admission path: `EngineRepairRequired`
 is an internal work request, not an exception that a model must first prove is

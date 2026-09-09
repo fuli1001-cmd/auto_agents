@@ -112,6 +112,8 @@ def test_cancel_then_original_invocation_retains_code_and_history_but_requires_n
         assert not git(retained, "status", "--porcelain")
     copied = SelfRepairExperimentStore(working, "session-session", "root")
     experiment = copied.load()
+    assert experiment.base_commit == revision
+    assert experiment.candidates["base"].candidate_commit == revision
     assert experiment.experiment_id == restart.evidence.load().experiment_id
     assert experiment.attempt_count == 1
     assert experiment.best_search_candidate_id == experiment.best_safe_candidate_id == "base"
@@ -221,3 +223,53 @@ def test_import_waits_for_cancelled_worker_cleanup_before_reusing_it(restart):
          patch("auto_agents.repair_restart._quiescent", side_effect=[False, True, True]):
         assert import_cancelled_repair(restart.store, job, working, restart.repository)
     sleep.assert_called_once()
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_restart_after_legacy_fallback_uses_newest_deep_candidate(restart, interrupted):
+    import hashlib
+    state = restart.evidence.load()
+    deep = restart.repository.worktree(state.candidates["c1"].candidate_commit, "deep-search")
+    (deep / "bug.py").write_text("newer deep-search code\n")
+    git(deep, "add", "bug.py")
+    git(deep, "commit", "-m", "deep candidate")
+    commit = git(deep, "rev-parse", "HEAD")
+    state.candidates["c2"] = SelfRepairCandidateRecord("c2", candidate_ref=commit, candidate_commit=commit,
+                                                     status="candidate_review_rejected")
+    state.attempt_count = 2
+    expected = "newer deep-search code\n"
+    if interrupted:
+        state.current_candidate_id = "c3"
+        expected = "interrupted newest deep-search code\n"
+        (deep / "bug.py").write_text(expected)
+        (deep / "binary.dat").write_bytes(b"\x00\xffretained")
+        git(deep, "add", "-A")
+        diff = git(deep, "diff", "--cached", "--binary", "HEAD", check=False).stdout
+        path = restart.evidence.candidate_root("c3")
+        path.mkdir(parents=True)
+        (path / "partial-candidate.diff").write_text(diff)
+        restart.evidence.write_candidate_artifact("c3", "partial-candidate.json", {
+            "status": "interrupted", "candidate_id": "c3", "base_ref": commit,
+            "patch_sha256": hashlib.sha256(diff.encode()).hexdigest(),
+        })
+    atomic_json(restart.source.parent / "fallback.json", {"reason": "deeper diagnosis"})
+    state.repair_design = {"contract_fingerprint": state.contract_fingerprint, "strategy_id": "retained-design"}
+    state.repair_design_fingerprint = "retained-design"
+    state.finding_groups = [{"group_id": "binding", "status": "pending"}]
+    restart.evidence.save(state)
+    job, working = _new_job(restart, restart.payload)
+    destination = SelfRepairExperimentStore(working, "session-session", "root")
+    fresh = SelfRepairExperiment.create(run_id="session-session", root_fingerprint="root", category="engine",
+                                        base_commit=restart.payload["base"], expected_postconditions=["resume the retained child"])
+    destination.save(fresh)
+    assert import_cancelled_repair(restart.store, job, working, restart.repository)
+    retained = working.parent / "continuous/repair"
+    assert (retained / "bug.py").read_text() == expected
+    assert (restart.source / "bug.py").read_text() == "unfinished latest repair\n"
+    if interrupted:
+        assert (retained / "binary.dat").read_bytes() == b"\x00\xffretained"
+    assert (retained.parent / "fallback.json").exists()
+    assert destination.load().repair_design["strategy_id"] == "retained-design"
+    assert destination.load().finding_groups[0]["status"] == "pending"
+    receipt = json.loads((working.parent / "prior-repair-import.json").read_text())
+    assert receipt["source_candidate"] == ("c3" if interrupted else "c2")

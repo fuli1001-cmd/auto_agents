@@ -3092,7 +3092,9 @@ class AutoAgentsSelfRepairRunner:
             and experiment.finding_groups
         ):
             return True
-        if self.diagnosis is None or not hasattr(self.diagnosis, "to_dict") or self._continuous_mode():
+        if self.diagnosis is None or not hasattr(self.diagnosis, "to_dict") or (
+            self._continuous_mode() and not self._deep_repair_design()
+        ):
             # Legacy direct API repairs do not carry a causal contract. Keep
             # their historical one-candidate behavior.
             experiment.repair_design = {
@@ -3504,6 +3506,24 @@ class AutoAgentsSelfRepairRunner:
         self._experiment_store.save(experiment)
         return True
 
+    def _stalled_search_result(self, experiment, candidate=None):
+        anchor = experiment.accepted_progress_anchor()
+        if not any(item.get("progress_anchor") == anchor for item in experiment.automatic_corrections):
+            return None
+        experiment.status = "stalled"
+        self._experiment_store.save(experiment)
+        self._experiment_store.record_health(experiment, status="search_stalled", detail="redesign did not produce accepted component progress")
+        result = SelfRepairResult(**candidate.to_dict()) if candidate else SelfRepairResult(False, "search_stalled", "")
+        result.ok = False
+        result.status = "search_stalled"
+        result.experiment_id = experiment.experiment_id
+        result.reason = (
+            "repair search stalled after redesign without accepted component progress; "
+            "candidate code and review history are preserved for inspection. "
+            f"experiment={experiment.experiment_id}; evidence={self._experiment_store.root}"
+        )
+        return result
+
     def _run_search(self) -> SelfRepairResult:
         autonomy = self._autonomy_config()
         mode = str(
@@ -3602,11 +3622,21 @@ class AutoAgentsSelfRepairRunner:
                     )
                     experiment._recompute_frontier()
                 store.save(experiment)
+            if experiment.status == "stalled":
+                stalled = self._stalled_search_result(experiment)
+                if stalled is not None:
+                    return stalled
+                experiment.status = "active"
+                store.save(experiment)
             if (
                 self._consecutive_design_rejections(experiment)
                 >= SELF_REPAIR_MAX_CONSECUTIVE_DESIGN_REJECTIONS
             ):
-                experiment.apply_automatic_correction(reason="design stalled; preserve verified components and change the failing strategy")
+                stalled = self._stalled_search_result(experiment)
+                if stalled is not None:
+                    return stalled
+                experiment.apply_automatic_correction(reason="design stalled; preserve verified components and change the failing strategy",
+                                                      progress_anchor=experiment.accepted_progress_anchor())
                 experiment.design_history.append({"event": "design_search_restart", "at": _utc_now_iso()})
                 store.save(experiment)
                 self._automatic_contract_reanalysis(experiment, SelfRepairResult(
@@ -3616,8 +3646,12 @@ class AutoAgentsSelfRepairRunner:
                 continue
             active_group = experiment.next_finding_group()
             if active_group is None:
+                stalled = self._stalled_search_result(experiment)
+                if stalled is not None:
+                    return stalled
                 experiment.apply_automatic_correction(
-                    reason="approved design had no schedulable finding group"
+                    reason="approved design had no schedulable finding group",
+                    progress_anchor=experiment.accepted_progress_anchor(),
                 )
                 store.save(experiment)
                 continue
@@ -3771,16 +3805,15 @@ class AutoAgentsSelfRepairRunner:
                               status=candidate.status, reason=redact_incident_text(candidate.reason)[:400],
                               duration=f"{record.duration_seconds / 60:.1f} min",
                               total=f"{sum(item.duration_seconds for item in experiment.candidates.values()) / 60:.1f} min")
+            correction_cutoff = experiment.automatic_corrections[-1].get("at", "") if experiment.automatic_corrections else ""
             semantic_repeat = bool(
                 not candidate.ok
                 and not candidate.infrastructure_failure
                 and experiment.candidates[candidate.candidate_id].semantic_state_fingerprint
-                and experiment.semantic_state_history.count(
-                    experiment.candidates[
-                        candidate.candidate_id
-                    ].semantic_state_fingerprint
-                )
-                > 1
+                and sum(record.semantic_state_fingerprint == experiment.candidates[candidate.candidate_id].semantic_state_fingerprint
+                        for record in experiment.candidates.values()
+                        if record.created_at > correction_cutoff)
+                >= experiment.max_consecutive_non_improvements
             )
             if candidate.status == "candidate_group_completed":
                 experiment.mark_finding_group_completed(
@@ -3800,20 +3833,6 @@ class AutoAgentsSelfRepairRunner:
                     f"progress={candidate.progress_kind} status={candidate.status}"
                 ),
             )
-            if (semantic_repeat or health.get("anomaly") == "strategy_oscillation") and not self._continuous_mode():
-                experiment.apply_automatic_correction(
-                    reason=(
-                        "semantic search state repeated"
-                        if semantic_repeat
-                        else "strategy oscillation detected"
-                    ),
-                    candidate_id=candidate.candidate_id,
-                    strategy_fingerprint=(
-                        experiment.repair_design_fingerprint
-                        or candidate.strategy_fingerprint
-                    ),
-                )
-                store.save(experiment)
             if candidate.ok:
                 experiment.status = "approved"
                 experiment.current_candidate_id = ""
@@ -3840,7 +3859,13 @@ class AutoAgentsSelfRepairRunner:
             if candidate.recoverable_validation:
                 store.save(experiment)
                 return candidate
-            if experiment.patience_exhausted:
+            repeated_search = (semantic_repeat or health.get("anomaly") == "strategy_oscillation") and (
+                not self._continuous_mode() or self._deep_repair_design()
+            )
+            if experiment.patience_exhausted or experiment.review_patience_exhausted or repeated_search:
+                stalled = self._stalled_search_result(experiment, candidate)
+                if stalled is not None:
+                    return stalled
                 if self._continuous_mode():
                     write_json(Path(self._continuous_workspace) / "fallback.json", {
                         "reason": "three non-improving continuous attempts; deepen diagnosis without discarding evidence",
@@ -3866,6 +3891,7 @@ class AutoAgentsSelfRepairRunner:
                         experiment.repair_design_fingerprint
                         or candidate.strategy_fingerprint
                     ),
+                    progress_anchor=experiment.accepted_progress_anchor(),
                 )
                 store.record_health(
                     experiment,
@@ -3995,8 +4021,11 @@ class AutoAgentsSelfRepairRunner:
                 shutil.rmtree(temporary, ignore_errors=True)
 
     def _continuous_mode(self) -> bool:
+        return bool(getattr(self, "_continuous_workspace", None))
+
+    def _deep_repair_design(self) -> bool:
         root = getattr(self, "_continuous_workspace", None)
-        return bool(root and not (Path(root) / "fallback.json").exists())
+        return bool(root and (Path(root) / "fallback.json").exists())
 
     @contextmanager
     def _verification_argv(self, argv, cwd, *, read_roots=(), dependency_state=None):

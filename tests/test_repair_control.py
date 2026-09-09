@@ -408,7 +408,11 @@ def test_continuous_mode_keeps_worktree_and_provider_receipt(tmp_path):
         atomic_json(root / "provider.json", {"context": "contract", "continuation": {"resume_session_id": "same-session"}})
         assert runner._provider_continuation()["resume_session_id"] == "same-session"
     atomic_json(root / "fallback.json", {"reason": "no improvement"})
-    assert not runner._continuous_mode()
+    assert runner._continuous_mode()
+    assert runner._deep_repair_design()
+    with runner._candidate_workspace() as same_root:
+        assert same_root == root
+        assert (same_root / "patch.txt").read_text() == "retained"
     assert (root / "patch.txt").exists()
 
 

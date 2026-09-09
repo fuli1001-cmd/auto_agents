@@ -1761,11 +1761,15 @@ accepted within a small hard-ceiling grace of 25% (minimum two tools) so post-ho
 discard a useful diagnosis for a one-command overage.
 The repaired process then reconciles only protected paths named by a durable attempt checkpoint and
 restarts the original stateful command. Task-scoped blockers remain localized while independent task
-lineages continue. Self-repair has no root-level candidate or wall-clock ceiling: it persists a
-Pareto frontier and resumes each round from the strongest revalidated candidate. After
-`max_consecutive_non_improving_candidates` candidates make no semantic improvement, it corrects
-the strategy or component decomposition while retaining verified work. Discovering a new defect
-or rewording a summary does not itself prove repair progress. Candidate, review, replay, and test
+lineages continue. Self-repair persists a Pareto frontier and retains its current working
+candidate when deeper diagnosis changes the strategy. After
+`max_consecutive_non_improving_candidates` non-improving attempts or rejected reviews of the
+same component, it corrects the strategy or component decomposition. Closing a previously
+resolved finding on another branch does not earn fresh progress. If another attempt window
+fails without accepted component or root-proof progress, the search returns `search_stalled`
+with its code and evidence preserved. Resuming the same unchanged stopped search does not
+silently grant another retry window; a changed engine, frozen contract, or accepted component
+opens a new correction window. Candidate, review, replay, and test
 operations retain provider/tool/no-progress leases plus final safety ceilings; ordinary activity no
 longer loses work at a short absolute deadline. Normal interruption persists the candidate before
 worktree cleanup. Irreversible production actions, missing
