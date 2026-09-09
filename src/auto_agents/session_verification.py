@@ -620,7 +620,41 @@ def _owned_inventory(state, gates, session=None):
     return required, owners
 
 
-def _retained_reference_exists(session, state, ref):
+def _retained_vitest_filter_sources(session, revision, invocation, *, root=None, reference=None):
+    """Resolve filename filters to retained source inputs, not live files.
+
+    Vitest filters are case-insensitive substrings, rather than literal Git
+    paths. This supplies source provenance only; the unchanged invocation
+    still has to establish executable selection through gate verification.
+    """
+    import re
+
+    if invocation.runner != 'vitest' or not invocation.targets:
+        return []
+    filters = [target.split('::', 1)[0] for target, relative in
+               zip(invocation.targets, invocation.repository_targets)
+               if reference is None or relative == reference]
+    if not filters:
+        return []
+    root = root or getattr(session, '_retained_source_root', session.project_root)
+    entries = subprocess.run(['git', 'ls-tree', '-rz', '--name-only', revision or 'HEAD'],
+                             cwd=root, capture_output=True, text=True)
+    if entries.returncode:
+        return []
+    sources = []
+    for path in entries.stdout.split('\0'):
+        if not re.search(r'\.(?:test|spec)\.[cm]?[jt]sx?$', path, re.IGNORECASE):
+            continue
+        try:
+            relative = Path(path).relative_to(invocation.cwd).as_posix()
+        except ValueError:
+            continue
+        if any(value.lower() in relative.lower() for value in filters):
+            sources.append(path)
+    return sources
+
+
+def _retained_reference_exists(session, state, ref, *, commands=()):
     """Disambiguate command-only paths using retained source, not argument text."""
     if session is None:
         return False
@@ -650,12 +684,24 @@ def _retained_reference_exists(session, state, ref):
     object_name = f'{revision}:{relative.as_posix()}' if relative.parts else f'{revision}^{{tree}}'
     result = subprocess.run(['git', 'cat-file', '-t', object_name],
                             cwd=root, capture_output=True, text=True)
-    return result.returncode == 0 and result.stdout.strip() in {'blob', 'tree'}
+    if result.returncode == 0 and result.stdout.strip() in {'blob', 'tree'}:
+        return True
+    for command in commands:
+        try:
+            invocations = test_invocations(command)
+        except ValueError:
+            continue
+        if any(_retained_vitest_filter_sources(session, revision, invocation, root=root, reference=ref)
+               for invocation in invocations):
+            return True
+    return False
 
 
 def _session_reference_kind(session, state, gates, ref):
     return _reference_kind(ref, gates, commands=[state.fix_verify_command],
-                           source_exists=lambda value: _retained_reference_exists(session, state, value))
+                           source_exists=lambda value: _retained_reference_exists(
+                               session, state, value,
+                               commands=[*_legacy_commands(gates), state.fix_verify_command]))
 
 
 def _reference_kind(ref, gates, *, commands=(), source_exists=None):
@@ -1002,6 +1048,8 @@ def _command_source_targets(command, *, session, revision, config_paths):
                     targets.add((cwd.as_posix(), patterns))
             else:
                 targets.update((path.split('::', 1)[0], ()) for path in invocation.repository_targets)
+                targets.update((path, ()) for path in
+                               _retained_vitest_filter_sources(session, revision, invocation))
         # Retain source protection for explicit non-runner scripts as well.
         parsed = {invocation.raw for invocation in test_invocations(command)}
         cwd = Path('.')

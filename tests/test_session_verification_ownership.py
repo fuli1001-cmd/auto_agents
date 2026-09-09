@@ -737,7 +737,8 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
 @pytest.mark.parametrize('reference_kind', ['selector', 'proof', 'command', 'directory', 'vitest_file',
                                            'command_directory', 'command_vitest_file', 'file', 'command_node',
                                            'cwd_node', 'env_node', 'delimited_node', 'empty_fix',
-                                           'conda_node', 'nested_node', 'command_vitest_selector', 'expanded_report'])
+                                           'conda_node', 'nested_node', 'command_vitest_selector', 'expanded_report',
+                                           'command_vitest_basename', 'command_vitest_filter'])
 def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch, command_source, reference_kind):
     from auto_agents.models import GateParallelGroup
 
@@ -755,6 +756,7 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
                  'conda_node': 'tests/test_owned.py::test_owned',
                  'nested_node': 'tests/test_owned.py::test_owned',
                  'vitest_selector': 'tests/owned.test.ts::owned value',
+                 'vitest_basename': 'owned.test.ts', 'vitest_filter': 'OWNED.TEST',
                  'expanded_report': 'tests/test_owned.py::test_owned'}[target_kind]
     if target_kind == 'node':
         command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned --junit-prefix owned'
@@ -789,10 +791,10 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     marker = tmp_path / 'vitest-executed'
     if target_kind == 'directory':
         config.gates.steps[0].targets = [reference]
-    elif target_kind in {'vitest_file', 'vitest_selector'}:
+    elif target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter'}:
         from test_vitest_selector_execution import _prepare_real_vitest
         _prepare_real_vitest(root, monkeypatch)
-        (root / reference.split('::', 1)[0]).write_text(
+        (root / 'tests/owned.test.ts').write_text(
             'import { test, expect } from "vitest";\n'
             'import { readFileSync, appendFileSync } from "node:fs";\n'
             'test("owned value", () => {\n'
@@ -809,9 +811,10 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         config.gates.steps = []
         if target_kind == 'directory':
             command = './.conda/bin/python -m pytest -q tests --junitxml report.xml'
-        elif target_kind in {'vitest_file', 'vitest_selector'}:
+        elif target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter'}:
             launcher = 'npm exec --' if command_source == 'manual' else 'npx --no-install'
-            command = launcher + ' vitest run tests/owned.test.ts --reporter=json --maxWorkers=1'
+            selector = reference if target_kind in {'vitest_basename', 'vitest_filter'} else 'tests/owned.test.ts'
+            command = launcher + ' vitest run ' + selector + ' --reporter=json --maxWorkers=1'
             if target_kind == 'vitest_selector':
                 command += ' -t ' + shlex.quote('owned value')
     config.gates.commands = []
@@ -849,8 +852,9 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     elif reference_kind in {'directory', 'vitest_file'}:
         assert binding['required_proof_ids'] == ['owned.contract']
         assert binding['proof_owners']['owned.contract'][0]['task_id'] == 'task-owned'
-    if target_kind in {'vitest_file', 'vitest_selector'}:
+    if target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter'}:
         assert 'VALUE = 1' in marker.read_text().splitlines(), 'the retained Vitest proof must execute'
+        assert 'tests/owned.test.ts' in binding['proof_sources']
     assert binding['task_ids'] == ['task-owned']
     assert binding['requirement_ids'] == ['REQ-owned']
     assert any(entry.get('result') == 'pass' for entry in saved.execution_log)
