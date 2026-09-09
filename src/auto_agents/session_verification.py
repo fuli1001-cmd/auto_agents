@@ -318,6 +318,19 @@ def validate_binding(session, state):
 def _validate_task_authority(state):
     binding = state.verification_binding
     scope = binding.get('task_scope', {})
+    task_ids = set(scope.get('task_ids', []))
+    requirement_ids = set(scope.get('requirement_ids', []))
+    if task_ids and requirement_ids:
+        # These are two representations of the child's authority, not
+        # independent grants. Resolve against retained tasks before taking
+        # any union of their proof obligations, even within one workflow.
+        requirement_task_ids = {task.get('task_id') for task in binding.get('tasks', [])
+                                if requirement_ids.intersection(task.get('requirement_ids', []))}
+        if requirement_task_ids != task_ids:
+            raise ownership_error(state, 'task and requirement authority conflict in retained contract',
+                                  retained_task_ids=sorted(task_ids),
+                                  requirement_task_ids=sorted(requirement_task_ids, key=str),
+                                  requirement_ids=sorted(requirement_ids))
     if (not any(scope.values()) and binding.get('plan_workflow_id')
             and binding['plan_workflow_id'] != state.workflow_id):
         raise ownership_error(state, 'retained plan belongs to another workflow without matching task authority')

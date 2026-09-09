@@ -1775,6 +1775,84 @@ def test_public_child_binding_rejects_conflicting_task_authority(tmp_path, monke
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+@pytest.mark.parametrize('matching', [False, True])
+@pytest.mark.parametrize('binding_version', [None, 11, 13])
+def test_public_child_reconciles_task_and_requirement_authority(
+        tmp_path, monkeypatch, reverse, matching, binding_version):
+    from copy import deepcopy
+    from auto_agents.config import load_task_plan
+    from auto_agents.session_verification import fingerprint
+    from test_engine_child_recovery import parent_workflow, resume_to_observation
+
+    root, child = project(tmp_path)
+    store, snapshot, handoff = parent_workflow(root, child)
+    config = load_project_config(root)
+    (root / 'tests/test_other.py').write_text('def test_other():\n    assert True\n')
+    config.gates.steps.append(VerificationStep(proof_id='other.contract', runner='pytest',
+        targets=['tests/test_other.py::test_other'], levels=['affected'], impact_paths=['other.py']))
+    plan = load_task_plan(root)
+    plan['tasks'][0]['workflow_id'] = child.workflow_id
+    plan['tasks'].append({'task_id': 'task-other', 'title': 'Another child obligation',
+        'workflow_id': child.workflow_id, 'requirement_ids': ['REQ-other'],
+        'verification_refs': ['other.contract']})
+    plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
+    _retain_contract(root, child, config, plan)
+    task_scope = {'task_id': 'task-owned'}
+    requirement_scope = {'requirement_ids': ['REQ-owned']}
+    handoff.payload.update(requirement_scope if reverse else task_scope)
+    store.save_handoff(handoff)
+    issue = root / '.auto-agents/state/sessions' / child.session_id / 'issue.json'
+    issue.write_text(json.dumps(task_scope if reverse else requirement_scope))
+    if binding_version is not None:
+        _binding_fixture(root, child)
+        child.verification_binding['schema_version'] = binding_version
+        child.verification_binding['binding_fingerprint'] = fingerprint({
+            key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+        save_session_state(root, child)
+    prior_binding = deepcopy(child.verification_binding)
+    if not matching:
+        issue.write_text(json.dumps({'task_id': 'task-other'} if reverse
+                                    else {'requirement_ids': ['REQ-other']}))
+    _prepare_binding_child_resume(root, store, snapshot, handoff)
+    ambient = _switch_ambient_binding_plan(root)
+    handoff_bytes = (root / '.auto-agents/state/handoffs' / (handoff.handoff_id + '.json')).read_bytes()
+    if matching:
+        from test_engine_child_recovery import ObservationBoundary
+        # Stop after the public parent consumes the child result, before
+        # starting the ambient workflow's separate implementation phase.
+        collab_loop = Session._phase_collab_loop
+        def parent_boundary(self, state):
+            if state.session_id == 'parent':
+                raise ObservationBoundary()
+            return collab_loop(self, state)
+        monkeypatch.setattr(Session, '_phase_collab_loop', parent_boundary)
+        calls = []
+        def writer(state, prompt, candidate_root):
+            calls.append(state.session_id)
+            (candidate_root / 'value.py').write_text('VALUE = 1\n')
+            return 'Repaired\nCOMMIT_MESSAGE: Repair owned value'
+        resume_to_observation(root, monkeypatch, writer)
+        saved = load_session_state(root, child.session_id)
+        assert saved.status == 'completed', saved.to_dict()
+        assert calls == [child.session_id]
+        assert saved.verification_binding['required_proof_ids'] == ['owned.contract']
+        assert saved.verification_binding['task_scope'] == {
+            'task_ids': ['task-owned'], 'requirement_ids': ['REQ-owned']}
+    else:
+        saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
+        assert 'conflict' in saved.execution_log[-1]['result']
+        diagnostic = saved.execution_log[-1]['diagnostic']
+        assert diagnostic['handoff_id'] == handoff.handoff_id
+        if binding_version is None:
+            assert diagnostic['retained_task_ids'] == ['task-other' if reverse else 'task-owned']
+            assert diagnostic['requirement_task_ids'] == ['task-owned' if reverse else 'task-other']
+        assert saved.verification_binding == prior_binding
+        assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+        assert (root / '.auto-agents/state/handoffs' / (handoff.handoff_id + '.json')).read_bytes() == handoff_bytes
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
 def test_public_legacy_upgrade_preserves_conflicting_retained_handoff(tmp_path, monkeypatch):
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
