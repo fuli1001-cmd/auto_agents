@@ -364,6 +364,7 @@ class TestInvocation:
     targets: tuple[str, ...] | None
     cwd: str
     option_offset: int
+    shell_cwd: str = '.'
 
     @property
     def repository_targets(self):
@@ -441,7 +442,7 @@ def test_invocations(command: str) -> list[TestInvocation]:
                         if re.match(r'^\d*[<>]', word)}
         targets = _runner_targets(runner, arguments, redirections)
         invocations.append(TestInvocation(raw, runner, tuple(arguments),
-                           None if targets is None else tuple(targets), invocation_cwd, offset))
+                           None if targets is None else tuple(targets), invocation_cwd, offset, cwd))
     return invocations
 
 

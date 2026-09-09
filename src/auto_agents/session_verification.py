@@ -667,7 +667,8 @@ def _retained_vitest_discovery(session, root, revision, invocation):
     from .session_candidate import _clone
     from .verification_sandbox import verification_argv
 
-    key = fingerprint([str(root), revision, invocation.raw, invocation.cwd, dict(os.environ)])
+    key = fingerprint([str(root), revision, invocation.raw, invocation.cwd,
+                       invocation.shell_cwd, dict(os.environ)])
     cache = getattr(session, '_retained_vitest_discovery_cache', None)
     if cache is None:
         cache = session._retained_vitest_discovery_cache = {}
@@ -678,20 +679,26 @@ def _retained_vitest_discovery(session, root, revision, invocation):
         prefix, count = re.subn(r'''(?:\brun|'run'|"run")$''', '', prefix)
         if not count:
             return []  # An unresolved launcher cannot establish selection.
-    # Put boolean flags before the original args so '--' keeps its meaning.
-    command = (prefix + ' list --filesOnly --json --no-cache '
-               + invocation.raw[invocation.option_offset:])
     selected = []
     try:
         with tempfile.TemporaryDirectory(prefix='auto-agents-vitest-discovery-') as temporary:
             checkout = Path(temporary) / 'project'
             _clone(root, revision, checkout)
+            # Machine output must not depend on the retained command's stdout
+            # redirections or launcher capture behavior. Reserve a private
+            # report in the writable checkout; never reuse a project report.
+            descriptor, report_name = tempfile.mkstemp(prefix='.discovery-', suffix='.json', dir=checkout)
+            os.close(descriptor)
+            command = (prefix + ' list --filesOnly --json=' + shlex.quote(report_name)
+                       + ' --no-cache ' + invocation.raw[invocation.option_offset:])
             dependencies = discover_dependency_links(root)
             for relative, source in dependencies.items():
                 link = checkout / relative
-                if link.name != 'node_modules' or not link.is_symlink():
+                conda_prefix = (source / 'conda-meta').is_dir()
+                if not link.is_symlink() or (link.name != 'node_modules' and not conda_prefix):
                     continue
                 # Vite bundles retained configuration into node_modules/.vite-temp.
+                # Conda also creates activation scripts at the prefix root.
                 # Keep that scratch space private instead of writing through
                 # the shared dependency link; package contents stay read-only.
                 link.unlink()
@@ -700,14 +707,17 @@ def _retained_vitest_discovery(session, root, revision, invocation):
                     if package.name != '.vite-temp':
                         (link / package.name).symlink_to(package, target_is_directory=package.is_dir())
             cwd = (checkout / invocation.cwd).resolve()
-            if not cwd.is_relative_to(checkout):
+            shell_cwd = (checkout / invocation.shell_cwd).resolve()
+            if not cwd.is_relative_to(checkout) or not shell_cwd.is_relative_to(checkout):
                 return []
-            shell = 'cd ' + shlex.quote(str(cwd)) + ' && ' + command
+            # Wrappers such as conda apply --cwd themselves, relative to the
+            # original shell location. Applying effective cwd here doubles it.
+            shell = 'cd ' + shlex.quote(str(shell_cwd)) + ' && ' + command
             with verification_argv(['sh', '-c', shell], checkout, root,
                     read_roots=list(dependencies.values())) as argv:
                 result = subprocess.run(argv, cwd=checkout, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
-                payload = json.loads(result.stdout)
+                payload = json.loads(Path(report_name).read_text())
                 if isinstance(payload, list):
                     for item in payload:
                         if not isinstance(item, dict) or not isinstance(item.get('file'), str):
