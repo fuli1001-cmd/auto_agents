@@ -8,7 +8,8 @@ import sys
 
 import pytest
 
-from auto_agents.config import load_session_state, save_session_state
+from auto_agents.config import (load_session_state, save_session_state,
+                                load_project_config, save_project_config)
 from auto_agents.gate_execution import LocalGatePlanExecutor
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
@@ -24,6 +25,11 @@ BINARY = b"candidate\x00\xff\r\n"
 
 def fixture(tmp_path, monkeypatch, *, parent=False, gitlink=False):
     root, child = project(tmp_path)
+    config = load_project_config(root)
+    # These scenarios require cache reuse, not probabilistic audit execution.
+    # Retain real lookup, source admission and evidence from executed tests.
+    config.execution.acceleration.proof_audit_sample_rate = 0.0
+    save_project_config(root, config)
     (root / 'obsolete.bin').write_bytes(b'old\x00bytes')
     (root / '.gitattributes').write_text('binary.dat filter=receipt\n')
     test = root / 'tests/test_owned.py'
@@ -387,8 +393,18 @@ def test_retained_gitlink_rejects_changed_identity_or_materialization(tmp_path, 
                    (root / 'vendor', root / 'vendor/foreign.bin')}
         def mutate_before_lookup(executor, command):
             if getattr(executor, 'validate_source_materialization', None) and executor.use_result_cache:
+                assert executor.proof_audit_sample_rate == 0.0
+                if case == 'materialized-missing':
+                    # Demonstrate why the former uncontrolled precondition
+                    # could miss even though genuine cached evidence exists.
+                    with monkeypatch.context() as audit:
+                        audit.setattr(executor, 'proof_audit_sample_rate', 1.0)
+                        assert cached_result(executor, command) is None
+                        assert executor._cache_miss_reasons[command] == 'proof_audit_sample'
                 prior = cached_result(executor, command)
-                assert prior is not None and prior.ok, 'real retained cache evidence must be eligible'
+                assert prior is not None and prior.ok, (
+                    'real retained cache evidence must be eligible',
+                    executor._cache_miss_reasons.get(command))
                 hits.append(command)
                 lane = executor._shared_sandboxes['receipt-admission']
                 vendor = lane / 'vendor'
