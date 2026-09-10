@@ -8,7 +8,7 @@ import pytest
 
 from auto_agents.models import AgentResult
 from auto_agents.repair_planning import (
-    PlanningBlocked, _probe, finding_key, history_report, nonblocking_scope, prepare_component, review_scope, validate_plan,
+    POLICY_VERSION, PlanningBlocked, _probe, finding_key, history_report, nonblocking_scope, prepare_component, review_scope, validate_plan,
 )
 from auto_agents.repair_schedule import canonical_commands
 from auto_agents.self_repair import _VerificationResult
@@ -318,7 +318,8 @@ def test_serialized_approval_without_independent_artifact_is_not_reused(setup, d
             result_path.write_text(json.dumps({'decision': 'APPROVE', 'issues': [], 'scenario_ids': []}))
         runner._candidate_group = dict(state.finding_groups[0])
         second = prepare_component(runner, runner.repo_root)
-    assert second['request_id'] != first['request_id'] and len(calls) == 4
+    assert second['request_id'] != first['request_id'] and len(calls) == 3
+    assert [request.stage for request, _ in calls].count('self_repair_component_plan') == 1
 
 
 def test_verified_existing_candidate_uses_acceptance_without_a_writer(setup):
@@ -351,7 +352,7 @@ def test_scope_reclassification_never_earns_a_repair_resolution_credit(setup):
     finding = SelfRepairFinding('unrelated', disposition='contract_violation',
         causal_obligation_id=state.contract_obligation_ids[0], required_test=plan['quick_checks'][0])
     state.findings[finding.finding_id] = finding
-    state.scope_decisions[finding.finding_id] = dict(policy=1, contract=state.contract_fingerprint,
+    state.scope_decisions[finding.finding_id] = dict(policy=POLICY_VERSION, contract=state.contract_fingerprint,
         engine_base=state.base_commit, finding_key=finding_key(finding), verdict='follow_up', request_id='reviewed')
     record = SelfRepairCandidateRecord('candidate', review_completed=True,
         resolved_finding_ids=[finding.finding_id], verified_check_ids=['tests/test_contract.py::test_contract'])

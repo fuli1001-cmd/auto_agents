@@ -4,67 +4,95 @@ Self-repair retains one serial implementation workspace and chooses its next
 step from verification evidence. There is no root-level or candidate wall-clock
 budget. A step without meaningful progress can still be diagnosed and stopped.
 
-## Independent planning and necessity review
+## Incremental planning and independent review
 
-The overall design is a proposed decomposition, not permission to write code.
-Before a diagnosed automatic repair edits its next component, the controller
-uses separate provider requests for component planning and independent review.
-Neither request resumes the writer's or planner's provider conversation. The
-inputs identify the current retained source, environment, original request,
-frozen requirements, component and complete historical evidence. Full inputs,
-outputs and request identities are retained under the experiment's `planning/`
-directory. A large diff has a complete artifact in addition to its inline excerpt.
+Experiment schema 7 retains immutable plan revisions, stable step/scenario IDs,
+parent revisions, independent review results, bounded repair episodes and
+verification schedules. The latest draft survives rejection, malformed replies,
+interruption and restart. Complete historical inputs remain in protected artifacts;
+the working input supplies the active obligations, previous plan/review, unresolved
+feedback and relevant changes. It does not require rereading all history each turn.
+A full response or a parent-bound amendment can produce the next complete plan.
+Stale amendments and removal of existing acceptance scenarios are rejected.
 
-Plans specify mechanisms, safe relative paths, explicit quick-test nodes, and
-negative, positive, recovery and interaction scenarios with expected behavior and
-requirement/finding mappings. Inapplicable recovery or interaction cases need an
-explanation. A controller-owned disposable checkout runs at most three diagnostic
-probes, each bounded to 60 seconds. Probes can use existing targeted tests or a
-Python memory fixture; they cannot install dependencies or modify the retained
-candidate. Missing tests, import errors, timeouts and modified probe source are
-inconclusive. Probe results do not enter candidate proof or progress credits.
+The controller, rather than a prompt-only convention, distinguishes these actions:
 
-An independent reviewer must inspect every scenario and the actual probe results.
-Approval requires no remaining design issues and matching probe expectations.
-There are at most two targeted revisions (three reviews) for unchanged planning
-inputs; exhausting them returns a planning rejection through the existing bounded
-recovery policy. Receipt reuse requires the same contract, component strategy,
-material findings and environment. Changes outside planned paths invalidate it;
-implementing the same plan inside those paths does not itself require replanning.
-Existing code can be independently approved for `verify_existing`, which runs the
-normal acceptance stages without invoking a writer or inventing a patch.
+* Quantity overruns are scheduling decisions. Commands remain atomic and all
+  acceptance is retained; nine commands do not force another global design.
+* Protocol errors identify the field, actual value, constraint and evidence.
+  At most two local format corrections are allowed per semantic round, including
+  interrupted calls. They cannot change mechanisms or remove acceptance. Historical
+  finding and planning-review labels are references, not new blocking finding IDs.
+* Independent plan review has at most three semantic attempts for the same
+  component/contract/evidence/environment episode. Commit and display-label changes
+  do not replenish it. The previous draft remains usable when review artifacts
+  require another independent review.
+* A code review can identify an implementation error already covered by the approved
+  mechanisms and scenarios. Verified scenario/obligation/path mappings allow direct
+  code correction without replanning. A new mechanism or scenario needs a local
+  amendment and independent review of its effects.
+* Count exhaustion alone cannot discard the whole design. One bounded local
+  diagnosis must identify a disproved assumption or dependency conflict before
+  component/global redesign. Unsupported or exhausted recovery returns a structured
+  blocker without manufacturing empty code candidates.
 
-Schema 6 preserves historical component completion separately from reusable
-current proof. Migration backs up the actual previous schema version atomically;
-legacy plan stamps do not count as independent reviews. Existing no-progress
-counters and achievement identities survive migration. Identical supported
-commands are coalesced with an original-request mapping; different target cohorts,
-flags, or shell effects are not merged, since fixture semantics may differ. The
-existing trusted verification ledger still governs source/environment/input-bound
-certificate reuse; this change does not relax its cache policy.
+Planning requests have separate identities. A candidate is created only when
+writing or `verify_existing` validation is admitted. Planning is not a successful
+repair, and format correction, scope reclassification and introduced-regression
+repair do not mint achievement credits. Existing cumulative counts remain intact.
 
-`scripts/audit_repair_history.py --experiment FILE --checkout DIR --output FILE`
-inspects a stopped checkpoint without restarting it. The report distinguishes
-historically resolved observations from outstanding findings awaiting independent
-scope review and records which source the restart selector would preserve. It
-does not manufacture model decisions or acceptance receipts. Compare actual
-phase timings, model requests and executed/cached commands; the absence of an
-expanded-suite call after semantic rejection is a structural saving, not a claim
-about end-to-end speed before a subsequent real run.
+Scope decisions remain independent of code review. `required`, `follow_up`,
+`not_applicable` and `unknown` preserve their previous meaning. A safety violation
+or introduced regression requires explicit disproof to become nonblocking.
+Current facts retain their original request/result artifacts and a controller-built
+file/import/configuration dependency manifest. Relevant changes invalidate them;
+unrelated files need not. Dynamic calls, external imports or incomplete dependency
+knowledge conservatively require a fact-level review. Symbol locations help target
+inspection, but never authorize reuse of a safety decision in a changed file.
+Independent code reviewers receive the previous verdict, unresolved findings and
+changes; final integration still reviews the complete repair and interactions.
 
-Scope classification is a separate request from code review. A new finding needs
-a concrete supported trigger, original requirement, consequence and evidence to
-become required. Outcomes are `required`, `follow_up`, `not_applicable`, or
-`unknown`. Unknown observations can request bounded diagnostic probes; they never
-authorize code changes or successful acceptance. An introduced regression or
-safety violation cannot be deferred merely because it is unlikely: rejecting its
-applicability requires explicit disproof. Reclassification is recorded separately
-without deleting historical findings or treating them as repaired. New evidence,
-source or environment changes require refreshing nonblocking decisions.
+Small probes still execute in disposable checkouts with a 60-second limit and do
+not issue candidate proof. Full probe results remain referenced when the working
+input uses an explicit excerpt. Models and provider settings remain unchanged.
 
-Legacy direct API calls without a diagnosis keep their previous execution mode;
-their records cannot supply the independent planning receipt required by a
-diagnosed automatic repair. No CLI or model-selection change is required.
+Quick selection chooses a negative oracle and a compatible positive control for
+each current finding, plus explicitly required safety oracles. Its defaults are
+three commands, twelve collected cases and 180 estimated seconds. These are
+selection/batching targets, not runtime deadlines or permission to drop necessary
+checks. A scenario may name an exact parameter case in `quick_check`; its original
+`check` remains expanded acceptance. Unknown collection sizes and mandatory atomic
+commands exceeding targets are reported. Commands with different target cohorts,
+flags or shell effects are never treated as interchangeable proof.
+
+Schema 6 migration backs up the old state and preserves candidates, histories,
+proof schema 4 and old counters. Matching original request/input/result artifacts
+can recover a legacy draft and an interrupted review slot; an old approval flag
+never manufactures a new approval. New memory artifacts use the existing
+transactional restart-copy mechanism. Future-schema state cannot be overwritten.
+The existing trusted verification ledger continues to govern all proof reuse;
+cross-environment or unproved cross-snapshot reuse is not enabled by this work.
+
+### Offline acceptance and performance
+
+`python scripts/benchmark_repair_incremental.py --experiment FILE --output FILE`
+replays archived planning admission and scheduling without model calls, test
+execution or job mutations. It reports comparable command counts separately from
+plans still needing reference/format correction. It does not approve those plans
+or predict end-to-end model speedups. `benchmark_verification.py` independently
+measures fresh and warm trusted checks in a fixed isolated snapshot.
+
+Planning request metrics record complete/working input size, prompt size and call
+time. History reports include semantic/format counts, revision/fact counts and
+blocked episodes. Quick schedules record mandatory exceptions, deferred acceptance,
+actual collected-case counts, queue/execution time and certificate hits. Verification
+batches are serial; adding their durations to enclosing phase durations would
+count the same wall time twice.
+
+The implementation and offline validation do not resume the stopped collab job.
+A subsequent operator-requested restart still imports the retained private source
+and validates actual engine/project recovery. Faster scheduling or an earlier
+bounded stop alone is not evidence of faster successful end-to-end repair.
 
 ## Failure evidence and verification
 
@@ -96,15 +124,16 @@ because the revision changed.
 
 ## Progress, diagnosis and restart
 
-Experiment schema 6 separates historical achievement from currently reusable
+Experiment schema 7 separates historical achievement from currently reusable
 proof. Existing proof schema 4 is not invalidated just by adding progress fields.
 Repeated check identities, regrouping, candidate labels and restarting cannot
 credit the same achievement again. Review-only resolutions require completed
 review and actual passing check identities. Fixing an introduced regression does
 not buy another search window. Verified environment preparation is credited once.
 
-Three unsuccessful attempts allow one evidence-driven strategy adjustment. A
-second exhausted window at the same achievement state reports `search_stalled`
+Three unsuccessful attempts allow one evidence-driven local strategy adjustment.
+Global redesign requires a concrete invalidated assumption or dependency conflict.
+A second exhausted window at the same achievement state reports `search_stalled`
 and preserves the code and evidence. Stopped and failed jobs can import their
 latest checkpoint transactionally; exhausted state and historical credits survive
 proof invalidation. The last completed review has a separate receipt so later
