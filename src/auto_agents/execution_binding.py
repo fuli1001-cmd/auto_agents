@@ -16,6 +16,14 @@ class ExecutionBindingError(ValueError):
     """A command cannot be executed by the currently bound repository."""
 
 
+class RunnerContextError(RuntimeError):
+    """Preparation failure, distinct from a successfully discovered empty set."""
+
+    def __init__(self, kind, message, command):
+        super().__init__(message)
+        self.kind, self.command = kind, command
+
+
 # Only these derived fields may change during this inventory transition.
 # Tasks (including requirement hashes), task_scope, handoff and source authority
 # stay fixed. task_ids/requirement_ids summarize proof owners, including retained
@@ -282,7 +290,7 @@ PYTEST_VALUE_OPTIONS = frozenset({
     '--capture', '--color', '--code-highlight', '--show-capture', '--verbosity',
     '--log-level', '--log-format', '--log-date-format', '--log-cli-level',
     '--log-cli-format', '--log-cli-date-format', '--log-file-level',
-    '--log-file-format', '--log-file-date-format', '--log-file-mode', '--log-disable',
+    '--log-auto-indent', '--log-file-format', '--log-file-date-format', '--log-file-mode', '--log-disable',
     '--override-toml', '-W', '--pythonwarnings', '--doctest-glob', '--doctest-report',
     '--pastebin', '-r', '--debug',
 })
@@ -365,6 +373,8 @@ class TestInvocation:
     cwd: str
     option_offset: int
     shell_cwd: str = '.'
+    launcher: tuple[str, ...] = ()
+    environment: tuple[tuple[str, str], ...] = ()
 
     @property
     def repository_targets(self):
@@ -442,7 +452,9 @@ def test_invocations(command: str) -> list[TestInvocation]:
                         if re.match(r'^\d*[<>]', word)}
         targets = _runner_targets(runner, arguments, redirections)
         invocations.append(TestInvocation(raw, runner, tuple(arguments),
-                           None if targets is None else tuple(targets), invocation_cwd, offset, cwd))
+                           None if targets is None else tuple(targets), invocation_cwd, offset, cwd,
+                           tuple(tokens[:option_start]), tuple(tuple(token.split('=', 1)) for token in prefix
+                           if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', token))))
     return invocations
 
 
@@ -597,3 +609,120 @@ def engine_verification_command(command: str, root: Path, python: str, source_ro
             result = "env " + shlex.join([value.replace(str(source_root), str(root)) for value in assignments]) + " " + result
         return result
     return rewrite_simple_commands(command, compile_branch)
+
+
+def prepare_conda_prefix(prefix, checkout, shell_cwd):
+    """Give a Conda launcher private scratch without changing its packages.
+
+    Ask installed Conda to resolve its selector by emitting (not evaluating) its
+    activation script. Only the physical selector changes in the prepared
+    command; retained authority and the remaining shell text stay intact.
+    """
+    import os
+    import subprocess
+    import re
+    from . import artifact_temp as tempfile
+
+    lexer = shlex.shlex(prefix, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    words, spans = [], []
+    offset = 0
+    for word in lexer:
+        end = lexer.instream.tell()
+        start = offset
+        while start < end and prefix[start].isspace():
+            start += 1
+        words.append(word)
+        spans.append((start, len(prefix[:end].rstrip())))
+        offset = end
+    index = 0
+    environment = dict(os.environ)
+    while index < len(words):
+        word = words[index]
+        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', word):
+            key, value = word.split('=', 1)
+            environment[key] = value
+        elif word not in {'env', 'exec'}:
+            break
+        index += 1
+    if index >= len(words) or Path(words[index]).name != 'conda' or words[index + 1:index + 2] != ['run']:
+        return prefix, []
+    executable = words[index]
+    index += 2
+    while index < len(words) and words[index].startswith('-'):
+        option = words[index]
+        if option == '--':
+            break
+        if option in {'-n', '--name', '-p', '--prefix'} or option.startswith(('--name=', '--prefix=')):
+            last = index if '=' in option else index + 1
+            if last >= len(words):
+                raise RunnerContextError('unsupported_invocation', 'Conda selector has no value', prefix)
+            name = option.partition('=')[2] if last == index else words[last]
+            if '$' in name or '`' in name:
+                raise RunnerContextError('unsupported_invocation', 'dynamic Conda selector', prefix)
+            if option in {'-p', '--prefix'} or option.startswith('--prefix='):
+                name = str((shell_cwd / Path(name).expanduser()).resolve())
+            # This read-only probe resolves a name, not an activation delta.
+            # Reactivation omits an unchanged CONDA_PREFIX export, so resolve
+            # from an inactive probe context without changing the actual run.
+            environment.pop('CONDA_PREFIX', None)
+            environment['CONDA_SHLVL'] = '0'
+            try:
+                result = subprocess.run([executable, 'shell.posix', 'activate', name],
+                                        cwd=shell_cwd, env=environment, capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise RunnerContextError('environment', 'Conda environment resolution failed', prefix) from error
+            if result.returncode:
+                raise RunnerContextError('environment', 'retained Conda environment could not be resolved', prefix)
+            resolved = [shlex.split(line)[1].partition('=')[2] for line in result.stdout.splitlines()
+                        if line.startswith('export CONDA_PREFIX=')]
+            if len(resolved) != 1 or not (Path(resolved[0]) / 'conda-meta').is_dir():
+                raise RunnerContextError('environment', 'retained Conda environment has no valid prefix', prefix)
+            source = Path(resolved[0]).resolve()
+            checkout.mkdir(parents=True, exist_ok=True)
+            private = Path(tempfile.mkdtemp(prefix='conda-prefix-', dir=checkout))
+            for entry in source.iterdir():
+                (private / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+            replacement = '--prefix ' + shlex.quote(str(private))
+            return prefix[:spans[index][0]] + replacement + prefix[spans[last][1]:], [source]
+        index += 2 if option in {'-p', '--prefix', '--cwd'} else 1
+    return prefix, []
+
+
+def prepare_dependency_scratch(checkout):
+    """Keep Vite bundling scratch private while packages remain linked inputs."""
+    from .gate_execution import discover_dependency_links
+    sources = []
+    for relative, source in discover_dependency_links(checkout).items():
+        link = checkout / relative
+        if link.name != 'node_modules' or not link.is_symlink():
+            continue
+        link.unlink()
+        link.mkdir()
+        for package in source.iterdir():
+            if package.name != '.vite-temp':
+                (link / package.name).symlink_to(package, target_is_directory=package.is_dir())
+        sources.append(source)
+    return sources
+
+
+def prepare_runner_command(command, checkout, scratch):
+    """Prepare a bound invocation without changing its retained shell identity."""
+    sources = []
+    replacements = []
+    offset = 0
+    for invocation in test_invocations(command):
+        if invocation.targets is None:
+            raise RunnerContextError('unsupported_invocation', 'runner option arity is unknown', invocation.raw)
+        start = command.index(invocation.raw, offset)
+        end = start + invocation.option_offset
+        offset = start + len(invocation.raw)
+        prepared, inputs = prepare_conda_prefix(
+            command[start:end], scratch, checkout / invocation.shell_cwd)
+        replacements.append((start, end, prepared))
+        sources.extend(inputs)
+    for start, end, prepared in reversed(replacements):
+        command = command[:start] + prepared + command[end:]
+    sources.extend(prepare_dependency_scratch(checkout))
+    return command, sources

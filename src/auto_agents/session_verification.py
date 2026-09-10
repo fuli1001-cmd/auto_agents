@@ -14,7 +14,7 @@ from pathlib import Path
 from copy import deepcopy
 
 from .config import config_path, requirements_trace_path, run_state_path, task_plan_path
-from .execution_binding import command_spans, executable_tokens, route_sources, test_invocations
+from .execution_binding import command_spans, executable_tokens, route_sources, test_invocations, RunnerContextError
 from .git_ops import head_ref
 from .io_utils import read_json
 
@@ -84,9 +84,16 @@ def bind_session(session, state) -> None:
     state.candidate_custody = deepcopy(original_custody)
     try:
         _bind_session(session, state)
-    except Exception:
+    except Exception as error:
+        owned = [_task_owner(task) for task in _owned_tasks(state)] if isinstance(error, RunnerContextError) else []
+        diagnostic = (ownership_error(state, str(error), failure_kind=error.kind, command=error.command,
+                      owners=owned, task_ids=[owner['task_id'] for owner in owned],
+                      requirement_ids=sorted({key for owner in owned for key in owner['requirement_ids']}))
+                      if isinstance(error, RunnerContextError) else None)
         state.verification_binding = original
         state.candidate_custody = original_custody
+        if diagnostic is not None:
+            raise diagnostic from error
         raise
     finally:
         if had_source:
@@ -666,91 +673,10 @@ def _retained_vitest_filter_sources(session, revision, invocation, *, root=None,
     return [path for path in sources if path in selectable]
 
 
-def _private_named_conda_prefix(prefix, checkout, shell_cwd):
-    """Give a named launcher private scratch without changing its packages.
-
-    Ask installed Conda to resolve the name by emitting (not evaluating) its
-    activation script. Only the physical selector changes in the prepared
-    command; retained authority and the remaining shell text stay intact.
-    """
-    import os
-    import re
-    from . import artifact_temp as tempfile
-
-    lexer = shlex.shlex(prefix, posix=True)
-    lexer.whitespace_split = True
-    lexer.commenters = ''
-    words, spans = [], []
-    offset = 0
-    for word in lexer:
-        end = lexer.instream.tell()
-        start = offset
-        while start < end and prefix[start].isspace():
-            start += 1
-        words.append(word)
-        spans.append((start, len(prefix[:end].rstrip())))
-        offset = end
-    index = 0
-    environment = dict(os.environ)
-    while index < len(words):
-        word = words[index]
-        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', word):
-            key, value = word.split('=', 1)
-            environment[key] = value
-        elif word not in {'env', 'exec'}:
-            break
-        index += 1
-    if index >= len(words) or Path(words[index]).name != 'conda' or words[index + 1:index + 2] != ['run']:
-        return prefix, []
-    executable = words[index]
-    index += 2
-    while index < len(words) and words[index].startswith('-'):
-        option = words[index]
-        if option == '--':
-            break
-        if option in {'-n', '--name'} or option.startswith('--name='):
-            last = index if '=' in option else index + 1
-            name = option.partition('=')[2] if last == index else words[last]
-            # This read-only probe resolves a name, not an activation delta.
-            # Reactivation omits an unchanged CONDA_PREFIX export, so resolve
-            # from an inactive probe context without changing the actual run.
-            environment.pop('CONDA_PREFIX', None)
-            environment['CONDA_SHLVL'] = '0'
-            result = subprocess.run([executable, 'shell.posix', 'activate', name],
-                                    cwd=shell_cwd, env=environment, capture_output=True, text=True, timeout=30)
-            if result.returncode:
-                raise RuntimeError('retained Conda environment could not be resolved')
-            resolved = [shlex.split(line)[1].partition('=')[2] for line in result.stdout.splitlines()
-                        if line.startswith('export CONDA_PREFIX=')]
-            if len(resolved) != 1 or not (Path(resolved[0]) / 'conda-meta').is_dir():
-                raise RuntimeError('retained Conda environment has no valid prefix')
-            source = Path(resolved[0]).resolve()
-            checkout.mkdir(parents=True, exist_ok=True)
-            private = Path(tempfile.mkdtemp(prefix='conda-prefix-', dir=checkout))
-            for entry in source.iterdir():
-                (private / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
-            replacement = '--prefix ' + shlex.quote(str(private))
-            return prefix[:spans[index][0]] + replacement + prefix[spans[last][1]:], [source]
-        index += 2 if option in {'-p', '--prefix', '--cwd'} else 1
-    return prefix, []
-
-
 def prepare_retained_vitest_command(command, checkout, scratch):
-    """Use the same named environment preparation at discovery and execution."""
-    sources = []
-    offset = 0
-    for invocation in test_invocations(command):
-        start = command.index(invocation.raw, offset)
-        end = start + invocation.option_offset
-        offset = start + len(invocation.raw)
-        if invocation.runner != 'vitest':
-            continue
-        prepared, inputs = _private_named_conda_prefix(
-            command[start:end], scratch, checkout / invocation.shell_cwd)
-        command = command[:start] + prepared + command[end:]
-        offset += len(prepared) - (end - start)
-        sources.extend(inputs)
-    return command, sources
+    # Retain the existing session hook while preparing both supported runners.
+    from .execution_binding import prepare_runner_command
+    return prepare_runner_command(command, checkout, scratch)
 
 
 def _retained_vitest_discovery(session, root, revision, invocation):
@@ -765,6 +691,7 @@ def _retained_vitest_discovery(session, root, revision, invocation):
     from .gate_execution import discover_dependency_links
     from .session_candidate import _clone
     from .verification_sandbox import verification_argv
+    from .execution_binding import prepare_conda_prefix, prepare_dependency_scratch
 
     key = fingerprint([str(root), revision, invocation.raw, invocation.cwd,
                        invocation.shell_cwd, dict(os.environ)])
@@ -788,48 +715,37 @@ def _retained_vitest_discovery(session, root, revision, invocation):
             # report in the writable checkout; never reuse a project report.
             descriptor, report_name = tempfile.mkstemp(prefix='.discovery-', suffix='.json', dir=checkout)
             os.close(descriptor)
-            prepared_prefix, conda_sources = _private_named_conda_prefix(
+            prepared_prefix, conda_sources = prepare_conda_prefix(
                 prefix, checkout, checkout / invocation.shell_cwd)
             command = (prepared_prefix + ' list --filesOnly --json=' + shlex.quote(report_name)
                        + ' --no-cache ' + invocation.raw[invocation.option_offset:])
             dependencies = discover_dependency_links(root)
-            for relative, source in dependencies.items():
-                link = checkout / relative
-                conda_prefix = (source / 'conda-meta').is_dir()
-                if not link.is_symlink() or (link.name != 'node_modules' and not conda_prefix):
-                    continue
-                # Vite bundles retained configuration into node_modules/.vite-temp.
-                # Conda also creates activation scripts at the prefix root.
-                # Keep that scratch space private instead of writing through
-                # the shared dependency link; package contents stay read-only.
-                link.unlink()
-                link.mkdir()
-                for package in source.iterdir():
-                    if package.name != '.vite-temp':
-                        (link / package.name).symlink_to(package, target_is_directory=package.is_dir())
+            prepare_dependency_scratch(checkout)
             cwd = (checkout / invocation.cwd).resolve()
             shell_cwd = (checkout / invocation.shell_cwd).resolve()
             if not cwd.is_relative_to(checkout) or not shell_cwd.is_relative_to(checkout):
-                return []
+                raise RunnerContextError('unsupported_invocation', 'runner cwd leaves retained checkout', invocation.raw)
             # Wrappers such as conda apply --cwd themselves, relative to the
             # original shell location. Applying effective cwd here doubles it.
             shell = 'cd ' + shlex.quote(str(shell_cwd)) + ' && ' + command
             with verification_argv(['sh', '-c', shell], checkout, root,
                     read_roots=[*dependencies.values(), *conda_sources]) as argv:
                 result = subprocess.run(argv, cwd=checkout, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                payload = json.loads(Path(report_name).read_text())
-                if isinstance(payload, list):
-                    for item in payload:
-                        if not isinstance(item, dict) or not isinstance(item.get('file'), str):
-                            continue
-                        path = (cwd / item['file']).resolve()
-                        if path.is_relative_to(checkout):
-                            selected.append(path.relative_to(checkout).as_posix())
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
-        # Missing tooling, ambiguous configuration, and failed discovery must
-        # leave the reference unresolved, never fall back to filename overlap.
-        selected = []
+            if result.returncode:
+                raise RunnerContextError('discovery', 'retained Vitest discovery failed', invocation.raw)
+            payload = json.loads(Path(report_name).read_text())
+            if not isinstance(payload, list):
+                raise RunnerContextError('discovery', 'retained Vitest report is invalid', invocation.raw)
+            for item in payload:
+                if not isinstance(item, dict) or not isinstance(item.get('file'), str):
+                    raise RunnerContextError('discovery', 'retained Vitest report is invalid', invocation.raw)
+                path = (cwd / item['file']).resolve()
+                if path.is_relative_to(checkout):
+                    selected.append(path.relative_to(checkout).as_posix())
+    except RunnerContextError:
+        raise
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        raise RunnerContextError('discovery', 'retained Vitest discovery is unavailable', invocation.raw) from error
     cache[key] = selected
     return selected
 
@@ -1219,6 +1135,8 @@ def _command_source_targets(command, *, session, revision, config_paths):
     targets = set()
     try:
         for invocation in test_invocations(command):
+            if invocation.targets is None:
+                raise RunnerContextError('unsupported_invocation', 'runner option arity is unknown', invocation.raw)
             cwd = Path(invocation.cwd)
             if invocation.runner == 'pytest':
                 args = ['pytest', *invocation.arguments]
@@ -1241,6 +1159,8 @@ def _command_source_targets(command, *, session, revision, config_paths):
             elif raw not in parsed:
                 targets.update(((cwd / arg.split('::', 1)[0]).as_posix(), ()) for arg in args
                                if arg.split('::', 1)[0].endswith(('.py', '.js', '.ts', '.tsx', '.jsx')))
+    except RunnerContextError:
+        raise
     except ValueError:
         pass  # Unsupported commands still face execution preflight.
     return targets
