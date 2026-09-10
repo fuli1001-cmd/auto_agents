@@ -67,7 +67,7 @@ for key in ('HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'TMPDIR'):
         if provider == 'codex':
             script += "sys.stderr.write('rate limit exceeded; try again later\\n')\nsys.exit(1)\n"
         else:
-            script += "Path('value.py').write_text('VALUE = 1\\n')\nprint(json.dumps({'type': 'result', 'subtype': 'success', 'result': 'Repaired value.\\nCOMMIT_MESSAGE: Repair owned value'}))\n"
+            script += "value = int(os.environ.get('BOUNDARY_CANDIDATE_VALUE', '1'))\nPath('value.py').write_text(f'VALUE = {value}\\n')\nprint(json.dumps({'type': 'result', 'subtype': 'success', 'result': 'Repaired value.\\nCOMMIT_MESSAGE: Repair owned value'}))\n"
         stub.write_text(script)
         stub.chmod(0o755)
     config = load_project_config(root)
@@ -106,14 +106,30 @@ def _resume(root):
     return Session(orch, mode='fix', auto_approve=True).resume('owned-child')
 
 
-def _resume_retained_location(root, location):
+def _resume_retained_location(root, location, monkeypatch):
     if location == 'runtime':
         return _resume(root)
-    saved = _resume(root)
-    assert saved.status == 'completed', json.dumps(saved.execution_log[-1], indent=2)
+    from auto_agents import session_candidate
+
+    # Retain an interrupted, failing candidate so recovery must dispatch a
+    # writer in the legacy checkout. A completed passing receipt is correctly
+    # reused, and cannot prove that a second provider process was confined.
+    with monkeypatch.context() as interrupt:
+        interrupt.setenv('BOUNDARY_CANDIDATE_VALUE', '2')
+        record_receipt = session_candidate.record_receipt
+        def stop_after_receipt(session, state):
+            record_receipt(session, state)
+            raise KeyboardInterrupt()
+        interrupt.setattr(session_candidate, 'record_receipt', stop_after_receipt)
+        saved = _resume(root)
+    assert saved.status == 'paused', json.dumps(saved.execution_log[-1], indent=2)
     custody = saved.candidate_custody
+    assert not custody.get('delivered_revision')
+    assert not any(entry.get('action') == 'receipt_verification' for entry in saved.execution_log)
     previous_receipt = custody['receipt']['attempt_id']
+    previous_attempt = saved.current_attempt
     original_checkout = Path(custody['checkout'])
+    assert (original_checkout / 'value.py').read_text() == 'VALUE = 2\n'
     legacy = root / '.auto-agents/candidate-custody/retained/project'
     legacy.parent.mkdir(parents=True)
     shutil.move(original_checkout, legacy)
@@ -131,13 +147,18 @@ def _resume_retained_location(root, location):
     assert result.candidate_custody['checkout'] == str(legacy)
     assert (legacy.stat().st_dev, legacy.stat().st_ino) == identity
     assert result.candidate_custody['receipt']['attempt_id'] != previous_receipt
+    assert result.current_attempt == previous_attempt + 1
+    recovery = [entry for entry in result.execution_log if entry.get('action') == 'receipt_verification']
+    assert recovery and not recovery[0]['verification']['ok']
+    assert recovery[0]['verification']['executed_commands'] > 0
+    assert recovery[-1]['verification']['ok']
     return result
 
 
 @pytest.mark.parametrize('location', ['runtime', 'legacy'])
 def test_claude_writer_cannot_write_shared_or_dependency_targets(tmp_path, monkeypatch, location):
     root, dependency, before = _writer_project(tmp_path, monkeypatch)
-    result = _resume_retained_location(root, location)
+    result = _resume_retained_location(root, location, monkeypatch)
     assert result.status == 'completed', json.dumps(result.execution_log[-1], indent=2)
     candidate = Path(result.candidate_custody['checkout'])
     evidence = json.loads((candidate / 'claude-boundary.json').read_text())
@@ -159,7 +180,7 @@ globals()['test_claude_writer_cannot_write_shared_or_dependency_targets.'] = (
 @pytest.mark.parametrize('location', ['runtime', 'legacy'])
 def test_claude_fallback_keeps_candidate_write_boundary(tmp_path, monkeypatch, location):
     root, dependency, before = _writer_project(tmp_path, monkeypatch, fallback=True)
-    result = _resume_retained_location(root, location)
+    result = _resume_retained_location(root, location, monkeypatch)
     assert result.status == 'completed', json.dumps(result.execution_log[-1], indent=2)
     candidate = Path(result.candidate_custody['checkout'])
     for provider in ('codex', 'claude'):
