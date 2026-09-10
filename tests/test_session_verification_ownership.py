@@ -1705,7 +1705,7 @@ def test_public_resume_rejects_pytest_configuration_deselection(tmp_path, monkey
     assert diagnostic['retry_fix'] is False
 
 
-@pytest.mark.parametrize('source', ['structured', 'legacy', 'explicit_fix'])
+@pytest.mark.parametrize('source', ['structured', 'legacy', 'explicit_fix', 'manual'])
 @pytest.mark.parametrize('selector', ['deselect', 'name_filter', 'attached_name_filter',
                                      'marker_filter', 'override', 'config', 'unfiltered',
                                      'discovery_cli', 'discovery_attached', 'discovery_long',
@@ -1713,8 +1713,11 @@ def test_public_resume_rejects_pytest_configuration_deselection(tmp_path, monkey
                                      'discovery_other_config', 'discovery_inclusive',
                                      'norecurse_cli', 'norecurse_config', 'norecurse_toml',
                                      'norecurse_path', 'norecurse_override', 'norecurse_explicit',
-                                     'norecurse_unrelated', 'norecurse_default'])
-def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeypatch, source, selector):
+                                     'norecurse_unrelated', 'norecurse_default',
+                                     'filename_default', 'filename_explicit', 'filename_config',
+                                     'filename_addopts', 'inline_deselect'])
+def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeypatch, source, selector,
+                                                             retained=False):
     """A passing control cannot certify an explicitly excluded owned node."""
     from auto_agents.config import load_task_plan
     import auto_agents.session as session_module
@@ -1725,7 +1728,8 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     proof.write_text(proof.read_text() + f'    Path({str(marker)!r}).write_text("owned")\n'
                      '\ndef test_control(): assert True\n')
     inclusive = selector in {'unfiltered', 'discovery_inclusive', 'norecurse_override',
-                             'norecurse_explicit', 'norecurse_unrelated'}
+                             'norecurse_explicit', 'norecurse_unrelated',
+                             'filename_explicit', 'filename_config', 'filename_addopts'}
     if not inclusive:
         proof.write_text(proof.read_text().replace('def test_owned():\n',
                                                   'def test_owned():\n    assert False\n'))
@@ -1753,6 +1757,11 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         'norecurse_explicit': ['-o', 'norecursedirs=owned'],
         'norecurse_unrelated': ['-o', 'norecursedirs=other'],
         'norecurse_default': [],
+        'filename_default': [],
+        'filename_explicit': [],
+        'filename_config': [],
+        'filename_addopts': [],
+        'inline_deselect': [],
         'unfiltered': [],
     }[selector]
     if selector == 'marker_filter':
@@ -1767,6 +1776,13 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         (root / 'pytest.toml').write_text('[pytest]\npython_functions = ["test_control"]\n')
     required_node = 'tests/test_owned.py::test_owned'
     target = 'tests/test_owned.py'
+    if selector.startswith('filename_'):
+        proof.rename(root / 'tests/check_owned.py')
+        (root / 'tests/test_control.py').write_text('def test_control(): assert True\n')
+        required_node = 'tests/check_owned.py::test_owned'
+        target = 'tests/check_owned.py' if selector == 'filename_explicit' else 'tests'
+        if selector == 'filename_config':
+            (root / 'pytest.ini').write_text('[pytest]\npython_files = check_*.py test_*.py\n')
     if selector.startswith('norecurse_'):
         directory = 'build' if selector == 'norecurse_default' else 'owned'
         nested = root / 'tests' / directory / 'test_owned.py'
@@ -1780,12 +1796,22 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         if selector == 'norecurse_toml':
             (root / 'pyproject.toml').write_text('[tool.pytest.ini_options]\nnorecursedirs = ["owned"]\n')
     command = shlex.join(['./.conda/bin/python', '-m', 'pytest', '-q', *args, target])
+    if selector == 'filename_addopts':
+        command = "PYTEST_ADDOPTS='-o python_files=check_*.py' " + command
+        # Structured steps express their effective runner options as args.
+        args = ['-o', 'python_files=check_*.py']
+    elif selector == 'inline_deselect':
+        command = "PYTEST_ADDOPTS='--deselect=tests/test_owned.py::test_owned' " + command
+        args = ['--deselect=tests/test_owned.py::test_owned']
     config.gates.steps[0].targets = [target]
     config.gates.steps[0].args = args
     if source != 'structured':
         config.gates.steps = []
         config.gates.commands = [command] if source == 'legacy' else []
         child.fix_verify_command = command if source == 'explicit_fix' else ''
+        if source == 'manual':
+            from auto_agents.models import GateParallelGroup
+            config.gates.parallel_groups = [GateParallelGroup(name='manual', commands=[command])]
     if selector == 'discovery_other_config':
         from auto_agents.models import GateParallelGroup
         (root / 'z-other.ini').write_text('[pytest]\npython_functions = test_*\n')
@@ -1796,14 +1822,32 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     plan['tasks'][0]['verification_refs'] = [required_node]
     plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
     _retain_contract(root, child, config, plan)
+    if retained:
+        import auto_agents.session_verification as verification
+        # Model an authenticated older inventory that admitted this excluded
+        # node. Resume must recheck it before baseline or writer admission.
+        with monkeypatch.context() as old:
+            old.setattr(verification, '_validate_required_node_selection', lambda *_: None)
+            _binding_fixture(root, child)
+        save_session_state(root, child)
+        retained_binding = json.loads(json.dumps(child.verification_binding))
     ambient = {path: (root / path).read_bytes() for path in
                ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
     dispatched = []
     execute = session_module.run_gate_plan
     def observe(commands, *args, **kwargs):
         dispatched.extend(commands)
+        if selector == 'filename_default':
+            from auto_agents.models import CommandResult, GateResult
+            return GateResult(ok=True, commands=[CommandResult(
+                command=command, ok=True, returncode=0, cached=True,
+            ) for command in commands], summary='cached passing control')
         return execute(commands, *args, **kwargs)
     monkeypatch.setattr(session_module, 'run_gate_plan', observe)
+    if not inclusive:
+        def reject_baseline(*args, **kwargs):
+            pytest.fail('Known exclusions must block before baseline admission')
+        monkeypatch.setattr(Session, '_ensure_baseline', reject_baseline)
     saved, calls, _ = run_session(root, monkeypatch)
     if inclusive:
         assert saved.status == 'completed', saved.to_dict()
@@ -1818,11 +1862,25 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         diagnostic = saved.execution_log[-1]['diagnostic']
         assert diagnostic['verification_ref'] == required_node
         assert diagnostic['session_id'] == child.session_id
+        assert diagnostic['workflow_id'] == saved.workflow_id
+        assert diagnostic['handoff_id'] == child.parent_handoff_id
         assert diagnostic['owners'][0]['task_id'] == 'task-owned'
         assert diagnostic['owners'][0]['requirement_ids'] == ['REQ-owned']
         assert diagnostic['contract_fingerprint']
         assert diagnostic['retry_fix'] is False
+        if retained:
+            assert saved.verification_binding == retained_binding
+            resumed, repeated_calls, _ = run_session(root, monkeypatch)
+            assert resumed.status == 'blocked'
+            assert repeated_calls == dispatched == []
+            assert resumed.verification_binding == retained_binding
     assert {path: (root / path).read_bytes() for path in ambient} == ambient
+
+
+@pytest.mark.parametrize('source', ['structured', 'legacy', 'explicit_fix', 'manual'])
+def test_public_resume_rechecks_retained_default_filename_exclusion(tmp_path, monkeypatch, source):
+    test_public_resume_requires_executable_owned_node_coverage(
+        tmp_path, monkeypatch, source, 'filename_default', retained=True)
 
 
 @pytest.mark.parametrize('reference', ['node', 'proof_id'])

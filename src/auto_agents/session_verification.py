@@ -455,7 +455,17 @@ def _validate_binding_inventory(session, state):
         # Retained inventories may have been sealed by the old untyped
         # command matcher. A valid fingerprint cannot supply a missing proof.
         from .models import GateConfig
-        _owned_inventory(state, GateConfig.from_dict(_complete_gates(state)), session)
+        from .gates import command_from_verification_step
+        gates = GateConfig.from_dict(_complete_gates(state))
+        _owned_inventory(state, gates, session)
+        # A valid retained fingerprint does not make an older admission's
+        # selection assumptions executable. Recheck before baseline or writer
+        # dispatch, using the sealed configuration and original commands.
+        _validate_required_node_selection(session, state, [
+            *(step.command or command_from_verification_step(step, session.project_root)
+              for step in gates.steps), *_legacy_commands(gates),
+            binding.get('fix_verify_command', state.fix_verify_command),
+        ])
 
 
 def _validate_task_authority(state):
@@ -1089,8 +1099,8 @@ def _pytest_discovery_excludes(args, ref, *, directory, collection_root, source_
                         pattern = '*' + os.sep + pattern
                 if fnmatch(name, pattern):
                     return True
-    return bool(directory and 'python_files' in overrides
-                and not any(fnmatch(Path(path).name, pattern) for pattern in overrides['python_files']))
+    patterns = overrides.get('python_files', ['test_*.py', '*_test.py'])
+    return bool(directory and not any(fnmatch(Path(path).name, pattern) for pattern in patterns))
 
 
 def _pytest_selection_restricted(args):
