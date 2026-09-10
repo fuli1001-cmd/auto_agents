@@ -401,30 +401,40 @@ class Session:
             )
         return self._coordinator.start_session(self)
 
+    def _retain_resume_authority(self, state) -> bool:
+        """Capture persisted provenance before any coordinator migration."""
+        from copy import deepcopy
+        if self._resumed_verification_state is None:
+            self._resumed_verification_state = deepcopy(state)
+        if state.mode != 'fix':
+            return True
+        try:
+            if state.verification_binding:
+                bind_session(self, state)
+            elif not state.source_descriptor and not state.parent_handoff_id and head_ref(self.project_root):
+                refs = (state.baseline_git_ref, state.baseline_head_ref, state.lineage_head_ref)
+                if not any(subprocess.run(['git', 'rev-parse', '--verify', ref + '^{commit}'],
+                        cwd=self.project_root, capture_output=True).returncode == 0 for ref in refs if ref):
+                    raise ownership_error(state, 'session verification contract revision is unavailable')
+        except SessionOwnershipError as error:
+            self._block_execution_binding(state, error, 'verification_ownership')
+            return False
+        return True
+
     def resume(self, session_id: str) -> SessionState:
         """Resume an existing session.
 
-        Completed sessions are returned as-is.  Failed sessions are reset to
-        ``executing`` with a fresh attempt counter so the user can continue
-        where the previous run left off while preserving all prior context.
+        Failed sessions without a receipt start a fresh attempt epoch.
+        Retained private candidates recover verification and delivery before
+        any writer retry, preserving their original attempt budget.
         """
         existing = load_session_state(self.project_root, session_id)
-        self._resumed_verification_state = existing
         if existing.mode != self.mode:
-            raise ValueError(
-                f"session {session_id} is {existing.mode}, not {self.mode}"
-            )
-        if (self.mode == 'fix' and existing.status != 'completed'
-                and not existing.verification_binding and not existing.parent_handoff_id
-                and head_ref(self.project_root)
-                and not any(subprocess.run(['git', 'rev-parse', '--verify', ref + '^{commit}'],
-                    cwd=self.project_root, capture_output=True).returncode == 0
-                    for ref in (existing.baseline_git_ref, existing.baseline_head_ref, existing.lineage_head_ref) if ref)):
-            # Block before workflow migration can persist today's HEAD as
-            # apparent legacy history and authorize it on the next resume.
-            return self._block_execution_binding(existing, ownership_error(
-                existing, 'session verification contract revision is unavailable'), 'verification_ownership')
-        if existing.status == "completed" and not existing.parent_handoff_id:
+            raise ValueError(f"session {session_id} is {existing.mode}, not {self.mode}")
+        if not self._retain_resume_authority(existing):
+            return existing
+        if (existing.status == "completed" and not existing.parent_handoff_id
+                and not existing.candidate_custody):
             if not existing.workflow_id:
                 self._print(f"Session {session_id} is already completed.")
                 return existing
@@ -2058,6 +2068,9 @@ class Session:
             self._fix_verify_command_for_execution(state.fix_verify_command)
             bind_session(self, state)
             with execution_checkout(self, state):
+                if (state.candidate_custody.get("receipt")
+                        and state.status in {"completed", "failed", "blocked"}):
+                    return state
                 return self._phase_fix_execute_owned(state)
         except SessionOwnershipError as error:
             return self._block_execution_binding(state, error, "verification_ownership")
@@ -2078,7 +2091,7 @@ class Session:
                 self._ensure_baseline(state)
         except SessionOwnershipError as error:
             return self._block_execution_binding(state, error, "verification_ownership")
-        feedback = ""
+        feedback = getattr(self, "_receipt_retry_feedback", "")
         while True:
             self._reconcile_interrupted_collab_checkpoints(state)
             self._check_health_action()
@@ -2271,25 +2284,12 @@ class Session:
             verify = self._run_verify()
             verify_reason = "" if verify["ok"] else str(verify["reason"])
             self._append_verification_log(state, "verify", verify)
+            from .session_candidate import record_verification
+            record_verification(self, state, verify)
             self._save(state)
 
             if verify["ok"]:
-                self._print("Verification passed!")
-                self._run_session_persistence_action(state)
-                state.status = "completed"
-                state.resolution = "fixed"
-                if not self._git_commit(state, "fix", reply=reply):
-                    state.status = "failed"
-                    state.resolution = "commit_failed"
-                    self._save(state)
-                    self._print(
-                        "Verification passed, but the fix commit did not complete."
-                    )
-                    return state
-                self._record_release_attestation(state, verify)
-                self._release_baseline(state)
-                self._print(f"Bug fix completed in session {state.session_id}.")
-                return state
+                return self._complete_verified_fix(state, verify, reply)
 
             self._print(f"Verification failed: {verify_reason}")
             if verify.get("retry_fix") is False:
@@ -2318,6 +2318,26 @@ class Session:
         self._record_terminal_stop(state)
         self._save(state)
         self._print("Fix session stopped (no further progress). Session marked as failed.")
+        return state
+
+    def _complete_verified_fix(self, state, verify, reply):
+        self._print("Verification passed!")
+        self._run_session_persistence_action(state)
+        state.status, state.resolution = 'completed', 'fixed'
+        if not self._git_commit(state, 'fix', reply=reply):
+            state.status, state.resolution = 'failed', 'commit_failed'
+            self._save(state)
+            self._print("Verification passed, but the fix commit did not complete.")
+            return state
+        self._record_release_attestation(state, verify)
+        self._release_baseline(state)
+        if state.candidate_custody.get('receipt'):
+            from .session_candidate import verification_identity
+            state.execution_log.append({'action': 'receipt_completion',
+                'identity': verification_identity(self, state),
+                'delivered_revision': state.candidate_custody['delivered_revision']})
+        self._save(state)
+        self._print(f"Bug fix completed in session {state.session_id}.")
         return state
 
     def _phase_fix_after_child(self, state: SessionState) -> SessionState:
@@ -3815,6 +3835,7 @@ class Session:
             from .session_candidate import candidate_request
             with candidate_request(self, state, request) as scoped_request:
                 result: AgentResult = self.orch._call_with_failover(scoped_request)
+                self._candidate_writer_result = {"ok": result.ok, "reply": (result.summary or result.stdout).strip()}
                 if result.cleanup_incomplete:
                     raise ProviderCleanupIncompleteError("Provider cleanup incomplete; automatic execution stopped.")
         except BaseException:

@@ -17,15 +17,17 @@ def test_second_child_inherits_private_source_and_survives_parent_restart(tmp_pa
     root, child = project(tmp_path)
     store, _, _ = parent_workflow(root, child)
     shared_head, shared_index = head_ref(root), (root / '.git/index').read_bytes()
-    calls, observed = [], []
+    calls, observed, routes = [], [], []
 
     def agent(self, request):
         if request.purpose.startswith('collab'):
             parent = load_session_state(root, 'parent')
             if len(calls) == 1:
+                assert not routes, 'second child must retain explicit task authority and complete'
+                routes.append(True)
                 reply = 'ROUTE_WORKFLOW v1: ' + json.dumps({
                     'target': 'fix', 'reason': 'Continue repairing the same owned value',
-                    'issue_seed': {'summary': 'Retain the verified value and add the next implementation step'}})
+                    'issue_seed': {'task_id': 'task-owned', 'summary': 'Retain the verified value and add the next implementation step'}})
             else:
                 observed.append(request.cwd)
                 assert (request.cwd / 'second.txt').read_text() == 'second private child'

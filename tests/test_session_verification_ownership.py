@@ -2299,7 +2299,8 @@ def _prepare_binding_child_resume(root, store, snapshot, handoff):
 
 
 @pytest.mark.parametrize('has_workflow', [True, False])
-def test_public_legacy_resume_without_history_rejects_ambient_plan(tmp_path, monkeypatch, has_workflow):
+@pytest.mark.parametrize('entrypoint', ['session', 'coordinator'])
+def test_public_legacy_resume_without_history_rejects_ambient_plan(tmp_path, monkeypatch, has_workflow, entrypoint):
     from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
 
     root, child = project(tmp_path)
@@ -2310,12 +2311,28 @@ def test_public_legacy_resume_without_history_rejects_ambient_plan(tmp_path, mon
     ambient = _switch_ambient_binding_plan(root)
     git(root, 'add', '-A')
     git(root, 'commit', '-m', 'switch global contract without child history')
-    saved = _assert_binding_blocked_before_execution(root, monkeypatch)
+    from auto_agents.workflow_runtime import WorkflowCoordinator
+    def resume():
+        if entrypoint == 'session':
+            return _assert_binding_blocked_before_execution(root, monkeypatch)
+        def forbidden(*args, **kwargs):
+            pytest.fail('Missing retained authority must precede baseline and writer')
+        monkeypatch.setattr(Session, '_ensure_baseline', forbidden)
+        monkeypatch.setattr(Orchestrator, '_call_with_failover', forbidden)
+        coordinator = WorkflowCoordinator(Orchestrator(root))
+        if has_workflow:
+            result = coordinator.resume_workflow(child.workflow_id)
+        else:
+            result = coordinator.resume_session(Session(coordinator.orch, mode='fix'), child.session_id)
+        assert result.status == 'blocked'
+        assert result.execution_log[-1]['retry_fix'] is False
+        return result
+    saved = resume()
     assert saved.verification_binding == {}
     assert 'contract revision is unavailable' in saved.execution_log[-1]['result']
     assert saved.workflow_id == child.workflow_id
     assert saved.baseline_git_ref == saved.baseline_head_ref == saved.lineage_head_ref == ''
-    repeated = _assert_binding_blocked_before_execution(root, monkeypatch)
+    repeated = resume()
     assert repeated.verification_binding == {}
     assert repeated.lineage_head_ref == ''
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
@@ -2908,7 +2925,8 @@ def test_public_resume_validates_registered_runtime_and_retains_legacy_custody(t
     resumed, calls, _ = run_session(root, monkeypatch)
     if location in {'runtime', 'legacy'}:
         assert resumed.status == 'completed', resumed.to_dict()
-        assert calls == ['fix']
+        assert calls == []
+        assert resumed.candidate_custody['receipt'] == receipt
         assert resumed.candidate_custody['checkout'] == saved.candidate_custody['checkout']
     else:
         assert resumed.status == 'blocked', resumed.to_dict()
@@ -3165,7 +3183,8 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(
         contexts.append(kwargs.get('contract_fingerprint'))
         return executor(self, *args, **kwargs)
     monkeypatch.setattr(Orchestrator, '_gate_executor_context', observe)
-    for _ in range(2):
+    for resume_index in range(2):
+        before_contexts = len(contexts)
         before_log = len(result.execution_log)
         result = Session(orch, mode='fix', auto_approve=True).resume(state.session_id)
         assert result.status == 'completed', result.to_dict()
@@ -3178,10 +3197,14 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(
         assert {key: value for key, value in result.candidate_custody.items()
                 if key != 'binding_migration'} == retained
         assert result.candidate_custody['binding_migration']['receipt'] == retained['receipt']
-        assert any(entry['action'] == 'inventory_migration_verify' and entry['result'] == 'pass'
-                   for entry in result.execution_log[before_log:])
+        fresh_verification = any(entry['action'] == 'inventory_migration_verify' and entry['result'] == 'pass'
+                                 for entry in result.execution_log[before_log:])
+        assert fresh_verification == (resume_index == 0)
         expected = verification.fingerprint([binding['binding_fingerprint'], retained['receipt']['fingerprint']])
-        assert contexts and all(identity == expected for identity in contexts)
+        if resume_index == 0:
+            assert contexts and all(identity == expected for identity in contexts)
+        else:
+            assert len(contexts) == before_contexts, 'matching durable verification must not execute again'
         assert binding['proof_sources']['tests/test_initial.py'] == (root / 'tests/test_initial.py').read_text()
     custody = result.candidate_custody
     private = Path(custody['checkout'])
@@ -3629,45 +3652,144 @@ def _retain_candidate_binding_identity(state):
     custody = state.candidate_custody
     custody['binding_fingerprint'] = state.verification_binding['binding_fingerprint']
     receipt = custody['receipt']
+    previous_fingerprint = receipt['fingerprint']
     receipt['binding_fingerprint'] = custody['binding_fingerprint']
     receipt['fingerprint'] = fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'})
+    for entry in state.execution_log:
+        if entry.get('action') == 'receipt_writer_result' and entry.get('receipt_fingerprint') == previous_fingerprint:
+            entry['receipt_fingerprint'] = receipt['fingerprint']
 
 
-@pytest.mark.parametrize('inventory_version', [None, 1, 2])
-def test_public_inventory_migration_resumes_existing_undelivered_receipt(tmp_path, monkeypatch, inventory_version):
+@pytest.mark.parametrize('inventory_version,boundary,outcome', [
+    (None, 'receipt', 'pass'), (1, 'receipt', 'pass'), (2, 'receipt', 'pass'),
+    (3, 'verification', 'pass'), (3, 'delivery', 'pass'), (3, 'legacy_pass', 'pass'),
+    (3, 'receipt', 'failure'), (3, 'receipt', 'exhausted'),
+    (3, 'receipt', 'inconclusive'), (3, 'delivery', 'missing_disposition'),
+])
+def test_public_inventory_migration_resumes_existing_undelivered_receipt(
+        tmp_path, monkeypatch, inventory_version, boundary, outcome):
     from copy import deepcopy
+    import auto_agents.session_candidate as candidate
     from auto_agents.session_verification import fingerprint
 
     root, child = project(tmp_path)
-    child, _, _ = run_session(root, monkeypatch)
-    assert child.status == 'completed'
-    # Retain the same frozen candidate at an interrupted pre-delivery boundary.
-    child.status = 'failed'
-    child.candidate_custody.pop('delivered_revision')
-    for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
-        child.verification_binding.pop(key, None)
-    if inventory_version is not None:
-        child.verification_binding['proof_inventory_version'] = inventory_version
-    child.verification_binding['binding_fingerprint'] = fingerprint({
-        k: v for k, v in child.verification_binding.items() if k != 'binding_fingerprint'})
-    _retain_candidate_binding_identity(child)
+    if outcome == 'inconclusive':
+        path = root / 'tests/test_owned.py'
+        path.write_text('import os\nif os.environ.get("OWNED_PREREQUISITE") != "ready":\n'
+                        '    raise ImportError("required runtime input unavailable")\n' + path.read_text())
+        git(root, 'add', 'tests/test_owned.py')
+        git(root, 'commit', '-m', 'retain prerequisite dependent proof')
+        child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
+        save_session_state(root, child)
+    # Interrupt production at a durable boundary; retain actual Git, baseline,
+    # pytest, writer confinement and public Session.resume execution.
+    with monkeypatch.context() as interrupt:
+        if boundary == 'receipt':
+            original = candidate.record_receipt
+            def stop(session, state):
+                original(session, state)
+                raise KeyboardInterrupt()
+            interrupt.setattr(candidate, 'record_receipt', stop)
+        elif boundary == 'verification':
+            original = Session._run_session_persistence_action
+            def stop(self, state):
+                raise KeyboardInterrupt()
+            interrupt.setattr(Session, '_run_session_persistence_action', stop)
+        else:
+            original = candidate.deliver_candidate
+            def stop(session, state, message):
+                original(session, state, message)
+                raise KeyboardInterrupt()
+            interrupt.setattr(candidate, 'deliver_candidate', stop)
+        orch = Orchestrator(root)
+        def writer(request):
+            value = 2 if outcome in {'failure', 'exhausted'} else 1
+            (request.cwd / 'value.py').write_text(f'VALUE = {value}\n')
+            reply = 'Fixed owned value.\nCOMMIT_MESSAGE: Repair owned value'
+            request.output_path.write_text(reply)
+            return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                               summary=reply, stdout=reply, returncode=0)
+        interrupt.setattr(orch, '_call_with_failover', writer)
+        child = Session(orch, mode='fix', auto_approve=True).resume(child.session_id)
+    assert child.status == 'paused', child.to_dict()
+    if boundary == 'legacy_pass':
+        child.execution_log = [entry for entry in child.execution_log if entry.get('action') != 'receipt_verification']
+        assert any(entry.get('action') == 'verify' and entry.get('result') == 'pass' for entry in child.execution_log)
+    if outcome == 'missing_disposition':
+        child.execution_log = [entry for entry in child.execution_log
+                               if entry.get('action') not in {'receipt_writer_result', 'fix'}]
+        child.status = 'completed'
+    if inventory_version != 3:
+        for key in ('proof_graph', 'proof_inventory_version', 'required_references'):
+            child.verification_binding.pop(key, None)
+        if inventory_version is not None:
+            child.verification_binding['proof_inventory_version'] = inventory_version
+        child.verification_binding['binding_fingerprint'] = fingerprint({
+            k: v for k, v in child.verification_binding.items() if k != 'binding_fingerprint'})
+        _retain_candidate_binding_identity(child)
+    if outcome == 'exhausted':
+        child.hard_ceiling = child.current_attempt
     retained = deepcopy(child.candidate_custody)
+    attempts = child.current_attempt
     save_session_state(root, child)
     ambient = _switch_ambient_binding_plan(root)
+    (root / 'foreign.py').write_text('VALUE = 88\n')
+    git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 99\n')
+    (root / 'foreign.py').chmod(0o711)
+    (root / 'foreign-note.txt').write_bytes(b'foreign\x00bytes')
+    protected = {name: (root / name).read_bytes() for name in (
+        '.git/index', 'value.py', 'foreign.py', 'foreign-note.txt', *ambient)}
+    refs = git(root, 'show-ref')
+    verified = []
+    verify = Session._run_verify
+    def observe(self, *args, **kwargs):
+        verified.append(self._current_state.candidate_custody['receipt']['source_revision'])
+        return verify(self, *args, **kwargs)
+    monkeypatch.setattr(Session, '_run_verify', observe)
     saved, calls, _ = run_session(root, monkeypatch)
-    assert saved.status == 'completed', saved.to_dict()
-    assert calls == ['fix']
-    custody = saved.candidate_custody
+    if outcome in {'pass', 'failure'}:
+        assert saved.status == 'completed', saved.to_dict()
+        assert calls == (['fix'] if outcome == 'failure' else [])
+        assert saved.current_attempt == attempts + len(calls)
+    else:
+        assert saved.status in {'failed', 'blocked'}, saved.to_dict()
+        assert calls == []
+        if outcome == 'missing_disposition':
+            assert saved.candidate_custody['delivered_revision'] == retained['delivered_revision']
+            assert saved.execution_log[-1]['retry_fix'] is False
+        else:
+            assert not saved.candidate_custody.get('delivered_revision')
+        assert saved.current_attempt == attempts
+    custody = deepcopy(saved.candidate_custody)
     assert custody['checkout'] == retained['checkout']
     assert custody['base_revision'] == retained['base_revision']
     assert custody['binding_fingerprint'] == retained['binding_fingerprint']
-    assert custody['binding_migration']['receipt'] == retained['receipt']
-    assert custody['receipt']['binding_fingerprint'] == saved.verification_binding['binding_fingerprint']
+    if outcome != 'failure':
+        assert custody['receipt'] == retained['receipt']
+    else:
+        archive = next(entry for entry in saved.execution_log if entry['action'] == 'candidate_superseded')
+        assert archive['receipt'] == retained['receipt']
+    if boundary in {'receipt', 'legacy_pass'}:
+        assert verified[0] == retained['receipt']['source_revision']
+    else:
+        assert verified == [], 'durable keyed pass must resume delivery without verification'
+    assert any(entry.get('action') == 'receipt_verification' for entry in saved.execution_log)
+    count = len(verified)
+    (root / 'foreign-note.txt').write_bytes(b'new ambient bytes')
+    protected['foreign-note.txt'] = b'new ambient bytes'
     repeated, calls, _ = run_session(root, monkeypatch)
-    assert repeated.status == 'completed' and calls == []
+    assert calls == [] and len(verified) == count
     assert repeated.candidate_custody == custody
-    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
-    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+    assert {name: (root / name).read_bytes() for name in protected} == protected
+    assert (root / 'foreign.py').stat().st_mode & 0o777 == 0o711
+    assert git(root, 'show-ref') == refs
+    if outcome == 'inconclusive':
+        monkeypatch.setenv('OWNED_PREREQUISITE', 'ready')
+        resolved, calls, _ = run_session(root, monkeypatch)
+        assert resolved.status == 'completed', resolved.to_dict()
+        assert calls == [] and len(verified) == count + 1
+        assert resolved.candidate_custody['receipt'] == retained['receipt']
 
 
 @pytest.mark.parametrize('previous_version,intermediate_writer', [
@@ -3679,6 +3801,13 @@ def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_p
     import auto_agents.session_verification as verification
 
     root, child = project(tmp_path)
+    if intermediate_writer:
+        path = root / 'tests/test_owned.py'
+        path.write_text(path.read_text().replace('"VALUE = 1"', '"VALUE = " + __import__("os").environ.get("OWNED_EXPECTED_VALUE", "1")'))
+        git(root, 'add', 'tests/test_owned.py')
+        git(root, 'commit', '-m', 'retain environment dependent owned assertion')
+        child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
+        save_session_state(root, child)
     with monkeypatch.context() as old:
         old.setattr(verification, '_PROOF_INVENTORY_VERSION', previous_version)
         child, calls, _ = run_session(root, old)
@@ -3695,10 +3824,23 @@ def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_p
             # A fresh writer runs after the original custody upgrade.
             # The new inventory must accept its receipt through the bridge.
             child.status = 'failed'
-            child.candidate_custody.pop('delivered_revision')
+            old.setenv('OWNED_EXPECTED_VALUE', '2')
+            original_call = Session._call_agent
+            def repair(self, state, label, prompt):
+                assert 'verification' in prompt.lower()
+                from auto_agents.session_candidate import completed_delivery
+                assert state.candidate_custody['delivered_revision']
+                assert not completed_delivery(state), 'failed inventory must make old delivery ineligible'
+                assert any(entry.get('action') == 'receipt_verification' and not entry['verification']['ok']
+                           for entry in state.execution_log)
+                old.setenv('OWNED_EXPECTED_VALUE', '1')
+                return original_call(self, state, label, prompt)
+            old.setattr(Session, '_call_agent', repair)
             save_session_state(root, child)
             child, calls, _ = run_session(root, old)
             assert child.status == 'completed' and calls == ['fix']
+            assert any(entry['action'] == 'candidate_superseded' and entry['delivered_revision']
+                       for entry in child.execution_log)
             assert child.candidate_custody['receipt']['binding_fingerprint'] == child.verification_binding['binding_fingerprint']
             assert child.candidate_custody['receipt']['binding_fingerprint'] != child.candidate_custody['binding_fingerprint']
     retained = deepcopy(child.candidate_custody)
@@ -3743,7 +3885,7 @@ def _assert_migrated_candidate_reused(root, monkeypatch, saved, retained):
     assert repeated.verification_binding == saved.verification_binding
     assert repeated.baseline_git_ref == saved.baseline_git_ref
     assert repeated.baseline_head_ref == saved.baseline_head_ref
-    assert contexts and all(identity == expected for identity in contexts)
+    assert not contexts, 'matching durable verification must not execute again'
     assert git(Path(custody['checkout']), 'show', custody['receipt']['source_revision'] + ':value.py') == 'VALUE = 1\n'
 
 

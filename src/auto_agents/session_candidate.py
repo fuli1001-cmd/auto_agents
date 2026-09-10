@@ -185,18 +185,11 @@ def execution_checkout(session, state):
     session.orch = execution
     session._execution_binding = context
     try:
-        if custody.get('binding_migration') and custody.get('delivered_revision'):
-            # A retained completion predates the recovered proof inventory.
-            # Reuse its immutable candidate, but attest with the new binding
-            # identity (which is already part of the gate certificate key).
+        if state.mode == 'fix' and custody.get('receipt'):
             previous_state = session._current_state
             session._current_state = state
             try:
-                result = session._run_verify()
-                session._append_verification_log(state, 'inventory_migration_verify', result)
-                if not result['ok']:
-                    raise ownership_error(state, 'retained candidate failed upgraded inventory verification',
-                                          verification=result)
+                recover_receipt(session, state)
             finally:
                 session._current_state = previous_state
         yield
@@ -278,11 +271,113 @@ def validate_receipt(state):
     _git(root, 'cat-file', '-e', receipt['source_revision'] + '^{commit}')
 
 
+def verification_identity(session, state):
+    """Relevant private evidence, independent of resume epochs and shared edits."""
+    from .workers import gate_environment_fingerprint
+    gates = session.config.gates
+    environment = gate_environment_fingerprint(
+        isolation_mode=gates.isolation.mode, environment_id=gates.distributed.mode,
+        distributed=gates.distributed.enabled,
+        extra_denylist=gates.distributed.extra_environment_denylist,
+        project_root=session.project_root)
+    receipt = state.candidate_custody['receipt']
+    return fingerprint([receipt['fingerprint'], receipt['source_revision'],
+        state.verification_binding, state.fix_verify_command, state.full_verify,
+        environment])
+
+
+def record_verification(session, state, result, *, identity=None):
+    if not state.candidate_custody.get('receipt'):
+        return
+    from copy import deepcopy
+    state.execution_log.append({'action': 'receipt_verification',
+        'identity': identity or verification_identity(session, state),
+        'receipt_fingerprint': state.candidate_custody['receipt']['fingerprint'],
+        'binding_fingerprint': state.verification_binding['binding_fingerprint'],
+        'verification': deepcopy(result)})
+    session._save(state)
+
+
+def recover_receipt(session, state):
+    """Verify an interrupted writer's exact candidate before retry or delivery."""
+    receipt = state.candidate_custody['receipt']
+    identity = verification_identity(session, state)
+    retained = next((entry for entry in reversed(state.execution_log)
+        if entry.get('action') == 'receipt_verification' and entry.get('identity') == identity), None)
+    if retained is None:
+        # Legacy pass logs and delivered revisions do not attest this inventory.
+        # A changed environment reopens diagnostics for the same candidate.
+        state.verification_diagnostics = {}
+        with session._session_verification_context():
+            session._ensure_baseline(state)
+        result = session._run_verify()
+        session._append_verification_log(state, 'inventory_migration_verify', result)
+        record_verification(session, state, result, identity=identity)
+    else:
+        result = retained['verification']
+    if result['ok']:
+        if completed_delivery(state) and any(
+                entry.get('action') == 'receipt_completion' and entry.get('identity') == identity
+                and entry.get('delivered_revision') == state.candidate_custody['delivered_revision']
+                for entry in state.execution_log):
+            state.status, state.resolution = 'completed', 'fixed'
+            session._save(state)
+            return
+        writer = next((entry for entry in reversed(state.execution_log)
+            if entry.get('action') == 'receipt_writer_result'
+            and entry.get('receipt_fingerprint') == receipt['fingerprint']), None)
+        if writer is not None:
+            reply = writer['reply'] if writer['ok'] else ''
+        else:
+            # The pre-receipt protocol retained successful writer replies here.
+            reply = next((entry.get('result', '') for entry in reversed(state.execution_log)
+                if entry.get('action') == 'fix' and entry.get('attempt') == receipt['attempt']), '')
+            if len(reply) >= 500:
+                reply = ''  # Truncated legacy text cannot establish the full disposition.
+        disposition, error = session._parse_fix_disposition(reply)
+        if (not reply or error or (disposition and disposition.get('decision') == 'run_iteration')
+                or session._apply_session_persistence_marker(state, reply)
+                or session._session_persistence_issue(state)):
+            raise ownership_error(state, 'retained writer disposition or persistence evidence is unavailable')
+        session._complete_verified_fix(state, result, reply)
+        return
+    if result.get('retry_fix') is False:
+        state.status = 'blocked'
+        state.resolution = 'verification_inconclusive'
+        session._save(state)
+        return
+    stop = session._should_stop(state, str(result.get('reason', 'verification failed')))
+    if stop:
+        state.status = 'failed'
+        session._record_terminal_stop(state)
+        session._save(state)
+        return
+    # Admission and the ordinary writer boundary still govern a retry. Keep
+    # the receipt and any old delivery until a new writer receipt is recorded.
+    session._receipt_retry_feedback = session.orch._format_retry_feedback(
+        'local_verification', reason=str(result.get('reason', 'verification failed')))
+    state.status, state.resolution = 'executing', ''
+    session._save(state)
+
+
 def record_receipt(session, state):
     receipt = getattr(session, '_candidate_receipt', None)
     if receipt is None:
         raise ownership_error(state, 'candidate writer did not return a frozen receipt')
+    previous = state.candidate_custody.get('receipt')
+    if previous and previous != receipt:
+        from copy import deepcopy
+        state.execution_log.append({'action': 'candidate_superseded',
+            'receipt': deepcopy(previous),
+            'delivered_revision': state.candidate_custody.get('delivered_revision', ''),
+            'binding_fingerprint': state.verification_binding['binding_fingerprint']})
+        state.candidate_custody.pop('delivered_revision', None)
     state.candidate_custody['receipt'] = receipt
+    writer = getattr(session, '_candidate_writer_result', None)
+    if writer is not None:
+        state.execution_log.append({'action': 'receipt_writer_result',
+            'receipt_fingerprint': receipt['fingerprint'], **writer})
+        session._candidate_writer_result = None
     state.candidate_paths = {path: fingerprint(entry['postimage']) for path, entry in receipt['manifest'].items()}
     validate_receipt(state)
     session._candidate_receipt = None
@@ -297,6 +392,8 @@ def deliver_candidate(session, state, message):
         raise ownership_error(state, 'candidate delivery requires a writer receipt')
     # The verified snapshot is a real commit in the private object database.
     # Give delivery its normal user-facing subject without changing its tree.
+    if completed_delivery(state):
+        return True
     tree = _git(session.project_root, 'rev-parse', receipt['source_revision'] + '^{tree}')
     revision = _git(session.project_root, 'commit-tree', tree, '-p', custody['base_revision'], '-m', message)
     custody['delivered_revision'] = revision
@@ -312,6 +409,13 @@ def completed_delivery(state):
     revision = custody.get('delivered_revision')
     if not receipt or not revision:
         return False
+    for entry in reversed(state.execution_log):
+        if (entry.get('action') == 'receipt_verification'
+                and entry.get('receipt_fingerprint') == receipt['fingerprint']
+                and entry.get('binding_fingerprint') == state.verification_binding.get('binding_fingerprint')):
+            if not entry['verification']['ok']:
+                return False
+            break
     validate_receipt(state)
     root = Path(custody['checkout'])
     if _git(root, 'rev-parse', revision + '^{tree}') != _git(root, 'rev-parse', receipt['source_revision'] + '^{tree}'):
@@ -321,6 +425,10 @@ def completed_delivery(state):
 
 def consume_delivery(root, state, delivery, *, child_id):
     """Materialize the child's revision for the parent's next public execution."""
+    from .config import load_session_state
+    child = load_session_state(root, child_id)
+    if child.status != 'completed' or not completed_delivery(child) or child.candidate_custody != delivery:
+        raise ownership_error(state, 'delivery is not eligible under the retained child verification')
     source = Path(delivery['checkout'])
     receipt = delivery['receipt']
     receipt_binding = delivery['binding_fingerprint']

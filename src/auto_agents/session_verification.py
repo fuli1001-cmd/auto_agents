@@ -169,7 +169,7 @@ def _bind_session(session, state) -> None:
     if state.source_descriptor:
         revision = state.source_descriptor['contract_revision']
     resumed = getattr(session, '_resumed_verification_state', None)
-    if resumed is not None and resumed.session_id == state.session_id:
+    if resumed is not None and resumed.session_id == state.session_id and not state.source_descriptor:
         # Workflow migration may populate lineage with today's HEAD. That is
         # not evidence of the contract authorized by a legacy session.
         revision = resumed.baseline_git_ref or resumed.baseline_head_ref or resumed.lineage_head_ref

@@ -59,13 +59,16 @@ class WorkflowCoordinator:
         self.run_lock = run_lock
 
     def _create_session(self, session: object):
-        return create_session(
+        state = create_session(
             self.project_root,
             session.mode,
             hard_ceiling=session.config.execution.session_limits.for_mode(
                 session.mode
             ),
         )
+
+        session._fresh_session_id = state.session_id
+        return state
 
     @staticmethod
     def _engine_blocker_error(state: object) -> RuntimeError | None:
@@ -223,6 +226,19 @@ class WorkflowCoordinator:
             state = self._create_session(session)
             handoff.payload["child_session_id"] = state.session_id
             self.store.save_handoff(handoff)
+        if retained_child:
+            from .session_verification import ownership_error
+            expected = {'workflow_id': snapshot.workflow_id, 'parent_handoff_id': handoff.handoff_id,
+                        'mode': session.mode, 'source_descriptor': dict(handoff.payload.get('source_descriptor', {}))}
+            for key in ('authorization_policy', 'goal_execution_environment'):
+                if handoff.payload.get(key):
+                    expected[key] = handoff.payload[key]
+            if any(getattr(state, key) != value for key, value in expected.items()):
+                return session._block_execution_binding(state, ownership_error(
+                    state, 'retained child identity conflicts with seeded handoff'), 'verification_ownership')
+            if not session._retain_resume_authority(state):
+                return state
+            return self._drive_session(session, state, snapshot, root=False)
         self.auto_approve = bool(
             self.auto_approve or handoff.payload.get("auto_approve", False)
         )
@@ -277,8 +293,10 @@ class WorkflowCoordinator:
             raise ValueError(
                 f"session {session_id} is {state.mode}, not {session.mode}"
             )
+        if not session._retain_resume_authority(state):
+            return state
         resume_state_changed = False
-        if state.status != "completed":
+        if state.status != "completed" and not state.candidate_custody.get("receipt"):
             resume_state_changed = session._invalidate_provider_continuations(
                 state,
                 reason="process-level session resume uses the durable transcript",
@@ -366,7 +384,6 @@ class WorkflowCoordinator:
             snapshot = candidates[0]
             self.store.activate(snapshot.workflow_id)
         root = snapshot.root
-        self._inherit_root_policies(snapshot)
         if root.kind in {"collab", "fix", "provider_resolve"}:
             from .session import Session
 
@@ -383,6 +400,7 @@ class WorkflowCoordinator:
         if root.kind == "run":
             self._reconcile_open_operations(snapshot)
             self.store.begin_resume(snapshot)
+            self._inherit_root_policies(snapshot)
             return self._resume_run_root(snapshot)
         raise RuntimeError(f"unsupported workflow root: {root.kind}")
 
@@ -475,7 +493,6 @@ class WorkflowCoordinator:
         self._reconcile_open_operations(snapshot)
         self.store.begin_resume(snapshot)
         root = snapshot.root
-        self._inherit_root_policies(snapshot)
         if root.kind in {"collab", "fix", "provider_resolve"}:
             from .session import Session
 
@@ -492,6 +509,11 @@ class WorkflowCoordinator:
                 self.project_root,
                 root.native_id,
             )
+            if not session._retain_resume_authority(state):
+                return state
+            self._inherit_root_policies(snapshot)
+            session._auto_approve = self.auto_approve
+            session._full_verify = self.full_verify
             self._ensure_completed_session_commit(session, state)
             snapshot = self.store.load(snapshot.workflow_id)
             return self._drive_session(
@@ -500,6 +522,7 @@ class WorkflowCoordinator:
                 snapshot,
                 root=True,
             )
+        self._inherit_root_policies(snapshot)
         return self._resume_run_root(snapshot)
 
     def _inherit_root_policies(self, snapshot: WorkflowSnapshot) -> None:
@@ -577,7 +600,14 @@ class WorkflowCoordinator:
                 },
             )
 
-    def _ensure_completed_session_commit(
+    def _ensure_completed_session_commit(self, session: object, state: object) -> None:
+        from .session_verification import SessionOwnershipError
+        try:
+            self._ensure_completed_session_commit_owned(session, state)
+        except SessionOwnershipError as error:
+            session._block_execution_binding(state, error, 'verification_ownership')
+
+    def _ensure_completed_session_commit_owned(
         self,
         session: object,
         state: object,
@@ -591,6 +621,8 @@ class WorkflowCoordinator:
         # source inside custody here too; shared HEAD is not its commit log.
         context = execution_checkout(session, state) if state.candidate_custody else nullcontext()
         with context:
+            if state.status != "completed":
+                return
             def committed():
                 return (bool(state.candidate_custody) and completed_delivery(state)
                         or _head_contains_completed_session(session.project_root, state.session_id))
@@ -613,6 +645,9 @@ class WorkflowCoordinator:
         *,
         root: bool,
     ):
+        if (getattr(session, "_fresh_session_id", None) != state.session_id
+                and not session._retain_resume_authority(state)):
+            return state
         session._coordinator = self
         session._coordinator_managed = True
         if state.status == "failed":
@@ -620,11 +655,9 @@ class WorkflowCoordinator:
                 state,
                 reason="failed session started a fresh durable resume boundary",
             )
-            state.current_attempt = 0
-            session._begin_attempt_epoch(
-                state,
-                reason="failed session resumed",
-            )
+            if not state.candidate_custody.get("receipt"):
+                state.current_attempt = 0
+                session._begin_attempt_epoch(state, reason="failed session resumed")
             state.status = (
                 "waiting_child"
                 if state.active_handoff_id
@@ -642,10 +675,8 @@ class WorkflowCoordinator:
                 state,
                 reason="interrupted session started a fresh durable resume boundary",
             )
-            session._begin_attempt_epoch(
-                state,
-                reason="interrupted session resumed",
-            )
+            if not state.candidate_custody.get("receipt"):
+                session._begin_attempt_epoch(state, reason="interrupted session resumed")
             state.status = (
                 "waiting_child"
                 if state.active_handoff_id
@@ -966,6 +997,8 @@ class WorkflowCoordinator:
         session = Session(self.orch, mode="fix", auto_approve=state.auto_approve,
                           full_verify=state.full_verify, coordinator=self,
                           health_runtime=self.health_runtime)
+        if not session._retain_resume_authority(state):
+            return self._session_result(state, original)
         from .session_verification import engine_verification_refs
         refs = engine_verification_refs(state.fix_verify_command, self.project_root, payload)
         if refs and state.status != "completed" and not any(
@@ -1452,7 +1485,7 @@ class WorkflowCoordinator:
         after = delivery.get('delivered_revision') or head_ref(self.project_root)
         source = Path(delivery['checkout']) if delivery else self.project_root
         return {
-            "candidate_delivery": delivery if delivery.get('delivered_revision') else {},
+            "candidate_delivery": delivery if state.status == "completed" and delivery.get('delivered_revision') else {},
             "status": state.status,
             "resolution": state.resolution,
             "summary": state.resolution or f"{state.mode} status={state.status}",
