@@ -1715,7 +1715,11 @@ def test_public_resume_rejects_pytest_configuration_deselection(tmp_path, monkey
                                      'norecurse_path', 'norecurse_override', 'norecurse_explicit',
                                      'norecurse_unrelated', 'norecurse_default',
                                      'filename_default', 'filename_explicit', 'filename_config',
-                                     'filename_addopts', 'inline_deselect'])
+                                     'filename_addopts', 'filename_config_addopts_excluded',
+                                     'filename_config_addopts_included',
+                                     'filename_config_env_excluded', 'filename_config_env_included',
+                                     'filename_config_cli_excluded', 'filename_config_cli_included',
+                                     'inline_deselect'])
 def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeypatch, source, selector,
                                                              retained=False):
     """A passing control cannot certify an explicitly excluded owned node."""
@@ -1730,6 +1734,7 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     inclusive = selector in {'unfiltered', 'discovery_inclusive', 'norecurse_override',
                              'norecurse_explicit', 'norecurse_unrelated',
                              'filename_explicit', 'filename_config', 'filename_addopts'}
+    inclusive |= selector.endswith('_included')
     if not inclusive:
         proof.write_text(proof.read_text().replace('def test_owned():\n',
                                                   'def test_owned():\n    assert False\n'))
@@ -1761,6 +1766,12 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         'filename_explicit': [],
         'filename_config': [],
         'filename_addopts': [],
+        'filename_config_addopts_excluded': [],
+        'filename_config_addopts_included': [],
+        'filename_config_env_excluded': [],
+        'filename_config_env_included': [],
+        'filename_config_cli_excluded': [],
+        'filename_config_cli_included': [],
         'inline_deselect': [],
         'unfiltered': [],
     }[selector]
@@ -1783,6 +1794,20 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         target = 'tests/check_owned.py' if selector == 'filename_explicit' else 'tests'
         if selector == 'filename_config':
             (root / 'pytest.ini').write_text('[pytest]\npython_files = check_*.py test_*.py\n')
+        if selector.startswith(('filename_config_addopts_', 'filename_config_env_',
+                                'filename_config_cli_')):
+            final_pattern = 'check_*.py test_*.py' if inclusive else 'test_*.py'
+            opposite_pattern = 'test_*.py' if inclusive else 'check_*.py test_*.py'
+            # Make each successive precedence layer disagree. The control
+            # passes even when the required failing node is not discovered.
+            config_pattern, addopts_pattern = opposite_pattern, final_pattern
+            if '_env_' in selector or '_cli_' in selector:
+                config_pattern, addopts_pattern = final_pattern, opposite_pattern
+            (root / 'pytest.ini').write_text(
+                '[pytest]\npython_files = ' + config_pattern + '\naddopts = '
+                + shlex.join(['-o', 'python_files=' + addopts_pattern]) + '\n')
+            if '_cli_' in selector:
+                args = ['-o', 'python_files=' + final_pattern]
     if selector.startswith('norecurse_'):
         directory = 'build' if selector == 'norecurse_default' else 'owned'
         nested = root / 'tests' / directory / 'test_owned.py'
@@ -1796,6 +1821,12 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         if selector == 'norecurse_toml':
             (root / 'pyproject.toml').write_text('[tool.pytest.ini_options]\nnorecursedirs = ["owned"]\n')
     command = shlex.join(['./.conda/bin/python', '-m', 'pytest', '-q', *args, target])
+    if selector.startswith('filename_config_env_'):
+        command = ('PYTEST_ADDOPTS=' + shlex.quote(shlex.join(['-o', 'python_files=' + final_pattern]))
+                   + ' ' + command)
+        # Structured runner steps carry effective options in args; their
+        # command is generated from those fields rather than shell text.
+        args = ['-o', 'python_files=' + final_pattern]
     if selector == 'filename_addopts':
         command = "PYTEST_ADDOPTS='-o python_files=check_*.py' " + command
         # Structured steps express their effective runner options as args.
@@ -1878,9 +1909,14 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize('source', ['structured', 'legacy', 'explicit_fix', 'manual'])
-def test_public_resume_rechecks_retained_default_filename_exclusion(tmp_path, monkeypatch, source):
+@pytest.mark.parametrize('selector', [
+    'filename_default', 'filename_config_addopts_excluded', 'filename_config_addopts_included',
+    'filename_config_env_excluded', 'filename_config_env_included',
+    'filename_config_cli_excluded', 'filename_config_cli_included',
+])
+def test_public_resume_rechecks_retained_default_filename_exclusion(tmp_path, monkeypatch, source, selector):
     test_public_resume_requires_executable_owned_node_coverage(
-        tmp_path, monkeypatch, source, 'filename_default', retained=True)
+        tmp_path, monkeypatch, source, selector, retained=True)
 
 
 @pytest.mark.parametrize('reference', ['node', 'proof_id'])

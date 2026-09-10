@@ -970,11 +970,15 @@ def _validate_required_node_selection(session, state, commands):
                 settings = _pytest_selection_config(session.project_root, cwd, options,
                                                     targets, configurations)
                 addopts = settings.get('addopts', [])
-                config_args = shlex.split(addopts) if isinstance(addopts, str) else list(addopts)
+                config_args = []
                 for key in ('python_functions', 'python_classes', 'python_files', 'norecursedirs'):
                     if key in settings:
                         value = settings[key]
                         config_args.extend(['-o', key + '=' + (value if isinstance(value, str) else ' '.join(value))])
+                # Discovery settings are defaults. Pytest applies config
+                # addopts, then environment options and explicit arguments;
+                # later -o values override those defaults during admission too.
+                config_args.extend(shlex.split(addopts) if isinstance(addopts, str) else list(addopts))
                 for ref in refs:
                     path, _, node = ref.partition('::')
                     absolute = (session.project_root / path).resolve()
