@@ -112,6 +112,10 @@ def _discard_incomplete_import(marker, destination, retained, repository):
             shutil.rmtree(artifacts)
         for name in _HISTORY_FILES:
             (destination.candidate_root(candidate_id) / name).unlink(missing_ok=True)
+    for identity in pending.get('planning_ids', []):
+        path = destination.root / 'planning' / identity
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
     if pending["previous_experiment"] is None:
         destination.path.unlink(missing_ok=True)
     else:
@@ -175,9 +179,16 @@ def import_cancelled_repair(store, job, working, repository, *, revision=None):
         retained.parent.mkdir(parents=True, exist_ok=True)
         candidate_ids = [path.name for path in source_store.root.iterdir()
                          if path.is_dir() and not path.is_symlink() and path.name.startswith("c")]
+        planning_ids = [path.name for path in (source_store.root / 'planning').glob('*')
+                        if path.is_dir() and not path.is_symlink()
+                        and not (destination.root / 'planning' / path.name).exists()]
         atomic_json(marker, {"source_job": row["id"], "candidate_ids": candidate_ids,
+                             "planning_ids": planning_ids,
                              "previous_experiment": current.to_dict() if current else None})
         try:
+            for identity in planning_ids:
+                shutil.copytree(source_store.root / 'planning' / identity,
+                                destination.root / 'planning' / identity, symlinks=True)
             with repository.locked():
                 git(repository.cache, "worktree", "add", "--detach", str(retained), snapshot[0])
             if snapshot[1]:

@@ -308,3 +308,22 @@ def test_deep_restart_preserves_descendant_manual_correction_without_claiming_pr
     assert receipt['source_commit'] == corrected
     assert receipt['source_candidate'] == 'c1'
     assert receipt['verification_required']
+
+
+def test_restart_retains_independent_planning_artifacts_and_historical_completion(restart):
+    state = restart.evidence.load()
+    state.historical_completed_groups['custody'] = {'completed_by': 'c1', 'status': 'completed'}
+    state.planning_attempts['audit'] = 2
+    state.planning_receipts['audit'] = {'decision': 'REVISE', 'feedback': ['missing recovery case']}
+    restart.evidence.save(state)
+    artifact = restart.evidence.root / 'planning' / 'independent-request'
+    artifact.mkdir(parents=True)
+    (artifact / 'input.json').write_text('{"source":"retained"}')
+    job, working = _new_job(restart, restart.payload)
+    assert import_cancelled_repair(restart.store, job, working, restart.repository)
+    copied = SelfRepairExperimentStore(working, 'session-session', 'root')
+    assert (copied.root / 'planning/independent-request/input.json').read_bytes() == (artifact / 'input.json').read_bytes()
+    migrated = copied.load()
+    assert migrated.historical_completed_groups == state.historical_completed_groups
+    assert migrated.planning_attempts == state.planning_attempts
+    assert migrated.planning_receipts == state.planning_receipts

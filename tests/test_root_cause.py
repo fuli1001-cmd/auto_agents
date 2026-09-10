@@ -2783,6 +2783,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 )
                 self.assertEqual(probe.returncode, 0, probe.stderr)
 
+    @patch.object(AutoAgentsSelfRepairRunner, '_prepare_component_plan', lambda *_: None)
     def test_candidate_experiment_uses_feedback_and_approves_second_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3568,6 +3569,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertIn("production-route-not-wired", runtime_group["finding_ids"])
             self.assertIn("PENDING_COMPONENTS:", reviewer.prompt)
 
+    @patch.object(AutoAgentsSelfRepairRunner, '_prepare_component_plan', lambda *_: None)
     def test_finding_groups_complete_before_one_full_suite(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4380,6 +4382,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(promoted.publish_status, "publish_pending")
             self.assertTrue((auto_root / "fixed.py").is_file())
 
+    @patch.object(AutoAgentsSelfRepairRunner, '_prepare_component_plan', lambda *_: None)
     def test_self_repair_skips_repair_when_remote_update_resolves_diagnosis(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

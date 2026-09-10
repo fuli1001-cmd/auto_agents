@@ -33,9 +33,10 @@ def achievements(experiment, record):
     result.update('verification:' + key for key in record.passed_obligations
                   if key == 'validation:full_suite')
     if record.review_completed:
+        from .repair_planning import nonblocking_scope
         for key in record.resolved_finding_ids:
             finding = experiment.findings.get(key)
-            if finding and finding.disposition == 'contract_violation':
+            if finding and finding.disposition == 'contract_violation' and not nonblocking_scope(experiment, finding):
                 checks = pytest_targets(finding.required_test)
                 if checks and set(checks).issubset(record.verified_check_ids):
                     result.add('finding:' + finding_identity(finding, experiment))

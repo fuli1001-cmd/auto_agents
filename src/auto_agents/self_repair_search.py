@@ -16,7 +16,7 @@ from .execution_recovery import redact_incident_text
 from .io_utils import read_json
 
 
-SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 5
+SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 6
 # Adding progress metadata does not change what existing proof establishes.
 SELF_REPAIR_PROOF_SCHEMA_VERSION = 4
 
@@ -252,6 +252,10 @@ class SelfRepairExperiment:
     sticky_verification_commands: list[str] = field(default_factory=list)
     progress_credits: Dict[str, str] = field(default_factory=dict)
     diagnostic_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    scope_decisions: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    planning_receipts: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    planning_attempts: Dict[str, int] = field(default_factory=dict)
+    historical_completed_groups: Dict[str, Dict[str, object]] = field(default_factory=dict)
     completed_contract_obligation_ids: list[str] = field(default_factory=list)
     completed_finding_ids: list[str] = field(default_factory=list)
     strategy_blacklist: list[str] = field(default_factory=list)
@@ -400,6 +404,13 @@ class SelfRepairExperiment:
             for key, value in raw_candidates.items()
             if isinstance(value, Mapping)
         }
+        for name in ('scope_decisions', 'planning_receipts', 'planning_attempts', 'historical_completed_groups'):
+            if not isinstance(payload.get(name, {}), Mapping):
+                raise ValueError(f'self-repair experiment {name} must be an object')
+            if name != 'planning_attempts' and any(not isinstance(value, Mapping) for value in payload.get(name, {}).values()):
+                raise ValueError(f'self-repair experiment {name} entries must be objects')
+        if any(type(value) is not int or value < 0 for value in payload.get('planning_attempts', {}).values()):
+            raise ValueError('planning attempt counters must be nonnegative integers')
         findings = {
             str(key): SelfRepairFinding.from_dict(value)
             for key, value in raw_findings.items()
@@ -468,6 +479,10 @@ class SelfRepairExperiment:
             ),
             progress_credits=dict(payload.get("progress_credits", {})),
             diagnostic_actions=dict(payload.get("diagnostic_actions", {})),
+            scope_decisions=dict(payload.get('scope_decisions', {})),
+            planning_receipts=dict(payload.get('planning_receipts', {})),
+            planning_attempts=dict(payload.get('planning_attempts', {})),
+            historical_completed_groups=dict(payload.get('historical_completed_groups', {})),
             sticky_verification_commands=[
                 str(item)
                 for item in payload.get("sticky_verification_commands", []) or []
@@ -521,6 +536,9 @@ class SelfRepairExperiment:
         )
 
         from .repair_progress import remember_history
+        for group in experiment.finding_groups:
+            if group.get('status') == 'completed':
+                experiment.historical_completed_groups.setdefault(group['group_id'], dict(group))
         if "progress_credits" not in payload:
             remember_history(experiment)
         experiment.normalize_review_commands()
@@ -617,6 +635,7 @@ class SelfRepairExperiment:
         return changed
 
     def blocking_findings(self) -> list[SelfRepairFinding]:
+        from .repair_planning import nonblocking_scope
         contract_ids = set(self.contract_obligation_ids)
         return [
             finding
@@ -624,6 +643,7 @@ class SelfRepairExperiment:
             if finding.status in {"confirmed", "reopened"}
             and finding.disposition in {"contract_violation", "candidate_regression"}
             and finding.causal_obligation_id in contract_ids
+            and not nonblocking_scope(self, finding)
         ]
 
     def next_finding_group(self) -> Optional[Dict[str, object]]:
@@ -667,6 +687,7 @@ class SelfRepairExperiment:
             group["status"] = "completed"
             group["completed_by"] = candidate_id
             group["completed_at"] = _utc_now()
+            self.historical_completed_groups[group_id] = dict(group)
             self.completed_contract_obligation_ids = sorted(
                 set(self.completed_contract_obligation_ids).union(
                     str(item)
@@ -980,6 +1001,9 @@ class SelfRepairExperiment:
                     record.failed_obligations.append(causal_id)
         for finding_id in record.resolved_finding_ids:
             finding = self.findings.get(finding_id)
+            from .repair_planning import nonblocking_scope
+            if finding is not None and nonblocking_scope(self, finding):
+                continue  # Scope decisions are not a repaired-behavior receipt.
             if finding is not None and finding.disposition == "candidate_regression":
                 if not record.review_completed or finding_id in candidate_regressions:
                     continue
@@ -1191,6 +1215,8 @@ class SelfRepairExperiment:
                 for item in recent
             ],
             "verified_progress_count": len(self.progress_credits),
+            "historical_completed_groups": self.historical_completed_groups,
+            "scope_decisions": self.scope_decisions,
             "next_action": review_action(self, next_action(
                 recent[-1].failure_evidence if recent else [])),
             "recent_automatic_corrections": self.automatic_corrections[-3:],
@@ -1229,7 +1255,7 @@ class SelfRepairExperimentStore:
         if self.path.is_file():
             previous = read_json(self.path, default={})
             if int(previous.get("schema_version", 3)) < SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION:
-                backup = self.path.with_name("experiment.v3.json")
+                backup = self.path.with_name(f"experiment.v{int(previous.get('schema_version', 3))}.json")
                 if not backup.exists():
                     _atomic_json(backup, previous)
         _atomic_json(self.path, experiment.to_dict())

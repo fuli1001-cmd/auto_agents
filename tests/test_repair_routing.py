@@ -162,6 +162,9 @@ def test_existing_regression_owner_is_not_bounced_back_by_overlapping_paths(tmp_
 
 def test_unchanged_source_can_verify_next_component_without_recrediting_same_scope(tmp_path):
     runner, state, reply = make_runner(tmp_path)
+    # This test isolates source/progress routing; independent planning has its
+    # own real-provider-protocol and failure-gate regression tests.
+    runner._prepare_component_plan = lambda workspace: None
     runner._candidate_is_final_group = False
     runner._continuous_workspace = tmp_path / 'continuous'
     runner._continuous_workspace.mkdir()

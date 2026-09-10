@@ -1733,6 +1733,7 @@ class AutoAgentsSelfRepairRunner:
         self.target_project_root = target_project_root
         self.error = error
         self.decision = decision
+        self._candidate_group = {}
         self.diagnosis = diagnosis
         self.repair_case = repair_case
         self.print_agent_output = print_agent_output
@@ -2375,6 +2376,23 @@ class AutoAgentsSelfRepairRunner:
                     self.target_project_root,
                     ignore_run_artifacts=True,
                 )
+                try:
+                    self._prepare_component_plan(candidate_root)
+                except (OSError, RuntimeError, ValueError) as error:
+                    return SelfRepairResult(False, 'candidate_design_rejected', category=self.decision.category,
+                        reason=str(error), candidate_id=candidate_id, candidate_ref=candidate_ref,
+                        candidate_commit=candidate_commit, experiment_id=experiment_id,
+                        recoverable_validation=True)
+                if getattr(self, '_candidate_group', {}).get('planning_receipt'):
+                    quick, early = self._early_candidate_checks(candidate_root, base_head)
+                    if not quick.ok or not early.ok:
+                        rejected_ref = self._reject_pending_validation_ref(candidate_ref, candidate_commit, candidate_id)
+                        return SelfRepairResult(False, 'candidate_review_rejected' if quick.ok else 'candidate_verification_failed',
+                            category=self.decision.category, reason=early.summary if quick.ok else quick.summary,
+                            verification=early.summary if quick.ok else quick.summary,
+                            candidate_id=candidate_id, candidate_ref=rejected_ref, candidate_commit=candidate_commit,
+                            experiment_id=experiment_id, review_findings=early.payload.get('findings', []),
+                            resolved_finding_ids=early.payload.get('resolved_finding_ids', []))
                 focused = self._run_verification(candidate_root)
                 if not focused.ok:
                     rejected_ref = self._reject_pending_validation_ref(candidate_ref, candidate_commit, candidate_id)
@@ -2474,6 +2492,7 @@ class AutoAgentsSelfRepairRunner:
                     finding_id
                     for finding_id, finding in experiment_findings.items()
                     if finding.status in {"confirmed", "reopened"}
+                    and finding_id in {f.finding_id for f in self._experiment.blocking_findings()}
                     and finding_id not in resolved_finding_ids
                 )
                 if not focused.ok or not review.ok or unresolved:
@@ -3136,9 +3155,7 @@ class AutoAgentsSelfRepairRunner:
             and experiment.finding_groups
         ):
             return True
-        if self.diagnosis is None or not hasattr(self.diagnosis, "to_dict") or (
-            self._continuous_mode() and not self._deep_repair_design()
-        ):
+        if self.diagnosis is None or not hasattr(self.diagnosis, "to_dict"):
             # Legacy direct API repairs do not carry a causal contract. Keep
             # their historical one-candidate behavior.
             experiment.repair_design = {
@@ -3186,7 +3203,9 @@ class AutoAgentsSelfRepairRunner:
         )
         prompt = "\n".join(
             [
-                "Design and adversarially review a minimal auto_agents self-repair before any code is written.",
+                "Draft a minimal auto_agents repair design and identify its apparent gaps. "
+                "This call only proposes the overall decomposition; it cannot authorize code generation. "
+                "Each ready component receives a separate plan, diagnostic probes and independent review before implementation.",
                 "Do not modify files or run mutating commands.",
                 "The repair contract is frozen. Do not add generic hardening, follow-up tasks, or obligations.",
                 "Split independent work into dependency-ordered components. Each component must have focused tests.",
@@ -4523,6 +4542,12 @@ class AutoAgentsSelfRepairRunner:
                 )
                 self._candidate_attempt = attempt
                 self._candidate_prior_failures = list(prior_failures)
+                try:
+                    self._prepare_component_plan(repair_root)
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    return SelfRepairResult(False, 'candidate_design_rejected', category=self.decision.category,
+                        reason=str(error), experiment_id=experiment_id, candidate_id=candidate_id,
+                        base_commit=base_head, finding_group_id=self._candidate_group.get('group_id', ''))
                 prompt = self._build_prompt(repair_root, target_snapshot)
                 prompt_path, output_path = self._artifact_paths()
                 write_text(prompt_path, prompt)
@@ -4576,9 +4601,12 @@ class AutoAgentsSelfRepairRunner:
                 )
                 try:
                     with self._phase_timer("candidate_generation"):
-                        result: AgentResult = (
-                            self.target_orchestrator._call_with_failover(request)
-                        )
+                        if self._candidate_group.get('planning_receipt') and self._candidate_group.get('mode') == 'verify_existing':
+                            self._report_candidate_phase('candidate_revalidation', 'revalidating retained code without a writer')
+                            result = AgentResult(True, [], output_path,
+                                summary='Retained candidate requires validation; no new code was generated.')
+                        else:
+                            result = self.target_orchestrator._call_with_failover(request)
                     blocker = self._verification_environment_blocker(repair_root)
                     if blocker:
                         from .verification_dependencies import MissingDependency, VerificationDependencyError
@@ -4822,9 +4850,21 @@ class AutoAgentsSelfRepairRunner:
                     sorted(item.finding_id for item in self._experiment.blocking_findings()),
                 )
                 self._report_candidate_phase(
-                    "validating_focused_tests", "running known regressions before model review",
+                    "quick_verification", "running current counterexamples before model review",
                 )
-                verification = self._run_active_group_verification(repair_root)
+                verification, early_review = self._early_candidate_checks(repair_root, base_head)
+                if verification.ok and not early_review.ok:
+                    return SelfRepairResult(False, 'candidate_review_rejected', category=self.decision.category,
+                        reason=early_review.summary, summary=summary, verification=early_review.summary,
+                        experiment_id=experiment_id, candidate_id=candidate_id, base_commit=base_head,
+                        candidate_commit=candidate_commit, candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint, strategy_fingerprint=strategy_fingerprint,
+                        review_findings=early_review.payload.get('findings', []),
+                        finding_ids=[f['finding_id'] for f in early_review.payload.get('findings', [])],
+                        resolved_finding_ids=early_review.payload.get('resolved_finding_ids', []),
+                        diff_line_count=diff_line_count, passed_obligations=['validation:quick'])
+                if verification.ok and self._candidate_group.get('planning_receipt'):
+                    verification = self._run_active_group_verification(repair_root)
                 if not verification.ok:
                     sticky = set(self._experiment.sticky_verification_commands)
                     failed_commands = self._failed_source_commands(verification)
@@ -4834,7 +4874,8 @@ class AutoAgentsSelfRepairRunner:
                     ]
                     return SelfRepairResult(
                         ok=False, status="candidate_verification_failed", category=self.decision.category,
-                        reason="focused verification failed before semantic review", summary=summary,
+                        reason=('expanded verification failed after semantic review' if early_review.ok
+                                and early_review.payload.get('early_review') else 'quick verification failed before semantic review'), summary=summary,
                         verification=verification.summary, experiment_id=experiment_id,
                         candidate_id=candidate_id, base_commit=base_head,
                         candidate_commit=candidate_commit, candidate_ref=candidate_ref,
@@ -4921,10 +4962,10 @@ class AutoAgentsSelfRepairRunner:
                 )
                 reviewed_identity = (
                     self._candidate_review_identity(repair_root)
-                    if review_phase == "integration"
+                    if review_phase == "integration" and not early_review.payload.get('early_review')
                     else ""
                 )
-                review = self._review_candidate(
+                review = early_review if early_review.payload.get('early_review') else self._review_candidate(
                     repair_root,
                     self._experiment.base_commit,
                     progress_lease_seconds=review_progress_lease,
@@ -4952,6 +4993,7 @@ class AutoAgentsSelfRepairRunner:
                     finding_id
                     for finding_id, finding in self._experiment.findings.items()
                     if finding.status in {"confirmed", "reopened"}
+                    and finding_id in {f.finding_id for f in self._experiment.blocking_findings()}
                     and finding_id
                     in set(
                         getattr(self, "_candidate_group", {}).get(
@@ -5011,34 +5053,6 @@ class AutoAgentsSelfRepairRunner:
                     "validating_focused_tests",
                     "adversarial review approved; running focused verification",
                 )
-                # This exact immutable candidate already passed the focused
-                # checks before review; the reviewer has read-only access.
-                if not verification.ok:
-                    with self._phase_timer("focused_baseline"):
-                        baseline_verification = self._run_verification_at_ref(
-                            list(verification.payload.get("source_commands", [])),
-                            base_head,
-                        )
-                    baseline_signature = self._verification_failure_signature(
-                        baseline_verification.summary
-                    )
-                    candidate_signature = self._verification_failure_signature(
-                        verification.summary
-                    )
-                    if (
-                        not baseline_verification.ok
-                        and baseline_signature
-                        and baseline_signature == candidate_signature
-                    ):
-                        verification = _VerificationResult(
-                            True,
-                            "\n\n".join(
-                                (
-                                    verification.summary,
-                                    "nonfatal=pre-existing verification failure set retained",
-                                )
-                            ),
-                        )
                 if not verification.ok:
                     return SelfRepairResult(
                         ok=False,
@@ -5912,6 +5926,11 @@ class AutoAgentsSelfRepairRunner:
             if isinstance(experiment, SelfRepairExperiment)
             else []
         )
+        full_diff = ''
+        if hasattr(self, '_experiment_store'):
+            full_diff_path = self._experiment_store.root / ('review-diff-' + _search_stable_hash(diff) + '.patch')
+            write_text(full_diff_path, diff)
+            full_diff = str(full_diff_path)
         prompt = "\n".join(
             [
                 "Review this isolated auto_agents self-repair candidate.",
@@ -5933,7 +5952,9 @@ class AutoAgentsSelfRepairRunner:
                 "approved component, identify its repair_group_id (legacy defer_until is also accepted). "
                 "The controller will schedule its correction without waiving the regression. "
                 "Distinguish the cumulative diff from this attempt's parent when identifying its origin.",
-                "Focused checks already passed. Whole-repair boundary proof belongs to "
+                ("Only the small counterexample and safety checks passed. Full component regression is REQUIRED "
+                 "AFTER this review, not evidence to demand now. Inspect the complete source and approved scenarios. "
+                 if phase == 'quick' else "Focused checks already passed. ") + "Whole-repair boundary proof belongs to "
                 "integration, and the full suite runs after semantic review; absence of "
                 "proof belonging to a future component or gate is not a finding.",
                 "Return exactly JSON with decision, reason, findings, and resolved_finding_ids. "
@@ -5981,6 +6002,8 @@ class AutoAgentsSelfRepairRunner:
                 replay_summary[-12_000:],
                 "CANDIDATE_DIFF:",
                 diff[:40_000],
+                "COMPLETE_DIFF_ARTIFACT:",
+                full_diff,
             ]
         )
         output_path = Path(tempfile.gettempdir()) / (
@@ -6084,6 +6107,17 @@ class AutoAgentsSelfRepairRunner:
             else:
                 finding["disposition"] = "unrelated_observation"
                 ignored_observations.append(finding)
+        if active_group.get('planning_receipt') and isinstance(experiment, SelfRepairExperiment):
+            from .repair_planning import review_scope, nonblocking_scope, PlanningBlocked
+            try:
+                review_scope(self, repair_root, [*findings, *deferred_findings])
+            except (OSError, RuntimeError, ValueError) as error:
+                return _VerificationResult(False, 'independent scope review blocked: ' + str(error),
+                    payload={'scope_pending': True, 'findings': findings, 'deferred_findings': deferred_findings})
+            for collection in (findings, deferred_findings):
+                excluded = [item for item in collection if nonblocking_scope(experiment, SelfRepairFinding.from_dict(item))]
+                ignored_observations.extend(excluded)
+                collection[:] = [item for item in collection if item not in excluded]
         raw_resolved = payload.get("resolved_finding_ids", [])
         normalized_payload = {
             **payload,
@@ -8523,6 +8557,51 @@ class AutoAgentsSelfRepairRunner:
         return replay, self._diagnosis_differential(
             self._experiment.base_commit if base_ref is None else base_ref, repair_root)
 
+    def _prepare_component_plan(self, workspace):
+        # Direct legacy callers without a diagnosis have no causal contract to
+        # expand. Diagnosed automatic repairs cannot use their old plan stamp
+        # as a replacement for the independent component gate.
+        if self.diagnosis is None:
+            return
+        from .repair_planning import prepare_component
+        return prepare_component(self, workspace)
+
+    def _early_candidate_checks(self, workspace, base_head):
+        """Shared by newly generated and resumed candidates; reject before broad work."""
+        group = dict(getattr(self, '_candidate_group', {}) or {})
+        if not group.get('planning_receipt'):
+            return self._run_active_group_verification(workspace), _VerificationResult(True, 'legacy verification order')
+        from .repair_schedule import canonical_commands
+        commands, requests = canonical_commands(group['quick_checks'])
+        with self._phase_timer('quick_verification'):
+            quick = self._guarded_component_checks(commands, workspace)
+        quick.payload.update(source_commands=commands[:len(quick.returncodes)], requests=requests)
+        if not quick.ok:
+            return quick, _VerificationResult(False, 'quick checks failed; semantic review deferred')
+        review = self._review_candidate(workspace, base_head,
+            progress_lease_seconds=getattr(self._autonomy_config(), 'candidate_review_timeout_seconds', 600),
+            replay_summary=quick.summary, phase='quick')
+        unresolved = {finding.finding_id for finding in self._experiment.blocking_findings()
+                      if finding.finding_id in group.get('finding_ids', [])}
+        unresolved.difference_update(review.payload.get('resolved_finding_ids', []))
+        if review.ok and unresolved:
+            review.ok = False
+            review.summary += '\nRequired findings were not resolved: ' + ', '.join(sorted(unresolved))
+        review.payload['early_review'] = True
+        return quick, review
+
+    def _guarded_component_checks(self, commands, workspace):
+        from .verification_ledger import source_identity
+        before = source_identity(workspace)
+        verified = set(getattr(self, '_candidate_verified_check_ids', set()))
+        result = self._run_verification_commands(commands, workspace)
+        if source_identity(workspace) != before:
+            result.ok = False
+            result.summary += '\nverification source changed; component proof is invalid'
+            result.payload['outcome'] = 'invalid'
+            self._candidate_verified_check_ids = verified
+        return result
+
     @_timed_repair_phase("focused_verification")
     def _run_active_group_verification(
         self,
@@ -8542,8 +8621,11 @@ class AutoAgentsSelfRepairRunner:
                             repository_aliases={self.repo_root.name, verification_root.name})]
         if not commands:
             commands = ["git diff --check"]
-        result = self._run_verification_commands(commands, verification_root)
+        result = (self._guarded_component_checks(commands, verification_root)
+                  if group.get('planning_receipt') else self._run_verification_commands(commands, verification_root))
         result.payload["source_commands"] = commands[: len(result.returncodes)]
+        result.payload['requests'] = plan.get('requests', [])
+        result.payload['deduplicated_commands'] = plan.get('deduplicated_commands', 0)
         return result
 
     @_timed_repair_phase("integration_verification")
@@ -8784,7 +8866,7 @@ class AutoAgentsSelfRepairRunner:
                 command_failures.append(evidence)
                 with self._feedback_lock:
                     self._candidate_failure_evidence = [*getattr(self, "_candidate_failure_evidence", []), evidence]
-                if self._handle_verification_dependencies(process.stdout + "\n" + process.stderr, verification_root,
+                if not getattr(self, '_planning_probe', False) and self._handle_verification_dependencies(process.stdout + "\n" + process.stderr, verification_root,
                         structured=process.process_snapshot.get("verification_missing_dependencies"), dependency_state=dependency_state):
                     # The candidate and its proof obligations stay identical. A
                     # changed toolchain gets a fresh environment-bound ledger.
