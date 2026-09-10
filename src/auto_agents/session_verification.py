@@ -968,7 +968,9 @@ def _validate_required_node_selection(session, state, commands):
                 options = list(invocation.arguments)
                 targets = list(invocation.targets)
                 settings = _pytest_selection_config(session.project_root, cwd, options,
-                                                    targets, configurations)
+                                                    targets, configurations,
+                    source_exists=lambda path: _historical_source(session,
+                        _contract_source_revision(session, state) or 'HEAD', path) is not None)
                 addopts = settings.get('addopts', [])
                 config_args = []
                 for key in ('python_functions', 'python_classes', 'python_files', 'norecursedirs'):
@@ -1004,7 +1006,7 @@ def _validate_required_node_selection(session, state, commands):
                                   commands=[command for command in commands if command])
 
 
-def _pytest_selection_config(root, cwd, args, targets, configurations):
+def _pytest_selection_config(root, cwd, args, targets, configurations, *, source_exists):
     """Resolve retained discovery settings for this invocation only.
 
     Another command's configuration must never override this command's node
@@ -1013,11 +1015,14 @@ def _pytest_selection_config(root, cwd, args, targets, configurations):
     from os.path import commonpath
 
     explicit = ''
+    explicit_root = False
     index = 0
     while index < len(args):
         arg = args[index]
         if arg == '--':
             break
+        if arg == '--rootdir' or arg.startswith('--rootdir='):
+            explicit_root = True
         if arg in {'-c', '--config-file'} and index + 1 < len(args):
             index += 1
             explicit = args[index]
@@ -1038,13 +1043,32 @@ def _pytest_selection_config(root, cwd, args, targets, configurations):
     directories = [(cwd / target.split('::', 1)[0]).resolve() for target in targets]
     directories = [path.parent if path.suffix else path for path in directories]
     base = Path(commonpath(directories)) if directories else cwd
-    for start in dict.fromkeys([base, cwd]):
-        for parent in (start, *start.parents):
-            for name in _PYTEST_CONFIG_NAMES:
-                settings = retained(parent / name)
-                if settings is not None:
-                    return settings
-    return {}
+
+    def search(starts):
+        for start in dict.fromkeys(starts):
+            for parent in (start, *start.parents):
+                for name in _PYTEST_CONFIG_NAMES:
+                    settings = retained(parent / name)
+                    if settings is not None:
+                        return settings
+        return None
+
+    settings = search([base])
+    if settings is not None:
+        return settings
+    # Pytest only falls back to individual target directories when neither
+    # explicit rootdir nor an ancestor setup.py established the project root.
+    # Consult retained sources, never the ambient candidate worktree.
+    if explicit_root:
+        return {}
+    for parent in (base, *base.parents):
+        try:
+            setup = (parent / 'setup.py').relative_to(root.resolve()).as_posix()
+        except ValueError:
+            continue
+        if source_exists(setup):
+            return {}
+    return search(directories) or {}
 
 
 def _pytest_discovery_excludes(args, ref, *, directory, collection_root, source_path):

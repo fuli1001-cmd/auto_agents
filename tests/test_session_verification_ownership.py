@@ -1719,6 +1719,10 @@ def test_public_resume_rejects_pytest_configuration_deselection(tmp_path, monkey
                                      'filename_config_addopts_included',
                                      'filename_config_env_excluded', 'filename_config_env_included',
                                      'filename_config_cli_excluded', 'filename_config_cli_included',
+                                     'nested_config_excluded', 'nested_config_included',
+                                     'nested_config_later_excluded', 'nested_config_later_included',
+                                     'nested_config_ancestor_excluded', 'nested_config_ancestor_included',
+                                     'nested_config_setup_included', 'nested_config_rootdir_included',
                                      'inline_deselect'])
 def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeypatch, source, selector,
                                                              retained=False):
@@ -1772,6 +1776,14 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         'filename_config_env_included': [],
         'filename_config_cli_excluded': [],
         'filename_config_cli_included': [],
+        'nested_config_excluded': [],
+        'nested_config_included': [],
+        'nested_config_later_excluded': [],
+        'nested_config_later_included': [],
+        'nested_config_ancestor_excluded': [],
+        'nested_config_ancestor_included': [],
+        'nested_config_setup_included': [],
+        'nested_config_rootdir_included': ['--rootdir=.'],
         'inline_deselect': [],
         'unfiltered': [],
     }[selector]
@@ -1820,7 +1832,29 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
             (root / 'pytest.ini').write_text('[pytest]\nnorecursedirs = owned\n')
         if selector == 'norecurse_toml':
             (root / 'pyproject.toml').write_text('[tool.pytest.ini_options]\nnorecursedirs = ["owned"]\n')
-    command = shlex.join(['./.conda/bin/python', '-m', 'pytest', '-q', *args, target])
+    targets = [target]
+    if selector.startswith('nested_config_'):
+        (root / 'tests/a').mkdir()
+        (root / 'tests/b').mkdir()
+        proof.rename(root / 'tests/a/test_owned.py')
+        (root / 'tests/b/test_control.py').write_text('def test_control(): assert True\n')
+        required_node = 'tests/a/test_owned.py::test_owned'
+        targets = ['tests/a/test_owned.py', 'tests/b/test_control.py']
+        selected_patterns = 'test_*' if inclusive else 'test_control'
+        opposite_patterns = 'test_control' if inclusive else 'test_*'
+        nested_config = root / 'tests/a/pytest.ini'
+        if '_later_' in selector:
+            nested_config = root / 'tests/b/pytest.ini'
+        elif '_ancestor_' in selector:
+            (root / 'tests/pytest.ini').write_text(
+                '[pytest]\npython_functions = ' + selected_patterns + '\n')
+            selected_patterns = opposite_patterns
+        elif '_setup_' in selector or '_rootdir_' in selector:
+            selected_patterns = 'test_control'
+            if '_setup_' in selector:
+                (root / 'setup.py').write_text('# Retained project root marker.\n')
+        nested_config.write_text('[pytest]\npython_functions = ' + selected_patterns + '\n')
+    command = shlex.join(['./.conda/bin/python', '-m', 'pytest', '-q', *args, *targets])
     if selector.startswith('filename_config_env_'):
         command = ('PYTEST_ADDOPTS=' + shlex.quote(shlex.join(['-o', 'python_files=' + final_pattern]))
                    + ' ' + command)
@@ -1834,7 +1868,7 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     elif selector == 'inline_deselect':
         command = "PYTEST_ADDOPTS='--deselect=tests/test_owned.py::test_owned' " + command
         args = ['--deselect=tests/test_owned.py::test_owned']
-    config.gates.steps[0].targets = [target]
+    config.gates.steps[0].targets = targets
     config.gates.steps[0].args = args
     if source != 'structured':
         config.gates.steps = []
@@ -1913,6 +1947,10 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     'filename_default', 'filename_config_addopts_excluded', 'filename_config_addopts_included',
     'filename_config_env_excluded', 'filename_config_env_included',
     'filename_config_cli_excluded', 'filename_config_cli_included',
+    'nested_config_excluded', 'nested_config_included',
+    'nested_config_later_excluded', 'nested_config_later_included',
+    'nested_config_ancestor_excluded', 'nested_config_ancestor_included',
+    'nested_config_setup_included', 'nested_config_rootdir_included',
 ])
 def test_public_resume_rechecks_retained_default_filename_exclusion(tmp_path, monkeypatch, source, selector):
     test_public_resume_requires_executable_owned_node_coverage(
