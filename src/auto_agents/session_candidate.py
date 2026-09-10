@@ -367,12 +367,40 @@ def validate_source(state, revision):
                               conflicting_paths=sorted(state.candidate_paths), detail=str(error)) from error
 
 
+def _retained_gitlink_placeholder(state, root, path, identity):
+    """Admit only an untouched, uninitialized gitlink, without traversing it."""
+    manifest = state.candidate_custody['receipt']['manifest']
+    if any(name == path or name.startswith(path + '/') for name in manifest):
+        return False
+    try:
+        index = _raw_git(root, 'ls-files', '--stage', '-z', '--', ':(literal)' + path)
+        if index != b'160000 ' + identity[2].encode('ascii') + b' 0\t' + os.fsencode(path) + b'\0':
+            return False
+        with anchored_parent(root, path) as (parent, name):
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                 dir_fd=parent)
+            try:
+                return not os.listdir(descriptor)
+            finally:
+                os.close(descriptor)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def validate_materialized_source(state, root, revision):
     """Check raw source correspondence and anchored, fully restored postimages."""
     expected = validate_source(state, revision)
     conflicts = set()
     try:
         for path, identity in expected.items():
+            if identity[:2] == ('160000', 'commit'):
+                if not _retained_gitlink_placeholder(state, root, path, identity):
+                    # Stop before general inventory can inspect an invalid
+                    # submodule representation or anything below it.
+                    conflicts.add(path)
+                    raise ownership_error(state, 'retained gitlink materialization changed',
+                                          conflicting_paths=[path])
+                continue
             image = _image(root, path)
             if image['kind'] not in {'file', 'symlink'} or _blob_identity(image) != identity:
                 conflicts.add(path)
@@ -389,6 +417,9 @@ def validate_materialized_source(state, root, revision):
             if _image(root, path)['kind'] not in {'absent', 'directory'} and path not in expected:
                 conflicts.add(path)
     except (OSError, RuntimeError, ValueError) as error:
+        from .session_verification import SessionOwnershipError
+        if isinstance(error, SessionOwnershipError):
+            raise
         raise ownership_error(state, 'candidate materialization could not be checked',
                               conflicting_paths=sorted(conflicts), detail=str(error)) from error
     if conflicts:

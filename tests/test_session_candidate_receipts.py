@@ -22,7 +22,7 @@ from test_engine_child_recovery import parent_workflow, ObservationBoundary
 BINARY = b"candidate\x00\xff\r\n"
 
 
-def fixture(tmp_path, monkeypatch, *, parent=False):
+def fixture(tmp_path, monkeypatch, *, parent=False, gitlink=False):
     root, child = project(tmp_path)
     (root / 'obsolete.bin').write_bytes(b'old\x00bytes')
     (root / '.gitattributes').write_text('binary.dat filter=receipt\n')
@@ -33,6 +33,14 @@ def fixture(tmp_path, monkeypatch, *, parent=False):
         '    assert Path("writer-link").is_symlink()\n'
         '    assert not Path("obsolete.bin").exists()\n')
     git(root, 'add', '-A')
+    if gitlink:
+        # Seed a local commit identity; no submodule initialization or network.
+        vendor_oid = git(root, 'rev-parse', 'HEAD').strip()
+        git(root, 'update-index', '--add', '--cacheinfo', '160000', vendor_oid, 'vendor')
+        test.write_text(test.read_text() +
+            '    assert Path("vendor").is_dir()\n'
+            '    assert list(Path("vendor").iterdir()) == []\n')
+        git(root, 'add', 'tests/test_owned.py')
     git(root, 'commit', '-m', 'retain exact candidate contract')
     child.baseline_git_ref = child.baseline_head_ref = git(root, 'rev-parse', 'HEAD').strip()
     save_session_state(root, child)
@@ -47,11 +55,22 @@ def fixture(tmp_path, monkeypatch, *, parent=False):
     (root / 'foreign-note.txt').write_bytes(b'foreign\x00untracked')
     paths = ['value.py', 'foreign.py', 'foreign-note.txt', 'obsolete.bin', '.git/index',
              '.git/config', '.git/HEAD', '.auto-agents/config.json', '.auto-agents/state/task_plan.json']
+    if gitlink:
+        (root / 'vendor').mkdir()
+        (root / 'vendor/foreign.bin').write_bytes(b'foreign vendor\x00bytes')
+        (root / 'vendor/foreign.bin').chmod(0o640)
+        (root / 'vendor').chmod(0o751)
+        vendor_mode = (root / 'vendor').stat().st_mode
+        paths.append('vendor/foreign.bin')
     shared = {p: ((root / p).read_bytes(), (root / p).stat().st_mode) for p in paths}
     refs = git(root, 'show-ref')
     events = []
     def agent(self, request):
         events.append('parent' if request.purpose.startswith('collab') else 'writer')
+        if gitlink:
+            assert (request.cwd / 'vendor').is_dir()
+            assert list((request.cwd / 'vendor').iterdir()) == []
+            assert git(request.cwd, 'ls-files', '--stage', 'vendor').strip() == f'160000 {vendor_oid} 0\tvendor'
         if request.purpose.startswith('collab'):
             assert (request.cwd / 'binary.dat').read_bytes() == BINARY
             assert (request.cwd / 'value.py').stat().st_mode & 0o7777 == 0o750
@@ -89,6 +108,9 @@ def fixture(tmp_path, monkeypatch, *, parent=False):
     def unchanged():
         assert {p: ((root / p).read_bytes(), (root / p).stat().st_mode) for p in paths} == shared
         assert git(root, 'show-ref') == refs
+        if gitlink:
+            assert (root / 'vendor').stat().st_mode == vendor_mode
+            assert list((root / 'vendor').iterdir()) == [root / 'vendor/foreign.bin']
     return root, child, events, unchanged
 
 
@@ -129,10 +151,16 @@ def corrupt(root, receipt, kind):
                 return p.stdout.decode().strip()
             run('read-tree', receipt['source_revision'])
             path = {'extra-path-initial': 'extra.bin', 'base-path-tamper-cached-resume': 'foreign.py',
-                    'missing-deletion': 'obsolete.bin', 'executable-mode': 'value.py'}[kind]
+                    'missing-deletion': 'obsolete.bin', 'executable-mode': 'value.py',
+                    'changed-oid': 'vendor', 'missing-link': 'vendor', 'blob-replacement': 'vendor'}[kind]
             data = b'VALUE = 1\n' if kind == 'executable-mode' else b'unrelated\x00bytes'
             oid = run('hash-object', '-w', '--stdin', data=data)
-            run('update-index', '--add', '--cacheinfo', '100644', oid, path)
+            if kind == 'missing-link':
+                run('update-index', '--force-remove', path)
+            elif kind == 'changed-oid':
+                run('update-index', '--add', '--cacheinfo', '160000', receipt['base_revision'], path)
+            else:
+                run('update-index', '--add', '--cacheinfo', '100644', oid, path)
             tree = run('write-tree')
             receipt['source_revision'] = run('commit-tree', tree, '-p', receipt['base_revision'], '-m', 'alternative source')
     receipt['fingerprint'] = candidate.fingerprint({k: v for k, v in receipt.items() if k != 'fingerprint'})
@@ -269,9 +297,10 @@ def test_clean_filter_mismatch_blocks_with_owned_diagnostic(tmp_path, monkeypatc
     unchanged()
 
 
-@pytest.mark.parametrize('case', ['exact-tree', 'interrupted-before-record', 'interrupted-receipt'])
+@pytest.mark.parametrize('case', ['exact-tree', 'exact-tree-without-gitlink', 'interrupted-before-record', 'interrupted-receipt'])
 def test_matching_receipt_tree_materializes_exact_candidate(tmp_path, monkeypatch, case):
-    root, child, events, unchanged = fixture(tmp_path, monkeypatch, parent=case == 'exact-tree')
+    root, child, events, unchanged = fixture(tmp_path, monkeypatch,
+        parent=case in {'exact-tree', 'exact-tree-without-gitlink'}, gitlink=case != 'exact-tree-without-gitlink')
     if case == 'interrupted-before-record':
         frozen = []
         with monkeypatch.context() as patch:
@@ -292,7 +321,7 @@ def test_matching_receipt_tree_materializes_exact_candidate(tmp_path, monkeypatc
             paused = pause_after_verification(root, monkeypatch)
             receipt_id = paused.candidate_custody['receipt']['attempt_id']
             events.clear()
-        if case == 'exact-tree':
+        if case in {'exact-tree', 'exact-tree-without-gitlink'}:
             with pytest.raises(ObservationBoundary):
                 resume(root, parent=True)
         else:
@@ -310,9 +339,14 @@ def test_matching_receipt_tree_materializes_exact_candidate(tmp_path, monkeypatc
             assert 'writer' not in events and 'execution' not in events and 'collection' not in events
         else:
             assert events.count('writer') == 1 and 'execution' in events and 'collection' in events
+        if case != 'exact-tree-without-gitlink':
+            identity = git(root, 'ls-tree', child.baseline_git_ref, '--', 'vendor')
+            for revision in (receipt['base_revision'], receipt['source_revision'], result.candidate_custody['delivered_revision']):
+                assert git(private, 'ls-tree', revision, '--', 'vendor') == identity
+            assert not any(p == 'vendor' or p.startswith('vendor/') for p in receipt['manifest'])
         before = result.candidate_custody['delivered_revision']
         events.clear()
-        if case == 'exact-tree':
+        if case in {'exact-tree', 'exact-tree-without-gitlink'}:
             with pytest.raises(ObservationBoundary):
                 resume(root, parent=True)
             assert events == ['parent']
@@ -320,4 +354,93 @@ def test_matching_receipt_tree_materializes_exact_candidate(tmp_path, monkeypatc
             assert resume(root).status == 'completed'
             assert events == []
         assert load_session_state(root, child.session_id).candidate_custody['delivered_revision'] == before
+    unchanged()
+
+
+@pytest.mark.parametrize('case', [
+    'changed-oid', 'missing-link', 'blob-replacement', 'materialized-missing',
+    'materialized-file', 'materialized-symlink', 'materialized-populated-directory',
+    'materialized-index-oid',
+])
+def test_retained_gitlink_rejects_changed_identity_or_materialization(tmp_path, monkeypatch, case):
+    import os
+
+    root, child, events, unchanged = fixture(tmp_path, monkeypatch, gitlink=True)
+    if not case.startswith('materialized-'):
+        record = session_module.record_candidate
+        def alter(session, state, before):
+            corrupt(session.project_root, session._candidate_receipt, case)
+            return record(session, state, before)
+        monkeypatch.setattr(session_module, 'record_candidate', alter)
+        result = resume(root)
+        blocked(result, 'vendor')
+        assert events == ['writer']
+    else:
+        retained = pause_after_verification(root, monkeypatch)
+        assert 'execution' in events
+        retained.execution_log = [e for e in retained.execution_log if e.get('action') != 'receipt_verification']
+        save_session_state(root, retained)
+        events.clear()
+        cached_result = LocalGatePlanExecutor.cached_result
+        hits, lookups = [], []
+        foreign = {(p.stat().st_dev, p.stat().st_ino) for p in
+                   (root / 'vendor', root / 'vendor/foreign.bin')}
+        def mutate_before_lookup(executor, command):
+            if getattr(executor, 'validate_source_materialization', None) and executor.use_result_cache:
+                prior = cached_result(executor, command)
+                assert prior is not None and prior.ok, 'real retained cache evidence must be eligible'
+                hits.append(command)
+                lane = executor._shared_sandboxes['receipt-admission']
+                vendor = lane / 'vendor'
+                assert vendor.is_dir() and list(vendor.iterdir()) == []
+                if case == 'materialized-index-oid':
+                    git(lane, 'update-index', '--cacheinfo', '160000', retained.candidate_custody['base_revision'], 'vendor')
+                elif case == 'materialized-populated-directory':
+                    (vendor / 'unexpected.bin').write_bytes(b'not the retained placeholder')
+                else:
+                    vendor.rmdir()
+                    if case == 'materialized-file':
+                        vendor.write_bytes(b'not a gitlink')
+                    elif case == 'materialized-symlink':
+                        vendor.symlink_to(root / 'vendor', target_is_directory=True)
+                lookup = executor.result_cache.lookup_with_reason
+                def observed(*args, **kwargs):
+                    lookups.append(command)
+                    return lookup(*args, **kwargs)
+                monkeypatch.setattr(executor.result_cache, 'lookup_with_reason', observed)
+                events.clear()
+                # Guard the production revalidation itself. Descriptor-based
+                # access must not open or chmod the foreign symlink target.
+                open_fd, chmod, fchmod = os.open, os.chmod, os.fchmod
+                def guarded_open(*args, **kwargs):
+                    fd = open_fd(*args, **kwargs)
+                    info = os.fstat(fd)
+                    if (info.st_dev, info.st_ino) in foreign:
+                        os.close(fd)
+                        pytest.fail('gitlink admission opened foreign content')
+                    return fd
+                def guarded_fchmod(fd, mode):
+                    info = os.fstat(fd)
+                    assert (info.st_dev, info.st_ino) not in foreign
+                    return fchmod(fd, mode)
+                def guarded_chmod(path, mode, **kwargs):
+                    info = os.stat(path, **{k: v for k, v in kwargs.items()
+                                           if k in {'dir_fd', 'follow_symlinks'}})
+                    assert (info.st_dev, info.st_ino) not in foreign
+                    return chmod(path, mode, **kwargs)
+                with monkeypatch.context() as guard:
+                    guard.setattr(os, 'open', guarded_open)
+                    guard.setattr(os, 'chmod', guarded_chmod)
+                    guard.setattr(os, 'fchmod', guarded_fchmod)
+                    return cached_result(executor, command)
+            return cached_result(executor, command)
+        monkeypatch.setattr(LocalGatePlanExecutor, 'cached_result', mutate_before_lookup)
+        result = resume(root)
+        blocked(result, 'vendor')
+        assert len(hits) == 1 and lookups == []
+        assert events == []
+    events.clear()
+    result = resume(root)
+    blocked(result, 'vendor')
+    assert events == []
     unchanged()
