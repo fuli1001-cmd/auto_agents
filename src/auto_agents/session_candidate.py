@@ -1,6 +1,7 @@
 """Private candidate custody: writer receipts never authorize shared copy-back."""
 import base64
 import errno
+import io
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -244,6 +245,14 @@ def validate_receipt(state):
     if not receipt:
         if state.candidate_paths:
             raise ownership_error(state, 'candidate receipt is unavailable')
+        if state.mode == 'fix':
+            actual = _inventory(Path(custody['checkout']))
+            before = custody['preimages']
+            conflicts = sorted(path for path in actual.keys() | before.keys()
+                               if actual.get(path) != before.get(path))
+            if conflicts:
+                raise ownership_error(state, 'private changes have no recorded writer receipt',
+                                      conflicting_paths=conflicts)
         return
     accepted_bindings = {custody['binding_fingerprint'],
                          state.verification_binding.get('binding_fingerprint')}
@@ -268,7 +277,144 @@ def validate_receipt(state):
         if _image(root, path) != postimage['worktree'] or (
                 not custody.get('delivered_revision') and actual.get(path, {}).get('index', []) != postimage['index']):
             raise ownership_error(state, 'private candidate changed after receipt', conflicting_paths=[path])
-    _git(root, 'cat-file', '-e', receipt['source_revision'] + '^{commit}')
+    validate_source(state, receipt['source_revision'])
+
+
+def _raw_git(root, *args, data=None):
+    """Read immutable objects, never filtered worktree content or replace refs."""
+    result = subprocess.run(['git', '--no-replace-objects', *args], cwd=root,
+                            capture_output=True, input=data)
+    if result.returncode:
+        raise RuntimeError(os.fsdecode(result.stderr).strip())
+    return result.stdout
+
+
+def _tree(root, revision):
+    # NUL framing preserves tabs, newlines and non-UTF8 path bytes.
+    commit = _raw_git(root, 'rev-parse', '--verify', revision + '^{commit}').strip().decode('ascii')
+    rows = _raw_git(root, 'ls-tree', '-rz', '--full-tree', commit)
+    result = {}
+    for row in rows.split(b'\0'):
+        if not row:
+            continue
+        identity, path = row.split(b'\t', 1)
+        mode, kind, oid = identity.decode('ascii').split()
+        result[os.fsdecode(path)] = (mode, kind, oid)
+    blobs = sorted({oid for _, kind, oid in result.values() if kind == 'blob'})
+    contents = {}
+    if blobs:
+        stream = io.BytesIO(_raw_git(root, 'cat-file', '--batch',
+                                    data=('\n'.join(blobs) + '\n').encode('ascii')))
+        for oid in blobs:
+            header = stream.readline().split()
+            if len(header) != 3 or header[:2] != [oid.encode('ascii'), b'blob']:
+                raise RuntimeError('candidate tree blob is unavailable')
+            size = int(header[2])
+            content = stream.read(size)
+            if len(content) != size or stream.read(1) != b'\n':
+                raise RuntimeError('candidate tree blob is incomplete')
+            contents[oid] = content
+    return {path: (mode, kind, contents[oid] if kind == 'blob' else oid)
+            for path, (mode, kind, oid) in result.items()}
+
+
+def _blob_identity(image):
+    if image['kind'] == 'symlink':
+        data, mode = os.fsencode(image['target']), '120000'
+    elif image['kind'] == 'file':
+        data = base64.b64decode(image['bytes'], validate=True)
+        mode = '100755' if image['mode'] & 0o100 else '100644'
+    else:
+        raise ValueError('candidate source contains an unsupported file kind')
+    return mode, 'blob', data
+
+
+def _expected_tree(state):
+    custody = state.candidate_custody
+    receipt = custody['receipt']
+    if receipt.get('base_revision') != custody['base_revision']:
+        raise ownership_error(state, 'candidate receipt base differs from authenticated custody',
+                              conflicting_paths=sorted(receipt['manifest']))
+    root = Path(custody['checkout'])
+    expected = _tree(root, custody['base_revision'])
+    for path, entry in receipt['manifest'].items():
+        # Validate paths even for deletions, without resolving symlink parents.
+        if any(part in {'', '.', '..'} for part in path.split('/')):
+            raise ownership_error(state, 'invalid candidate receipt path', conflicting_paths=[path])
+        image = entry['postimage']['worktree']
+        expected.pop(path, None)
+        if image['kind'] not in {'absent', 'directory'}:
+            expected[path] = _blob_identity(image)
+    return expected
+
+
+def validate_source(state, revision):
+    """The complete source is the retained base overlaid with frozen postimages."""
+    try:
+        expected = _expected_tree(state)
+        actual = _tree(Path(state.candidate_custody['checkout']), revision)
+        conflicts = sorted(path for path in expected.keys() | actual.keys()
+                           if expected.get(path) != actual.get(path))
+        if conflicts:
+            raise ownership_error(state, 'candidate source tree differs from frozen receipt',
+                                  conflicting_paths=conflicts)
+        return expected
+    except (OSError, RuntimeError, ValueError) as error:
+        from .session_verification import SessionOwnershipError
+        if isinstance(error, SessionOwnershipError):
+            raise
+        raise ownership_error(state, 'candidate source tree is unavailable',
+                              conflicting_paths=sorted(state.candidate_paths), detail=str(error)) from error
+
+
+def validate_materialized_source(state, root, revision):
+    """Check raw source correspondence and anchored, fully restored postimages."""
+    expected = validate_source(state, revision)
+    conflicts = set()
+    try:
+        for path, identity in expected.items():
+            image = _image(root, path)
+            if image['kind'] not in {'file', 'symlink'} or _blob_identity(image) != identity:
+                conflicts.add(path)
+        for path, entry in state.candidate_custody['receipt']['manifest'].items():
+            if _image(root, path) != entry['postimage']['worktree']:
+                conflicts.add(path)
+        # Preserve runtime/dependency exclusions for generated files only.
+        # Every Git entry above is checked, even inside an excluded directory.
+        from .gate_execution import repository_exclusion_paths, GATE_SNAPSHOT_RUNTIME_PATHS
+        excluded = repository_exclusion_paths(root, surface_paths=GATE_SNAPSHOT_RUNTIME_PATHS)
+        for path in _inventory(root):
+            if any(path == item or path.startswith(item + '/') for item in excluded):
+                continue
+            if _image(root, path)['kind'] not in {'absent', 'directory'} and path not in expected:
+                conflicts.add(path)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ownership_error(state, 'candidate materialization could not be checked',
+                              conflicting_paths=sorted(conflicts), detail=str(error)) from error
+    if conflicts:
+        raise ownership_error(state, 'candidate materialization differs from frozen receipt',
+                              conflicting_paths=sorted(conflicts))
+
+
+def admit_fresh_materialization(state):
+    """Saved success still requires a fresh checkout, including smudge effects."""
+    validate_receipt(state)
+    receipt = state.candidate_custody['receipt']
+    with tempfile.TemporaryDirectory(prefix='auto-agents-receipt-') as runtime:
+        destination = Path(runtime) / 'project'
+        _clone(Path(state.candidate_custody['checkout']), receipt['source_revision'], destination)
+        restore_receipt_modes(state, destination)
+        validate_materialized_source(state, destination, receipt['source_revision'])
+
+
+def restore_receipt_modes(state, root):
+    try:
+        restore_private_modes(root, {path: entry['postimage']['worktree']['mode']
+            for path, entry in state.candidate_custody['receipt']['manifest'].items()
+            if entry['postimage']['worktree']['kind'] in {'file', 'directory'}})
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ownership_error(state, 'candidate permissions could not be restored',
+                              conflicting_paths=sorted(state.candidate_paths), detail=str(error)) from error
 
 
 def verification_identity(session, state):
@@ -307,6 +453,7 @@ def recover_receipt(session, state):
     """Verify an interrupted writer's exact candidate before retry or delivery."""
     from .session_verification import validate_selected_contracts
     receipt = state.candidate_custody['receipt']
+    admit_fresh_materialization(state)
     with session._session_verification_config():
         plan, commands = session._verification_plan_commands()
         validate_selected_contracts(session, state, commands, metadata=plan.metadata)
@@ -394,7 +541,7 @@ def record_receipt(session, state):
 
 
 def deliver_candidate(session, state, message):
-    validate_receipt(state)
+    admit_fresh_materialization(state)
     custody = state.candidate_custody
     receipt = custody.get('receipt')
     if not receipt:
@@ -427,6 +574,7 @@ def completed_delivery(state):
             break
     validate_receipt(state)
     root = Path(custody['checkout'])
+    validate_source(state, revision)
     if _git(root, 'rev-parse', revision + '^{tree}') != _git(root, 'rev-parse', receipt['source_revision'] + '^{tree}'):
         raise ownership_error(state, 'completed delivery differs from verified candidate')
     return True
@@ -460,10 +608,8 @@ def consume_delivery(root, state, delivery, *, child_id):
     from .session_source import validate_checkout
     validate_checkout(root, state, source, owner_id=child_id)
     destination, _ = _runtime_checkout(root, state, source, revision)
-    restore_private_modes(destination, {
-        path: entry['postimage']['worktree']['mode']
-        for path, entry in receipt['manifest'].items()
-        if entry['postimage']['worktree']['kind'] in {'file', 'directory'}})
+    restore_receipt_modes(child, destination)
+    validate_materialized_source(child, destination, revision)
     state.lineage_changed_paths = sorted(set(state.lineage_changed_paths) | set(state.candidate_paths))
     state.candidate_paths = {}
     state.candidate_custody = {'schema_version': 1, 'checkout': str(destination),

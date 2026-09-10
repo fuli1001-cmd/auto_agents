@@ -484,7 +484,13 @@ class Session:
                 auto_approve=self._auto_approve,
                 health_runtime=self._health_runtime,
             )
-        return self._coordinator.resume_session(self, session_id)
+        try:
+            return self._coordinator.resume_session(self, session_id)
+        except SessionOwnershipError as error:
+            # Child delivery can fail admission after its own session has
+            # returned. Keep the attributed diagnostic on the resumed parent.
+            state = load_session_state(self.project_root, session_id)
+            return self._block_execution_binding(state, error, 'verification_ownership')
 
     def offer_resume_or_new(self) -> SessionState:
         """If there are active or failed sessions for this mode, offer to resume; else start new."""
@@ -4062,6 +4068,10 @@ class Session:
         if state is not None and state.candidate_custody:
             receipt = state.candidate_custody.get('receipt', {})
             if (source_ref or getattr(self, '_candidate_source_ref', '')) == receipt.get('source_revision'):
+                from .session_candidate import validate_receipt, validate_materialized_source, restore_receipt_modes
+                validate_receipt(state)
+                executor.validate_source_materialization = lambda root, revision: validate_materialized_source(state, root, revision)
+                executor.restore_source_modes = lambda root: restore_receipt_modes(state, root)
                 executor.source_file_modes = {path: entry['postimage']['worktree']['mode']
                     for path, entry in receipt.get('manifest', {}).items()
                     if entry['postimage']['worktree']['kind'] in {'file', 'directory'}}
@@ -4361,6 +4371,8 @@ class Session:
                     )
             except Exception as exc:
                 from .execution_binding import ExecutionBindingError
+                if isinstance(exc, SessionOwnershipError):
+                    raise
                 if isinstance(exc, ExecutionBindingError):
                     return outcome(False, str(exc), retry_fix=False,
                                    failure_kind="verification_execution_binding")

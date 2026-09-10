@@ -1068,6 +1068,7 @@ class LocalGatePlanExecutor:
         self._cache_miss_reasons: dict[str, str] = {}
         self._timing_estimates: Optional[dict[str, Optional[float]]] = None
         self._lock = threading.Lock()
+        self._source_admission_lock = threading.Lock()
 
     def __enter__(self) -> "LocalGatePlanExecutor":
         self.worktree_root.mkdir(parents=True, exist_ok=True)
@@ -1120,6 +1121,11 @@ class LocalGatePlanExecutor:
                 self._timing_estimates.pop(command, None)
 
     def cached_result(self, command: str) -> Optional[CommandResult]:
+        if getattr(self, 'validate_source_materialization', None) is not None:
+            # Admission precedes lookup, including callers using the local
+            # cache through a distributed executor. Recheck reused lanes.
+            with self._source_admission_lock:
+                self._sandbox('receipt-admission', 'receipt-admission')
         if (
             not self.use_result_cache
             or self.gate_config.verification_policy_version < 2
@@ -1188,6 +1194,9 @@ class LocalGatePlanExecutor:
             with self._lock:
                 existing = self._shared_sandboxes.get(lane)
                 if existing is not None:
+                    validator = getattr(self, 'validate_source_materialization', None)
+                    if validator is not None:
+                        validator(existing, self.snapshot.commit_sha)
                     return existing, False
         if self.snapshot is None:
             raise RuntimeError("gate executor snapshot has not been created")
@@ -1207,7 +1216,14 @@ class LocalGatePlanExecutor:
         track(sandbox, "worktree", project=self.project_root, metadata={"repository": str(self.project_root)})
         install_dependency_links(sandbox, self.dependency_links)
         from .execution_binding import restore_private_modes
-        restore_private_modes(sandbox, getattr(self, "source_file_modes", {}))
+        restore = getattr(self, 'restore_source_modes', None)
+        if restore is not None:
+            restore(sandbox)
+        else:
+            restore_private_modes(sandbox, getattr(self, "source_file_modes", {}))
+        validator = getattr(self, 'validate_source_materialization', None)
+        if validator is not None:
+            validator(sandbox, self.snapshot.commit_sha)
         if lane:
             with self._lock:
                 self._shared_sandboxes[lane] = sandbox
@@ -1597,6 +1613,9 @@ class LocalGatePlanExecutor:
             self.record_timing(command, result)
             return result
         except (OSError, RuntimeError, ValueError) as error:
+            from .session_verification import SessionOwnershipError
+            if isinstance(error, SessionOwnershipError):
+                raise
             result = CommandResult(
                 command=command,
                 ok=False,
