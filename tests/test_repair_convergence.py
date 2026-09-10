@@ -91,6 +91,9 @@ def test_rejected_components_stop_after_one_redesign_without_accepted_progress(t
         patch.object(runner, "_latest_pending_validation_ref", return_value=""),
         patch.object(runner, "_resume_pending_validation_candidate", return_value=None),
         patch.object(runner, "_automatic_contract_reanalysis", return_value=False),
+        patch('auto_agents.repair_actions.stalled_correction', return_value={
+            'kind': 'local_repair', 'reason': 'retained review identifies a local implementation error',
+            'evidence_ids': ['retained-review']}),
         patch.object(runner, "_run_candidate", side_effect=candidate),
     ):
         result = runner._run_search()

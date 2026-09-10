@@ -315,6 +315,13 @@ def test_restart_retains_independent_planning_artifacts_and_historical_completio
     state.historical_completed_groups['custody'] = {'completed_by': 'c1', 'status': 'completed'}
     state.planning_attempts['audit'] = 2
     state.planning_receipts['audit'] = {'decision': 'REVISE', 'feedback': ['missing recovery case']}
+    from auto_agents.repair_memory import remember_revision, read_record
+    memory_runner = SimpleNamespace(_experiment=state, _experiment_store=restart.evidence)
+    reference = remember_revision(memory_runner, {'contract_obligation_ids': ['owned'],
+        'touched_paths': ['bug.py'], 'focused_tests': []},
+        {'draft': {'implementation_steps': ['preserve latest source']}, 'status': 'draft'})
+    state.repair_episodes['bounded'] = {'semantic_attempts': 2, 'format_corrections': 1,
+                                       'pending_round': True, 'phase': 'draft'}
     restart.evidence.save(state)
     artifact = restart.evidence.root / 'planning' / 'independent-request'
     artifact.mkdir(parents=True)
@@ -327,3 +334,8 @@ def test_restart_retains_independent_planning_artifacts_and_historical_completio
     assert migrated.historical_completed_groups == state.historical_completed_groups
     assert migrated.planning_attempts == state.planning_attempts
     assert migrated.planning_receipts == state.planning_receipts
+    assert migrated.plan_revisions == state.plan_revisions
+    assert migrated.component_memory == state.component_memory
+    assert migrated.repair_episodes == state.repair_episodes
+    assert read_record(SimpleNamespace(_experiment_store=copied), reference)['draft'] == {
+        'implementation_steps': ['preserve latest source']}

@@ -2379,9 +2379,10 @@ class AutoAgentsSelfRepairRunner:
                 try:
                     self._prepare_component_plan(candidate_root)
                 except (OSError, RuntimeError, ValueError) as error:
-                    return SelfRepairResult(False, 'candidate_design_rejected', category=self.decision.category,
+                    return SelfRepairResult(False, 'planning_blocked', category=self.decision.category,
                         reason=str(error), candidate_id=candidate_id, candidate_ref=candidate_ref,
                         candidate_commit=candidate_commit, experiment_id=experiment_id,
+                        next_action={'kind': 'blocked', 'planning_failure': getattr(error, 'detail', {'message': str(error)})},
                         recoverable_validation=True)
                 if getattr(self, '_candidate_group', {}).get('planning_receipt'):
                     quick, early = self._early_candidate_checks(candidate_root, base_head)
@@ -3717,16 +3718,7 @@ class AutoAgentsSelfRepairRunner:
                 self._consecutive_design_rejections(experiment)
                 >= SELF_REPAIR_MAX_CONSECUTIVE_DESIGN_REJECTIONS
             ):
-                stalled = self._stalled_search_result(experiment)
-                if stalled is not None:
-                    return stalled
-                experiment.apply_automatic_correction(reason="design stalled; preserve verified components and change the failing strategy",
-                                                      progress_anchor=experiment.accepted_progress_anchor())
-                experiment.design_history.append({"event": "design_search_restart", "at": _utc_now_iso()})
-                store.save(experiment)
-                self._automatic_contract_reanalysis(experiment, SelfRepairResult(
-                    False, "candidate_design_rejected", "repeated design rejection requires new causal evidence or component decomposition",
-                ))
+                return self._design_review_exhausted_result(experiment)
             if not self._ensure_approved_repair_design(experiment):
                 continue
             active_group = experiment.next_finding_group()
@@ -3758,6 +3750,9 @@ class AutoAgentsSelfRepairRunner:
                 deadline=None,
             )
             if pending is not None:
+                if pending.status == 'planning_blocked':
+                    store.save(experiment)
+                    return pending
                 pending.attempt = experiment.attempt_count
                 stored_pending = experiment.candidates.get(pending.candidate_id)
                 if stored_pending is not None:
@@ -3806,17 +3801,6 @@ class AutoAgentsSelfRepairRunner:
             attempt = experiment.attempt_count + 1
             self._candidate_started_at = time.monotonic()
             reporter = getattr(self.target_orchestrator, "reporter", None)
-            if reporter is not None and hasattr(reporter, "emit"):
-                reported_parent = experiment.best_search_candidate_id
-                if self._continuous_mode():
-                    retained = Path(self._continuous_workspace) / "repair"
-                    if retained.exists():
-                        retained_head = head_ref(retained)
-                        reported_parent = self._candidate_parent_id(retained_head) or retained_head[:12]
-                reporter.emit("repair.candidate_started", candidate=attempt,
-                              parent=reported_parent,
-                              component=active_group.get("group_id", ""),
-                              remaining=len(experiment.blocking_findings()))
             recent_records = sorted((
                 item
                 for candidate_id, item in experiment.candidates.items()
@@ -3876,6 +3860,13 @@ class AutoAgentsSelfRepairRunner:
                     diff_line_count=self._candidate_partial_diff_line_count,
                     infrastructure_failure=self._is_infrastructure_candidate_error(error),
                 )
+            if candidate.status == 'planning_blocked':
+                # Planning has its own durable identity and budget. Repeating an
+                # exhausted plan must not manufacture failed code candidates.
+                experiment.current_candidate_id = ''
+                store.save(experiment)
+                store.record_health(experiment, status='planning_blocked', detail=candidate.reason)
+                return candidate
             if not candidate.finding_group_id:
                 candidate.finding_group_id = str(
                     getattr(self, "_candidate_group", {}).get("group_id", "")
@@ -3961,6 +3952,27 @@ class AutoAgentsSelfRepairRunner:
                     return stalled
                 if self._use_regression_owner_correction(experiment, candidate):
                     continue
+                if candidate.status != 'candidate_design_rejected':
+                    from .repair_actions import stalled_correction
+                    correction = stalled_correction(self, experiment, candidate)
+                    if correction['kind'] == 'blocked':
+                        candidate.status = 'diagnosis_blocked'
+                        candidate.reason = correction['reason']
+                        candidate.next_action = correction
+                        store.save(experiment)
+                        return candidate
+                    if correction['kind'] != 'global_redesign':
+                        event = {'kind': correction['kind'], 'progress_anchor': experiment.accepted_progress_anchor(),
+                                 'candidate_id': candidate.candidate_id, 'reason': correction['reason'],
+                                 'evidence_ids': correction.get('evidence_ids', []), 'at': _utc_now_iso()}
+                        experiment.automatic_corrections.append(event)
+                        experiment.design_history.append(dict(event))
+                        experiment.consecutive_non_improvements = 0
+                        if correction['kind'] == 'component_redesign':
+                            group = next(g for g in experiment.finding_groups if g['group_id'] == candidate.finding_group_id)
+                            group.setdefault('implementation_steps', []).append(correction['reason'])
+                        store.save(experiment)
+                        continue
                 if self._continuous_mode():
                     write_json(Path(self._continuous_workspace) / "fallback.json", {
                         "reason": "three non-improving continuous attempts; deepen diagnosis without discarding evidence",
@@ -4513,13 +4525,10 @@ class AutoAgentsSelfRepairRunner:
             ignore_run_artifacts=True,
         )
         target_head_before = head_ref(self.target_project_root)
-        candidate_id = f"c{attempt}-{uuid.uuid4().hex[:8]}"
-        self._candidate_id = candidate_id
+        candidate_id = ''
+        self._candidate_id = ''
         self._candidate_provider_result = None
         self._candidate_review_completed = False
-        if isinstance(experiment, SelfRepairExperiment):
-            experiment.current_candidate_id = candidate_id
-            self._experiment_store.save(experiment)
         with self._candidate_workspace() as tmp:
             repair_root = Path(tmp) / "repair"
             created = False
@@ -4545,9 +4554,20 @@ class AutoAgentsSelfRepairRunner:
                 try:
                     self._prepare_component_plan(repair_root)
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-                    return SelfRepairResult(False, 'candidate_design_rejected', category=self.decision.category,
-                        reason=str(error), experiment_id=experiment_id, candidate_id=candidate_id,
+                    return SelfRepairResult(False, 'planning_blocked', category=self.decision.category,
+                        reason=str(error), experiment_id=experiment_id,
+                        next_action={'kind': 'blocked', 'planning_failure': getattr(error, 'detail', {'message': str(error)})},
                         base_commit=base_head, finding_group_id=self._candidate_group.get('group_id', ''))
+                candidate_id = f"c{attempt}-{uuid.uuid4().hex[:8]}"
+                self._candidate_id = candidate_id
+                if reporter is not None and hasattr(reporter, 'emit'):
+                    reporter.emit('repair.candidate_started', candidate=attempt,
+                        parent=self._candidate_parent_id(base_head) or base_head[:12],
+                        component=getattr(self, '_candidate_group', {}).get('group_id', ''),
+                        remaining=len(experiment.blocking_findings()) if isinstance(experiment, SelfRepairExperiment) else 0)
+                if isinstance(experiment, SelfRepairExperiment):
+                    experiment.current_candidate_id = candidate_id
+                    self._experiment_store.save(experiment)
                 prompt = self._build_prompt(repair_root, target_snapshot)
                 prompt_path, output_path = self._artifact_paths()
                 write_text(prompt_path, prompt)
@@ -5483,7 +5503,7 @@ class AutoAgentsSelfRepairRunner:
                 return approved
             except BaseException:
                 self._candidate_keep_workspace = created
-                if created:
+                if created and candidate_id:
                     saved = self._preserve_interrupted_candidate(
                         repair_root, base_head=base_head, candidate_id=candidate_id,
                     )
@@ -5931,6 +5951,23 @@ class AutoAgentsSelfRepairRunner:
             full_diff_path = self._experiment_store.root / ('review-diff-' + _search_stable_hash(diff) + '.patch')
             write_text(full_diff_path, diff)
             full_diff = str(full_diff_path)
+        review_context = self._incremental_review_context(repair_root, active_group, phase)
+        review_input_ref = ''
+        if isinstance(experiment, SelfRepairExperiment) and hasattr(self, '_experiment_store'):
+            from .repair_memory import save_record
+            reference = save_record(self, 'code_review_input', {
+                'component': active_group, 'pending_components': experiment.finding_groups,
+                'findings': [item.to_dict() for item in blocking_findings],
+                'contract': contract_payload, 'replay': replay_summary, 'diff': diff,
+                'incremental_context': review_context})
+            review_input_ref = str(self._experiment_store.root / 'planning' / reference['id'] / 'memory.json')
+        incremental = review_context.get('mode') == 'incremental' and phase != 'integration'
+        if incremental:
+            active_findings = set(active_group.get('finding_ids', []))
+            prompt_findings = [item for item in blocking_findings if item.finding_id in active_findings
+                               or item.disposition == 'candidate_regression']
+        else:
+            prompt_findings = blocking_findings
         prompt = "\n".join(
             [
                 "Review this isolated auto_agents self-repair candidate.",
@@ -5953,7 +5990,8 @@ class AutoAgentsSelfRepairRunner:
                 "The controller will schedule its correction without waiving the regression. "
                 "Distinguish the cumulative diff from this attempt's parent when identifying its origin.",
                 ("Only the small counterexample and safety checks passed. Full component regression is REQUIRED "
-                 "AFTER this review, not evidence to demand now. Inspect the complete source and approved scenarios. "
+                 "AFTER this review, not evidence to demand now. Inspect changed behavior, approved scenarios and "
+                 "their dependencies; use retained review conclusions without rebuilding unchanged background. "
                  if phase == 'quick' else "Focused checks already passed. ") + "Whole-repair boundary proof belongs to "
                 "integration, and the full suite runs after semantic review; absence of "
                 "proof belonging to a future component or gate is not a finding.",
@@ -5965,6 +6003,10 @@ class AutoAgentsSelfRepairRunner:
                 "a pending group_id for downstream-owned work, or post_full_suite for deferred "
                 "full-suite evidence. "
                 "Use stable semantic finding IDs and list prior finding IDs proven resolved.",
+                "For each finding include repair_kind=implementation|plan_gap and scenario_ids. "
+                "Use implementation only when the approved mechanisms and named scenarios already cover "
+                "the required fix. A new mechanism, boundary or scenario is plan_gap. "
+                "Established facts may be retained only after checking the delta and its interactions.",
                 "Schema: {\"decision\":\"APPROVE|REJECT\",\"reason\":\"...\","
                 "\"findings\":[{\"finding_id\":\"...\",\"severity\":\"hard\","
                 "\"disposition\":\"candidate_regression\","
@@ -5974,6 +6016,10 @@ class AutoAgentsSelfRepairRunner:
                 "\"evidence\":[\"...\"],\"defer_until\":\"\"}],"
                 "\"resolved_finding_ids\":[\"...\"]}.",
                 f"REVIEW_PHASE: {phase}",
+                "INCREMENTAL_REVIEW_CONTEXT:",
+                json.dumps(review_context, ensure_ascii=False),
+                "COMPLETE_REVIEW_INPUT:",
+                review_input_ref,
                 "FROZEN_CONTRACT:",
                 json.dumps(contract_payload, ensure_ascii=False),
                 "ACTIVE_COMPONENT:",
@@ -5981,7 +6027,8 @@ class AutoAgentsSelfRepairRunner:
                 "PENDING_COMPONENTS:",
                 json.dumps(
                     [
-                        dict(item)
+                        ({key: item.get(key) for key in ('group_id', 'depends_on', 'finding_ids', 'title')}
+                         if incremental else dict(item))
                         for item in (
                             experiment.finding_groups
                             if isinstance(experiment, SelfRepairExperiment)
@@ -5995,7 +6042,7 @@ class AutoAgentsSelfRepairRunner:
                 ),
                 "OPEN_CONTRACT_FINDINGS:",
                 json.dumps(
-                    [item.to_dict() for item in blocking_findings],
+                    [item.to_dict() for item in prompt_findings],
                     ensure_ascii=False,
                 ),
                 "SEALED_REPLAY:",
@@ -6135,6 +6182,9 @@ class AutoAgentsSelfRepairRunner:
             ],
         }
         self._persist_deferred_candidate_findings(deferred_findings)
+        if isinstance(experiment, SelfRepairExperiment) and hasattr(self, '_experiment_store'):
+            from .repair_memory import remember_review
+            remember_review(self, repair_root, active_group, normalized_payload)
         review_ok = bool(reason) and not findings and decision in {"APPROVE", "REJECT"}
         self._candidate_review_completed = bool(reason) and decision in {"APPROVE", "REJECT"}
         rendered_decision = decision or "INVALID"
@@ -6143,6 +6193,13 @@ class AutoAgentsSelfRepairRunner:
             f"candidate review={rendered_decision} reason={reason}",
             payload=normalized_payload,
         )
+
+    def _incremental_review_context(self, root, group, phase):
+        if (phase == 'integration' or not hasattr(self, '_experiment_store')
+                or not isinstance(getattr(self, '_experiment', None), SelfRepairExperiment)):
+            return {'mode': 'complete_integration' if phase == 'integration' else 'initial'}
+        from .repair_memory import review_context
+        return review_context(self, root, group)
 
     @_timed_repair_phase("proof_seal")
     def _deterministic_proof_seal(
@@ -8571,11 +8628,23 @@ class AutoAgentsSelfRepairRunner:
         group = dict(getattr(self, '_candidate_group', {}) or {})
         if not group.get('planning_receipt'):
             return self._run_active_group_verification(workspace), _VerificationResult(True, 'legacy verification order')
-        from .repair_schedule import canonical_commands
-        commands, requests = canonical_commands(group['quick_checks'])
+        from .repair_schedule import quick_verification_plan
+        plan = quick_verification_plan(self._experiment, group)
+        commands, requests = plan['commands'], plan['requests']
+        self._candidate_quick_plan = plan
         with self._phase_timer('quick_verification'):
             quick = self._guarded_component_checks(commands, workspace)
-        quick.payload.update(source_commands=commands[:len(quick.returncodes)], requests=requests)
+        quick.payload.update(source_commands=commands[:len(quick.returncodes)], requests=requests,
+                             quick_schedule=plan)
+        from .repair_memory import component_key, save_record
+        timings = quick.payload.get('command_timings', [])
+        memory = self._experiment.component_memory.setdefault(component_key(group), {})
+        memory.setdefault('check_timings', {}).update({row['command']: row for row in timings})
+        memory['verification_schedule'] = save_record(self, 'verification_schedule', {
+            'plan': plan, 'timings': timings, 'ok': quick.ok,
+            'certificate_hits': quick.payload.get('certificate_hits', 0),
+            'source_commit': head_ref(workspace)})
+        self._experiment_store.save(self._experiment)
         if not quick.ok:
             return quick, _VerificationResult(False, 'quick checks failed; semantic review deferred')
         review = self._review_candidate(workspace, base_head,
@@ -8744,6 +8813,7 @@ class AutoAgentsSelfRepairRunner:
         duration_seconds = 0.0
         proof_refs = []
         executed_tests = []
+        command_timings = []
         certificate_hits = 0
         for command in commands:
             source_command = command
@@ -8824,6 +8894,7 @@ class AutoAgentsSelfRepairRunner:
                         if profiled and receipt.exists():
                             recorded = read_json(receipt, default={})
                             process.executed_tests = list(recorded.get("passed", []))
+                            process.process_snapshot['collected_tests'] = list(recorded.get('collected', []))
                             process.process_snapshot["verification_failures"] = recorded.get("failures", [])
                             process.phase_seconds = dict(recorded.get("phases", {}))
                             process.test_timings = list(recorded.get("slowest", []))
@@ -8884,6 +8955,11 @@ class AutoAgentsSelfRepairRunner:
                     | getattr(self, "_pending_prepared_dependencies", set()))
                 self._pending_prepared_dependencies = set()
             duration_seconds += float(process.duration_seconds)
+            collected = process.process_snapshot.get('collected_tests')
+            command_timings.append({'command': source_command, 'seconds': float(process.duration_seconds),
+                'collected_cases': len(collected) if isinstance(collected, list) else None,
+                'passed_cases': len(process.executed_tests), 'cache_hit': bool(getattr(process, 'cached', False)),
+                'queue_seconds': float(getattr(process, 'queue_seconds', 0.0) or 0.0)})
             if getattr(process, "proof_ref", ""):
                 proof_refs.append(process.proof_ref)
             executed_tests.extend(getattr(process, "executed_tests", []))
@@ -8934,6 +9010,7 @@ class AutoAgentsSelfRepairRunner:
                         "source_commands": list(commands[: len(returncodes)]),
                         "nonfatal_source_commands": nonfatal_source_commands,
                         "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
+                        "command_timings": command_timings,
                     },
                 )
         return _VerificationResult(
@@ -8948,6 +9025,7 @@ class AutoAgentsSelfRepairRunner:
                 "source_commands": list(commands[: len(returncodes)]),
                 "nonfatal_source_commands": nonfatal_source_commands,
                 "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
+                "command_timings": command_timings,
             },
         )
 

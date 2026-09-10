@@ -3,6 +3,83 @@ import shlex
 
 from .repair_test_refs import migrate_review_commands, pytest_targets
 
+QUICK_COMMAND_TARGET = 3
+QUICK_NODE_TARGET = 12
+QUICK_SECONDS_TARGET = 180
+
+
+def quick_verification_plan(experiment, active):
+    """Select current negative/positive oracles, preserving full acceptance.
+
+    Commands are atomic: batching never changes a pytest invocation's cohort,
+    options or fixture lifetime. A budget is a scheduling target, not a waiver.
+    """
+    scenarios = active.get('scenarios', [])
+    required = set(active.get('finding_ids', []))
+    bindings = active.get('finding_scenario_bindings', {})
+    from .repair_memory import component_key
+    timings = experiment.component_memory.get(component_key(active), {}).get('check_timings', {})
+    def cost(row):
+        old = timings.get(row.get('quick_check') or row['check'], {})
+        return (old.get('collected_cases') is None, old.get('collected_cases') or 0,
+                old.get('seconds', 0))
+    selected, reasons = [], []
+    for finding in sorted(required) or [None]:
+        relevant = [row for row in scenarios if finding is None or finding in row.get('finding_ids', [])
+                    or row.get('scenario_id') in bindings.get(finding, [])]
+        negatives = [row for row in relevant if row.get('kind') == 'failure']
+        positives = [row for row in relevant if row.get('kind') == 'compatibility']
+        if not positives:
+            owners = {key for row in negatives for key in row.get('obligation_ids', [])}
+            positives = [row for row in scenarios if row.get('kind') == 'compatibility'
+                         and owners.intersection(row.get('obligation_ids', []))]
+        # Each required finding has a negative oracle and a compatible control.
+        # If mapping is incomplete, retain the supplied quick set rather than guess.
+        if not negatives or not positives:
+            selected.extend(active.get('quick_checks', []))
+            reasons.append('incomplete oracle mapping: retained supplied quick checks')
+        else:
+            for row in (negatives[0], min(positives, key=cost)):
+                selected.append(row.get('quick_check') or row['check'])
+    for row in scenarios:
+        if row.get('quick_required') is True:
+            selected.append(row.get('quick_check') or row['check'])
+    if not selected:
+        selected = list(active.get('quick_checks', []))
+    commands, requests = canonical_commands(selected)
+    inventory, _ = canonical_commands([*active.get('quick_checks', []),
+        *active.get('focused_tests', []), *(row['check'] for row in scenarios if row.get('check'))])
+    targets = sum(len((pytest_parts(command) or ([], []))[1]) for command in commands)
+    if len(commands) > QUICK_COMMAND_TARGET or targets > QUICK_NODE_TARGET:
+        reasons.append('required oracles exceed selection target; preserve them in serial batches')
+    batches, batch, cases, seconds = [], [], 0, 0.0
+    for command in commands:
+        old = timings.get(command, {})
+        count = old.get('collected_cases')
+        duration = old.get('seconds', 0)
+        if batch and (len(batch) >= QUICK_COMMAND_TARGET or cases + (count or 0) > QUICK_NODE_TARGET
+                      or seconds + duration > QUICK_SECONDS_TARGET):
+            batches.append(batch)
+            batch, cases, seconds = [], 0, 0.0
+        batch.append(command)
+        cases += count or 0
+        seconds += duration
+        if count is None:
+            reasons.append('unknown collection size: preserve explicit oracle; prefer a reviewed parameter case')
+        elif count > QUICK_NODE_TARGET or duration > QUICK_SECONDS_TARGET:
+            reasons.append('atomic required command exceeds target; preserve its fixture semantics')
+    if batch:
+        batches.append(batch)
+    return {'commands': commands, 'requests': requests,
+            'batches': batches,
+            'acceptance_inventory': inventory,
+            'deferred': [{'command': c, 'reason': 'expanded acceptance after code review'}
+                         for c in inventory if c not in commands],
+            'budget': {'commands': QUICK_COMMAND_TARGET, 'collected_cases': QUICK_NODE_TARGET,
+                       'estimated_seconds': QUICK_SECONDS_TARGET},
+            'budget_exceptions': list(dict.fromkeys(reasons)),
+            'estimated_seconds': sum(timings[c].get('seconds', 0) for c in commands) if all(c in timings for c in commands) else None}
+
 
 def canonical_commands(commands):
     """Coalesce identical supported invocations, retaining every request owner.
@@ -22,8 +99,15 @@ def canonical_commands(commands):
 
 
 def pytest_parts(command):
+    if not isinstance(command, str) or not command.strip():
+        return None
     try:
         args = shlex.split(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ''
+        if list(lexer) != args:
+            return None  # Shell lists/redirection are not a single pytest invocation.
     except ValueError:
         return None
     if args[:3] != ['python', '-m', 'pytest']:
@@ -38,6 +122,8 @@ def pytest_parts(command):
 def verification_plan(experiment, active):
     migrate_review_commands(experiment)
     focused = list(active.get('focused_tests', []))
+    focused.extend(active.get('quick_checks', []))
+    focused.extend(active.get('retained_acceptance', []))
     focused.extend(row['check'] for row in active.get('scenarios', []) if row.get('check'))
     # A routed regression retains its concrete reproduction as required proof,
     # even when the original component plan predates the review finding.

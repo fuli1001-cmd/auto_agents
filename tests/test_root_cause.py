@@ -1229,7 +1229,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             )
             self.assert_parseable_utc(evidence_change["at"])
 
-    def test_runner_automatically_corrects_non_progress_and_continues(self):
+    def test_runner_blocks_unsubstantiated_non_progress_without_resetting_design(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -1304,34 +1304,6 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     candidate_id="c3",
                     candidate_ref="HEAD",
                 ),
-                SelfRepairResult(
-                    False,
-                    "candidate_replay_failed",
-                    "another replay failed",
-                    candidate_id="c4",
-                    candidate_ref="HEAD",
-                ),
-                SelfRepairResult(
-                    False,
-                    "candidate_replay_failed",
-                    "final replay failed",
-                    candidate_id="c5",
-                    candidate_ref="HEAD",
-                ),
-                SelfRepairResult(
-                    True,
-                    "approved_candidate",
-                    "automatic redesign converged",
-                    candidate_id="c6",
-                    candidate_ref="HEAD",
-                    candidate_commit=subprocess.run(
-                        ["git", "rev-parse", "HEAD"],
-                        cwd=auto_root,
-                        check=True,
-                        text=True,
-                        capture_output=True,
-                    ).stdout.strip(),
-                ),
             ]
             with (
                 patch(
@@ -1344,8 +1316,8 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 runner.repo_root = auto_root
                 result = runner.run()
 
-            self.assertEqual(result.candidate_id, "c6")
-            self.assertEqual(result.status, "approved_candidate")
+            self.assertEqual(result.candidate_id, "c3")
+            self.assertEqual(result.status, "diagnosis_blocked")
             state = load_run_state(target_root)
             store = SelfRepairExperimentStore(
                 target_root,
@@ -1354,7 +1326,8 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             )
             experiment = store.load()
             self.assertIsNotNone(experiment)
-            self.assertTrue(experiment.automatic_corrections)
+            self.assertFalse(experiment.automatic_corrections)
+            self.assertEqual(experiment.attempt_count, 3)
             self.assertNotEqual(experiment.status, "needs_human")
 
     def test_self_repair_health_preemption_is_infrastructure_interruption(self):
@@ -3307,7 +3280,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(review["blocking_issues"], [])
             self.assertEqual(len(review["nonblocking_issues"]), 1)
 
-    def test_design_review_rejections_restart_strategy_without_stopping(self):
+    def test_design_review_rejections_require_new_evidence_before_replanning(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -3358,7 +3331,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 def _call_with_failover(self, request):
                     self.calls += 1
                     if self.calls > 3:
-                        raise KeyboardInterrupt("operator stopped the continued search")
+                        raise AssertionError("repeated rejection must not buy another design window")
                     contract = json.loads(
                         request.prompt.split("FROZEN_CONTRACT:\n", 1)[1].split(
                             "\nROOT_CAUSE:", 1
@@ -3421,12 +3394,12 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     decision=SelfRepairDecision(True, category="design-loop"),
                     diagnosis=Diagnosis(),
                 )
-                with self.assertRaises(KeyboardInterrupt):
-                    runner.run()
+                result = runner.run()
 
-            self.assertEqual(orchestrator.calls, 4)
-            self.assertEqual(runner._experiment.status, "active")
-            self.assertTrue(any(event.get("event") == "design_search_restart" for event in runner._experiment.design_history))
+            self.assertEqual(result.status, "design_review_exhausted")
+            self.assertEqual(orchestrator.calls, 3)
+            self.assertEqual(runner._experiment.attempt_count, 0)
+            self.assertFalse(any(event.get("event") == "design_search_restart" for event in runner._experiment.design_history))
 
     def test_candidate_review_defers_downstream_component_finding(self):
         with tempfile.TemporaryDirectory() as tmp:

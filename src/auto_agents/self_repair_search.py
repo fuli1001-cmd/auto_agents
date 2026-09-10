@@ -16,7 +16,7 @@ from .execution_recovery import redact_incident_text
 from .io_utils import read_json
 
 
-SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 6
+SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 7
 # Adding progress metadata does not change what existing proof establishes.
 SELF_REPAIR_PROOF_SCHEMA_VERSION = 4
 
@@ -77,6 +77,9 @@ class SelfRepairFinding:
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
     repair_group_id: str = ""
+    affected_paths: list[str] = field(default_factory=list)
+    scenario_ids: list[str] = field(default_factory=list)
+    repair_kind: str = ""
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "SelfRepairFinding":
@@ -97,6 +100,11 @@ class SelfRepairFinding:
             required_test=str(payload.get("required_test", "")),
             defer_until=defer_until,
             repair_group_id=str(payload.get("repair_group_id", "")).strip(),
+            affected_paths=[str(item) for item in payload.get('affected_paths', [])]
+                if isinstance(payload.get('affected_paths', []), list) else [],
+            scenario_ids=[str(item) for item in payload.get('scenario_ids', [])]
+                if isinstance(payload.get('scenario_ids', []), list) else [],
+            repair_kind=str(payload.get('repair_kind', '')),
             evidence=[
                 str(item)
                 for item in (raw_evidence if isinstance(raw_evidence, list) else [])
@@ -255,6 +263,10 @@ class SelfRepairExperiment:
     scope_decisions: Dict[str, Dict[str, object]] = field(default_factory=dict)
     planning_receipts: Dict[str, Dict[str, object]] = field(default_factory=dict)
     planning_attempts: Dict[str, int] = field(default_factory=dict)
+    plan_revisions: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    component_memory: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    repair_episodes: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    review_facts: Dict[str, Dict[str, object]] = field(default_factory=dict)
     historical_completed_groups: Dict[str, Dict[str, object]] = field(default_factory=dict)
     completed_contract_obligation_ids: list[str] = field(default_factory=list)
     completed_finding_ids: list[str] = field(default_factory=list)
@@ -373,6 +385,8 @@ class SelfRepairExperiment:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "SelfRepairExperiment":
+        if int(payload.get('schema_version', 3)) > SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION:
+            raise ValueError('self-repair experiment requires a newer reader')
         raw_candidates = payload.get("candidates", {})
         raw_findings = payload.get("findings", {})
         raw_obligations = payload.get("obligations", {})
@@ -404,13 +418,20 @@ class SelfRepairExperiment:
             for key, value in raw_candidates.items()
             if isinstance(value, Mapping)
         }
-        for name in ('scope_decisions', 'planning_receipts', 'planning_attempts', 'historical_completed_groups'):
+        for name in ('scope_decisions', 'planning_receipts', 'planning_attempts', 'historical_completed_groups',
+                     'plan_revisions', 'component_memory', 'repair_episodes', 'review_facts'):
             if not isinstance(payload.get(name, {}), Mapping):
                 raise ValueError(f'self-repair experiment {name} must be an object')
             if name != 'planning_attempts' and any(not isinstance(value, Mapping) for value in payload.get(name, {}).values()):
                 raise ValueError(f'self-repair experiment {name} entries must be objects')
         if any(type(value) is not int or value < 0 for value in payload.get('planning_attempts', {}).values()):
             raise ValueError('planning attempt counters must be nonnegative integers')
+        for episode in payload.get('repair_episodes', {}).values():
+            for name in ('semantic_attempts', 'format_corrections', 'pending_format', 'round_format_calls'):
+                if type(episode.get(name, 0)) is not int or episode.get(name, 0) < 0:
+                    raise ValueError('repair episode counters must be nonnegative integers')
+            if 'pending_round' in episode and type(episode['pending_round']) is not bool:
+                raise ValueError('repair episode pending_round must be boolean')
         findings = {
             str(key): SelfRepairFinding.from_dict(value)
             for key, value in raw_findings.items()
@@ -482,6 +503,10 @@ class SelfRepairExperiment:
             scope_decisions=dict(payload.get('scope_decisions', {})),
             planning_receipts=dict(payload.get('planning_receipts', {})),
             planning_attempts=dict(payload.get('planning_attempts', {})),
+            plan_revisions=dict(payload.get('plan_revisions', {})),
+            component_memory=dict(payload.get('component_memory', {})),
+            repair_episodes=dict(payload.get('repair_episodes', {})),
+            review_facts=dict(payload.get('review_facts', {})),
             historical_completed_groups=dict(payload.get('historical_completed_groups', {})),
             sticky_verification_commands=[
                 str(item)
@@ -995,6 +1020,11 @@ class SelfRepairExperiment:
                     existing.counterexample = finding.counterexample
                 if finding.required_test:
                     existing.required_test = finding.required_test
+                if finding.evidence:
+                    existing.evidence = list(finding.evidence)
+                existing.affected_paths = list(finding.affected_paths)
+                existing.scenario_ids = list(finding.scenario_ids)
+                existing.repair_kind = finding.repair_kind
                 existing.disposition = disposition
                 existing.causal_obligation_id = causal_id
                 if causal_id not in record.failed_obligations:
@@ -1254,6 +1284,8 @@ class SelfRepairExperimentStore:
         experiment.updated_at = _utc_now()
         if self.path.is_file():
             previous = read_json(self.path, default={})
+            if int(previous.get('schema_version', 3)) > SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION:
+                raise RuntimeError('refusing to overwrite a newer self-repair experiment schema')
             if int(previous.get("schema_version", 3)) < SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION:
                 backup = self.path.with_name(f"experiment.v{int(previous.get('schema_version', 3))}.json")
                 if not backup.exists():
