@@ -401,10 +401,29 @@ class Session:
             )
         return self._coordinator.start_session(self)
 
+    @contextlib.contextmanager
+    def _resume_authority_context(self, state):
+        """Keep the original authority for one public resume, including nesting."""
+        from copy import deepcopy
+        active = getattr(self, '_resume_authority_active', False)
+        if active:
+            if self._resumed_verification_state.session_id != state.session_id:
+                raise ownership_error(state, 'nested resume belongs to another session')
+            yield
+            return
+        self._resume_authority_active = True
+        self._resumed_verification_state = deepcopy(state)
+        try:
+            yield
+        finally:
+            self._resumed_verification_state = None
+            self._resume_authority_active = False
+
     def _retain_resume_authority(self, state) -> bool:
         """Capture persisted provenance before any coordinator migration."""
         from copy import deepcopy
-        if self._resumed_verification_state is None:
+        if (self._resumed_verification_state is None
+                or self._resumed_verification_state.session_id != state.session_id):
             self._resumed_verification_state = deepcopy(state)
         if state.mode != 'fix':
             return True
@@ -429,6 +448,11 @@ class Session:
         any writer retry, preserving their original attempt budget.
         """
         existing = load_session_state(self.project_root, session_id)
+        with self._resume_authority_context(existing):
+            return self._resume_existing(existing)
+
+    def _resume_existing(self, existing):
+        session_id = existing.session_id
         if existing.mode != self.mode:
             raise ValueError(f"session {session_id} is {existing.mode}, not {self.mode}")
         if not self._retain_resume_authority(existing):
@@ -2280,16 +2304,18 @@ class Session:
                     break
                 continue
 
-            # Gate verify
+            # Keep the evaluated identity through recording and delivery.
+            from .session_candidate import verification_identity
+            identity = verification_identity(self, state) if state.candidate_custody.get('receipt') else None
             verify = self._run_verify()
             verify_reason = "" if verify["ok"] else str(verify["reason"])
             self._append_verification_log(state, "verify", verify)
             from .session_candidate import record_verification
-            record_verification(self, state, verify)
+            record_verification(self, state, verify, identity=identity)
             self._save(state)
 
             if verify["ok"]:
-                return self._complete_verified_fix(state, verify, reply)
+                return self._complete_verified_fix(state, verify, reply, identity=identity)
 
             self._print(f"Verification failed: {verify_reason}")
             if verify.get("retry_fix") is False:
@@ -2320,7 +2346,13 @@ class Session:
         self._print("Fix session stopped (no further progress). Session marked as failed.")
         return state
 
-    def _complete_verified_fix(self, state, verify, reply):
+    def _complete_verified_fix(self, state, verify, reply, *, identity=None):
+        if state.candidate_custody.get('receipt'):
+            from .session_candidate import verification_identity
+            plan, commands = self._verification_plan_commands()
+            validate_selected_contracts(self, state, commands, metadata=plan.metadata)
+            if identity != verification_identity(self, state):
+                raise ownership_error(state, 'verification inputs changed before completion')
         self._print("Verification passed!")
         self._run_session_persistence_action(state)
         state.status, state.resolution = 'completed', 'fixed'
@@ -2332,9 +2364,8 @@ class Session:
         self._record_release_attestation(state, verify)
         self._release_baseline(state)
         if state.candidate_custody.get('receipt'):
-            from .session_candidate import verification_identity
             state.execution_log.append({'action': 'receipt_completion',
-                'identity': verification_identity(self, state),
+                'identity': identity,
                 'delivered_revision': state.candidate_custody['delivered_revision']})
         self._save(state)
         self._print(f"Bug fix completed in session {state.session_id}.")
@@ -3934,6 +3965,14 @@ class Session:
         )
         return True
 
+    def _verification_plan_commands(self, scope="final"):
+        plan = self._session_gate_plan(scope)
+        commands = self._logical_gate_commands(plan)
+        state = self._current_state
+        if self.mode == "fix" and state.fix_verify_command:
+            commands = [self._fix_verify_command_for_execution(state.fix_verify_command), *commands]
+        return plan, commands
+
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
         publish_operation = getattr(
             self._health_runtime, "set_active_operation", None
@@ -4260,12 +4299,9 @@ class Session:
 
         # Resolve once so targeted and affected layers share identical proof
         # metadata and therefore the same candidate certificate.
-        plan = self._session_gate_plan(scope)
+        plan, commands = self._verification_plan_commands(scope)
 
         if state.verification_binding:
-            commands = self._logical_gate_commands(plan)
-            if self.mode == "fix" and state.fix_verify_command:
-                commands = [self._fix_verify_command_for_execution(state.fix_verify_command), *commands]
             validate_selected_contracts(self, state, commands, metadata=plan.metadata)
             for command in dict.fromkeys(commands):
                 collect = collection_command(command)

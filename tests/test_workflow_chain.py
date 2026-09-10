@@ -260,6 +260,35 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertTrue(drive.call_args.args[0]._auto_approve)
             self.assertTrue(drive.call_args.args[0]._full_verify)
 
+        for requested, persisted in ((True, False), (False, True), (False, False)):
+            with self.subTest(requested=requested, persisted=persisted), tempfile.TemporaryDirectory() as tmp:
+                root = _make_project(tmp)
+                _commit_baseline(root)
+                orchestrator = Orchestrator(root)
+                coordinator = WorkflowCoordinator(orchestrator, full_verify=requested)
+                snapshot = coordinator.store.create_root(WorkflowRef("fix", "session-policy"))
+                state = SessionState(session_id="session-policy", mode="fix", status="paused",
+                    workflow_id=snapshot.workflow_id, baseline_head_ref=subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+                    auto_approve=False, full_verify=persisted)
+                save_session_state(root, state)
+                expected = requested or persisted
+                def drive(session, execution, snapshot, **kwargs):
+                    self.assertEqual(session._resumed_verification_state.full_verify, persisted)
+                    self.assertIsNot(session._resumed_verification_state, execution)
+                    self.assertEqual(session._full_verify, expected)
+                    self.assertEqual(execution.full_verify, expected)
+                    self.assertEqual(orchestrator._force_full_verify, expected)
+                    self.assertFalse(execution.auto_approve)
+                    self.assertFalse(session._auto_approve)
+                    save_session_state(root, execution)
+                    return execution
+                with patch.object(coordinator, "_drive_session", side_effect=drive):
+                    coordinator.resume_workflow(snapshot.workflow_id)
+                saved = load_session_state(root, state.session_id)
+                self.assertEqual(saved.full_verify, expected)
+                self.assertFalse(saved.auto_approve)
+
     def test_resume_with_auto_approve_upgrades_saved_root_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_project(tmp)

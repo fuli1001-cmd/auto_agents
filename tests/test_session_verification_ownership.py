@@ -1001,7 +1001,9 @@ def test_public_resume_protects_default_target_sources(tmp_path, monkeypatch, ed
 
 
 @pytest.mark.parametrize('shape', ['whole_file', 'directory', 'deduplicated'])
-@pytest.mark.parametrize('contract', ['changed', 'missing', 'unchanged'])
+@pytest.mark.parametrize('contract', ['changed', 'missing', 'unchanged',
+    'receipt_changed', 'receipt_missing', 'delivered_changed', 'delivered_missing',
+    'completed_changed', 'completed_missing'])
 def test_public_resume_validates_contract_owners_after_command_expansion(tmp_path, monkeypatch, shape, contract):
     from auto_agents.config import load_task_plan, requirements_trace_path
     from auto_agents.requirements import requirement_contract_sha256
@@ -1030,6 +1032,37 @@ def test_public_resume_validates_contract_owners_after_command_expansion(tmp_pat
     _retain_contract(root, child, config, plan)
     expected_task = plan['tasks'][-1]['task_id']
     expected_requirement = rows[-1]['id']
+    recovering = contract.startswith(('receipt_', 'delivered_', 'completed_'))
+    if recovering:
+        import auto_agents.session_candidate as candidate
+        with monkeypatch.context() as interrupt:
+            if contract.startswith('delivered_'):
+                deliver = candidate.deliver_candidate
+                def stop(session, state, message):
+                    deliver(session, state, message)
+                    raise KeyboardInterrupt()
+                interrupt.setattr(candidate, 'deliver_candidate', stop)
+            elif contract.startswith('receipt_'):
+                def stop(self, state):
+                    raise KeyboardInterrupt()
+                interrupt.setattr(Session, '_run_session_persistence_action', stop)
+            paused, calls, _ = run_session(root, interrupt)
+        assert paused.status == ('completed' if contract.startswith('completed_') else 'paused')
+        assert calls == ['fix']
+        if contract.startswith('completed_'):
+            assert any(entry.get('action') == 'receipt_completion' for entry in paused.execution_log)
+        assert any(entry.get('action') == 'receipt_verification' and entry['verification']['ok']
+                   for entry in paused.execution_log)
+        from copy import deepcopy
+        custody = deepcopy(paused.candidate_custody)
+        attempts = paused.current_attempt
+        ambient = _switch_ambient_binding_plan(root)
+        contract = contract.split('_', 1)[1]
+        def forbidden(*args, **kwargs):
+            pytest.fail('Changed receipt authority must block before baseline, verification or delivery')
+        monkeypatch.setattr(Session, '_ensure_baseline', forbidden)
+        monkeypatch.setattr(Session, '_run_verify', forbidden)
+        monkeypatch.setattr(candidate, 'deliver_candidate', forbidden)
     if contract == 'changed':
         rows[-1]['text'] = 'A different requirement'
     elif contract == 'missing':
@@ -1065,6 +1098,13 @@ def test_public_resume_validates_contract_owners_after_command_expansion(tmp_pat
         assert diagnostic['session_id'] == child.session_id
         assert diagnostic['contract_fingerprint']
         assert diagnostic['retry_fix'] is False
+    if recovering:
+        for _ in range(2):
+            saved, calls, _ = run_session(root, monkeypatch)
+            assert saved.status == 'blocked' and calls == []
+            assert saved.candidate_custody == custody
+            assert saved.current_attempt == attempts
+        assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
 @pytest.mark.parametrize('prerequisite', ['candidate_failure', 'unavailable', 'passing'])
@@ -2544,10 +2584,14 @@ def test_public_legacy_upgrade_preserves_conflicting_retained_handoff(tmp_path, 
 
 @pytest.mark.parametrize('legacy', [False, True, 'custody', 'missing_scope',
     'missing_scope_current', 'missing_scope_requirement', 'missing_scope_unresolved',
-    'missing_scope_conflict', 'missing_scope_fingerprint'])
+    'missing_scope_conflict', 'missing_scope_fingerprint', 'reuse_sessions'])
 def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_path, monkeypatch, legacy):
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
+
+    if legacy == 'reuse_sessions':
+        _assert_reused_session_authority(tmp_path, monkeypatch)
+        return
 
     if isinstance(legacy, str) and legacy.startswith('missing_scope'):
         _assert_public_missing_scope_recovery(tmp_path, monkeypatch, legacy)
@@ -2597,6 +2641,63 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
         assert saved.baseline_git_ref == refreshed_baseline
         _assert_prerequisite_owner_enrichment(saved, prerequisite_marker)
         _assert_migrated_candidate_reused(root, monkeypatch, saved, retained_custody)
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+def _assert_reused_session_authority(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from auto_agents.config import load_task_plan
+    import auto_agents.session as module
+
+    root, first = project(tmp_path)
+    second = deepcopy(first)
+    second.session_id = 'second-child'
+    config = load_project_config(root)
+    config.gates.steps[0].args = ['--strict-markers']
+    plan = load_task_plan(root)
+    plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
+    _retain_contract(root, second, config, plan)
+    save_session_state(root, second)
+    assert first.baseline_head_ref != second.baseline_head_ref
+    ambient = _switch_ambient_binding_plan(root)
+    orch = Orchestrator(root)
+    session = Session(orch, mode='fix', auto_approve=True)
+    observed, captures, writers = [], [], []
+    execute = module.run_gate_plan
+    retain = session._retain_resume_authority
+    def observe(commands, *args, **kwargs):
+        observed.extend((session._current_state.session_id, command) for command in commands)
+        return execute(commands, *args, **kwargs)
+    def capture(state):
+        result = retain(state)
+        original = session._resumed_verification_state
+        captures.append((state.session_id, original.session_id, original.baseline_head_ref))
+        assert original is not state
+        return result
+    def writer(request):
+        writers.append(session._current_state.session_id)
+        (request.cwd / 'value.py').write_text('VALUE = 1\n')
+        reply = 'Repaired\nCOMMIT_MESSAGE: Repair owned value'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    monkeypatch.setattr(module, 'run_gate_plan', observe)
+    monkeypatch.setattr(session, '_retain_resume_authority', capture)
+    monkeypatch.setattr(orch, '_call_with_failover', writer)
+    # Exercise fresh distinct histories, then repeated public calls on one object.
+    for child in (first, second, first, first, second, second):
+        result = session.resume(child.session_id)
+        assert result.status == 'completed', result.to_dict()
+        assert result.verification_binding['contract_revision'] == child.baseline_head_ref
+        args = result.verification_binding['gates']['steps'][0]['args']
+        assert ('--strict-markers' in args) == (child is second)
+    assert session._resumed_verification_state is None
+    assert writers == [first.session_id, second.session_id]
+    assert all(requested == captured for requested, captured, _ in captures)
+    for child in (first, second):
+        commands = [command for sid, command in observed if sid == child.session_id and '--collect-only' not in command]
+        assert commands
+        assert all(('--strict-markers' in command) == (child is second) for command in commands)
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
@@ -3646,6 +3747,133 @@ def _assert_prerequisite_owner_enrichment(saved, marker):
     assert marker.read_text() == 'VALUE = 1\n', 'recovered prerequisite must execute on the retained candidate'
 
 
+def _assert_receipt_current_authority(tmp_path, monkeypatch, outcome):
+    from copy import deepcopy
+    from auto_agents.config import load_task_plan, requirements_trace_path
+    from auto_agents.requirements import requirement_contract_sha256
+    from auto_agents.workflow_runtime import WorkflowCoordinator
+    import auto_agents.session_candidate as candidate
+
+    root, child = project(tmp_path)
+    config, plan = load_project_config(root), load_task_plan(root)
+    owned = {'id': 'REQ-owned', 'text': 'Repair the owned value', 'source': 'spec'}
+    foreign = {'id': 'REQ-foreign', 'text': 'Separate work', 'source': 'spec'}
+    trace = requirements_trace_path(root)
+    trace.write_text(json.dumps({'requirements': [owned, foreign]}))
+    plan['tasks'][0]['requirement_proofs'] = [{
+        'requirement_id': owned['id'], 'requirement_contract_sha256': requirement_contract_sha256(owned),
+        'evidence_refs': plan['tasks'][0]['verification_refs']}]
+    marker = tmp_path / 'release-executions'
+    policy_case = outcome in {'full_failure', 'full_pass', 'persisted_full', 'affected_policy'}
+    if policy_case:
+        (root / 'tests/test_release.py').write_text(
+            'from pathlib import Path\ndef test_release():\n'
+            f'    with Path({str(marker)!r}).open("a") as stream:\n'
+            '        stream.write(Path("value.py").read_text())\n'
+            + ('    assert "VALUE = 0" in Path("value.py").read_text()\n'
+               if outcome == 'full_failure' else '    assert True\n'))
+        config.gates.steps.append(VerificationStep(proof_id='release.regression', runner='pytest',
+            targets=['tests/test_release.py'], levels=['release'], impact_paths=['unrelated.py']))
+        config.gates.release_verification_mode = 'deferred'
+    _retain_contract(root, child, config, plan)
+    child.full_verify = outcome == 'persisted_full'
+    save_session_state(root, child)
+    with monkeypatch.context() as interrupt:
+        if outcome == 'restored_contract':
+            record_receipt = candidate.record_receipt
+            def missing_contract(session, state):
+                record_receipt(session, state)
+                trace.write_text(json.dumps({'requirements': [foreign]}))
+            interrupt.setattr(candidate, 'record_receipt', missing_contract)
+            record = candidate.record_verification
+            def stop(session, state, result, **kwargs):
+                record(session, state, result, **kwargs)
+                assert result['retry_fix'] is False and not result['ok']
+                raise KeyboardInterrupt()
+            interrupt.setattr(candidate, 'record_verification', stop)
+        else:
+            def stop(self, state):
+                raise KeyboardInterrupt()
+            interrupt.setattr(Session, '_run_session_persistence_action', stop)
+        paused, calls, _ = run_session(root, interrupt)
+    assert paused.status == 'paused' and calls == ['fix'], paused.to_dict()
+    evidence = [entry for entry in paused.execution_log if entry.get('action') == 'receipt_verification']
+    assert len(evidence) == 1
+    assert evidence[0]['verification']['ok'] == (outcome != 'restored_contract')
+    retained = deepcopy(paused.candidate_custody)
+    attempts = paused.current_attempt
+    # A failed release check must stop on the retained attempt, without a writer retry.
+    if outcome == 'full_failure':
+        paused.hard_ceiling = attempts
+        save_session_state(root, paused)
+    ambient = _switch_ambient_binding_plan(root)
+    if outcome == 'foreign_contract':
+        trace.write_text(json.dumps({'requirements': [dict(owned, status='done', notes='non-normative'),
+                                                     dict(foreign, text='Different foreign scope')]}))
+    protected_trace = trace.read_bytes()
+    (root / 'foreign.py').write_text('VALUE = 88\n')
+    git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 99\n')
+    (root / 'foreign.py').chmod(0o711)
+    (root / 'foreign-note.txt').write_bytes(b'foreign\x00bytes')
+    protected = {name: (root / name).read_bytes() for name in (*ambient, '.git/index', 'foreign.py', 'foreign-note.txt')}
+    refs = git(root, 'show-ref')
+    if marker.exists():
+        marker.unlink()
+    observed = []
+    verify = Session._run_verify
+    def observe(self, *args, **kwargs):
+        observed.append(self._current_state.full_verify)
+        return verify(self, *args, **kwargs)
+    monkeypatch.setattr(Session, '_run_verify', observe)
+    def resume():
+        if not policy_case:
+            saved, calls, _ = run_session(root, monkeypatch)
+            assert calls == []
+            return saved
+        orch = Orchestrator(root)
+        def forbidden(*args, **kwargs):
+            pytest.fail('Receipt policy recovery must not replay the writer')
+        monkeypatch.setattr(orch, '_call_with_failover', forbidden)
+        coordinator = WorkflowCoordinator(orch, full_verify=outcome in {'full_failure', 'full_pass'})
+        saved = coordinator.resume_workflow(paused.workflow_id)
+        expected = outcome != 'affected_policy'
+        assert saved.full_verify is expected
+        assert load_session_state(root, saved.session_id).full_verify is expected
+        assert saved.auto_approve == paused.auto_approve
+        assert orch._force_full_verify is expected
+        return saved
+    saved = resume()
+    if outcome == 'restored_contract':
+        assert saved.status == 'blocked' and observed == []
+        diagnostic = saved.execution_log[-1]['diagnostic']
+        assert diagnostic['requirement_id'] == 'REQ-owned' and diagnostic['retry_fix'] is False
+        assert resume().status == 'blocked' and observed == []
+        trace.write_text(json.dumps({'requirements': [owned, foreign]}))
+        protected_trace = trace.read_bytes()
+        saved = resume()
+        assert observed == [False], 'restoring owned authority must release the stale inconclusive result'
+    elif outcome in {'full_failure', 'full_pass'}:
+        assert observed == [True], 'a prior affected pass cannot attest requested release scope'
+        expected_runs = ['VALUE = 1', 'VALUE = 0'] if outcome == 'full_failure' else ['VALUE = 1']
+        assert marker.read_text().splitlines() == expected_runs
+    else:
+        assert observed == [], 'unchanged relevant authority must reuse its durable pass'
+        assert not marker.exists()
+    assert saved.status == ('failed' if outcome == 'full_failure' else 'completed'), saved.to_dict()
+    assert saved.current_attempt == attempts
+    assert saved.candidate_custody['receipt'] == retained['receipt']
+    count = len(observed)
+    delivered = saved.candidate_custody.get('delivered_revision')
+    repeated = resume()
+    assert len(observed) == count
+    assert repeated.candidate_custody.get('delivered_revision') == delivered
+    assert {name: (root / name).read_bytes() for name in protected} == protected
+    assert (root / 'foreign.py').stat().st_mode & 0o777 == 0o711
+    assert trace.read_bytes() == protected_trace
+    assert git(root, 'show-ref') == refs
+
+
 def _retain_candidate_binding_identity(state):
     """Represent a frozen writer receipt created with the older binding format."""
     from auto_agents.session_verification import fingerprint
@@ -3665,6 +3893,9 @@ def _retain_candidate_binding_identity(state):
     (3, 'verification', 'pass'), (3, 'delivery', 'pass'), (3, 'legacy_pass', 'pass'),
     (3, 'receipt', 'failure'), (3, 'receipt', 'exhausted'),
     (3, 'receipt', 'inconclusive'), (3, 'delivery', 'missing_disposition'),
+    (3, 'verification', 'foreign_contract'), (3, 'verification', 'restored_contract'),
+    (3, 'verification', 'full_failure'), (3, 'verification', 'full_pass'),
+    (3, 'verification', 'persisted_full'), (3, 'verification', 'affected_policy'),
 ])
 def test_public_inventory_migration_resumes_existing_undelivered_receipt(
         tmp_path, monkeypatch, inventory_version, boundary, outcome):
@@ -3672,6 +3903,10 @@ def test_public_inventory_migration_resumes_existing_undelivered_receipt(
     import auto_agents.session_candidate as candidate
     from auto_agents.session_verification import fingerprint
 
+    if outcome in {'foreign_contract', 'restored_contract', 'full_failure', 'full_pass',
+                   'persisted_full', 'affected_policy'}:
+        _assert_receipt_current_authority(tmp_path, monkeypatch, outcome)
+        return
     root, child = project(tmp_path)
     if outcome == 'inconclusive':
         path = root / 'tests/test_owned.py'

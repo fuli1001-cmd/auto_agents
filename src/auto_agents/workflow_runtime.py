@@ -289,11 +289,33 @@ class WorkflowCoordinator:
 
     def resume_session(self, session: object, session_id: str):
         state = load_session_state(self.project_root, session_id)
+        with session._resume_authority_context(state):
+            return self._resume_session_state(session, state)
+
+    def _resume_session_state(self, session, state):
+        session_id = state.session_id
         if state.mode != session.mode:
             raise ValueError(
                 f"session {session_id} is {state.mode}, not {session.mode}"
             )
-        if not session._retain_resume_authority(state):
+        authority_valid = session._retain_resume_authority(state)
+        # Retain explicitly requested policies even when missing authority
+        # blocks execution. Policy persistence cannot supply that authority.
+        self.auto_approve = bool(self.auto_approve or state.auto_approve)
+        self._apply_authorization_policy(state)
+        self.full_verify = bool(self.full_verify or state.full_verify)
+        session._auto_approve = self.auto_approve
+        session._full_verify = self.full_verify
+        self.orch._force_full_verify = bool(
+            self.full_verify and session.mode == "fix"
+        )
+        if state.auto_approve != self.auto_approve:
+            state.auto_approve = self.auto_approve
+            save_session_state(self.project_root, state)
+        if state.full_verify != self.full_verify:
+            state.full_verify = self.full_verify
+            save_session_state(self.project_root, state)
+        if not authority_valid:
             return state
         resume_state_changed = False
         if state.status != "completed" and not state.candidate_custody.get("receipt"):
@@ -314,20 +336,6 @@ class WorkflowCoordinator:
                 )
                 resume_state_changed = True
         if resume_state_changed:
-            save_session_state(self.project_root, state)
-        self.auto_approve = bool(self.auto_approve or state.auto_approve)
-        self._apply_authorization_policy(state)
-        self.full_verify = bool(self.full_verify or state.full_verify)
-        session._auto_approve = self.auto_approve
-        session._full_verify = self.full_verify
-        self.orch._force_full_verify = bool(
-            self.full_verify and session.mode == "fix"
-        )
-        if state.auto_approve != self.auto_approve:
-            state.auto_approve = self.auto_approve
-            save_session_state(self.project_root, state)
-        if state.full_verify != self.full_verify:
-            state.full_verify = self.full_verify
             save_session_state(self.project_root, state)
         if state.parent_handoff_id and not state.workflow_id:
             try:
@@ -509,33 +517,35 @@ class WorkflowCoordinator:
                 self.project_root,
                 root.native_id,
             )
-            if not session._retain_resume_authority(state):
-                return state
-            self._inherit_root_policies(snapshot)
-            session._auto_approve = self.auto_approve
-            session._full_verify = self.full_verify
-            self._ensure_completed_session_commit(session, state)
-            snapshot = self.store.load(snapshot.workflow_id)
-            return self._drive_session(
-                session,
-                state,
-                snapshot,
-                root=True,
-            )
+            with session._resume_authority_context(state):
+                if not session._retain_resume_authority(state):
+                    return state
+                self._inherit_root_policies(snapshot, root_session=state)
+                session._auto_approve = self.auto_approve
+                session._full_verify = self.full_verify
+                self.orch._force_full_verify = bool(self.full_verify and session.mode == "fix")
+                self._ensure_completed_session_commit(session, state)
+                snapshot = self.store.load(snapshot.workflow_id)
+                return self._drive_session(
+                    session,
+                    state,
+                    snapshot,
+                    root=True,
+                )
         self._inherit_root_policies(snapshot)
         return self._resume_run_root(snapshot)
 
-    def _inherit_root_policies(self, snapshot: WorkflowSnapshot) -> None:
+    def _inherit_root_policies(self, snapshot: WorkflowSnapshot, *, root_session=None) -> None:
         """Restore durable approval and verification policies from the root."""
 
         inherited = False
         inherited_full_verify = False
-        root_session = None
         if snapshot.root.kind in {"collab", "fix", "provider_resolve"}:
             try:
-                root_session = load_session_state(
-                    self.project_root, snapshot.root.native_id
-                )
+                if root_session is None:
+                    root_session = load_session_state(
+                        self.project_root, snapshot.root.native_id
+                    )
                 inherited = bool(root_session.auto_approve)
                 inherited_full_verify = bool(root_session.full_verify)
             except FileNotFoundError:

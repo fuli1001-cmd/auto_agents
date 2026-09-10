@@ -169,7 +169,9 @@ def _bind_session(session, state) -> None:
     if state.source_descriptor:
         revision = state.source_descriptor['contract_revision']
     resumed = getattr(session, '_resumed_verification_state', None)
-    if resumed is not None and resumed.session_id == state.session_id and not state.source_descriptor:
+    if resumed is not None and resumed.session_id != state.session_id:
+        resumed = None
+    if resumed is not None and not state.source_descriptor:
         # Workflow migration may populate lineage with today's HEAD. That is
         # not evidence of the contract authorized by a legacy session.
         revision = resumed.baseline_git_ref or resumed.baseline_head_ref or resumed.lineage_head_ref
@@ -1615,7 +1617,6 @@ def diagnostic_owners(state, command: str, *, proof_ids=()) -> list[dict[str, ob
 
 def validate_selected_contracts(session, state, commands: list[str], *, metadata=None) -> None:
     """A frozen selector cannot attest a changed requirement contract."""
-    from .requirements import requirement_contract_sha256
     from .models import VerificationStep
 
     _validate_required_node_selection(session, state, commands)
@@ -1645,6 +1646,22 @@ def validate_selected_contracts(session, state, commands: list[str], *, metadata
                                           or [owner for rows in state.verification_binding.get('required_commands', {}).values()
                                               for owner in rows]), verification_ref=path)
 
+    for task, proof, current in selected_requirement_contracts(session, state, commands, metadata=metadata):
+        expected = proof.get('requirement_contract_sha256')
+        if expected and current != expected:
+            requirement_id = proof.get('requirement_id')
+            raise ownership_error(state,
+                f"session {state.session_id} task {task['task_id']} requirement "
+                f"{requirement_id} no longer matches its bound verification contract",
+                task_id=task['task_id'], requirement_id=requirement_id,
+                owners=[{'task_id': task['task_id'], 'requirement_ids': task.get('requirement_ids', []),
+                         'verification_refs': sorted(_task_refs(task))}],
+            )
+
+
+def selected_requirement_contracts(session, state, commands, *, metadata=None):
+    """Use the same sealed owners for current validation and receipt identity."""
+    from .requirements import requirement_contract_sha256
     # Mandatory ownership comes from the sealed inventory, never reconstructed
     # only from shell substrings. Expansion and command coalescing may remove
     # the literal node reference while retaining its full contract obligation.
@@ -1660,19 +1677,8 @@ def validate_selected_contracts(session, state, commands: list[str], *, metadata
         if task.get('task_id') not in task_ids:
             continue
         for proof in task.get('requirement_proofs', []):
-            expected = proof.get('requirement_contract_sha256')
-            if not expected:
-                continue  # Legacy contracts predate proof hashes.
-            requirement_id = proof.get('requirement_id')
-            row = requirements.get(requirement_id)
-            if row is None or requirement_contract_sha256(row) != expected:
-                raise ownership_error(state,
-                    f"session {state.session_id} task {task['task_id']} requirement "
-                    f"{requirement_id} no longer matches its bound verification contract",
-                    task_id=task['task_id'], requirement_id=requirement_id,
-                    owners=[{'task_id': task['task_id'], 'requirement_ids': task.get('requirement_ids', []),
-                             'verification_refs': sorted(_task_refs(task))}],
-                )
+            row = requirements.get(proof.get('requirement_id'))
+            yield task, proof, requirement_contract_sha256(row) if row is not None else None
 
 
 def _preserves_pytest_config(path, before, after):

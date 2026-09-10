@@ -280,8 +280,12 @@ def verification_identity(session, state):
         distributed=gates.distributed.enabled,
         extra_denylist=gates.distributed.extra_environment_denylist,
         project_root=session.project_root)
+    from .session_verification import selected_requirement_contracts
+    plan, commands = session._verification_plan_commands()
+    contracts = {proof['requirement_id']: current for _, proof, current in
+                 selected_requirement_contracts(session, state, commands, metadata=plan.metadata)}
     receipt = state.candidate_custody['receipt']
-    return fingerprint([receipt['fingerprint'], receipt['source_revision'],
+    return fingerprint(['current-contracts-v1', contracts, commands, receipt['fingerprint'], receipt['source_revision'],
         state.verification_binding, state.fix_verify_command, state.full_verify,
         environment])
 
@@ -300,7 +304,10 @@ def record_verification(session, state, result, *, identity=None):
 
 def recover_receipt(session, state):
     """Verify an interrupted writer's exact candidate before retry or delivery."""
+    from .session_verification import validate_selected_contracts
     receipt = state.candidate_custody['receipt']
+    plan, commands = session._verification_plan_commands()
+    validate_selected_contracts(session, state, commands, metadata=plan.metadata)
     identity = verification_identity(session, state)
     retained = next((entry for entry in reversed(state.execution_log)
         if entry.get('action') == 'receipt_verification' and entry.get('identity') == identity), None)
@@ -339,7 +346,7 @@ def recover_receipt(session, state):
                 or session._apply_session_persistence_marker(state, reply)
                 or session._session_persistence_issue(state)):
             raise ownership_error(state, 'retained writer disposition or persistence evidence is unavailable')
-        session._complete_verified_fix(state, result, reply)
+        session._complete_verified_fix(state, result, reply, identity=identity)
         return
     if result.get('retry_fix') is False:
         state.status = 'blocked'
