@@ -3983,6 +3983,9 @@ class Session:
         executor = self.orch._gate_executor_context(
             metadata, source_ref=source_ref or getattr(self, "_candidate_source_ref", ""), **kwargs
         )
+        if state is not None and state.verification_binding:
+            from .session_verification import prepare_retained_vitest_command
+            executor.prepare_retained_command = prepare_retained_vitest_command
         if state is not None and state.candidate_custody:
             receipt = state.candidate_custody.get('receipt', {})
             if (source_ref or getattr(self, '_candidate_source_ref', '')) == receipt.get('source_revision'):

@@ -654,6 +654,88 @@ def _retained_vitest_filter_sources(session, revision, invocation, *, root=None,
     return [path for path in sources if path in selectable]
 
 
+def _private_named_conda_prefix(prefix, checkout, shell_cwd):
+    """Give a named launcher private scratch without changing its packages.
+
+    Ask installed Conda to resolve the name by emitting (not evaluating) its
+    activation script. Only the physical selector changes in the prepared
+    command; retained authority and the remaining shell text stay intact.
+    """
+    import os
+    import re
+    from . import artifact_temp as tempfile
+
+    lexer = shlex.shlex(prefix, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    words, spans = [], []
+    offset = 0
+    for word in lexer:
+        end = lexer.instream.tell()
+        start = offset
+        while start < end and prefix[start].isspace():
+            start += 1
+        words.append(word)
+        spans.append((start, len(prefix[:end].rstrip())))
+        offset = end
+    index = 0
+    environment = dict(os.environ)
+    while index < len(words):
+        word = words[index]
+        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', word):
+            key, value = word.split('=', 1)
+            environment[key] = value
+        elif word not in {'env', 'exec'}:
+            break
+        index += 1
+    if index >= len(words) or Path(words[index]).name != 'conda' or words[index + 1:index + 2] != ['run']:
+        return prefix, []
+    executable = words[index]
+    index += 2
+    while index < len(words) and words[index].startswith('-'):
+        option = words[index]
+        if option == '--':
+            break
+        if option in {'-n', '--name'} or option.startswith('--name='):
+            last = index if '=' in option else index + 1
+            name = option.partition('=')[2] if last == index else words[last]
+            result = subprocess.run([executable, 'shell.posix', 'activate', name],
+                                    cwd=shell_cwd, env=environment, capture_output=True, text=True, timeout=30)
+            if result.returncode:
+                raise RuntimeError('retained Conda environment could not be resolved')
+            resolved = [shlex.split(line)[1].partition('=')[2] for line in result.stdout.splitlines()
+                        if line.startswith('export CONDA_PREFIX=')]
+            if len(resolved) != 1 or not (Path(resolved[0]) / 'conda-meta').is_dir():
+                raise RuntimeError('retained Conda environment has no valid prefix')
+            source = Path(resolved[0]).resolve()
+            checkout.mkdir(parents=True, exist_ok=True)
+            private = Path(tempfile.mkdtemp(prefix='conda-prefix-', dir=checkout))
+            for entry in source.iterdir():
+                (private / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+            replacement = '--prefix ' + shlex.quote(str(private))
+            return prefix[:spans[index][0]] + replacement + prefix[spans[last][1]:], [source]
+        index += 2 if option in {'-p', '--prefix', '--cwd'} else 1
+    return prefix, []
+
+
+def prepare_retained_vitest_command(command, checkout, scratch):
+    """Use the same named environment preparation at discovery and execution."""
+    sources = []
+    offset = 0
+    for invocation in test_invocations(command):
+        start = command.index(invocation.raw, offset)
+        end = start + invocation.option_offset
+        offset = start + len(invocation.raw)
+        if invocation.runner != 'vitest':
+            continue
+        prepared, inputs = _private_named_conda_prefix(
+            command[start:end], scratch, checkout / invocation.shell_cwd)
+        command = command[:start] + prepared + command[end:]
+        offset += len(prepared) - (end - start)
+        sources.extend(inputs)
+    return command, sources
+
+
 def _retained_vitest_discovery(session, root, revision, invocation):
     """List files in a disposable retained checkout without collecting tests.
 
@@ -689,7 +771,9 @@ def _retained_vitest_discovery(session, root, revision, invocation):
             # report in the writable checkout; never reuse a project report.
             descriptor, report_name = tempfile.mkstemp(prefix='.discovery-', suffix='.json', dir=checkout)
             os.close(descriptor)
-            command = (prefix + ' list --filesOnly --json=' + shlex.quote(report_name)
+            prepared_prefix, conda_sources = _private_named_conda_prefix(
+                prefix, checkout, checkout / invocation.shell_cwd)
+            command = (prepared_prefix + ' list --filesOnly --json=' + shlex.quote(report_name)
                        + ' --no-cache ' + invocation.raw[invocation.option_offset:])
             dependencies = discover_dependency_links(root)
             for relative, source in dependencies.items():
@@ -714,7 +798,7 @@ def _retained_vitest_discovery(session, root, revision, invocation):
             # original shell location. Applying effective cwd here doubles it.
             shell = 'cd ' + shlex.quote(str(shell_cwd)) + ' && ' + command
             with verification_argv(['sh', '-c', shell], checkout, root,
-                    read_roots=list(dependencies.values())) as argv:
+                    read_roots=[*dependencies.values(), *conda_sources]) as argv:
                 result = subprocess.run(argv, cwd=checkout, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
                 payload = json.loads(Path(report_name).read_text())

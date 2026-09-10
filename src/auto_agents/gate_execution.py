@@ -1429,6 +1429,10 @@ class LocalGatePlanExecutor:
             from .pytest_invocation import compile_ini_overrides
             compiled = compile_ini_overrides(command, sandbox,
                 {**os.environ, **self.environment_overrides, **dict(environment_overrides or {})})
+            retained_sources = []
+            prepare_retained = getattr(self, 'prepare_retained_command', None)
+            if prepare_retained is not None:
+                compiled, retained_sources = prepare_retained(compiled, sandbox, runtime_root)
             traced_command = isolated_command(compiled)
             if (
                 result_cache_scope in {"observed_inputs", "auto"}
@@ -1498,7 +1502,7 @@ class LocalGatePlanExecutor:
                                     or key in {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "npm_config_cache"}}
                             argv = ["env", *[key + "=" + value for key, value in safe.items()], "sh", "-c", traced_command]
                             kernel_context = verification_argv(argv, sandbox, self.sandbox_target,
-                                read_roots=list(self.dependency_links.values()), write_roots=[runtime_root])
+                                read_roots=[*self.dependency_links.values(), *retained_sources], write_roots=[runtime_root])
                             traced_command = shlex.join(kernel_context.__enter__())
                         process = run_supervised_shell_command(
                             traced_command,

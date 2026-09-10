@@ -740,7 +740,8 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
                                            'conda_node', 'nested_node', 'command_vitest_selector', 'expanded_report',
                                            'command_vitest_basename', 'command_vitest_filter',
                                            'command_vitest_configured_filter', 'command_vitest_redirect',
-                                           'command_vitest_conda_cwd', 'command_vitest_shell_cwd'])
+                                           'command_vitest_conda_cwd', 'command_vitest_shell_cwd',
+                                           'command_vitest_named_conda_cwd'])
 def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch, command_source, reference_kind):
     from auto_agents.models import GateParallelGroup
 
@@ -761,6 +762,7 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
                  'vitest_basename': 'owned.test.ts', 'vitest_filter': 'OWNED.TEST',
                  'vitest_configured_filter': 'owned.check', 'vitest_redirect': 'owned.test.ts',
                  'vitest_conda_cwd': 'web/owned.test.ts', 'vitest_shell_cwd': 'web/owned.test.ts',
+                 'vitest_named_conda_cwd': 'web/owned.test.ts',
                  'expanded_report': 'tests/test_owned.py::test_owned'}[target_kind]
     if target_kind == 'node':
         command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned --junit-prefix owned'
@@ -794,13 +796,13 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned --log-file "$OWNED_REPORT"'
     marker = tmp_path / 'vitest-executed'
     vitest_source = 'tests/owned.check.ts' if target_kind == 'vitest_configured_filter' else 'tests/owned.test.ts'
-    if target_kind in {'vitest_conda_cwd', 'vitest_shell_cwd'}:
+    if target_kind in {'vitest_conda_cwd', 'vitest_shell_cwd', 'vitest_named_conda_cwd'}:
         (root / 'web/tests').mkdir(parents=True)
         vitest_source = 'web/tests/owned.test.ts'
     if target_kind == 'directory':
         config.gates.steps[0].targets = [reference]
     elif target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter', 'vitest_configured_filter',
-                         'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd'}:
+                         'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd', 'vitest_named_conda_cwd'}:
         from test_vitest_selector_execution import _prepare_real_vitest
         _prepare_real_vitest(root, monkeypatch)
         if target_kind == 'vitest_configured_filter':
@@ -819,7 +821,7 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
             'import { test, expect } from "vitest";\n'
             'import { readFileSync, appendFileSync } from "node:fs";\n'
             'test("owned value", () => {\n'
-            f'  const value = readFileSync({json.dumps("../value.py" if target_kind in {"vitest_conda_cwd", "vitest_shell_cwd"} else "value.py")}, "utf8");\n'
+            f'  const value = readFileSync({json.dumps("../value.py" if target_kind in {"vitest_conda_cwd", "vitest_shell_cwd", "vitest_named_conda_cwd"} else "value.py")}, "utf8");\n'
             f'  appendFileSync({json.dumps(str(marker))}, value);\n'
             '  expect(value).toBe("VALUE = 1\\n");\n'
             '});\n')
@@ -833,18 +835,42 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         if target_kind == 'directory':
             command = './.conda/bin/python -m pytest -q tests --junitxml report.xml'
         elif target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter', 'vitest_configured_filter',
-                         'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd'}:
+                         'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd', 'vitest_named_conda_cwd'}:
             launcher = 'npm exec --' if command_source == 'manual' else 'npx --no-install'
             selector = reference if target_kind in {'vitest_basename', 'vitest_filter', 'vitest_configured_filter',
-                         'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd'} else 'tests/owned.test.ts'
+                         'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd', 'vitest_named_conda_cwd'} else 'tests/owned.test.ts'
             command = launcher + ' vitest run ' + selector + ' --reporter=json --maxWorkers=1'
-            if target_kind in {'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd'}:
+            if target_kind in {'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd', 'vitest_named_conda_cwd'}:
                 command = launcher + ' vitest run owned.test.ts --reporter=json --maxWorkers=1 --outputFile=report.json'
             if target_kind == 'vitest_redirect':
                 (root / 'run.log').write_text('ambient log must survive\n')
                 command += ' > run.log 2>&1'
             elif target_kind == 'vitest_shell_cwd':
                 command = 'cd web && ' + command
+            elif target_kind == 'vitest_named_conda_cwd':
+                import hashlib
+                import shutil
+                conda = shutil.which('conda')
+                assert conda, 'the trusted test environment must provide Conda'
+                info = subprocess.run([conda, 'info', '--json'], capture_output=True, text=True, check=True)
+                info = json.loads(info.stdout)
+                environments = [Path(value) for value in info['envs']
+                                if Path(value).parent in map(Path, info['envs_dirs'])
+                                and (Path(value) / 'conda-meta/history').is_file()]
+                assert environments, 'a provisioned named Conda environment is required'
+                shared_environment = environments[0]
+                assert not shared_environment.is_relative_to(root)
+                def environment_snapshot():
+                    return {path.relative_to(shared_environment).as_posix(): (
+                        path.lstat().st_mode,
+                        str(path.readlink()) if path.is_symlink() else
+                        hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None)
+                        for path in shared_environment.rglob('*')}
+                shared_before = environment_snapshot()
+                selector = (['-n', shared_environment.name] if command_source == 'legacy' else
+                            ['--name', shared_environment.name] if command_source == 'manual' else
+                            ['--name=' + shared_environment.name])
+                command = shlex.join([conda, 'run', '--cwd', 'web', *selector]) + ' ' + command
             elif target_kind == 'vitest_conda_cwd':
                 import shutil
                 conda = shutil.which('conda')
@@ -895,9 +921,12 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         assert binding['required_proof_ids'] == ['owned.contract']
         assert binding['proof_owners']['owned.contract'][0]['task_id'] == 'task-owned'
     if target_kind in {'vitest_file', 'vitest_selector', 'vitest_basename', 'vitest_filter', 'vitest_configured_filter',
-                         'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd'}:
+                         'vitest_redirect', 'vitest_conda_cwd', 'vitest_shell_cwd', 'vitest_named_conda_cwd'}:
         assert 'VALUE = 1' in marker.read_text().splitlines(), 'the retained Vitest proof must execute'
         assert vitest_source in binding['proof_sources']
+    if target_kind == 'vitest_named_conda_cwd':
+        assert environment_snapshot() == shared_before
+        assert binding['fix_verify_command'] == child.fix_verify_command
     assert binding['task_ids'] == ['task-owned']
     assert binding['requirement_ids'] == ['REQ-owned']
     assert any(entry.get('result') == 'pass' for entry in saved.execution_log)
