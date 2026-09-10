@@ -1047,13 +1047,24 @@ def _pytest_selection_config(root, cwd, args, targets, configurations, *, source
     base = Path(commonpath(directories)) if directories else cwd
 
     def search(starts):
+        bare_pyproject = False
         for start in dict.fromkeys(starts):
             for parent in (start, *start.parents):
                 for name in _PYTEST_CONFIG_NAMES:
-                    settings = retained(parent / name)
+                    path = parent / name
+                    settings = retained(path)
                     if settings is not None:
                         return settings
-        return None
+                    if name == 'pyproject.toml':
+                        try:
+                            relative = path.resolve().relative_to(root.resolve()).as_posix()
+                        except ValueError:
+                            continue
+                        bare_pyproject |= relative in configurations
+        # Pytest remembers a build-only pyproject while looking for substantive
+        # settings. Its empty fallback still counts as a selected config, so
+        # individual-target search must not replace it with nested settings.
+        return {} if bare_pyproject else None
 
     settings = search([base])
     if settings is not None:

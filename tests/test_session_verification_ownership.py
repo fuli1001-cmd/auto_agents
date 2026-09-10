@@ -1770,6 +1770,9 @@ def test_public_resume_rejects_pytest_configuration_deselection(tmp_path, monkey
                                      'nested_config_later_excluded', 'nested_config_later_included',
                                      'nested_config_ancestor_excluded', 'nested_config_ancestor_included',
                                      'nested_config_setup_included', 'nested_config_rootdir_included',
+                                     'nested_config_bare_pyproject_included',
+                                     'nested_config_bare_pyproject_overridden_excluded',
+                                     'nested_config_bare_pyproject_overridden_included',
                                      'inline_deselect'])
 def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeypatch, source, selector,
                                                              retained=False):
@@ -1831,6 +1834,9 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         'nested_config_ancestor_included': [],
         'nested_config_setup_included': [],
         'nested_config_rootdir_included': ['--rootdir=.'],
+        'nested_config_bare_pyproject_included': [],
+        'nested_config_bare_pyproject_overridden_excluded': [],
+        'nested_config_bare_pyproject_overridden_included': [],
         'inline_deselect': [],
         'unfiltered': [],
     }[selector]
@@ -1890,7 +1896,15 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         selected_patterns = 'test_*' if inclusive else 'test_control'
         opposite_patterns = 'test_control' if inclusive else 'test_*'
         nested_config = root / 'tests/a/pytest.ini'
-        if '_later_' in selector:
+        if '_bare_pyproject_' in selector:
+            (root / 'pyproject.toml').write_text('[build-system]\nrequires = []\n')
+            if '_overridden_' in selector:
+                (root / 'tox.ini').write_text(
+                    '[pytest]\npython_functions = ' + selected_patterns + '\n')
+            # The build-only root config supplies empty defaults unless a
+            # substantive ancestor config wins; neither uses nested settings.
+            selected_patterns = opposite_patterns
+        elif '_later_' in selector:
             nested_config = root / 'tests/b/pytest.ini'
         elif '_ancestor_' in selector:
             (root / 'tests/pytest.ini').write_text(
@@ -1998,6 +2012,9 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     'nested_config_later_excluded', 'nested_config_later_included',
     'nested_config_ancestor_excluded', 'nested_config_ancestor_included',
     'nested_config_setup_included', 'nested_config_rootdir_included',
+    'nested_config_bare_pyproject_included',
+    'nested_config_bare_pyproject_overridden_excluded',
+    'nested_config_bare_pyproject_overridden_included',
 ])
 def test_public_resume_rechecks_retained_default_filename_exclusion(tmp_path, monkeypatch, source, selector):
     test_public_resume_requires_executable_owned_node_coverage(
