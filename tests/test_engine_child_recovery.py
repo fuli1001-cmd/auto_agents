@@ -28,7 +28,7 @@ def parent_workflow(root, child, *, engine=False):
     parent.workflow_id = child.workflow_id = snapshot.workflow_id
     original = store.prepare_handoff(snapshot, parent=snapshot.root, target='fix',
         goal=child.goal, reason='repair the saved defect', payload={'child_session_id': child.session_id,
-            'head_before': head_ref(root), 'auto_approve': True})
+            'head_before': head_ref(root), 'auto_approve': True, 'task_id': 'task-owned'})
     store.bind_child(snapshot, original, WorkflowRef('fix', child.session_id))
     child.parent_handoff_id = original.handoff_id
     child.goal_execution_environment = dict(parent.goal_execution_environment)

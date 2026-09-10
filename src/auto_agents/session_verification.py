@@ -440,6 +440,8 @@ def _validate_task_authority(state):
     scope = binding.get('task_scope', {})
     task_ids = set(scope.get('task_ids', []))
     requirement_ids = set(scope.get('requirement_ids', []))
+    if state.parent_handoff_id and not (task_ids or requirement_ids):
+        raise ownership_error(state, 'retained child contract ownership is unresolved')
     if task_ids and requirement_ids:
         # These are two representations of the child's authority, not
         # independent grants. Resolve against retained tasks before taking
@@ -531,12 +533,6 @@ def _mandatory_refs(state):
     if missing_requirements:
         raise ownership_error(state, 'owned requirements are absent from retained contract history',
                               missing_requirement_ids=sorted(missing_requirements))
-    if state.parent_handoff_id and not (task_ids or requirement_ids) and not any(
-        not (task.get('workflow_id') or binding.get('plan_workflow_id'))
-        or (task.get('workflow_id') or binding.get('plan_workflow_id')) == state.workflow_id
-        for task in tasks
-    ):
-        raise ownership_error(state, 'retained child contract ownership is unresolved')
     refs = set()
     for task in tasks:
         task_refs = _task_refs(task)
@@ -699,6 +695,11 @@ def _private_named_conda_prefix(prefix, checkout, shell_cwd):
         if option in {'-n', '--name'} or option.startswith('--name='):
             last = index if '=' in option else index + 1
             name = option.partition('=')[2] if last == index else words[last]
+            # This read-only probe resolves a name, not an activation delta.
+            # Reactivation omits an unchanged CONDA_PREFIX export, so resolve
+            # from an inactive probe context without changing the actual run.
+            environment.pop('CONDA_PREFIX', None)
+            environment['CONDA_SHLVL'] = '0'
             result = subprocess.run([executable, 'shell.posix', 'activate', name],
                                     cwd=shell_cwd, env=environment, capture_output=True, text=True, timeout=30)
             if result.returncode:

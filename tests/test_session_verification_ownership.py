@@ -741,7 +741,7 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
                                            'command_vitest_basename', 'command_vitest_filter',
                                            'command_vitest_configured_filter', 'command_vitest_redirect',
                                            'command_vitest_conda_cwd', 'command_vitest_shell_cwd',
-                                           'command_vitest_named_conda_cwd'])
+                                           'command_vitest_named_conda_cwd', 'command_vitest_active_conda_cwd'])
 def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch, command_source, reference_kind):
     from auto_agents.models import GateParallelGroup
 
@@ -749,6 +749,9 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
     config = load_project_config(root)
     command_only_target = reference_kind.startswith('command_')
     target_kind = reference_kind.removeprefix('command_')
+    active_conda = target_kind == 'vitest_active_conda_cwd'
+    if active_conda:
+        target_kind = 'vitest_named_conda_cwd'
     command = './.conda/bin/python -m pytest -q tests/test_owned.py --junitxml report.xml'
     reference = {'selector': 'tests/test_owned.py::test_owned', 'proof': 'owned.contract',
                  'command': 'cmd:' + command, 'directory': 'tests',
@@ -867,6 +870,15 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
                         hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None)
                         for path in shared_environment.rglob('*')}
                 shared_before = environment_snapshot()
+                if active_conda:
+                    monkeypatch.setenv('CONDA_PREFIX', str(shared_environment))
+                    monkeypatch.setenv('CONDA_SHLVL', '1')
+                    # Real installed Conda reactivation succeeds without a
+                    # CONDA_PREFIX delta; the session must still resolve it.
+                    activation = subprocess.run([conda, 'shell.posix', 'activate', shared_environment.name],
+                                                capture_output=True, text=True, check=True)
+                    assert not any(line.startswith('export CONDA_PREFIX=')
+                                   for line in activation.stdout.splitlines())
                 selector = (['-n', shared_environment.name] if command_source == 'legacy' else
                             ['--name', shared_environment.name] if command_source == 'manual' else
                             ['--name=' + shared_environment.name])
@@ -1242,6 +1254,9 @@ def test_public_resume_before_first_baseline_uses_child_history(tmp_path, monkey
     child.lineage_head_ref = 'refs/missing/child-history' if history == 'unavailable' else head_ref(root)
     child.current_attempt = 0
     store, snapshot, handoff = parent_workflow(root, child)
+    if history == 'unmatched_requirement':
+        handoff.payload.pop('task_id')
+        store.save_handoff(handoff)
     store.record_result(snapshot, handoff, status='failed',
                         result={'status': 'failed', 'resolution': child.resolution})
     store.consume_result(snapshot, handoff, operation_id='pre-baseline-failure')
@@ -2255,7 +2270,7 @@ def test_public_resume_rejects_conflicting_handoff_child_identities(tmp_path, mo
 
 
 @pytest.mark.parametrize('reverse', [False, True])
-@pytest.mark.parametrize('matching', [False, True])
+@pytest.mark.parametrize('matching', [False, True, 'unscoped'])
 @pytest.mark.parametrize('binding_version', [None, 11, 13])
 def test_public_child_reconciles_task_and_requirement_authority(
         tmp_path, monkeypatch, reverse, matching, binding_version):
@@ -2279,12 +2294,22 @@ def test_public_child_reconciles_task_and_requirement_authority(
     _retain_contract(root, child, config, plan)
     task_scope = {'task_id': 'task-owned'}
     requirement_scope = {'requirement_ids': ['REQ-owned']}
-    handoff.payload.update(requirement_scope if reverse else task_scope)
+    handoff.payload.pop('task_id', None)
+    if matching != 'unscoped':
+        handoff.payload.update(requirement_scope if reverse else task_scope)
     store.save_handoff(handoff)
     issue = root / '.auto-agents/state/sessions' / child.session_id / 'issue.json'
-    issue.write_text(json.dumps(task_scope if reverse else requirement_scope))
+    issue.write_text(json.dumps({} if matching == 'unscoped' else
+                                task_scope if reverse else requirement_scope))
     if binding_version is not None:
-        _binding_fixture(root, child)
+        if matching == 'unscoped':
+            # Reproduce the old workflow-only binding, then exercise recovery
+            # with the real authority validator restored.
+            with monkeypatch.context() as legacy:
+                legacy.setattr('auto_agents.session_verification._validate_task_authority', lambda state: None)
+                _binding_fixture(root, child)
+        else:
+            _binding_fixture(root, child)
         child.verification_binding['schema_version'] = binding_version
         child.verification_binding['binding_fingerprint'] = fingerprint({
             key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
@@ -2296,7 +2321,7 @@ def test_public_child_reconciles_task_and_requirement_authority(
     _prepare_binding_child_resume(root, store, snapshot, handoff)
     ambient = _switch_ambient_binding_plan(root)
     handoff_bytes = (root / '.auto-agents/state/handoffs' / (handoff.handoff_id + '.json')).read_bytes()
-    if matching:
+    if matching is True:
         from test_engine_child_recovery import ObservationBoundary
         # Stop after the public parent consumes the child result, before
         # starting the ambient workflow's separate implementation phase.
@@ -2320,13 +2345,18 @@ def test_public_child_reconciles_task_and_requirement_authority(
             'task_ids': ['task-owned'], 'requirement_ids': ['REQ-owned']}
     else:
         saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
-        assert 'conflict' in saved.execution_log[-1]['result']
+        assert ('unresolved' if matching == 'unscoped' else 'conflict') in saved.execution_log[-1]['result']
         diagnostic = saved.execution_log[-1]['diagnostic']
         assert diagnostic['handoff_id'] == handoff.handoff_id
-        if binding_version is None:
+        if binding_version is None and matching != 'unscoped':
             assert diagnostic['retained_task_ids'] == ['task-other' if reverse else 'task-owned']
             assert diagnostic['requirement_task_ids'] == ['task-owned' if reverse else 'task-other']
         assert saved.verification_binding == prior_binding
+        if matching == 'unscoped':
+            assert diagnostic['task_scope'] == {'task_ids': [], 'requirement_ids': []}
+            assert diagnostic['retry_fix'] is False
+            repeated = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
+            assert repeated.verification_binding == prior_binding
         assert (root / 'value.py').read_text() == 'VALUE = 0\n'
         assert (root / '.auto-agents/state/handoffs' / (handoff.handoff_id + '.json')).read_bytes() == handoff_bytes
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
