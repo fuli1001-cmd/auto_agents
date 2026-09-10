@@ -4,6 +4,23 @@ import shlex
 from .repair_test_refs import migrate_review_commands, pytest_targets
 
 
+def canonical_commands(commands):
+    """Coalesce identical supported invocations, retaining every request owner.
+
+    Different target cohorts can change fixture lifetimes and are deliberately
+    not treated as equivalent merely because they contain a common node.
+    """
+    selected, requests, seen = [], [], {}
+    for original in commands:
+        command = shlex.join(shlex.split(original)) if pytest_parts(original) else original
+        if command not in seen:
+            seen[command] = len(selected)
+            selected.append(command)
+        requests.append({'original_command': original, 'execution_index': seen[command],
+                         'command': command})
+    return selected, requests
+
+
 def pytest_parts(command):
     try:
         args = shlex.split(command)
@@ -21,6 +38,7 @@ def pytest_parts(command):
 def verification_plan(experiment, active):
     migrate_review_commands(experiment)
     focused = list(active.get('focused_tests', []))
+    focused.extend(row['check'] for row in active.get('scenarios', []) if row.get('check'))
     # A routed regression retains its concrete reproduction as required proof,
     # even when the original component plan predates the review finding.
     for finding in getattr(experiment, 'findings', {}).values():
@@ -73,5 +91,6 @@ def verification_plan(experiment, active):
                 elif command in focused + regressions:
                     failures.append(command)
             break
-    commands = list(dict.fromkeys([*failures, *focused, *regressions]))
-    return {'commands': commands, 'deferred': deferred}
+    commands, requests = canonical_commands([*failures, *focused, *regressions])
+    return {'commands': commands, 'deferred': deferred, 'requests': requests,
+            'deduplicated_commands': len(requests) - len(commands)}
