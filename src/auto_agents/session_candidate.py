@@ -273,21 +273,22 @@ def validate_receipt(state):
 
 def verification_identity(session, state):
     """Relevant private evidence, independent of resume epochs and shared edits."""
-    from .workers import gate_environment_fingerprint
-    gates = session.config.gates
-    environment = gate_environment_fingerprint(
-        isolation_mode=gates.isolation.mode, environment_id=gates.distributed.mode,
-        distributed=gates.distributed.enabled,
-        extra_denylist=gates.distributed.extra_environment_denylist,
-        project_root=session.project_root)
-    from .session_verification import selected_requirement_contracts
-    plan, commands = session._verification_plan_commands()
-    contracts = {proof['requirement_id']: current for _, proof, current in
-                 selected_requirement_contracts(session, state, commands, metadata=plan.metadata)}
-    receipt = state.candidate_custody['receipt']
-    return fingerprint(['current-contracts-v1', contracts, commands, receipt['fingerprint'], receipt['source_revision'],
-        state.verification_binding, state.fix_verify_command, state.full_verify,
-        environment])
+    with session._session_verification_config():
+        from .workers import gate_environment_fingerprint
+        gates = session.config.gates
+        environment = gate_environment_fingerprint(
+            isolation_mode=gates.isolation.mode, environment_id=gates.distributed.mode,
+            distributed=gates.distributed.enabled,
+            extra_denylist=gates.distributed.extra_environment_denylist,
+            project_root=session.project_root)
+        from .session_verification import selected_requirement_contracts
+        plan, commands = session._verification_plan_commands()
+        contracts = {proof['requirement_id']: current for _, proof, current in
+                     selected_requirement_contracts(session, state, commands, metadata=plan.metadata)}
+        receipt = state.candidate_custody['receipt']
+        return fingerprint(['retained-config-contracts-v2', contracts, commands, receipt['fingerprint'], receipt['source_revision'],
+            state.verification_binding, state.fix_verify_command, state.full_verify,
+            environment])
 
 
 def record_verification(session, state, result, *, identity=None):
@@ -306,9 +307,10 @@ def recover_receipt(session, state):
     """Verify an interrupted writer's exact candidate before retry or delivery."""
     from .session_verification import validate_selected_contracts
     receipt = state.candidate_custody['receipt']
-    plan, commands = session._verification_plan_commands()
-    validate_selected_contracts(session, state, commands, metadata=plan.metadata)
-    identity = verification_identity(session, state)
+    with session._session_verification_config():
+        plan, commands = session._verification_plan_commands()
+        validate_selected_contracts(session, state, commands, metadata=plan.metadata)
+        identity = verification_identity(session, state)
     retained = next((entry for entry in reversed(state.execution_log)
         if entry.get('action') == 'receipt_verification' and entry.get('identity') == identity), None)
     if retained is None:

@@ -1000,7 +1000,8 @@ def test_public_resume_protects_default_target_sources(tmp_path, monkeypatch, ed
     assert 'tests/test_control.py' in saved.verification_binding['proof_sources']
 
 
-@pytest.mark.parametrize('shape', ['whole_file', 'directory', 'deduplicated'])
+@pytest.mark.parametrize('shape', ['whole_file', 'directory', 'deduplicated',
+                                  'policy_blocking', 'policy_deferred'])
 @pytest.mark.parametrize('contract', ['changed', 'missing', 'unchanged',
     'receipt_changed', 'receipt_missing', 'delivered_changed', 'delivered_missing',
     'completed_changed', 'completed_missing'])
@@ -1009,6 +1010,12 @@ def test_public_resume_validates_contract_owners_after_command_expansion(tmp_pat
     from auto_agents.requirements import requirement_contract_sha256
     import auto_agents.session as session_module
 
+    if shape.startswith('policy_'):
+        prefix, _, change = contract.rpartition('_')
+        _assert_receipt_policy_mismatch(tmp_path, monkeypatch, shape.removeprefix('policy_'),
+            change, boundary={'delivered': 'delivery', 'completed': 'completed'}.get(prefix, 'verification'),
+            switch_before=not prefix)
+        return
     root, child = project(tmp_path)
     config = load_project_config(root)
     config.gates.steps[0].targets = ['tests' if shape == 'directory' else 'tests/test_owned.py']
@@ -3747,6 +3754,161 @@ def _assert_prerequisite_owner_enrichment(saved, marker):
     assert marker.read_text() == 'VALUE = 1\n', 'recovered prerequisite must execute on the retained candidate'
 
 
+def _assert_receipt_policy_mismatch(tmp_path, monkeypatch, policy, change, *, boundary, switch_before):
+    from copy import deepcopy
+    from auto_agents.config import load_task_plan, requirements_trace_path
+    from auto_agents.requirements import requirement_contract_sha256
+    import auto_agents.session_candidate as candidate
+
+    root, child = project(tmp_path)
+    child.goal_execution_environment = {'mode': 'real', 'confirmed': True, 'source': 'explicit_goal'}
+    config, plan = load_project_config(root), load_task_plan(root)
+    marker = tmp_path / 'release-runs'
+    (root / 'tests/test_release.py').write_text(
+        'from pathlib import Path\ndef test_release():\n'
+        f'    with Path({str(marker)!r}).open("a") as output:\n'
+        '        output.write("release\\n")\n'
+        '    assert True\n')
+    config.gates.release_verification_mode = policy
+    config.gates.distributed.mode = 'off'
+    config.gates.steps.append(VerificationStep(proof_id='foreign.release', runner='pytest',
+        targets=['tests/test_release.py'], levels=['release'], impact_paths=['unrelated.py']))
+    plan['tasks'].append({'task_id': 'task-foreign', 'title': 'Existing release regression',
+        'workflow_id': 'foreign-workflow', 'status': 'pending',
+        'requirement_ids': ['REQ-foreign'], 'verification_refs': ['foreign.release']})
+    rows = [{'id': 'REQ-owned', 'text': 'Repair owned value', 'source': 'spec'},
+            {'id': 'REQ-foreign', 'text': 'Existing release contract', 'source': 'spec'}]
+    for task, row in zip(plan['tasks'], rows):
+        task['requirement_proofs'] = [{'requirement_id': row['id'],
+            'requirement_contract_sha256': requirement_contract_sha256(row),
+            'evidence_refs': task['verification_refs']}]
+    trace = requirements_trace_path(root)
+    trace.write_text(json.dumps({'requirements': rows}))
+    plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
+    _retain_contract(root, child, config, plan)
+    issue = root / '.auto-agents/state/sessions' / child.session_id / 'issue.json'
+    issue.write_text(json.dumps({'task_id': 'task-owned'}))
+
+    def switch():
+        _switch_ambient_binding_plan(root)
+        ambient = load_project_config(root)
+        ambient.gates.release_verification_mode = 'deferred' if policy == 'blocking' else 'blocking'
+        ambient.gates.distributed.mode = 'auto'
+        ambient.gates.distributed.extra_environment_denylist = ['LANG']
+        save_project_config(root, ambient)
+    if switch_before:
+        switch()
+    identities = []
+    original_identity = candidate.verification_identity
+    def identity(session, state):
+        ambient = session.config.gates
+        before = deepcopy(ambient.to_dict())
+        try:
+            result = original_identity(session, state)
+            identities.append(result)
+            return result
+        finally:
+            assert session.config.gates is ambient
+            assert ambient.to_dict() == before
+    monkeypatch.setattr(candidate, 'verification_identity', identity)
+    with monkeypatch.context() as interrupt:
+        if boundary == 'delivery':
+            deliver = candidate.deliver_candidate
+            def stop(session, state, message):
+                deliver(session, state, message)
+                raise KeyboardInterrupt()
+            interrupt.setattr(candidate, 'deliver_candidate', stop)
+        elif boundary != 'completed':
+            def stop(self, state):
+                raise KeyboardInterrupt()
+            interrupt.setattr(Session, '_run_session_persistence_action', stop)
+        paused, calls, _ = run_session(root, interrupt)
+    assert paused.status == ('completed' if boundary == 'completed' else 'paused'), paused.to_dict()
+    assert calls == ['fix'] and paused.full_verify is False
+    assert marker.exists() == (policy == 'blocking'), 'actual initial runner scope must use retained policy'
+    assert paused.verification_binding['task_ids'] == ['task-owned']
+    assert paused.verification_binding['required_proof_ids'] == ['owned.contract']
+    evidence = [entry for entry in paused.execution_log if entry.get('action') == 'receipt_verification']
+    assert len(evidence) == 1 and evidence[0]['verification']['ok']
+    original_key = evidence[0]['identity']
+    if boundary == 'legacy_pass':
+        # Preserve the genuine old result, without attesting its scope as current.
+        evidence[0]['identity'] = 'older-receipt-context'
+        save_session_state(root, paused)
+    if not switch_before:
+        switch()
+    if change == 'changed':
+        rows[-1]['text'] = 'Changed release contract'
+    elif change == 'missing':
+        rows.pop()
+    trace.write_text(json.dumps({'requirements': rows}))
+    (root / 'foreign.py').write_text('VALUE = 88\n')
+    git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 99\n')
+    (root / 'foreign.py').chmod(0o711)
+    (root / 'foreign-note.txt').write_bytes(b'foreign\x00work')
+    protected = {path: (root / path).read_bytes() for path in (
+        'value.py', 'foreign.py', 'foreign-note.txt', '.git/index',
+        '.auto-agents/config.json', '.auto-agents/state/task_plan.json',
+        trace.relative_to(root).as_posix())}
+    refs = git(root, 'show-ref')
+    custody = deepcopy(paused.candidate_custody)
+    retained_fields = {key: deepcopy(getattr(paused, key)) for key in (
+        'current_attempt', 'auto_approve', 'authorization_policy', 'goal',
+        'goal_execution_environment', 'full_verify', 'verification_binding')}
+    if marker.exists():
+        marker.unlink()
+    verified, delivered = [], []
+    verify, deliver = Session._run_verify, candidate.deliver_candidate
+    blocked = policy == 'blocking' and change != 'unchanged'
+    def forbidden(*args, **kwargs):
+        pytest.fail('Required release authority must reject before execution or completion side effects')
+    def observe_verify(self, *args, **kwargs):
+        assert boundary == 'legacy_pass', 'matching evidence must be reused'
+        result = verify(self, *args, **kwargs)
+        verified.append(result)
+        return result
+    def observe_delivery(session, state, message):
+        delivered.append(state.session_id)
+        return deliver(session, state, message)
+    monkeypatch.setattr(Session, '_run_verify', forbidden if blocked else observe_verify)
+    monkeypatch.setattr(candidate, 'deliver_candidate', forbidden if blocked else observe_delivery)
+    if blocked:
+        monkeypatch.setattr(Session, '_ensure_baseline', forbidden)
+        monkeypatch.setattr(Session, '_run_session_persistence_action', forbidden)
+    for _ in range(2):
+        saved, calls, orch = run_session(root, monkeypatch)
+        assert calls == []
+        assert saved.status == ('blocked' if blocked else 'completed'), saved.to_dict()
+        assert orch.config.gates.to_dict() == load_project_config(root).gates.to_dict()
+        assert {key: getattr(saved, key) for key in retained_fields} == retained_fields
+        assert saved.candidate_custody['receipt'] == custody['receipt']
+        if blocked:
+            assert saved.candidate_custody == custody
+            diagnostic = saved.execution_log[-1]['diagnostic']
+            assert diagnostic['task_id'] == 'task-foreign'
+            assert diagnostic['requirement_id'] == 'REQ-foreign'
+            assert diagnostic['session_id'] == child.session_id
+            assert diagnostic['contract_fingerprint'] and diagnostic['retry_fix'] is False
+        else:
+            assert identities[-1] == original_key
+    assert len(verified) == (1 if boundary == 'legacy_pass' else 0)
+    assert len(delivered) == (0 if blocked or boundary == 'completed' else 1)
+    if boundary == 'legacy_pass':
+        assert verified[0]['ok']
+        assert ('foreign.release' in verified[0]['proof_ids']) == (policy == 'blocking')
+        records = [entry for entry in saved.execution_log if entry.get('action') == 'receipt_verification']
+        assert len(records) == 2 and records[0]['identity'] == 'older-receipt-context'
+        assert records[1]['identity'] == original_key and records[1]['verification'] == verified[0]
+        if policy == 'blocking' and not marker.exists():
+            assert verified[0]['certificate_hits'] > 0
+    else:
+        assert not marker.exists(), 'matching receipts must not replay test bodies'
+    assert {path: (root / path).read_bytes() for path in protected} == protected
+    assert (root / 'foreign.py').stat().st_mode & 0o777 == 0o711
+    assert git(root, 'show-ref') == refs
+
+
 def _assert_receipt_current_authority(tmp_path, monkeypatch, outcome):
     from copy import deepcopy
     from auto_agents.config import load_task_plan, requirements_trace_path
@@ -3896,6 +4058,10 @@ def _retain_candidate_binding_identity(state):
     (3, 'verification', 'foreign_contract'), (3, 'verification', 'restored_contract'),
     (3, 'verification', 'full_failure'), (3, 'verification', 'full_pass'),
     (3, 'verification', 'persisted_full'), (3, 'verification', 'affected_policy'),
+    (3, 'verification', 'policy_blocking'), (3, 'delivery', 'policy_blocking'),
+    (3, 'completed', 'policy_blocking'), (3, 'verification', 'policy_deferred'),
+    (3, 'delivery', 'policy_deferred'), (3, 'completed', 'policy_deferred'),
+    (3, 'legacy_pass', 'policy_blocking'), (3, 'legacy_pass', 'policy_deferred'),
 ])
 def test_public_inventory_migration_resumes_existing_undelivered_receipt(
         tmp_path, monkeypatch, inventory_version, boundary, outcome):
@@ -3903,6 +4069,10 @@ def test_public_inventory_migration_resumes_existing_undelivered_receipt(
     import auto_agents.session_candidate as candidate
     from auto_agents.session_verification import fingerprint
 
+    if outcome.startswith('policy_'):
+        _assert_receipt_policy_mismatch(tmp_path, monkeypatch, outcome.removeprefix('policy_'),
+                                        'unchanged', boundary=boundary, switch_before=False)
+        return
     if outcome in {'foreign_contract', 'restored_contract', 'full_failure', 'full_pass',
                    'persisted_full', 'affected_policy'}:
         _assert_receipt_current_authority(tmp_path, monkeypatch, outcome)

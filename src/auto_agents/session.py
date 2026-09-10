@@ -192,7 +192,11 @@ class Session:
         return list(self.config.gates.commands)
 
     def _session_gate_plan(self, scope: str):
-        """Resolve the gate plan used by a session verification scope."""
+        """Resolve scope only after installing the authenticated session policy."""
+        with self._session_verification_config():
+            return self._retained_gate_plan(scope)
+
+    def _retained_gate_plan(self, scope):
         release = scope == "release" or (
             scope == "final"
             and (
@@ -202,9 +206,6 @@ class Session:
         )
         state = self._current_state
         if state is not None and state.verification_binding:
-            validate_binding(self, state)
-            ambient = self.config.gates
-            self.config.gates = session_gates(self, state)
             try:
                 if release:
                     plan = self.orch._resolved_gate_plan("final", level="release",
@@ -220,8 +221,6 @@ class Session:
                 return plan
             except ValueError as error:
                 raise ownership_error(state, str(error)) from error
-            finally:
-                self.config.gates = ambient
         if release:
             return self.orch._resolved_gate_plan("final", level="release")
         changed_path_set = set(changed_paths(self.project_root))
@@ -2349,10 +2348,11 @@ class Session:
     def _complete_verified_fix(self, state, verify, reply, *, identity=None):
         if state.candidate_custody.get('receipt'):
             from .session_candidate import verification_identity
-            plan, commands = self._verification_plan_commands()
-            validate_selected_contracts(self, state, commands, metadata=plan.metadata)
-            if identity != verification_identity(self, state):
-                raise ownership_error(state, 'verification inputs changed before completion')
+            with self._session_verification_config():
+                plan, commands = self._verification_plan_commands()
+                validate_selected_contracts(self, state, commands, metadata=plan.metadata)
+                if identity != verification_identity(self, state):
+                    raise ownership_error(state, 'verification inputs changed before completion')
         self._print("Verification passed!")
         self._run_session_persistence_action(state)
         state.status, state.resolution = 'completed', 'fixed'
@@ -3966,12 +3966,13 @@ class Session:
         return True
 
     def _verification_plan_commands(self, scope="final"):
-        plan = self._session_gate_plan(scope)
-        commands = self._logical_gate_commands(plan)
-        state = self._current_state
-        if self.mode == "fix" and state.fix_verify_command:
-            commands = [self._fix_verify_command_for_execution(state.fix_verify_command), *commands]
-        return plan, commands
+        with self._session_verification_config():
+            plan = self._session_gate_plan(scope)
+            commands = self._logical_gate_commands(plan)
+            state = self._current_state
+            if self.mode == "fix" and state.fix_verify_command:
+                commands = [self._fix_verify_command_for_execution(state.fix_verify_command), *commands]
+            return plan, commands
 
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
         publish_operation = getattr(
@@ -4003,7 +4004,8 @@ class Session:
                 publish_operation()
 
     @contextlib.contextmanager
-    def _session_verification_context(self):
+    def _session_verification_config(self):
+        """Install retained gates without snapshot, execution or persistence work."""
         state = self._current_state
         if state is None or not state.verification_binding:
             yield
@@ -4015,23 +4017,34 @@ class Session:
             raise SessionOwnershipError("verification contract belongs to another workflow")
         if state.verification_binding.get("authorization") != state.authorization_policy:
             raise SessionOwnershipError("session authorization changed since contract binding")
-        paths = owned_paths(self.orch, state)
         ambient = self.config.gates
         self.config.gates = session_gates(self, state)
-        self.config.gates.isolation.enabled = True
-        manager = GateSnapshotManager(
-            self.project_root, f"session-{state.session_id}-candidate-{uuid4().hex[:8]}",
-            excluded_paths=repository_exclusion_paths(self.project_root),
-        )
-        previous = getattr(self, "_candidate_source_ref", "")
         try:
-            self._candidate_source_ref = (state.candidate_custody.get("receipt", {}).get("source_revision")
-                                          or manager.create(paths=paths).ref_name)
             yield
         finally:
-            self._candidate_source_ref = previous
-            manager.close()
             self.config.gates = ambient
+
+    @contextlib.contextmanager
+    def _session_verification_context(self):
+        with self._session_verification_config():
+            state = self._current_state
+            if state is None or not state.verification_binding:
+                yield
+                return
+            paths = owned_paths(self.orch, state)
+            self.config.gates.isolation.enabled = True
+            manager = GateSnapshotManager(
+                self.project_root, f"session-{state.session_id}-candidate-{uuid4().hex[:8]}",
+                excluded_paths=repository_exclusion_paths(self.project_root),
+            )
+            previous = getattr(self, "_candidate_source_ref", "")
+            try:
+                self._candidate_source_ref = (state.candidate_custody.get("receipt", {}).get("source_revision")
+                                              or manager.create(paths=paths).ref_name)
+                yield
+            finally:
+                self._candidate_source_ref = previous
+                manager.close()
 
     def _session_gate_executor_context(self, metadata=None, *, source_ref="", **kwargs):
         state = self._current_state
