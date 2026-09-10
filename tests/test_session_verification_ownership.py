@@ -2393,10 +2393,16 @@ def test_public_legacy_upgrade_preserves_conflicting_retained_handoff(tmp_path, 
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
-@pytest.mark.parametrize('legacy', [False, True, 'custody'])
+@pytest.mark.parametrize('legacy', [False, True, 'custody', 'missing_scope',
+    'missing_scope_current', 'missing_scope_requirement', 'missing_scope_unresolved',
+    'missing_scope_conflict', 'missing_scope_fingerprint'])
 def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_path, monkeypatch, legacy):
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
+
+    if isinstance(legacy, str) and legacy.startswith('missing_scope'):
+        _assert_public_missing_scope_recovery(tmp_path, monkeypatch, legacy)
+        return
 
     root, child = project(tmp_path)
     child.goal_execution_environment = {'mode': 'real', 'confirmed': True, 'source': 'explicit_goal'}
@@ -2442,6 +2448,79 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
         assert saved.baseline_git_ref == refreshed_baseline
         _assert_prerequisite_owner_enrichment(saved, prerequisite_marker)
         _assert_migrated_candidate_reused(root, monkeypatch, saved, retained_custody)
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+
+
+def _assert_public_missing_scope_recovery(tmp_path, monkeypatch, shape):
+    from copy import deepcopy
+    from auto_agents.session_verification import fingerprint
+    from test_engine_child_recovery import parent_workflow, resume_to_observation, ObservationBoundary
+
+    root, child = project(tmp_path)
+    store, snapshot, handoff = parent_workflow(root, child)
+    if shape == 'missing_scope_requirement':
+        handoff.payload.pop('task_id')
+        handoff.payload['requirement_ids'] = ['REQ-owned']
+        store.save_handoff(handoff)
+    _binding_fixture(root, child)
+    expected_scope = deepcopy(child.verification_binding.pop('task_scope'))
+    child.verification_binding['schema_version'] = 13 if shape == 'missing_scope_current' else 11
+    child.verification_binding['binding_fingerprint'] = fingerprint({
+        key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+    if shape == 'missing_scope_unresolved':
+        handoff.payload.pop('task_id')
+        store.save_handoff(handoff)
+    elif shape == 'missing_scope_conflict':
+        handoff.payload['child_session_id'] = 'another-child'
+        store.save_handoff(handoff)
+    elif shape == 'missing_scope_fingerprint':
+        child.verification_binding['binding_fingerprint'] = 'invalid-fingerprint'
+    retained = deepcopy(child.verification_binding)
+    save_session_state(root, child)
+    _prepare_binding_child_resume(root, store, snapshot, handoff)
+    ambient = _switch_ambient_binding_plan(root)
+    handoff_path = root / '.auto-agents/state/handoffs' / (handoff.handoff_id + '.json')
+    handoff_bytes = handoff_path.read_bytes()
+    if shape in {'missing_scope_unresolved', 'missing_scope_conflict', 'missing_scope_fingerprint'}:
+        for _ in range(2):
+            saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
+            assert saved.verification_binding == retained
+            diagnostic = saved.execution_log[-1]['diagnostic']
+            assert diagnostic['handoff_id'] == handoff.handoff_id
+            assert diagnostic['contract_fingerprint'] == retained['contract_fingerprint']
+            assert diagnostic['retry_fix'] is False
+        assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+        assert handoff_path.read_bytes() == handoff_bytes
+    else:
+        collab_loop = Session._phase_collab_loop
+        def parent_boundary(self, state):
+            if state.session_id == 'parent':
+                raise ObservationBoundary()
+            return collab_loop(self, state)
+        monkeypatch.setattr(Session, '_phase_collab_loop', parent_boundary)
+        calls = []
+        def writer(state, prompt, candidate_root):
+            calls.append(state.session_id)
+            (candidate_root / 'value.py').write_text('VALUE = 1\n')
+            return 'Repaired\nCOMMIT_MESSAGE: Repair owned value'
+        resume_to_observation(root, monkeypatch, writer)
+        saved = load_session_state(root, child.session_id)
+        assert saved.status == 'completed', saved.to_dict()
+        assert calls == [child.session_id]
+        binding = saved.verification_binding
+        assert binding['task_scope'] == expected_scope
+        assert binding['required_proof_ids'] == ['owned.contract']
+        for key in ('repository', 'session_id', 'workflow_id', 'original_handoff_id',
+                    'authorization', 'contract_revision', 'contract_fingerprint', 'tasks', 'plan'):
+            assert binding[key] == retained[key]
+        assert binding['binding_fingerprint'] == fingerprint({
+            key: value for key, value in binding.items() if key != 'binding_fingerprint'})
+        # The recovered binding must round-trip and remain usable after the
+        # parent has consumed delivery, with the ambient plan still switched.
+        resume_to_observation(root, monkeypatch, writer)
+        assert calls == [child.session_id]
+        assert load_session_state(root, child.session_id).verification_binding == binding
+    assert store.load_handoff(handoff.handoff_id).payload == handoff.payload
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 

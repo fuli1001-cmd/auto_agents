@@ -101,17 +101,24 @@ def bind_session(session, state) -> None:
 
 def _bind_session(session, state) -> None:
     if state.verification_binding:
-        validate_binding(session, state)
-        scope = _task_scope(session, state)
-        if 'task_scope' not in state.verification_binding:
-            state.verification_binding['task_scope'] = scope
-        elif any(scope.values()) and scope != state.verification_binding['task_scope']:
-            raise ownership_error(state, 'retained task authority conflicts with session evidence')
-        upgrade_inventory = state.verification_binding.get('proof_inventory_version', 0) < _PROOF_INVENTORY_VERSION
         original = deepcopy(state.verification_binding)
+        recover_scope = 'task_scope' not in state.verification_binding
+        if recover_scope:
+            # Authenticate the untouched record first. Its omitted legacy
+            # scope must be recovered before checking executable ownership.
+            _validate_binding_identity(session, state)
+        else:
+            validate_binding(session, state)
         if state.candidate_custody:
             from .session_candidate import validate_receipt
             validate_receipt(state)
+        scope = _task_scope(session, state)
+        if recover_scope:
+            state.verification_binding['task_scope'] = scope
+            _validate_binding_inventory(session, state)
+        elif any(scope.values()) and scope != state.verification_binding['task_scope']:
+            raise ownership_error(state, 'retained task authority conflicts with session evidence')
+        upgrade_inventory = recover_scope or state.verification_binding.get('proof_inventory_version', 0) < _PROOF_INVENTORY_VERSION
         if state.verification_binding.get('schema_version', 1) < 12 or upgrade_inventory:
             if state.candidate_custody.get('initial_source') and not original['contract_revision']:
                 # An unborn session froze its initial inputs in private custody.
@@ -399,6 +406,11 @@ def _future_foreign_step(session, state, step, excluded):
 
 
 def validate_binding(session, state):
+    _validate_binding_identity(session, state)
+    _validate_binding_inventory(session, state)
+
+
+def _validate_binding_identity(session, state):
     binding = state.verification_binding
     for key, expected in (
         ('session_id', state.session_id), ('workflow_id', state.workflow_id),
@@ -427,6 +439,10 @@ def validate_binding(session, state):
                               ('session_mode', state.mode)):
             if binding.get(key) != expected:
                 raise ownership_error(state, f'session verification binding has conflicting {key}')
+
+
+def _validate_binding_inventory(session, state):
+    binding = state.verification_binding
     _validate_task_authority(state)
     if binding.get('proof_graph'):
         # Retained inventories may have been sealed by the old untyped
