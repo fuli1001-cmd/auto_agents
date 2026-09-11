@@ -62,6 +62,8 @@ def _retain_command(root, child, command, reference):
 
 @pytest.mark.parametrize('active', [False, True])
 def test_named_conda_vitest_discovery_preserves_activation_cwd_and_shared_environment(tmp_path, monkeypatch, active):
+    from execution_marker import ExecutionMarker
+
     root, child = project(tmp_path)
     _prepare_real_vitest(root, monkeypatch)
     conda, source, provisioned = _environment(tmp_path)
@@ -76,15 +78,15 @@ def test_named_conda_vitest_discovery_preserves_activation_cwd_and_shared_enviro
         'if (process.env.RETAINED_ACTIVATION !== "activated value") throw Error("activation lost");\n'
         'if (process.env.INLINE_CONTEXT !== "inline value") throw Error("assignment lost");\n'
         'export default {test: {include: ["tests/*.test.js"]}};\n')
-    marker = tmp_path / 'executions'
+    marker = ExecutionMarker(tmp_path / 'executions')
     (root / 'web/tests/owned.test.js').write_text(
         'import {test, expect} from "vitest";\n'
-        'import {readFileSync, appendFileSync} from "node:fs";\n'
-        'test("retained", () => {\n'
+        'import {readFileSync} from "node:fs";\n'
+        'test("retained", async () => {\n'
         'expect(process.env.RETAINED_ACTIVATION).toBe("activated value");\n'
         'expect(process.env.INLINE_CONTEXT).toBe("inline value");\n'
         'const value = readFileSync("../value.py", "utf8");\n'
-        f'appendFileSync({json.dumps(str(marker))}, value);\n'
+        f'await {marker.javascript_source("value", append=True)};\n'
         'expect(value).toBe("VALUE = 1\\n");\n});\n')
     command = shlex.join(['env', 'CONDA_ENVS_PATH=' + str(source.parent),
                          'INLINE_CONTEXT=inline value', conda, 'run', '--cwd', 'web',
@@ -106,13 +108,15 @@ def test_named_conda_vitest_discovery_preserves_activation_cwd_and_shared_enviro
 
 @pytest.mark.parametrize('selector', ['name', 'prefix', 'prefix_equals'])
 def test_relative_prefix_and_named_launchers_share_execution_semantics(tmp_path, monkeypatch, selector):
+    from execution_marker import ExecutionMarker
+
     root, child = project(tmp_path)
     conda, source, provisioned = _environment(tmp_path)
     before, installed_before = _snapshot(source), _snapshot(provisioned)
     (root / 'launch').mkdir()
     (root / 'launch/environment').symlink_to(source, target_is_directory=True)
     (root / 'web/tests').mkdir(parents=True)
-    marker = tmp_path / 'python-executed'
+    marker = ExecutionMarker(tmp_path / 'python-executed')
     # Use the provisioned engine interpreter while retaining Conda activation.
     (root / 'web/tests/test_context.py').write_text(
         'import os\nfrom pathlib import Path\n'
@@ -123,7 +127,7 @@ def test_relative_prefix_and_named_launchers_share_execution_semantics(tmp_path,
         f'    assert Path(os.environ["CONDA_PREFIX"]).resolve() != Path({str(source)!r})\n'
         '    assert (Path(os.environ["CONDA_PREFIX"]) / "conda-meta").is_symlink()\n'
         '    value = Path("../value.py").read_text()\n'
-        f'    Path({str(marker)!r}).write_text(value)\n'
+        f'    {marker.source("value")}\n'
         '    assert value == "VALUE = 1\\n"\n')
     options = {'name': ['-n', source.name], 'prefix': ['-p', './environment'],
                'prefix_equals': ['--prefix=./environment']}[selector]

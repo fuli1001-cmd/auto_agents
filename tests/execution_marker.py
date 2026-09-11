@@ -5,6 +5,7 @@ child reached the original observation point, even inside a private /tmp mount.
 """
 import atexit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import threading
 from uuid import uuid4
 
@@ -54,3 +55,37 @@ class ExecutionMarker:
         # No project source or verification behavior is intercepted or mocked.
         return ("__import__('urllib.request', fromlist=['']).urlopen("
                 f"{endpoint!r}, data=({expression}).encode(), timeout=5).close()")
+
+    def javascript_source(self, expression, *, append=False):
+        endpoint = f'http://127.0.0.1:{_server.server_port}/{self.token}/' + ('append' if append else 'replace')
+        return '''import('node:http').then(({request}) => new Promise((resolve, reject) => {
+            const body = Buffer.from(String((EXPRESSION)), 'utf8');
+            let req, response;
+            let settled = false;
+            const finish = (error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                response?.destroy();
+                req?.destroy();
+                if (error) reject(error);
+                else resolve();
+            };
+            const timer = setTimeout(() => finish(new Error('Execution marker timeout')), 5000);
+            try {
+                req = request(ENDPOINT, {
+                    method: 'POST', headers: {'Content-Length': body.length}
+                }, (res) => {
+                    response = res;
+                    res.on('error', finish);
+                    res.on('aborted', () => finish(new Error('Execution marker response aborted')));
+                    res.on('end', () => finish(res.statusCode === 200 ? undefined :
+                        new Error('Execution marker HTTP ' + res.statusCode)));
+                    res.resume();
+                });
+                req.on('error', finish);
+                req.end(body);
+            } catch (error) {
+                finish(error);
+            }
+        }))'''.replace('ENDPOINT', json.dumps(endpoint)).replace('EXPRESSION', expression)

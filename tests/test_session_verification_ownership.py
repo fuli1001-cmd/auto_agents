@@ -798,7 +798,7 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         proof.write_text(proof.read_text().replace('from pathlib import Path',
             'from pathlib import Path\nimport os\nassert Path(os.environ["OWNED_REPORT"]).is_file()'))
         command = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned --log-file "$OWNED_REPORT"'
-    marker = tmp_path / 'vitest-executed'
+    marker = ExecutionMarker(tmp_path / 'vitest-executed')
     vitest_source = 'tests/owned.check.ts' if target_kind == 'vitest_configured_filter' else 'tests/owned.test.ts'
     if target_kind in {'vitest_conda_cwd', 'vitest_shell_cwd', 'vitest_named_conda_cwd'}:
         (root / 'web/tests').mkdir(parents=True)
@@ -823,10 +823,10 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
                 {'test': {'include': ['tests/*.check.ts'], 'exclude': ['**/control*']}}) + ';\n')
         (root / vitest_source).write_text(
             'import { test, expect } from "vitest";\n'
-            'import { readFileSync, appendFileSync } from "node:fs";\n'
-            'test("owned value", () => {\n'
+            'import { readFileSync } from "node:fs";\n'
+            'test("owned value", async () => {\n'
             f'  const value = readFileSync({json.dumps("../value.py" if target_kind in {"vitest_conda_cwd", "vitest_shell_cwd", "vitest_named_conda_cwd"} else "value.py")}, "utf8");\n'
-            f'  appendFileSync({json.dumps(str(marker))}, value);\n'
+            f'  await {marker.javascript_source("value", append=True)};\n'
             '  expect(value).toBe("VALUE = 1\\n");\n'
             '});\n')
         config.gates.steps[0].runner = 'vitest'
