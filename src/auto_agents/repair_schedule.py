@@ -23,6 +23,26 @@ def quick_verification_plan(experiment, active):
         old = timings.get(row.get('quick_check') or row['check'], {})
         return (not bool(old), old.get('seconds', 0), old.get('collected_cases') or 0)
     selected, reasons = [], []
+    # Recheck the actual failed acceptance cohort before paying for another
+    # semantic review. Do not split its fixture lifetime or invent new commands
+    # from failure prose, and keep future-component checks deferred.
+    expanded = verification_plan(experiment, active)
+    allowed, _ = canonical_commands(expanded['commands'])
+    for record in sorted(experiment.candidates.values(), key=lambda item: item.created_at, reverse=True):
+        if record.finding_group_id != active.get('group_id'):
+            continue
+        for evidence in record.failure_evidence:
+            if evidence.get('phase') == 'baseline' or evidence.get('resolved'):
+                continue
+            command = evidence.get('command')
+            if not pytest_parts(command):
+                continue
+            canonical = canonical_commands([command])[0][0]
+            if canonical in allowed:
+                selected.append(canonical)
+        break
+    if selected:
+        reasons.append('latest failed acceptance cohorts run first, unchanged, before semantic review')
     for finding in sorted(required) or [None]:
         relevant = [row for row in scenarios if finding is None or finding in row.get('finding_ids', [])
                     or row.get('scenario_id') in bindings.get(finding, [])]
@@ -46,8 +66,7 @@ def quick_verification_plan(experiment, active):
     if not selected:
         selected = list(active.get('quick_checks', []))
     commands, requests = canonical_commands(selected)
-    inventory, _ = canonical_commands([*active.get('quick_checks', []),
-        *active.get('focused_tests', []), *(row['check'] for row in scenarios if row.get('check'))])
+    inventory = allowed
     targets = sum(len((pytest_parts(command) or ([], []))[1]) for command in commands)
     if len(commands) > QUICK_COMMAND_TARGET or targets > QUICK_NODE_TARGET:
         reasons.append('required oracles exceed selection target; preserve them in serial batches')

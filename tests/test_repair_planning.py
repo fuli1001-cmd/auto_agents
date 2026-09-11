@@ -106,7 +106,10 @@ def test_approval_reuse_requires_unchanged_assumptions(setup, mutation):
             state.finding_groups[0]['implementation_steps'] += ['new uncovered counterexample']
             runner._candidate_group = dict(state.finding_groups[0])
         second = prepare_component(runner, runner.repo_root)
-    assert first['request_id'] != second['request_id'] and len(calls) == 4
+    assert first['request_id'] != second['request_id']
+    # Changed scope needs an amendment; source/environment revalidation can
+    # audit the existing draft directly, with fresh probes and approval.
+    assert len(calls) == (4 if mutation == 'new_counterexample' else 3)
 
 
 def test_implementation_edits_within_approved_plan_do_not_force_replanning(setup):
