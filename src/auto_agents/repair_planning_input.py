@@ -44,7 +44,7 @@ def working_input(context, directory, stage):
     def reference(section):
         return {'complete_input_ref': full, 'section': section,
                 'retrieve_when': 'needed to inspect an affected mechanism or resolve missing evidence'}
-    scope = stage == 'self_repair_scope_review'
+    scope = stage in {'self_repair_scope_review', 'self_repair_scope_format'}
     incremental = isinstance(working.get('previous_revision'), dict)
     if scope or incremental:
         for key in ('history', 'root_cause', 'previous_code_review'):
@@ -58,6 +58,13 @@ def working_input(context, directory, stage):
             if key in component and (scope or component[key] == prior_component.get(key)):
                 component[key] = reference('component.' + key)
     if scope:
+        # Scope needs the observation's evidence and original obligations, not
+        # a second copy of every implementation scenario and approval receipt.
+        component = working.get('component', {})
+        for key in list(component):
+            if key not in {'group_id', 'title', 'contract_obligation_ids', 'finding_ids',
+                           'touched_paths', 'depends_on', 'status'}:
+                component[key] = reference('component.' + key)
         if 'previous_revision' in working:
             working['previous_revision'] = reference('previous_revision')
         for identity, row in working.get('scope_revalidation', {}).items():

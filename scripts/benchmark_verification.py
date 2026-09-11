@@ -39,6 +39,8 @@ def main():
             result = runner._run_verification_commands([shlex.join(["python", "-m", "pytest", "-q", *targets])], root)
             results.append({"fresh": fresh, "seconds": time.monotonic() - started,
                             "ok": result.ok, "certificate_hits": result.payload.get("certificate_hits", 0),
+                            "command_timings": result.payload.get("command_timings", []),
+                            **({"failure": result.summary[-4000:]} if not result.ok else {}),
                             "proof_refs": result.payload.get("proof_refs", [])})
         print(json.dumps({"scope": "fixed isolated snapshot", "targets": targets, "runs": results}, indent=2))
         return 0 if all(row["ok"] for row in results) else 1

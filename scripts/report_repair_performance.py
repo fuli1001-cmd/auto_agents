@@ -8,6 +8,56 @@ from pathlib import Path
 import sqlite3
 
 
+def legacy_runner_commands(root, job, events):
+    """Read retained schedules from the reported invocation, excluding imports.
+
+    Legacy schedules lack job/candidate bindings. Require both a candidate from
+    this job and an artifact mtime inside its event interval; label that fallback
+    explicitly. New events include checks from candidates that did not finish.
+    """
+    ids = {payload.get('candidate_id') for kind, payload, _ in events if kind == 'candidate_result'}
+    if not ids or not events:
+        return []
+    covered = {(p.get('candidate_id'), p.get('phase')) for k, p, _ in events
+               if k == 'verification_command_finished'}
+    commands = []
+    base = root / 'jobs' / job / 'working-evidence' / '.auto-agents' / 'runs'
+    for path in base.glob('*/self-repair/*/experiment.json'):
+        experiment = json.loads(path.read_text())
+        commits = defaultdict(list)
+        for candidate in ids:
+            commit = experiment.get('candidates', {}).get(candidate, {}).get('candidate_commit')
+            if commit:
+                commits[commit].append(candidate)
+        seen = set()
+        for memory in experiment.get('component_memory', {}).values():
+            for ref in memory.get('verification_history', []):
+                identity = ref.get('id', '')
+                if identity in seen or len(identity) != 32 or any(c not in '0123456789abcdef' for c in identity):
+                    continue
+                seen.add(identity)
+                record_path = path.parent / 'planning' / identity / 'memory.json'
+                if not record_path.is_file():
+                    continue
+                record = json.loads(record_path.read_text())
+                candidates = commits.get(record.get('source_commit'), [])
+                explicit = record.get('job') == job and record.get('candidate_id') in ids
+                legacy = (not record.get('job') and len(candidates) == 1
+                          and events[0][2] <= record_path.stat().st_mtime <= events[-1][2])
+                if not explicit and not legacy:
+                    continue
+                candidate = record['candidate_id'] if explicit else candidates[0]
+                phase = {'quick': 'quick_verification', 'expanded': 'focused_verification'}.get(record.get('phase'))
+                if (candidate, phase) in covered:
+                    continue
+                for command in record.get('timings', []):
+                    commands.append({**command, 'candidate_id': candidate, 'phase': phase,
+                        'generation': record.get('generation'), 'origin': 'runner_schedule',
+                        'attribution': 'explicit' if explicit else 'legacy_source_and_mtime',
+                        'evidence_ref': str(record_path)})
+    return commands
+
+
 def report(control_root, job):
     root = Path(control_root).resolve()
     with sqlite3.connect((root / 'control.sqlite3').as_uri() + '?mode=ro', uri=True) as db:
@@ -27,7 +77,9 @@ def report(control_root, job):
             cost['seconds'] += payload.get('duration_seconds', 0)
         if kind == 'candidate_result':
             outcomes[payload.get('status', 'unknown')] += 1
-    commands = []
+    commands = [{**payload, 'origin': 'runner_event', 'created': created}
+                for kind, payload, created in events if kind == 'verification_command_finished']
+    commands.extend(legacy_runner_commands(root, job, events))
     for identity, payload in verifications:
         if payload.get('job') != job:
             continue
@@ -39,15 +91,24 @@ def report(control_root, job):
         details = verification.get('payload', {})
         for command in details.get('command_timings', []):
             commands.append({**command, 'verification_id': identity, 'ok': result.get('ok'),
+                             'origin': 'provider_verification_tool', 'generation': payload.get('generation'),
                              'evidence_ref': str(path)})
     return {
         'job': job, 'state': row[0], 'terminal_result': json.loads(row[2]),
         'started_at': datetime.fromtimestamp(events[0][2], timezone.utc).isoformat() if events else None,
         'last_state_change': datetime.fromtimestamp(row[1], timezone.utc).isoformat(),
+        'wall_seconds': max(row[1], events[-1][2]) - events[0][2] if events else None,
         'phase_costs': dict(phase), 'candidate_outcomes': dict(outcomes),
         'verification_commands': sorted(commands, key=lambda c: c.get('seconds', 0), reverse=True),
         'cache_hit_commands': sum(bool(c.get('cache_hit')) for c in commands),
+        'cache_miss_reasons': dict(Counter(c.get('cache_miss_reason') or 'not_recorded'
+                                          for c in commands if not c.get('cache_hit'))),
+        'input_trace_reasons': dict(Counter(c.get('input_trace_reason') or 'not_recorded'
+                                           for c in commands if not c.get('cache_hit') and not c.get('input_trace_complete'))),
+        'command_origins': dict(Counter(c['origin'] for c in commands)),
         'interpretation': 'Phase costs can nest; do not sum them as wall time. Counts describe this job only. '
+                          'Command times are nested inside phases, and parallel command times are work, not wall time. '
+                          'Legacy schedule attribution uses candidate source and artifact mtime; incomplete evidence is not a cache miss proof. '
                           'No counterfactual run is available to infer net speedup from review costs alone.',
     }
 

@@ -73,6 +73,49 @@ transactional restart-copy mechanism. Future-schema state cannot be overwritten.
 The existing trusted verification ledger continues to govern all proof reuse;
 cross-environment or unproved cross-snapshot reuse is not enabled by this work.
 
+## Component verification latency
+
+Expanded acceptance now orders supported pytest invocations by recorded cost,
+after prior failures. Unknown costs use a conservative scheduling estimate;
+every original command and request owner remains in the plan. Non-pytest shell
+commands are ordering barriers, and different cohorts or flags are not merged.
+
+With acceleration enabled, managed expanded checks on a clean committed source
+use at most two independent worktrees. Short checks finish before expensive
+matrices start. Each invocation retains its complete cohort and flags, private
+sandbox filesystem/network, and the existing host resource leases. Conflicting
+resources serialize; ready independent commands can pass a resource waiter.
+A failure stops new dispatch and drains running checks. Changed dependency
+environments cause complete revalidation; uncommitted inputs, shell steps,
+single-CPU hosts and disabled acceleration retain serial execution. Quick checks
+and final recovery/proof requirements are unchanged.
+
+The Python input observer records supported stat/lstat/access/readlink/getcwd
+results, including missing paths and metadata. Content, permission, symlink,
+working-directory or observed-input changes invalidate reuse. Native aliases,
+descriptor-relative probes, custom path callbacks, subprocesses and unknown
+inputs still decline cross-snapshot proof. Verification ledger policy version 2
+invalidates older certificates. Input reuse remains in observation mode by
+default; metadata support does not make subprocess-heavy tests reusable.
+
+Full repair prompt fallback uses the complete current feedback already present
+in the canonical prompt instead of appending another copy of native continuation
+evidence. Independent provider handoff evidence is still transferred. Native
+compatibility checks are unchanged; fingerprint components identify which
+settings invalidated a continuation without recording configuration values.
+Scope review and format correction retain current findings, prior disproof and
+original obligations inline, while repeated component plans remain referenced.
+An incomplete factual dependency closure still requires independent review.
+
+The performance report includes internal quick/expanded commands as well as
+provider verification tools. New command events bind candidate, phase/span and
+generation, cache decisions, input tracing, queue time and pytest phase costs.
+Older jobs use retained schedule records matched to the job's candidates and
+artifact timestamps, explicitly labeled as legacy attribution. Imported history
+is excluded. Command durations are nested work and can overlap; they are never
+added to phase durations to infer wall time. Candidate preflight now has its own
+phase timing.
+
 ### Offline acceptance and performance
 
 `python scripts/benchmark_repair_incremental.py --experiment FILE --output FILE`
@@ -317,3 +360,20 @@ python scripts/benchmark_planning_inputs.py --experiment /path/to/experiment.jso
 不再要求先推送本地修复。成功交付后检查工作区是否出现新改动，将必要的
 合并结果复验后安全快进本地分支，再按操作者权限推送。具体恢复、冲突和
 清理行为以 [独立修复控制](repair-supervisor.md) 的当前流程为准。
+
+## 组件复验完成后的调度
+
+作业 `b0c60027` 的 c75 已通过独立代码审核和全部组件扩展验收。
+这些验收曾在历史候选中完成，因此本次没有新增进展积分。旧控制器却把它计作
+又一次失败，随后对已经完成的组件启动停滞诊断，返回
+`no concrete failure evidence authorizes another design`。
+
+已完成组件现在直接进入后续组件调度，最终集成仍须通过原有完整门禁。
+历史验收的复验不会重复授予积分，也不会增加或重置失败计数；后续真实失败
+仍正常消耗预算。候选完成提示明确区分组件验收通过与整个修复完成。
+
+归档状态重放使用本次实际实验和 c75 完成收据，替代上游准入及候选执行，
+保留结果登记、调度和收敛逻辑：旧代码得到同一个 diagnosis_blocked；新代码
+保持原积分，进入 g01_retained_authority。该重放不执行模型或验收，不代表
+剩余组件已通过。两轮扩展验收累计约 65.7 分钟；本次没有删除检查或扩大
+跨源码版本的证据复用范围。

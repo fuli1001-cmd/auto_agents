@@ -322,6 +322,10 @@ def remember_check_timings(runner, workspace, group, plan, result, *, phase):
             known[row['command']] = row
     record = save_record(runner, 'verification_schedule', {
         'phase': phase, 'plan': plan, 'timings': timings, 'ok': result.ok,
+        'job': (getattr(runner, '_repair_control_binding', None) or {}).get('job', ''),
+        'generation': (getattr(runner, '_repair_control_binding', None) or {}).get('generation'),
+        'candidate_id': getattr(runner, '_candidate_id', ''),
+        'parallel_workers': result.payload.get('parallel_workers', 1),
         'certificate_hits': result.payload.get('certificate_hits', 0),
         'source_commit': head_ref(workspace),
         'slow_commands': [row for row in timings if not row.get('cache_hit') and row.get('seconds', 0) > 180],

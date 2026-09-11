@@ -24,7 +24,8 @@ def execution_policy_fingerprint() -> str:
     global _POLICY_CACHE
     paths = [Path(__file__).with_name(name) for name in (
         "gate_execution.py", "gate_result_cache.py", "gates.py", "workers.py",
-        "verification_sandbox.py", "verification_inputs.py", "verification_pytest.py", "verification_trace.py")]
+        "verification_sandbox.py", "verification_inputs.py", "verification_probes.py",
+        "verification_pytest.py", "verification_trace.py")]
     identity = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in paths if path.exists())
     if _POLICY_CACHE[0] != identity:
         _POLICY_CACHE = (identity, _stable_hash([(path.name, hashlib.sha256(path.read_bytes()).hexdigest())
@@ -344,9 +345,14 @@ class GateResultCache:
             self.disabled = True
 
     def _manifest_matches(self, manifest: Mapping[str, object]) -> bool:
+        from .verification_probes import PREFIX, matches
         if not manifest:
             return False
         for raw_path, expected in manifest.items():
+            if str(raw_path).startswith(PREFIX):
+                if not matches(self.project_root, str(raw_path), expected):
+                    return False
+                continue
             relative = str(raw_path).replace("\\", "/").strip()
             denied = relative.startswith("?")
             if denied:

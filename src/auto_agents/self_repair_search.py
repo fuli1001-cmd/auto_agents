@@ -1142,6 +1142,12 @@ class SelfRepairExperiment:
             progress_kind = "infrastructure_interruption"
         elif progress_kind and not candidate_regressions:
             self.consecutive_non_improvements = 0
+        elif (record.status == 'candidate_group_completed' and not candidate_regressions
+              and not record.fatal and not record.failed_obligations):
+            # Revalidating old acceptance is not a new achievement, but neither
+            # is it another failed attempt. Preserve the existing patience and
+            # historical credits; the scheduler must advance the verified group.
+            progress_kind = 'no_progress'
         else:
             self.consecutive_non_improvements += 1
             progress_kind = "no_progress"

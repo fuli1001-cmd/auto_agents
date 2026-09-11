@@ -8,6 +8,11 @@ import json
 import os
 from pathlib import Path
 import sys
+if __package__:
+    from .verification_probes import OPERATIONS, PREFIX, descriptor, value
+else:
+    # The trusted pytest launcher imports siblings before exposing candidate src.
+    from verification_probes import OPERATIONS, PREFIX, descriptor, value
 
 
 class InputObserver:
@@ -18,6 +23,52 @@ class InputObserver:
         self.runtime = [Path(os.environ[key]).resolve() for key in ("TMPDIR", "HOME", "CODEX_HOME") if os.environ.get(key)]
         self.runtime = [path for path in self.runtime if path != self.root and path not in self.root.parents]
         self.helpers = {str(Path(__file__).resolve()), str(Path(__file__).with_name("verification_pytest.py").resolve())}
+        self.probes = []
+
+    def _probe(self, operation, original):
+        def observed(*args, **kwargs):
+            if not self.active or self.busy or not self.source_frame(sys._getframe(1)):
+                return original(*args, **kwargs)
+            self.busy = True
+            try:
+                try:
+                    spec = descriptor(self.root, operation, args, kwargs)
+                except (ValueError, TypeError):
+                    self.reasons.add('unresolved_filesystem_probe')
+                    self.active = False
+                    sys.setprofile(None)
+                    return original(*args, **kwargs)
+                location = spec.get('path', '')
+                path = Path(location) if spec.get('external') else self.root / location
+                if operation != 'getcwd' and any(path == base or base in path.parents for base in self.runtime):
+                    # The private fixture filesystem is recreated per command.
+                    # Its inode/time metadata is not a reusable source input.
+                    self.reasons.add('private_runtime_metadata')
+                    self.active = False
+                    sys.setprofile(None)
+                    return original(*args, **kwargs)
+                key = PREFIX + json.dumps(spec, sort_keys=True)
+                def record(fingerprint):
+                    if key in self.inputs and self.inputs[key] != fingerprint:
+                        self.reasons.add('filesystem_probe_changed_during_check')
+                        self.active = False
+                        sys.setprofile(None)
+                    self.inputs[key] = fingerprint
+                try:
+                    # Keep Python/audit observation active if a native call
+                    # invokes a path callback. Only our bookkeeping is hidden.
+                    self.busy = False
+                    result = original(*args, **kwargs)
+                except OSError as error:
+                    self.busy = True
+                    record(value(error=error))
+                    raise
+                self.busy = True
+                record(value(result))
+                return result
+            finally:
+                self.busy = False
+        return observed
 
     def source_frame(self, frame):
         for _ in range(3):
@@ -112,6 +163,21 @@ class InputObserver:
             self.reasons.add("another_profiler")
             self.active = False
             return
+        import pathlib
+        targets = [(os, name, original) for name, original in OPERATIONS.items()]
+        # Python 3.9/3.10 pathlib retains native stat aliases at import time.
+        accessor = getattr(pathlib, '_normal_accessor', None)
+        if accessor is not None:
+            targets.extend((accessor, name, OPERATIONS[name]) for name in ('stat', 'lstat'))
+        for owner, name, original in targets:
+            if getattr(owner, name) is not original:
+                self.reasons.add('preexisting_filesystem_observer')
+                self.active = False
+                return
+        for owner, name, original in targets:
+            wrapper = self._probe(name, original)
+            self.probes.append((owner, name, original, wrapper, name in vars(owner)))
+            setattr(owner, name, wrapper)
         sys.addaudithook(self.audit)
         sys.setprofile(self.profile)
 
@@ -121,5 +187,13 @@ class InputObserver:
         self.active = False
         if sys.getprofile() == self.profile:
             sys.setprofile(None)
+        for owner, name, original, wrapper, local in self.probes:
+            if getattr(owner, name) is wrapper:
+                if local:
+                    setattr(owner, name, original)
+                else:
+                    delattr(owner, name)
+            else:
+                self.reasons.add('filesystem_observer_replaced')
         return {"manifest": self.inputs, "complete": bool(self.inputs) and not self.reasons,
                 "reasons": sorted(self.reasons)}

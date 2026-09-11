@@ -50,7 +50,11 @@ def test_regrouping_and_restart_do_not_credit_the_same_proof(tmp_path):
     repeated = SelfRepairCandidateRecord('second', status='candidate_group_completed',
         finding_group_id='renamed', candidate_commit='second')
     assert restored.register_candidate(repeated) == 'no_progress'
-    assert restored.patience_exhausted
+    assert restored.consecutive_non_improvements == 2
+    assert not restored.patience_exhausted
+    restored.register_candidate(SelfRepairCandidateRecord('failed', finding_group_id='renamed',
+        status='candidate_verification_failed', failed_obligations=['validation:focused']))
+    assert restored.patience_exhausted  # A real failure still consumes patience.
 
 
 def test_schema_four_history_keeps_credit_before_restart_invalidates_proof():
