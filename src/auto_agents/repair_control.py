@@ -93,11 +93,16 @@ def operator_root():
                 str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "auto-agents/repair-control")).expanduser().resolve()
 
 
-def publication_policy(config):
+def operator_policy(config):
     path = Path(config["root"]) / "operator.json" if config.get("root") else None
     current = json.loads(path.read_text()) if path and path.exists() else config
     if any(current.get(key) != config.get(key) for key in ("remote", "ref", "identity")):
         raise PermissionError("operator repository identity changed; use a separate control namespace")
+    return current
+
+
+def publication_policy(config):
+    current = operator_policy(config)
     if not current.get("publish", False):
         raise PermissionError("automatic publication is not authorized by the operator")
     return current
@@ -227,6 +232,11 @@ class Store:
         result = dict(row)
         for key in ("payload", "result"):
             result[key] = json.loads(result[key])
+        if include_progress:
+            for name in ('source-selection', 'source-delivery'):
+                path = self.root / 'jobs' / identity / (name + '.json')
+                if path.is_file() and not path.is_symlink():
+                    result[name.replace('-', '_')] = json.loads(path.read_text())
         if include_progress and result["state"] in TERMINAL:
             receipt = result['result']
             outcome = receipt.get('result', {})
@@ -371,6 +381,97 @@ class Repository:
             self.initialize()
             git(self.cache, "fetch", str(source), revision)
         return revision
+
+    def source_snapshot(self, branch=None):
+        """Observe the operator installation, never a candidate-supplied path."""
+        source = Path(self.config['source_root'])
+        actual = git(source, 'symbolic-ref', '--quiet', 'HEAD', check=False)
+        if actual.returncode:
+            raise RuntimeError('engine workspace must be on a local branch before self-repair')
+        actual = actual.stdout.strip()
+        if branch and actual != branch:
+            raise RuntimeError('engine workspace branch changed; retained repair is waiting for integration')
+        name = actual.removeprefix('refs/heads/')
+        tracking = git(source, 'config', '--get', f'branch.{name}.merge', check=False).stdout.strip()
+        remote = git(source, 'config', '--get', f'branch.{name}.remote', check=False).stdout.strip()
+        if tracking and (tracking != self.config['ref'] or not remote
+                         or git(source, 'remote', 'get-url', remote) != self.config['remote']):
+            raise RuntimeError('engine branch upstream differs from the configured repair destination')
+        if git(source, 'status', '--porcelain', '--untracked-files=all'):
+            raise RuntimeError('engine workspace has uncommitted changes; commit them before self-repair or integration')
+        return {'root': str(source.resolve()), 'branch': actual, 'commit': git(source, 'rev-parse', 'HEAD')}
+
+    def update_source(self, snapshot, revision):
+        """Only fast-forward the still-clean branch observed before preparation."""
+        source = Path(self.config['source_root'])
+        common = Path(git(source, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        with (common / 'auto-agents-source.lock').open('a+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self.source_snapshot(snapshot['branch']) != snapshot:
+                raise RuntimeError('engine workspace advanced during verification; retry integration with its new commits')
+            if snapshot['commit'] != revision:
+                git(source, 'fetch', '--no-tags', str(self.cache), revision)
+                if self.source_snapshot(snapshot['branch']) != snapshot:
+                    raise RuntimeError('engine workspace changed during synchronization; retained repair is preserved')
+                # Git also rejects overlapping dirty/untracked files that appear
+                # after our check; never use reset, checkout --force, or autostash.
+                git(source, 'merge', '--ff-only', revision)
+            current = self.source_snapshot(snapshot['branch'])
+            if current['commit'] != revision:
+                raise RuntimeError('engine workspace changed during synchronization')
+            return current
+
+    def select_source(self, requested):
+        snapshot = self.source_snapshot()
+        self.import_commit(self.config['source_root'], snapshot['commit'])
+        self.import_commit(self.config['source_root'], requested)
+        if git(self.cache, 'merge-base', '--is-ancestor', requested, snapshot['commit'], check=False).returncode:
+            raise RuntimeError('engine installation changed branches since this request; rerun the original command')
+        remote, fresh = self.fetch()
+        if not fresh:
+            raise RuntimeError('engine synchronization requires a successful remote refresh')
+        local = snapshot['commit']
+        if local == remote:
+            relation, selected = 'equal', local
+        elif not git(self.cache, 'merge-base', '--is-ancestor', remote, local, check=False).returncode:
+            relation, selected = 'local_ahead', local
+        elif not git(self.cache, 'merge-base', '--is-ancestor', local, remote, check=False).returncode:
+            relation, selected = 'remote_ahead', remote
+        else:
+            relation = 'merged'
+            name = 'source-merge-' + digest([local, remote])[:24]
+            root = self.root / 'runtimes' / name
+            atomic_json(root.with_name(name + '.source.json'), {'pending': True, 'local': local, 'remote': remote})
+            if not root.exists():
+                root = self.worktree(local, name)
+                git(root, 'merge', '--no-ff', '--no-edit', remote, check=False)
+            conflicts = git(root, 'diff', '--name-only', '--diff-filter=U').splitlines()
+            if conflicts or git(root, 'status', '--porcelain'):
+                raise RuntimeError(f'engine source merge requires resolution and a commit in {root}; '
+                                   'the installation has not been changed')
+            selected = git(root, 'rev-parse', 'HEAD')
+            if any(git(root, 'merge-base', '--is-ancestor', parent, selected, check=False).returncode
+                   for parent in (local, remote)):
+                raise RuntimeError(f'engine source merge is incomplete in {root}; retain both histories before retrying')
+        selection = {'snapshot': snapshot, 'requested_revision': requested, 'remote_revision': remote,
+                     'revision': selected, 'relation': relation, 'fresh': fresh}
+        if relation == 'merged':
+            selection['merge_receipt'] = str(root.with_name(root.name + '.source.json'))
+        return selection
+
+    def delivery_snapshot(self, job):
+        receipt = self.root / 'jobs' / job / 'source-selection.json'
+        selected = json.loads(receipt.read_text()) if receipt.exists() else {}
+        return self.source_snapshot(selected.get('snapshot', {}).get('branch') or self.config['ref'])
+
+    def record_delivery(self, job, snapshot, revision):
+        current = self.update_source(snapshot, revision)
+        ref = 'refs/auto-agents/delivered/' + digest(job)[:24]
+        with self.locked():
+            git(self.cache, 'update-ref', ref, revision)
+        atomic_json(self.root / 'jobs' / job / 'source-delivery.json',
+                    {'commit': revision, 'source': current, 'retained_ref': ref})
+        return current
 
     def initialize(self):
         if not self.cache.exists():
@@ -670,7 +771,7 @@ class Supervisor:
                           and details.get("fingerprint") != expected.get("fingerprint"))
             if passed and job["state"] != "completed":
                 self.store.event(job["id"], "live_boundary_passed", {"subscriber": row["id"], "commit": job["result"]["commit"]})
-                if job["result"].get("status") == "repaired":
+                if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
                     self.store.enqueue_publish(job["id"])
                 self.store.transition(job["id"], "completed")
             return {"ok": True, "accepted": passed}
@@ -687,7 +788,7 @@ class Supervisor:
                 job = self.store.job(row["job"])
                 self.store.event(job["id"], "engine_route_consumed", {"subscriber": row["id"]})
                 if job["state"] != "completed":
-                    if job["result"].get("status") == "repaired":
+                    if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
                         self.store.enqueue_publish(job["id"])
                     self.store.transition(job["id"], "completed")
             return {"ok": True, "accepted": passed}
@@ -818,7 +919,7 @@ class Supervisor:
                     job = self.store.job(row["job"])
                     if job["state"] != "completed":
                         self.store.transition(job["id"], "completed")
-                        if job["result"].get("status") == "repaired":
+                        if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
                             self.store.enqueue_publish(job["id"])
                 del self.resumes[identity]
             if row["state"] == "verified" and identity not in self.resumes:
@@ -868,21 +969,27 @@ class Supervisor:
         if job["state"] != "completed" or not job["result"].get("ok"):
             return
         try:
-            config = publication_policy(self.config)
+            config = operator_policy(self.config)
             repository = Repository(config)
             revision, fresh = repository.fetch()
-            if not fresh:
-                raise RuntimeError("publication requires a successful upstream refresh")
             current = self.store.job(identity)
             if current["state"] == "cancelled" or current["generation"] != job["generation"]:
                 return
             candidate = job["result"]["commit"]
-            contained = git(repository.cache, "merge-base", "--is-ancestor", candidate, revision, check=False).returncode == 0
-            if not contained and revision != job["result"]["base"]:
+            snapshot = repository.delivery_snapshot(identity)
+            repository.import_commit(self.config['source_root'], snapshot['commit'])
+            contains_inputs = all(git(repository.cache, 'merge-base', '--is-ancestor', parent, candidate,
+                                      check=False).returncode == 0 for parent in (revision, snapshot['commit']))
+            if not contains_inputs:
                 with self.store.connect() as db:
                     db.execute("UPDATE outbox SET state='integration_pending',due=? WHERE job=? AND state='pending'", (time.time(), identity))
                 return
+            repository.record_delivery(identity, snapshot, candidate)
+            if not fresh:
+                raise RuntimeError("publication requires a successful upstream refresh")
+            contained = revision == candidate
             if not contained:
+                publication_policy(config)
                 repository.push(candidate)
             with self.store.connect() as db:
                 db.execute("UPDATE outbox SET state='published',detail=? WHERE job=? AND state!='cancelled'", (revision if contained else candidate, identity))

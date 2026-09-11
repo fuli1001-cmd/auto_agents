@@ -19,6 +19,43 @@ def _json(path):
     return json.loads(Path(path).read_text())
 
 
+def retained_repair_candidates(root, db):
+    """Cancellation is not delivery. Release ancestors only after durable handoff."""
+    jobs = {row[0]: row[1] for row in db.execute('SELECT id,state FROM jobs')}
+    delivered = set()
+    for identity, state in jobs.items():
+        receipt = root / 'jobs' / identity / 'source-delivery.json'
+        if state != 'completed' or not receipt.is_file():
+            continue
+        value = _json(receipt)
+        ref = value.get('retained_ref', '')
+        if not ref.startswith('refs/auto-agents/delivered/'):
+            continue
+        commit = subprocess.run(['git', '-C', str(root / 'engine.git'), 'rev-parse', '--verify', ref],
+                                capture_output=True, text=True, timeout=5)
+        if commit.returncode or commit.stdout.strip() != value.get('commit'):
+            continue
+        current, seen = identity, set()
+        while current in jobs and current not in seen:
+            seen.add(current)
+            delivered.add(current)
+            imported = root / 'jobs' / current / 'prior-repair-import.json'
+            if not imported.is_file():
+                break
+            incoming = _json(imported)
+            ancestor = incoming.get('source_commit')
+            if not isinstance(ancestor, str) or len(ancestor) not in {40, 64}:
+                break
+            contained = subprocess.run(['git', '-C', str(root / 'engine.git'), 'merge-base',
+                                        '--is-ancestor', ancestor, value['commit']], capture_output=True, timeout=5)
+            if contained.returncode:
+                break
+            current = incoming.get('source_job')
+    return any(state == 'cancelled' and identity not in delivered
+               and (root / 'jobs' / identity / 'continuous/repair').exists()
+               for identity, state in jobs.items())
+
+
 def project_protection(project, *, recovery=True):
     deadline = time.monotonic() + 0.5
     root = Path(project)
@@ -135,6 +172,11 @@ def protection(row):
             return "evidence_contract_requires_retention"
         if metadata.get("repair_root"):
             root = Path(metadata["repair_root"])
+            path = Path(row['path'])
+            merge = path.with_name(path.name + '.source.json')
+            if path.parent == root / 'runtimes' and path.name.startswith('source-merge-') and merge.is_file():
+                if _json(merge).get('pending', True):
+                    return 'source_merge_pending'
             config = _json(root / "operator.json")
             if config.get("implementation_root") == row["path"]:
                 return "installed_controller_runtime"
@@ -142,9 +184,11 @@ def protection(row):
                 with contextlib.closing(sqlite3.connect((root / "control.sqlite3").as_uri() + "?mode=ro", uri=True)) as db:
                     if db.execute("SELECT 1 FROM jobs WHERE state NOT IN ('completed','cancelled') LIMIT 1").fetchone():
                         return "repair_or_recovery_pending"
+                    if retained_repair_candidates(root, db):
+                        return 'cancelled_repair_candidate_retained'
                     if db.execute("SELECT 1 FROM subscribers WHERE state NOT IN ('finished','cancelled') LIMIT 1").fetchone():
                         return "subscriber_pending"
-                    if db.execute("SELECT 1 FROM outbox WHERE state NOT IN ('published','invalidated') LIMIT 1").fetchone():
+                    if db.execute("SELECT 1 FROM outbox WHERE state NOT IN ('published','invalidated','cancelled') LIMIT 1").fetchone():
                         return "publication_pending"
         if metadata.get("worker_root"):
             root = Path(metadata["worker_root"])

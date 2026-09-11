@@ -53,16 +53,23 @@ older controller is replaced without resetting jobs or recovery evidence. Active
 work defers the update with an explicit error. Repair progress and stop reasons
 use the normal user-event renderer and are saved in the invocation's user log.
 
-The repair worker separately selects its engine from the configured remote branch.
-A local commit and an updated controller therefore do not establish that the worker
-will load that commit. Before environment setup or worker replacement, the controller
-imports the requested installation commit and requires it to be an ancestor of the
-selected remote revision. A behind or divergent remote, including a prepared cached
-runtime, stops with `runtime_revision_mismatch`. The result names both revisions and
-asks the operator to publish/integrate the installation into the configured branch.
-It does not silently select unpublished local code or discard retained repair work.
-Successful selection records `runtime_selected` with both revisions. The existing
-runtime compatibility, behavioral proof and publication checks still apply.
+Before self-repair, the engine installation must be on a clean local branch.
+Staged, unstaged and nonignored untracked files stop admission with a request to
+commit first; nothing is automatically stashed, committed or discarded. The worker
+fetches the configured remote and compares Git ancestry. Equal/local-ahead histories
+use the local commit without requiring a push. Remote-ahead histories use the remote
+commit. Divergent histories merge in an isolated directory; a conflict leaves that
+directory available for resolution and a commit, while the installation stays intact.
+A successful refresh is required at startup; a stale cache cannot establish the latest
+known version. A conflicting branch upstream configuration also stops synchronization.
+
+After runtime compatibility checks, the still-clean installation branch is fast-forwarded
+to the selected commit. The worker runs an independent snapshot of that same commit.
+`source-selection.json` binds the source branch, local/remote revisions and selected
+revision across worker replacement. It appears in `repair status --job JOB`, together
+with `source-delivery.json` after delivery. Switching branches, advancing HEAD or making
+uncommitted edits while an update is prepared prevents overwriting the operator's work.
+The existing behavioral proof and recovery gates remain mandatory.
 
 The foreground shows an eight-character job ID and explains the problem once,
 using the current workflow's engine request or approved diagnosis. Without an
@@ -193,11 +200,11 @@ in-process path for compatibility and isolated tests.
 
 1. Quiesce managed project children and transfer the held project lock. Freeze
    project evidence; no engine patch is applied to the target project.
-2. Fetch the trusted branch in a private bare repository, never pull into the
-   developer checkout. Three bounded attempts may fall back to a cached SHA,
-   explicitly marked stale; an empty cache blocks recovery.
+2. Require a clean installation, fetch the trusted branch, select or merge the
+   latest local/remote histories, then safely synchronize the installation.
+   A failed refresh stops startup instead of silently selecting an older cache.
 3. Prepare an engine-specific dependency environment. A behavior differential
-   and an original-boundary replay must both pass to reuse a remote fix.
+   and an original-boundary replay must both pass to reuse an existing fix.
    Collection/import/setup failure is not proof that the engine is repaired.
 4. Otherwise retain one repair workspace and provider continuation for focused
    edits and tests. Three non-improving attempts or rejected reviews of the same
@@ -210,8 +217,9 @@ in-process path for compatibility and isolated tests.
    invocation against the approved runtime. Native gate/stage/engine-route
    receipts can confirm recovery before the whole business goal finishes.
    Unknown boundaries conservatively require successful workflow completion.
-6. Publish only after recovery confirmation. Source developer files, index and
-   unrelated local commits are not promoted or pushed by this path.
+6. After recovery confirmation, integrate the verified commit into the installation
+   before publishing. Uncommitted changes or a switched branch defer delivery.
+   New committed local/remote work is merged and reverified in isolation first.
 
 When recovering cancelled jobs from older engines that abandoned their continuous
 workspace during deep search, import the latest candidate or its verified interrupted
@@ -266,11 +274,26 @@ After resolving the blocker, `repair resume --job JOB` can queue another attempt
 
 ## Publication and evidence
 
-Remote updates during repair are integrated only in a private publication
-worktree. Equivalent upstream fixes are rechecked. Integration conflicts use
+Local and remote commits arriving during repair are integrated in a private delivery
+worktree. Integration conflicts use
 the scoped conflict resolver; the result must pass behavior, boundary and full
 suite checks. Cached integration receipts avoid repeating successful validation
-after a network-only push failure. All pushes are ordinary, non-forced pushes.
+after a network-only push failure. Before copying the verified commit into the
+installation, the source branch, HEAD and clean status are checked again. The update
+is a Git fast-forward, never a reset or forced checkout. A concurrent change defers
+delivery for another integration; it is not overwritten. All pushes are ordinary,
+non-forced pushes. Remote publication permission and a fresh remote check remain
+required for pushing. Revoked publication or a temporary remote outage does not undo
+a completed local delivery; the outbox retains the pending publication.
+
+Successful delivery pins the exact Git commit under `refs/auto-agents/delivered/`
+in the private repository and records its installation branch. Cancelled candidates
+remain protected until a completed successor has durably delivered their imported
+history. Pending subscribers, publication, recovery and running processes continue
+to protect worktrees. After all references are released, the existing storage policy
+can reclaim clean registered worktrees (normally after seven days). Diagnostic
+scratch cleanup remains separate; core job records and required audit evidence are
+not removed as part of worktree cleanup.
 
 Publication retries are durable with delays of 1, 5, 15, then 60 minutes. A
 permission failure becomes `authorization_required`; fix the credentials or

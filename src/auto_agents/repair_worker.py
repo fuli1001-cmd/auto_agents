@@ -10,11 +10,12 @@ import sys
 import signal
 import shutil
 import re
+import time
 
 # Direct script execution deliberately avoids auto_agents.cli initialization.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from auto_agents.repair_control import Repository, Store, atomic_json, digest, git, publication_policy
+from auto_agents.repair_control import Repository, Store, atomic_json, digest, git, operator_policy, publication_policy
 from auto_agents.repair_runtime import RuntimeCompatibilityError, require_runtime, verify_runtime
 
 
@@ -178,33 +179,42 @@ def repair(request):
     store = Store(config["root"])
     repository = Repository(config)
     prepared = request.get("prepared_runtime")
-    revision, fresh = (prepared["revision"], prepared["fresh"]) if prepared else repository.fetch()
-    store.event(job["id"], "remote_checked", {"revision": revision, "fresh": fresh})
     base = payload["base"]
-    repository.import_commit(config["source_root"], base)
-    contains = git(repository.cache, "merge-base", "--is-ancestor", base, revision, check=False)
-    if contains.returncode:
-        if contains.returncode != 1:
-            raise RuntimeError("could not verify requested engine ancestry before worker replacement")
-        details = {"requested_revision": base, "selected_revision": revision,
-                   "ref": config["ref"], "fresh": fresh}
-        store.event(job["id"], "runtime_revision_mismatch", details)
-        return {"ok": False, "status": "runtime_revision_mismatch",
-                "error": "selected repair engine does not contain the requested installation revision",
-                "runtime_selection": details,
-                "next_action": {"kind": "synchronize_engine",
-                                "reason": "Publish or integrate the requested installation into the configured "
-                                          "remote branch, then retry the original command. Retained repair "
-                                          "source and evidence have not been changed."}}
+    directory = Path(config["root"]) / 'jobs' / job['id']
+    selection_path = directory / 'source-selection.json'
+    if prepared and prepared.get('source_selection'):
+        selection = prepared['source_selection']
+        if (not selection_path.is_file() or json.loads(selection_path.read_text()) != selection
+                or selection['revision'] != prepared['revision'] or selection['requested_revision'] != base):
+            raise RuntimeError('prepared engine selection does not match its durable receipt')
+    else:
+        prepared = None  # A legacy cached remote is not a new source selection.
+        started = time.monotonic()
+        store.event(job['id'], 'phase_started', {'phase': 'engine_source_sync'})
+        try:
+            selection = repository.select_source(base)
+        finally:
+            store.event(job['id'], 'phase_finished', {'phase': 'engine_source_sync',
+                        'duration_seconds': time.monotonic() - started})
+    revision, fresh = selection['revision'], selection['fresh']
+    store.event(job["id"], "remote_checked", {"revision": selection['remote_revision'], "fresh": fresh})
     store.event(job["id"], "runtime_selected", {"requested_revision": base,
-                "selected_revision": revision, "contains_requested": True, "fresh": fresh})
+                "selected_revision": revision, "contains_requested": True, "fresh": fresh,
+                'relation': selection['relation'], 'remote_revision': selection['remote_revision']})
     checkout = repository.worktree(revision, job["id"] + "-base-" + revision[:12])
     python, environment = ((prepared["python"], prepared["environment"]) if prepared else engine_environment(config, checkout))
-    request["prepared_runtime"] = {"revision": revision, "fresh": fresh, "python": python, "environment": environment}
+    if not prepared:
+        if request.get('_request_path'):
+            verify_runtime(checkout, python)
+        repository.update_source(selection['snapshot'], revision)
+        atomic_json(selection_path, selection)
+        if selection.get('merge_receipt'):
+            atomic_json(Path(selection['merge_receipt']), {'pending': False, 'commit': revision})
+    request["prepared_runtime"] = {"revision": revision, "fresh": fresh, "python": python,
+                                   "environment": environment, 'source_selection': selection}
     execute_selected_worker(request, checkout, python)
     from auto_agents.verification_sandbox import check_verification_sandbox
     check_verification_sandbox(checkout, python, Path(payload["project"]))
-    directory = Path(config["root"]) / "jobs" / job["id"]
     evidence = directory / "evidence"
     if not evidence.exists():
         RootCauseCoordinator._copy_diagnostic_tree(Path(payload["project"]), evidence)
@@ -235,6 +245,7 @@ def repair(request):
             return {"ok": False, "error": "upstream behavior passed but full engine proof is incomplete or failed",
                     "proof": proof + "\n" + full.summary}
         return {"ok": True, "status": "already_repaired", "commit": revision,
+                'source_delivery_needed': True,
                 "base": revision, "runtime": str(checkout), "python": python,
                 "environment": environment, "proof": proof + "\n" + full.summary, "fresh": fresh, "request_contract": request_contract,
                 "engine_full_proof": {"policy": 1, "commit": revision, "environment": environment, "ok": True}}
@@ -259,6 +270,7 @@ def repair(request):
         return {"ok": False, "error": "approved repair has no immutable candidate revision"}
     runtime = repository.worktree(candidate, job["id"] + "-approved-" + candidate[:12])
     return {"ok": True, "status": "repaired", "commit": candidate, "base": revision,
+            'source_delivery_needed': True,
             "runtime": str(runtime), "python": python, "environment": environment,
             "proof": result.verification, "fresh": fresh, "result": result.to_dict(), "request_contract": request_contract,
             "engine_full_proof": {"policy": 1, "commit": candidate, "environment": environment, "ok": True}}
@@ -303,65 +315,77 @@ def carry_continuous_work(runner, revision):
 
 def publish(request):
     config, job = request["config"], request["job"]
-    config = publication_policy(config)
+    config = operator_policy(config)
     repository = Repository(config)
     approved = job["result"]
     if approved.get("runtime"):
         execute_selected_worker(request, approved["runtime"], approved["python"])
     revision, fresh = repository.fetch()
-    if not fresh:
-        raise RuntimeError("publication requires a successful upstream refresh")
-    candidate = approved["commit"]
-    if git(repository.cache, "merge-base", "--is-ancestor", candidate, revision, check=False).returncode == 0:
-        return {"ok": True, "commit": revision, "status": "already_published"}
-    if revision != approved["base"]:
-        directory = Path(config["root"]) / "jobs" / job["id"]
-        receipt_key = digest([revision, approved["commit"], approved.get("environment", "")])
-        receipt = directory / ("integrated-" + receipt_key + ".json")
-        if receipt.exists():
-            recorded = json.loads(receipt.read_text())
-            candidate = recorded["commit"]
-            repository.push(candidate)
-            return {"ok": True, "commit": candidate, "status": "published"}
-        name = job["id"] + "-publish-" + revision[:12] + "-" + approved["commit"][:12]
-        root = Path(config["root"]) / "runtimes" / name
+    snapshot = repository.delivery_snapshot(job['id'])
+    repository.import_commit(config['source_root'], snapshot['commit'])
+    candidate = approved['commit']
+    directory = Path(config['root']) / 'jobs' / job['id']
+    # A verified integration remains reusable after local delivery followed by a
+    # network failure. New local/remote commits invalidate this cache naturally.
+    receipt = directory / 'verified-delivery.json'
+    recorded = json.loads(receipt.read_text()) if receipt.exists() else {}
+    reusable = (recorded.get('approved') == candidate and recorded.get('upstream') == revision
+                and recorded.get('environment') == approved.get('environment', '')
+                and recorded.get('branch') == snapshot['branch']
+                and snapshot['commit'] in {recorded.get('local'), recorded.get('commit')})
+    if reusable:
+        candidate = recorded['commit']
+    elif not all(git(repository.cache, 'merge-base', '--is-ancestor', parent, candidate,
+                     check=False).returncode == 0 for parent in (revision, snapshot['commit'])):
+        name = 'delivery-' + digest([job['id'], revision, candidate, snapshot])[:24]
+        root = repository.root / 'runtimes' / name
         if not root.exists():
             root = repository.worktree(revision, name)
-        if git(root, "merge-base", "--is-ancestor", revision, "HEAD", check=False).returncode:
-            raise RuntimeError("publication worktree does not descend from its recorded upstream")
-        working = Path(config["root"]) / "jobs" / job["id"] / "working-evidence"
+        working = directory / 'working-evidence'
         from auto_agents.repair_contract import with_request_contract
-        runner = make_runner(with_request_contract(job["payload"], approved), root, working, approved["python"])
-        # A different machine may already have published an equivalent fix.
-        if git(root, "rev-parse", "HEAD") == revision and not git(root, "status", "--porcelain"):
-            fixed, proof = check_revision(runner, root, job["payload"]["base"])
-            if fixed:
-                return {"ok": True, "commit": revision, "status": "already_published"}
-        merged = git(root, "merge-base", "--is-ancestor", candidate, "HEAD", check=False).returncode == 0
-        if not merged:
-            merge_head = git(root, "rev-parse", "--verify", "MERGE_HEAD", check=False)
-            if merge_head.returncode:
-                git(root, "merge", "--no-commit", "--no-ff", candidate, check=False)
-            conflicts = git(root, "diff", "--name-only", "--diff-filter=U").splitlines()
+        runner = make_runner(with_request_contract(job['payload'], approved), root, working, approved['python'])
+        for parent in (candidate, snapshot['commit']):
+            if git(root, 'merge-base', '--is-ancestor', parent, 'HEAD', check=False).returncode == 0:
+                continue
+            if git(root, 'rev-parse', '--verify', 'MERGE_HEAD', check=False).returncode:
+                git(root, 'merge', '--no-commit', '--no-ff', parent, check=False)
+            conflicts = git(root, 'diff', '--name-only', '--diff-filter=U').splitlines()
             if conflicts:
                 from auto_agents.self_repair import _SelfRepairGitConflict, _SelfRepairRemote
-                runner._resolve_remote_conflicts(_SelfRepairRemote("trusted", config["ref"]),
-                    _SelfRepairGitConflict("upstream advanced during verified repair publication", conflicts))
-            else:
-                git(root, "commit", "-m", f"fix: integrate verified engine repair {job['id']}")
-        candidate = git(root, "rev-parse", "HEAD")
-        weakening = runner._candidate_test_weakening_reason(root, revision)
+                runner._resolve_remote_conflicts(_SelfRepairRemote('trusted', config['ref']),
+                    _SelfRepairGitConflict('engine source advanced during repair delivery', conflicts))
+            if not git(root, 'rev-parse', '--verify', 'MERGE_HEAD', check=False).returncode:
+                git(root, 'add', '-A')
+                git(root, 'commit', '-m', f"fix: integrate verified engine repair {job['id']}")
+            if git(root, 'merge-base', '--is-ancestor', parent, 'HEAD', check=False).returncode:
+                raise RuntimeError('repair delivery merge did not retain its input history')
+        candidate = git(root, 'rev-parse', 'HEAD')
+        if git(root, 'status', '--porcelain'):
+            raise RuntimeError('repair delivery integration has uncommitted changes')
+        if git(root, 'diff', approved['commit'], candidate, '--', 'pyproject.toml'):
+            python, _ = engine_environment(config, root)
+            runner = make_runner(with_request_contract(job['payload'], approved), root, working, python)
+        weakening = runner._candidate_test_weakening_reason(root, approved['commit'])
         if weakening:
-            raise RuntimeError("integrated publication weakened proof: " + weakening)
-        passed, proof = check_revision(runner, root, job["payload"]["base"])
+            raise RuntimeError('integrated publication weakened proof: ' + weakening)
+        passed, proof = check_revision(runner, root, job['payload']['base'])
         suite = runner._run_full_suite_shards(root)
-        if not passed or not suite.ok:
-            raise RuntimeError("integrated publication failed verification; retain local recovery version")
-        atomic_json(receipt, {"commit": candidate, "upstream": revision, "proof": proof, "suite": suite.summary})
-    if not config.get("publish", False):
-        raise PermissionError("automatic publication is not authorized by the operator")
-    repository.push(candidate)
-    return {"ok": True, "commit": candidate, "status": "published"}
+        if not passed or not suite.ok or getattr(suite, 'recoverable', False):
+            raise RuntimeError('integrated publication failed verification; retain local recovery version')
+        if git(root, 'rev-parse', 'HEAD') != candidate or git(root, 'status', '--porcelain'):
+            raise RuntimeError('repair delivery source changed during verification')
+        atomic_json(receipt, {'approved': approved['commit'], 'upstream': revision,
+            'local': snapshot['commit'], 'branch': snapshot['branch'], 'commit': candidate,
+            'environment': approved.get('environment', ''), 'proof': proof, 'suite': suite.summary})
+    repository.record_delivery(job['id'], snapshot, candidate)
+    if not fresh:
+        raise RuntimeError('publication requires a successful upstream refresh')
+    contained = git(repository.cache, 'merge-base', '--is-ancestor', candidate, revision, check=False).returncode == 0
+    if not contained:
+        publication_policy(config)
+        repository.push(candidate)
+    return {'ok': True, 'commit': candidate, 'status': 'already_published' if contained else 'published',
+            'source_delivery': {'commit': candidate, 'branch': snapshot['branch']}}
 
 
 def validate_subscriber(request):
