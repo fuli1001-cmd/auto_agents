@@ -219,8 +219,8 @@ def _claude(config, request, env):
     return model, resolved, "cli" if explicit else "native-settings"
 
 
-def _settings_fingerprint(config, request, env) -> str:
-    """Hash native settings and selection inputs without persisting raw values."""
+def _settings_values(config, request, env):
+    """Read native settings once; callers persist only fingerprints."""
     args = list(config.extra_args)
     profile = last_option(args, "--profile", "-p") or config.profile_map.get(request.effort, "")
     roots = _root_chain(request.cwd)
@@ -261,8 +261,19 @@ def _settings_fingerprint(config, request, env) -> str:
     selected_env = {key: value for key, value in env.items() if key.startswith(
         ("CODEX_", "CLAUDE_", "ANTHROPIC_", "COPILOT_", "GEMINI_", "OPENAI_")
     ) and key not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"}}
-    return digest(json.dumps({"files": values, "args": args, "profile": profile,
-                              "effort": request.effort, "env": selected_env}, sort_keys=True))
+    return {"files": values, "args": args, "profile": profile,
+            "effort": request.effort, "env": selected_env}
+
+
+def _settings_fingerprint(config, request, env) -> str:
+    return digest(json.dumps(_settings_values(config, request, env), sort_keys=True))
+
+
+def _settings_components(values):
+    components = {'file:' + path: fingerprint for path, fingerprint in values['files']}
+    components.update({'env:' + key: digest(value) for key, value in values['env'].items()})
+    components.update({key: digest(json.dumps(values[key], sort_keys=True)) for key in ('args', 'profile', 'effort')})
+    return components
 
 
 def resolve_runtime(config, request, *, env: Mapping[str, str] | None = None,
@@ -307,11 +318,14 @@ def resolve_runtime(config, request, *, env: Mapping[str, str] | None = None,
     except (ValueError, OSError, TypeError, AttributeError):
         model, resolved, source = "", "", "unreadable-or-unsupported-config"
     try:
-        settings = _settings_fingerprint(config, request, env)
+        values = _settings_values(config, request, env)
+        settings = digest(json.dumps(values, sort_keys=True))
+        components = _settings_components(values)
     except (ValueError, OSError, TypeError, AttributeError):
         settings, source = "", "unreadable-or-unsupported-config"
+        components = {}
     return ProviderRuntime(provider, version, model, resolved, source, capabilities,
-                           binary_identity(config.binary) if probe else "", settings)
+                           binary_identity(config.binary) if probe else "", settings, components)
 
 
 def observed_model_metadata(request, stdout: str) -> dict:

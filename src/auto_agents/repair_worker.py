@@ -108,7 +108,8 @@ def make_runner(payload, checkout, evidence, python):
         root = json.loads(Path(config_path).read_text())["root"]
         store = Store(root)
         runner._repair_control_binding = {"root": root, "job": job_id, "generation": store.job(job_id)["generation"]}
-        runner._control_phase_callback = lambda phase, details: store.event(job_id, phase, details)
+        generation = runner._repair_control_binding['generation']
+        runner._control_phase_callback = lambda phase, details: store.event(job_id, phase, {**details, 'generation': generation})
     return runner
 
 

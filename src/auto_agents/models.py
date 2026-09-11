@@ -2185,6 +2185,10 @@ class AgentRequest:
     resume_prompt_hash: str = ""
     prompt_is_continuation: bool = False
     prompt_continuation: str = ""
+    # Optional replacement when the canonical full spec already carries the
+    # continuation evidence, bound to its hash so later handoffs stay intact.
+    prompt_fallback_continuation: Optional[str] = None
+    prompt_fallback_continuation_hash: str = ""
     # Observation never selects the subprocess transport or renews a lease.
     diagnostic_output: Optional[Callable[[str, str], None]] = None
     stream_transport: bool = False

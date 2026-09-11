@@ -1,11 +1,36 @@
-"""Serial, prerequisite-aware verification selection without deleting obligations."""
+"""Prerequisite-aware verification selection without deleting obligations."""
 import shlex
+import math
 
 from .repair_test_refs import migrate_review_commands, pytest_targets
 
 QUICK_COMMAND_TARGET = 3
 QUICK_NODE_TARGET = 12
 QUICK_SECONDS_TARGET = 180
+
+
+def order_verification_commands(commands, timings, *, first=()):
+    """Find inexpensive failures before matrices, preserving atomic invocations.
+
+    Unsupported commands are ordering barriers: a shell preparation step must
+    never move across its consumers. Equal/unknown costs retain their order.
+    Timing hints only schedule work; they never remove an acceptance check.
+    """
+    priority = set(first)
+    def cost(command):
+        seconds = timings.get(command, {}).get('seconds', 60.0)
+        if not isinstance(seconds, (float, int)) or not math.isfinite(seconds) or seconds < 0:
+            seconds = 60.0
+        return (command not in priority, seconds)
+    ordered, batch = [], []
+    for command in commands:
+        if pytest_parts(command):
+            batch.append(command)
+        else:
+            ordered.extend(sorted(batch, key=cost))
+            batch = []
+            ordered.append(command)
+    return ordered + sorted(batch, key=cost)
 
 
 def quick_verification_plan(experiment, active):
@@ -196,5 +221,12 @@ def verification_plan(experiment, active):
                     failures.append(command)
             break
     commands, requests = canonical_commands([*failures, *focused, *regressions])
+    from .repair_memory import component_key
+    timings = experiment.component_memory.get(component_key(active), {}).get('check_timings', {})
+    commands = order_verification_commands(commands, timings, first=failures)
+    indexes = {command: index for index, command in enumerate(commands)}
+    for request in requests:
+        request['execution_index'] = indexes[request['command']]
     return {'commands': commands, 'deferred': deferred, 'requests': requests,
+            'ordering': 'previous failures, then short checks before expensive matrices; shell barriers retained',
             'deduplicated_commands': len(requests) - len(commands)}

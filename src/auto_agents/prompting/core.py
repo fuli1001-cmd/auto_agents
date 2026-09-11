@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
@@ -91,6 +91,7 @@ class ProviderRuntime:
     capabilities: Tuple[str, ...] = ()
     binary_identity: str = ""
     settings_fingerprint: str = ""
+    settings_components: dict = field(default_factory=dict)
 
 
 READ_ONLY = frozenset({
@@ -229,6 +230,7 @@ def render_prompt(spec: PromptSpec, runtime: ProviderRuntime = ProviderRuntime()
         "cli_version": runtime.cli_version, "configured_model": runtime.configured_model,
         "binary_identity": runtime.binary_identity,
         "settings_fingerprint": runtime.settings_fingerprint,
+        "settings_components": runtime.settings_components,
         "rule_aliases": aliases,
         "resolved_model": runtime.resolved_model, "resolution_source": runtime.resolution_source,
         "prompt_sha256": digest(rendered), "prompt_bytes": len(rendered.encode("utf-8")),
@@ -243,6 +245,9 @@ def fresh_request(request: Any, reason: str, progress: str = "") -> Any:
     continuation = request.prompt_continuation or (
         str(request.prompt) if request.prompt_is_continuation else ""
     )
+    if (request.prompt_fallback_continuation is not None and request.prompt_fallback_continuation_hash
+            and digest(continuation) == request.prompt_fallback_continuation_hash):
+        continuation = request.prompt_fallback_continuation
     if spec is not None:
         contexts = list(spec.contexts)
         for content, source in ((continuation, "previous progress"), (progress, "provider handoff")):
@@ -258,7 +263,8 @@ def fresh_request(request: Any, reason: str, progress: str = "") -> Any:
         request, prompt=prompt, prompt_spec=spec, resume_session_id="", resume_provider="",
         resume_prompt_hash="", prompt_is_continuation=False, prompt_continuation="",
         prompt_metadata={**{key: value for key, value in request.prompt_metadata.items()
-                            if key in {"stage_attempt", "delta_candidate_bytes", "delta_fallback_reason"}},
+                            if key in {"stage_attempt", "delta_candidate_bytes", "delta_fallback_reason",
+                                       "compatibility_changes", "settings_changes"}},
                          "fallback_reason": reason},
     )
 
@@ -324,7 +330,8 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
     metadata["cwd"] = str(request.cwd.resolve())
     metadata["effort"] = request.effort
     metadata["fallback_reason"] = request.prompt_metadata.get("fallback_reason", "")
-    for key in ("delta_candidate_bytes", "delta_fallback_reason", "stage_attempt"):
+    for key in ("delta_candidate_bytes", "delta_fallback_reason", "stage_attempt",
+                "compatibility_changes", "settings_changes"):
         if key in request.prompt_metadata:
             metadata[key] = request.prompt_metadata[key]
     metadata["policy_hash"] = policy_fingerprint()
@@ -336,15 +343,25 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
         }],
     }, sort_keys=True, ensure_ascii=False))
     metadata["instructions_hash"] = instruction_fingerprint(request.cwd, runtime.provider)
-    metadata["compatibility_hash"] = digest(json.dumps({key: metadata[key] for key in (
+    compatibility = {key: metadata[key] for key in (
         "policy_hash", "contract_hash", "instructions_hash", "purpose", "model_profile", "provider",
         "cli_version", "binary_identity", "configured_model", "resolved_model", "output_contract_version", "sandbox_mode",
         "effort", "settings_fingerprint", "cwd",
-    )}, sort_keys=True))
+    )}
+    metadata["compatibility_hash"] = digest(json.dumps(compatibility, sort_keys=True))
+    metadata["compatibility_components"] = {key: digest(json.dumps(value, sort_keys=True))
+                                             for key, value in compatibility.items()}
     if request.resume_session_id and (request.resume_prompt_hash != metadata["compatibility_hash"]
                                       or runtime.resolution_source == "unreadable-or-unsupported-config"):
         # Rebuild from the complete saved spec, never from a takeover-only message.
-        return prepare_request(fresh_request(request, "incompatible-native-session"), runtime)
+        prior = request.prompt_metadata.get('resume_compatibility_components', {})
+        settings = request.prompt_metadata.get('resume_settings_components', {})
+        changed = {**request.prompt_metadata,
+            'compatibility_changes': sorted(key for key in set(prior) | set(metadata['compatibility_components'])
+                if prior.get(key) != metadata['compatibility_components'].get(key)) if prior else ['previous_identity_unavailable'],
+            'settings_changes': sorted(key for key in set(settings) | set(runtime.settings_components)
+                if settings.get(key) != runtime.settings_components.get(key)) if settings else []}
+        return prepare_request(fresh_request(replace(request, prompt_metadata=changed), "incompatible-native-session"), runtime)
     full_spec = request.prompt_spec
     if request.attachments and runtime.provider == "claude-code":
         full_spec = replace(full_spec, contexts=(*full_spec.contexts, ContextBlock(

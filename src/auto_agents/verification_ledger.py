@@ -23,7 +23,7 @@ from .gate_result_cache import GateResultCache
 from .models import CommandResult
 from .repair_control import digest, private_directory, atomic_json
 
-LEDGER_VERSION = 1
+LEDGER_VERSION = 2
 
 
 def engine_command(command):

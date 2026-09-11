@@ -140,6 +140,7 @@ SELF_REPAIR_TRIAGE_OWNERS = {
 
 
 _verification_role = ContextVar("repair_verification_role", default="candidate")
+_repair_phase_context = ContextVar("repair_phase_context", default={})
 
 
 @contextmanager
@@ -238,6 +239,7 @@ class _FullSuiteShard:
     isolated: bool = False
     priority: int = 100
     estimated_seconds: float = 0.0
+    command: str = ""
 
 
 class _FullSuiteSlots:
@@ -1762,10 +1764,13 @@ class AutoAgentsSelfRepairRunner:
     @contextmanager
     def _phase_timer(self, phase: str) -> Iterator[None]:
         started = time.perf_counter()
+        identity = {'phase': phase, 'span_id': uuid.uuid4().hex,
+                    'parent_span_id': _repair_phase_context.get().get('span_id', ''),
+                    'candidate': getattr(self, '_candidate_attempt', 0), 'candidate_id': getattr(self, '_candidate_id', '')}
+        token = _repair_phase_context.set(identity)
         callback = getattr(self, "_control_phase_callback", None)
         if callback:
-            callback("phase_started", {"phase": phase, "candidate": getattr(self, "_candidate_attempt", 0),
-                                       "candidate_id": getattr(self, "_candidate_id", "")})
+            callback("phase_started", identity)
         raised = False
         try:
             yield
@@ -1774,8 +1779,9 @@ class AutoAgentsSelfRepairRunner:
             raise
         finally:
             duration = time.perf_counter() - started
+            _repair_phase_context.reset(token)
             if callback:
-                callback("phase_finished", {"phase": phase, "duration_seconds": duration, "raised": raised})
+                callback("phase_finished", {**identity, "duration_seconds": duration, "raised": raised})
             store = getattr(self, "_experiment_store", None)
             if isinstance(store, SelfRepairExperimentStore):
                 try:
@@ -2898,7 +2904,7 @@ class AutoAgentsSelfRepairRunner:
         callback = getattr(self, "_control_phase_callback", None)
         if callback:
             callback("phase_started", {"phase": normalized_phase, "candidate_id": candidate_id,
-                                       "candidate": getattr(self, "_candidate_attempt", 0)})
+                                       "candidate": getattr(self, "_candidate_attempt", 0), "progress_only": True})
         rendered_detail = " ".join(str(detail).split())
         message = (
             f"candidate={candidate_id or 'unknown'} "
@@ -4177,7 +4183,7 @@ class AutoAgentsSelfRepairRunner:
             dict(getattr(self, "_candidate_group", {}) or {}).get("group_id", ""),
         )
 
-    def _provider_continuation(self) -> dict[str, str]:
+    def _provider_continuation(self) -> dict[str, object]:
         if self._continuous_mode():
             receipt = read_json(Path(self._continuous_workspace) / "provider.json", default={})
             if receipt.get("context") == self._provider_continuation_context():
@@ -4601,6 +4607,8 @@ class AutoAgentsSelfRepairRunner:
                     ),
                 )
                 continuation = self._provider_continuation()
+                continuation_prompt = self._candidate_continuation_prompt() if continuation else ""
+                from .prompting.core import digest as prompt_digest
                 request = AgentRequest(
                     stage="self_repair",
                     purpose="self_repair",
@@ -4624,7 +4632,11 @@ class AutoAgentsSelfRepairRunner:
                     termination_probe=lambda: "verification_environment_blocked" if self._verification_environment_blocker(repair_root) else "",
                     **continuation,
                     prompt_is_continuation=bool(continuation.get("resume_session_id")),
-                    prompt_continuation=self._candidate_continuation_prompt() if continuation else "",
+                    prompt_continuation=continuation_prompt,
+                    prompt_fallback_continuation=(
+                        "Continue from the retained worktree. The complete current review findings, "
+                        "failure evidence, required checks and prior progress are in Repair iteration evidence."),
+                    prompt_fallback_continuation_hash=prompt_digest(continuation_prompt),
                     stream_output=(
                         self.target_orchestrator._stream_agent_output_callback(
                             f"self-repair-{candidate_id}"
@@ -4668,7 +4680,10 @@ class AutoAgentsSelfRepairRunner:
                         "context": self._provider_continuation_context(),
                         "continuation": {"resume_session_id": result.provider_session_id,
                             "resume_provider": str(getattr(self.target_orchestrator, "_current_provider", "")),
-                            "resume_prompt_hash": result.prompt_metadata.get("compatibility_hash", "")},
+                            "resume_prompt_hash": result.prompt_metadata.get("compatibility_hash", ""),
+                            "prompt_metadata": {
+                                "resume_compatibility_components": result.prompt_metadata.get("compatibility_components", {}),
+                                "resume_settings_components": result.prompt_metadata.get("settings_components", {})}},
                     })
                 if hasattr(self.target_orchestrator, "_emit_agent_output"):
                     self.target_orchestrator._emit_agent_output(
@@ -5633,6 +5648,7 @@ class AutoAgentsSelfRepairRunner:
             )
         return issues
 
+    @_timed_repair_phase("candidate_preflight")
     def _candidate_deterministic_issues(
         self,
         repair_root: Path,
@@ -6791,6 +6807,8 @@ class AutoAgentsSelfRepairRunner:
         verification_root: Path,
         shard: _FullSuiteShard,
     ) -> "_VerificationResult":
+        if shard.command:
+            return self._run_verification_commands([shard.command], verification_root)
         command = "python -m pytest -q -p no:cacheprovider " + " ".join(
             shlex.quote(target) for target in shard.targets
         )
@@ -8670,11 +8688,15 @@ class AutoAgentsSelfRepairRunner:
         review.payload['early_review'] = True
         return quick, review
 
-    def _guarded_component_checks(self, commands, workspace):
+    def _guarded_component_checks(self, commands, workspace, *, parallel=False):
         from .verification_ledger import source_identity
         before = source_identity(workspace)
         verified = set(getattr(self, '_candidate_verified_check_ids', set()))
-        result = self._run_verification_commands(commands, workspace)
+        if parallel and getattr(self, '_real_project_root', None) is not None and self._acceleration_enabled():
+            from .repair_verification import run_component_checks
+            result = run_component_checks(self, commands, workspace)
+        else:
+            result = self._run_verification_commands(commands, workspace)
         if source_identity(workspace) != before:
             result.ok = False
             result.summary += '\nverification source changed; component proof is invalid'
@@ -8701,12 +8723,12 @@ class AutoAgentsSelfRepairRunner:
                             repository_aliases={self.repo_root.name, verification_root.name})]
         if not commands:
             commands = ["git diff --check"]
-        result = (self._guarded_component_checks(commands, verification_root)
+        result = (self._guarded_component_checks(commands, verification_root, parallel=True)
                   if group.get('planning_receipt') else self._run_verification_commands(commands, verification_root))
         if isinstance(experiment, SelfRepairExperiment):
             from .repair_memory import remember_check_timings
             remember_check_timings(self, verification_root, group, plan, result, phase='expanded')
-        result.payload["source_commands"] = commands[: len(result.returncodes)]
+        result.payload.setdefault("source_commands", commands[: len(result.returncodes)])
         result.payload['requests'] = plan.get('requests', [])
         result.payload['deduplicated_commands'] = plan.get('deduplicated_commands', 0)
         return result
@@ -8937,6 +8959,24 @@ class AutoAgentsSelfRepairRunner:
                                       result_cache_scope="observed_inputs",
                                       input_mode=getattr(getattr(self.target_orchestrator.config.execution, "acceleration", None), "verification_input_mode", "observe"))
                        if ledger is not None else execute())
+            collected = process.process_snapshot.get('collected_tests')
+            timing = {'command': source_command, 'seconds': float(process.duration_seconds),
+                'collected_cases': len(collected) if isinstance(collected, list) else None,
+                'passed_cases': len(process.executed_tests), 'cache_hit': bool(getattr(process, 'cached', False)),
+                'queue_seconds': float(getattr(process, 'queue_seconds', 0.0) or 0.0),
+                'cache_miss_reason': getattr(process, 'cache_miss_reason', ''),
+                'input_trace_complete': bool(getattr(process, 'input_trace_complete', False)),
+                'input_trace_reason': getattr(process, 'input_trace_reason', ''),
+                'phases': dict(getattr(process, 'phase_seconds', {})),
+                'returncode': process.returncode, 'ok': bool(process.ok)}
+            command_timings.append(timing)
+            callback = getattr(self, '_control_phase_callback', None)
+            if callback:
+                callback('verification_command_finished', {**_repair_phase_context.get(), **timing,
+                    'command': redact_incident_text(source_command),
+                    'candidate_id': getattr(self, '_candidate_id', ''),
+                    'candidate': getattr(self, '_candidate_attempt', 0),
+                    'verification_role': _verification_role.get(), 'proof_ref': getattr(process, 'proof_ref', '')})
             if (_verification_role.get() != "baseline"
                     and not process.termination_reason and not process.infrastructure_error
                     and not process.cleanup_incomplete):
@@ -8969,11 +9009,6 @@ class AutoAgentsSelfRepairRunner:
                     | getattr(self, "_pending_prepared_dependencies", set()))
                 self._pending_prepared_dependencies = set()
             duration_seconds += float(process.duration_seconds)
-            collected = process.process_snapshot.get('collected_tests')
-            command_timings.append({'command': source_command, 'seconds': float(process.duration_seconds),
-                'collected_cases': len(collected) if isinstance(collected, list) else None,
-                'passed_cases': len(process.executed_tests), 'cache_hit': bool(getattr(process, 'cached', False)),
-                'queue_seconds': float(getattr(process, 'queue_seconds', 0.0) or 0.0)})
             if getattr(process, "proof_ref", ""):
                 proof_refs.append(process.proof_ref)
             executed_tests.extend(getattr(process, "executed_tests", []))

@@ -73,6 +73,49 @@ transactional restart-copy mechanism. Future-schema state cannot be overwritten.
 The existing trusted verification ledger continues to govern all proof reuse;
 cross-environment or unproved cross-snapshot reuse is not enabled by this work.
 
+## Component verification latency
+
+Expanded acceptance now orders supported pytest invocations by recorded cost,
+after prior failures. Unknown costs use a conservative scheduling estimate;
+every original command and request owner remains in the plan. Non-pytest shell
+commands are ordering barriers, and different cohorts or flags are not merged.
+
+With acceleration enabled, managed expanded checks on a clean committed source
+use at most two independent worktrees. Short checks finish before expensive
+matrices start. Each invocation retains its complete cohort and flags, private
+sandbox filesystem/network, and the existing host resource leases. Conflicting
+resources serialize; ready independent commands can pass a resource waiter.
+A failure stops new dispatch and drains running checks. Changed dependency
+environments cause complete revalidation; uncommitted inputs, shell steps,
+single-CPU hosts and disabled acceleration retain serial execution. Quick checks
+and final recovery/proof requirements are unchanged.
+
+The Python input observer records supported stat/lstat/access/readlink/getcwd
+results, including missing paths and metadata. Content, permission, symlink,
+working-directory or observed-input changes invalidate reuse. Native aliases,
+descriptor-relative probes, custom path callbacks, subprocesses and unknown
+inputs still decline cross-snapshot proof. Verification ledger policy version 2
+invalidates older certificates. Input reuse remains in observation mode by
+default; metadata support does not make subprocess-heavy tests reusable.
+
+Full repair prompt fallback uses the complete current feedback already present
+in the canonical prompt instead of appending another copy of native continuation
+evidence. Independent provider handoff evidence is still transferred. Native
+compatibility checks are unchanged; fingerprint components identify which
+settings invalidated a continuation without recording configuration values.
+Scope review and format correction retain current findings, prior disproof and
+original obligations inline, while repeated component plans remain referenced.
+An incomplete factual dependency closure still requires independent review.
+
+The performance report includes internal quick/expanded commands as well as
+provider verification tools. New command events bind candidate, phase/span and
+generation, cache decisions, input tracing, queue time and pytest phase costs.
+Older jobs use retained schedule records matched to the job's candidates and
+artifact timestamps, explicitly labeled as legacy attribution. Imported history
+is excluded. Command durations are nested work and can overlap; they are never
+added to phase durations to infer wall time. Candidate preflight now has its own
+phase timing.
+
 ### Offline acceptance and performance
 
 `python scripts/benchmark_repair_incremental.py --experiment FILE --output FILE`
