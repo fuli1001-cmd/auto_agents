@@ -3715,12 +3715,12 @@ def test_public_resume_seals_unprojected_proof_graph(tmp_path, monkeypatch, lega
 def _retain_foreign_prerequisite(root, child):
     from auto_agents.config import load_task_plan
 
-    marker = root.parent / 'shared-prerequisite-executed'
+    marker = ExecutionMarker(root.parent / 'shared-prerequisite-executed')
     (root / 'tests/test_shared.py').write_text(
         'from pathlib import Path\ndef test_setup():\n'
         '    value = Path("value.py").read_text()\n'
         '    assert value == "VALUE = 1\\n"\n'
-        f'    Path({str(marker)!r}).write_text(value)\n')
+        f'    {marker.source("value")}\n')
     config, plan = load_project_config(root), load_task_plan(root)
     config.gates.steps[0].depends_on_proofs = ['shared.setup']
     config.gates.steps.append(VerificationStep(proof_id='shared.setup', runner='pytest',
@@ -3778,11 +3778,10 @@ def _assert_receipt_policy_mismatch(tmp_path, monkeypatch, policy, change, *, bo
     root, child = project(tmp_path)
     child.goal_execution_environment = {'mode': 'real', 'confirmed': True, 'source': 'explicit_goal'}
     config, plan = load_project_config(root), load_task_plan(root)
-    marker = tmp_path / 'release-runs'
+    marker = ExecutionMarker(tmp_path / 'release-runs')
     (root / 'tests/test_release.py').write_text(
         'from pathlib import Path\ndef test_release():\n'
-        f'    with Path({str(marker)!r}).open("a") as output:\n'
-        '        output.write("release\\n")\n'
+        '    ' + marker.source(repr('release\n'), append=True) + '\n'
         '    assert True\n')
     config.gates.release_verification_mode = policy
     config.gates.distributed.mode = 'off'
@@ -3940,13 +3939,12 @@ def _assert_receipt_current_authority(tmp_path, monkeypatch, outcome):
     plan['tasks'][0]['requirement_proofs'] = [{
         'requirement_id': owned['id'], 'requirement_contract_sha256': requirement_contract_sha256(owned),
         'evidence_refs': plan['tasks'][0]['verification_refs']}]
-    marker = tmp_path / 'release-executions'
+    marker = ExecutionMarker(tmp_path / 'release-executions')
     policy_case = outcome in {'full_failure', 'full_pass', 'persisted_full', 'affected_policy'}
     if policy_case:
         (root / 'tests/test_release.py').write_text(
             'from pathlib import Path\ndef test_release():\n'
-            f'    with Path({str(marker)!r}).open("a") as stream:\n'
-            '        stream.write(Path("value.py").read_text())\n'
+            '    ' + marker.source("Path('value.py').read_text()", append=True) + '\n'
             + ('    assert "VALUE = 0" in Path("value.py").read_text()\n'
                if outcome == 'full_failure' else '    assert True\n'))
         config.gates.steps.append(VerificationStep(proof_id='release.regression', runner='pytest',
