@@ -311,6 +311,26 @@ def dependencies_match(root, manifest):
         return False
 
 
+def remember_check_timings(runner, workspace, group, plan, result, *, phase):
+    """Keep actual execution costs separate from certificate lookup latency."""
+    from .git_ops import head_ref
+    memory = runner._experiment.component_memory.setdefault(component_key(group), {})
+    timings = result.payload.get('command_timings', [])
+    known = memory.setdefault('check_timings', {})
+    for row in timings:
+        if not row.get('cache_hit'):
+            known[row['command']] = row
+    record = save_record(runner, 'verification_schedule', {
+        'phase': phase, 'plan': plan, 'timings': timings, 'ok': result.ok,
+        'certificate_hits': result.payload.get('certificate_hits', 0),
+        'source_commit': head_ref(workspace),
+        'slow_commands': [row for row in timings if not row.get('cache_hit') and row.get('seconds', 0) > 180],
+    })
+    memory['verification_schedule'] = record
+    memory.setdefault('verification_history', []).append(record)
+    runner._experiment_store.save(runner._experiment)
+
+
 def review_context(runner, root, group):
     memory = runner._experiment.component_memory.get(component_key(group), {})
     previous = read_record(runner, memory.get('code_review', {}))

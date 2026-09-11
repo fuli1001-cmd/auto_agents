@@ -21,8 +21,7 @@ def quick_verification_plan(experiment, active):
     timings = experiment.component_memory.get(component_key(active), {}).get('check_timings', {})
     def cost(row):
         old = timings.get(row.get('quick_check') or row['check'], {})
-        return (old.get('collected_cases') is None, old.get('collected_cases') or 0,
-                old.get('seconds', 0))
+        return (not bool(old), old.get('seconds', 0), old.get('collected_cases') or 0)
     selected, reasons = [], []
     for finding in sorted(required) or [None]:
         relevant = [row for row in scenarios if finding is None or finding in row.get('finding_ids', [])
@@ -39,7 +38,7 @@ def quick_verification_plan(experiment, active):
             selected.extend(active.get('quick_checks', []))
             reasons.append('incomplete oracle mapping: retained supplied quick checks')
         else:
-            for row in (negatives[0], min(positives, key=cost)):
+            for row in (min(negatives, key=cost), min(positives, key=cost)):
                 selected.append(row.get('quick_check') or row['check'])
     for row in scenarios:
         if row.get('quick_required') is True:

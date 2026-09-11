@@ -106,8 +106,22 @@ def _invoke(runner, workspace, stage, instruction, context):
     before = capture_repository_guard(workspace, ignore_run_artifacts=True)
     target_before = capture_repository_guard(runner.target_project_root, ignore_run_artifacts=True)
     working = deepcopy(sanitize_evidence(context))
+    if stage == 'self_repair_scope_review':
+        # Scope admission needs the original contract and current observations,
+        # not an inline replay of the component's plan and previous code review.
+        # The complete immutable input remains available for disputed evidence.
+        for key in ('previous_revision', 'previous_code_review', 'history'):
+            if key in working:
+                working[key] = {'complete_input_ref': str(directory / 'input.json'),
+                                'section': key, 'retrieve_when': 'needed to resolve this scope decision'}
+        for row in working.get('scope_revalidation', {}).values():
+            old = row.get('previous')
+            if isinstance(old, dict):
+                row['previous'] = {key: old.get(key) for key in (
+                    'verdict', 'reason', 'request_id', 'source_commit', 'fact_ref')}
     previous = working.get('previous_revision')
-    if isinstance(previous, dict) and working.get('proposed_plan') == previous.get('draft'):
+    if (isinstance(previous, dict) and 'proposed_plan' in working
+            and working['proposed_plan'] == previous.get('draft')):
         working['previous_revision'] = {key: previous.get(key) for key in (
             'id', 'parent_revision', 'status', 'feedback', 'review', 'planner_request')}
         working['previous_revision']['draft_location'] = 'proposed_plan (identical current draft)'
@@ -153,7 +167,10 @@ def _invoke(runner, workspace, stage, instruction, context):
         atomic_json(directory / 'metrics.json', {'stage': stage, 'seconds': time.monotonic() - started,
             'input_chars': len(json.dumps(context, ensure_ascii=False)),
             'working_input_chars': len(json.dumps(working, ensure_ascii=False)),
-            'prompt_chars': len(request.prompt), 'incremental': bool(context.get('previous_revision'))})
+            'prompt_chars': len(request.prompt), 'incremental': bool(context.get('previous_revision')),
+            'component': context.get('component', {}).get('group_id'),
+            'scope_revalidation_reasons': {key: row.get('reason') for key, row in
+                                           context.get('scope_revalidation', {}).items()}})
         if (changed_guard_paths(before, capture_repository_guard(workspace, ignore_run_artifacts=True))
                 or changed_guard_paths(target_before, capture_repository_guard(runner.target_project_root, ignore_run_artifacts=True))):
             raise PlanningBlocked('read-only planning changed retained source or target', code='source_changed')
@@ -183,7 +200,7 @@ def _retained_scope(runner, receipt, finding):
             return False
         request, context, result = [json.loads(path.read_text()) for path in paths]
         decisions = [row for row in result.get('decisions', []) if row.get('finding_id') == finding['finding_id']]
-        return (request.get('stage') == 'self_repair_scope_review' and len(decisions) == 1
+        return (request.get('stage') in {'self_repair_scope_review', 'self_repair_scope_format'} and len(decisions) == 1
                 and request.get('request_id') == identity
                 and all(decisions[0].get(key) == receipt.get(key) for key in (
                     'verdict', 'obligation_id', 'trigger', 'consequence', 'support_basis', 'evidence', 'reason', 'disproof'))
@@ -195,43 +212,179 @@ def _retained_scope(runner, receipt, finding):
         return False
 
 
+def _validate_scope(payload, pending, contract_ids):
+    decisions = payload.get('decisions')
+    ids = {item['finding_id'] for item in pending}
+    if (not isinstance(decisions, list) or any(not isinstance(row, dict) for row in decisions)
+            or len(decisions) != len(ids)
+            or any(not _text(row.get('finding_id')) for row in decisions)
+            or {row['finding_id'] for row in decisions} != ids):
+        raise PlanFormatError('scope review must classify every observation exactly once',
+            field='decisions', actual=decisions, constraint=sorted(ids))
+    incoming = {item['finding_id']: item for item in pending}
+    for index, row in enumerate(decisions):
+        finding = incoming[row['finding_id']]
+        def invalid(key, constraint, message):
+            raise PlanFormatError(message, field=f'decisions[{index}].{key}',
+                                  actual=row.get(key), constraint=constraint)
+        verdict = row.get('verdict')
+        if not _text(verdict) or verdict not in {'required', 'follow_up', 'not_applicable', 'unknown'}:
+            invalid('verdict', 'required|follow_up|not_applicable|unknown', 'invalid scope verdict')
+        for key in ('reason', 'evidence'):
+            if not (_texts(row.get(key)) if key == 'evidence' else _text(row.get(key))):
+                invalid(key, 'nonempty evidence list' if key == 'evidence' else 'nonempty text',
+                        'scope review lacks grounded decision ' + key)
+        if verdict == 'required':
+            obligation = row.get('obligation_id')
+            if not _text(obligation) or obligation not in contract_ids:
+                invalid('obligation_id', finding.get('causal_obligation_id'),
+                        'scope obligation_id is not an original contract obligation')
+            if obligation != finding.get('causal_obligation_id'):
+                invalid('obligation_id', finding.get('causal_obligation_id'),
+                        'scope obligation_id differs from the observation causal_obligation_id')
+            for key in ('trigger', 'consequence', 'support_basis'):
+                if not _text(row.get(key)):
+                    invalid(key, 'nonempty supported ' + key, 'required scope decision lacks ' + key)
+        protected = (finding.get('disposition') == 'candidate_regression'
+                     or str(finding.get('causal_obligation_id', '')).startswith('safety:'))
+        if protected and verdict in {'follow_up', 'not_applicable'}:
+            if verdict != 'not_applicable' or not _text(row.get('disproof')):
+                raise PlanningBlocked('scope review cannot defer a safety violation or introduced regression',
+                                      code='scope_safety_conflict', field=f'decisions[{index}].verdict')
+    return decisions
+
+
+def _correct_scope(runner, workspace, context, scope_key, instruction):
+    """Durably retry only malformed output; never relax necessity or safety."""
+    experiment = runner._experiment
+    saved = experiment.planning_receipts.setdefault(scope_key, {})
+    if saved.get('decision') == 'scope_format_exhausted':
+        raise PlanningBlocked('scope format corrections exhausted', code='scope_format_exhausted',
+                              field=saved.get('format_error', {}).get('field', ''),
+                              actual=saved.get('format_error', {}).get('actual'),
+                              constraint=saved.get('format_error', {}).get('constraint', ''),
+                              evidence=saved.get('request_id', ''))
+    if saved.get('decision') == 'scope_validated':
+        # The caller already rejected reuse (e.g. an unproved external input).
+        # A completed draft is not an authorization to skip that fresh review.
+        saved.setdefault('prior_requests', []).append(saved.get('request_id'))
+        for key in ('draft', 'request_id', 'format_error', 'format_calls', 'decision'):
+            saved.pop(key, None)
+    payload, request_id = saved.get('draft'), saved.get('request_id', '')
+    if payload is None and not saved.get('format_error'):
+        if experiment.planning_attempts.get(scope_key, 0) >= MAX_PLAN_REVIEWS:
+            raise PlanningBlocked('scope diagnosis exhausted its bounded attempts')
+        experiment.planning_attempts[scope_key] = experiment.planning_attempts.get(scope_key, 0) + 1
+        runner._experiment_store.save(experiment)
+        try:
+            payload, request_id = _invoke(runner, workspace, 'self_repair_scope_review', instruction, context)
+        except PlanFormatError as error:
+            saved['format_error'] = error.detail
+    while True:
+        if payload is not None:
+            saved.update(draft=payload, request_id=request_id)
+            runner._experiment_store.save(experiment)
+            try:
+                decisions = _validate_scope(payload, context['findings'], experiment.contract_obligation_ids)
+                saved.pop('format_error', None)
+                saved['decision'] = 'scope_validated'
+                runner._experiment_store.save(experiment)
+                return payload, request_id, decisions
+            except PlanFormatError as error:
+                saved['format_error'] = error.detail
+        if saved.get('format_calls', 0) >= MAX_FORMAT_CORRECTIONS:
+            saved['decision'] = 'scope_format_exhausted'
+            runner._experiment_store.save(experiment)
+            raise PlanningBlocked('scope format corrections exhausted', code='scope_format_exhausted',
+                field=saved['format_error']['field'], actual=saved['format_error']['actual'],
+                constraint=saved['format_error']['constraint'], evidence=request_id)
+        saved['format_calls'] = saved.get('format_calls', 0) + 1
+        runner._experiment_store.save(experiment)  # An interrupted call still spends its slot.
+        correction = {key: context[key] for key in ('source', 'source_commit', 'workspace',
+                      'environment', 'contract_fingerprint', 'findings', 'probe_results')}
+        correction.update(previous_scope=payload, feedback=saved['format_error'],
+            original_review_ref=str(runner._experiment_store.root / 'planning' / request_id / 'input.json')
+                                if request_id else saved['format_error'].get('evidence', ''),
+            required_obligation_ids={f['finding_id']: f.get('causal_obligation_id') for f in context['findings']})
+        previous, field = payload, saved['format_error']['field']
+        try:
+            payload, request_id = _invoke(runner, workspace, 'self_repair_scope_format',
+                'Correct only the reported output field. Preserve every verdict, trigger, consequence, '
+                'evidence, disproof and all other decisions. obligation_id must equal the supplied '
+                'causal_obligation_id, not a related requirement. Return the complete corrected JSON. '
+                'Do not replan or reassess unrelated source. If correction requires changing the '
+                'substantive decision, report that conflict instead of weakening it.', correction)
+        except PlanFormatError as error:
+            saved['format_error'] = error.detail
+            payload = previous
+            continue
+        # A syntactic correction cannot silently reclassify or weaken a safety finding.
+        match = re.fullmatch(r'decisions\[(\d+)\]\.(\w+)', field)
+        if previous is not None and match:
+            before, after = deepcopy(previous), deepcopy(payload)
+            try:
+                index, key = int(match[1]), match[2]
+                before['decisions'][index].pop(key, None)
+                after['decisions'][index].pop(key, None)
+            except (KeyError, IndexError, TypeError, AttributeError):
+                after = None
+            if before != after:
+                saved['decision'] = 'scope_format_exhausted'
+                runner._experiment_store.save(experiment)
+                raise PlanningBlocked('scope format correction changed unreported decision fields',
+                                      code='scope_semantics_changed', evidence=request_id)
+
+
+def _scope_revalidation_reason(runner, workspace, finding, environment):
+    from .repair_memory import dependencies_match, read_record
+    experiment = runner._experiment
+    old = experiment.scope_decisions.get(finding['finding_id'], {})
+    if not old:
+        return 'new observation'
+    for key, expected in (('policy', POLICY_VERSION), ('contract', experiment.contract_fingerprint),
+                          ('engine_base', experiment.base_commit), ('finding_key', finding_key(finding))):
+        if old.get(key) != expected:
+            return key + ' changed'
+    if not _retained_scope(runner, old, finding):
+        return 'original scope receipt missing or inconsistent'
+    if old.get('verdict') == 'unknown':
+        return 'scope evidence unresolved'
+    if old.get('verdict') == 'required':
+        return ''
+    if old.get('environment') != environment:
+        return 'execution environment changed'
+    fact = read_record(runner, old.get('fact_ref', {}))
+    if not fact or fact.get('finding_key') != finding_key(finding) or fact.get('request_id') != old.get('request_id'):
+        return 'dependency record missing or inconsistent'
+    dependencies = fact.get('dependencies', {})
+    if not dependencies.get('complete'):
+        return 'dependency closure incomplete; retained facts require independent recheck'
+    if not dependencies_match(workspace, dependencies):
+        return 'recorded source, imports or configuration changed'
+    return ''
+
+
 def review_scope(runner, workspace, findings):
     """Batch new/materially changed observations; never silently waive ambiguity."""
     experiment = runner._experiment
     values = [item.to_dict() if hasattr(item, 'to_dict') else dict(item) for item in findings]
     if not values:
         return
-    observed_source = source_identity(workspace)
     observed_environment = digest(runner._full_suite_environment_fingerprint())
-    from .repair_memory import dependencies_match, read_record
-    pending = [item for item in values if not (
-        (old := experiment.scope_decisions.get(item['finding_id'], {})).get('policy') == POLICY_VERSION
-        and old.get('contract') == experiment.contract_fingerprint
-        and old.get('engine_base') == experiment.base_commit
-        and old.get('finding_key') == finding_key(item)
-        and (old.get('verdict') == 'required' or (old.get('environment') == observed_environment
-             and ((fact := read_record(runner, old.get('fact_ref', {})))
-                   and fact.get('finding_key') == finding_key(item)
-                   and fact.get('request_id') == old.get('request_id')
-                   and dependencies_match(workspace, fact.get('dependencies', {})))))
-        and old.get('verdict') != 'unknown' and _retained_scope(runner, old, item))]
+    reasons = {item['finding_id']: _scope_revalidation_reason(runner, workspace, item, observed_environment)
+               for item in values}
+    pending = [item for item in values if reasons[item['finding_id']]]
     if not pending:
         return
     context = _context(runner, workspace)
     context['findings'] = pending
     context['scope_revalidation'] = {item['finding_id']: {
         'previous': experiment.scope_decisions.get(item['finding_id']),
-        'reason': 'new observation' if item['finding_id'] not in experiment.scope_decisions else
-            'changed evidence, environment, missing artifact or unproved dependency completeness; '
-            'review only this fact and its affected dependencies'} for item in pending}
+        'reason': reasons[item['finding_id']]} for item in pending}
     scope_key = 'scope:' + digest([context['source'], context['environment'], experiment.base_commit,
                                    experiment.contract_fingerprint, [finding_key(f) for f in pending]])
-    if experiment.planning_attempts.get(scope_key, 0) >= MAX_PLAN_REVIEWS:
-        raise PlanningBlocked('scope diagnosis exhausted its bounded attempts')
-    experiment.planning_attempts[scope_key] = experiment.planning_attempts.get(scope_key, 0) + 1
     context['probe_results'] = experiment.planning_receipts.get(scope_key, {}).get('probe_results', [])
-    runner._experiment_store.save(experiment)
-    payload, request_id = _invoke(runner, workspace, 'self_repair_scope_review',
+    payload, request_id, decisions = _correct_scope(runner, workspace, context, scope_key,
         'Independently decide whether each observation MUST block this original repair. '
         'Do not equate a valid obligation ID or a changed file with necessity. Use the original user '
         'request, required safety, and demonstrated compatibility of the changed public behavior. '
@@ -240,34 +393,16 @@ def review_scope(runner, workspace, findings):
         'Compare regressions against their actual parent and the required behavior, not just exit codes. '
         'Return JSON {decisions:[{finding_id,verdict:required|follow_up|not_applicable|unknown,'
         'obligation_id,trigger,consequence,support_basis,evidence:[...],reason,disproof}]} covering every input ID. '
-        'required needs concrete supported trigger, consequence and evidence. Disputing a regression or '
+        'required needs concrete supported trigger, consequence and evidence; obligation_id must exactly '
+        'equal that finding causal_obligation_id (not another related requirement). Disputing a regression or '
         'safety finding requires concrete disproof, not lack of a reproduction. unknown blocks generation '
         'pending bounded diagnosis; it is not permission to remove the finding. If inspection is insufficient, '
         'supply probes:[{command,expected:pass|behavior_failure,purpose}], at most three targeted existing-test '
-        'or python -B -c memory diagnostics. The controller executes them in a disposable copy, then asks again.', context)
-    decisions = payload.get('decisions')
-    ids = {item['finding_id'] for item in pending}
-    if (not isinstance(decisions, list) or any(not isinstance(row, dict) or not _text(row.get('finding_id')) for row in decisions)
-            or len(decisions) != len(ids) or {row.get('finding_id') for row in decisions} != ids):
-        raise PlanningBlocked('scope review did not classify every observation exactly once')
+        'or python -B -c memory diagnostics. The controller executes them in a disposable copy, then asks again.')
     incoming = {item['finding_id']: item for item in pending}
     validated = {}
     for row in decisions:
         finding = incoming[row['finding_id']]
-        verdict = row.get('verdict')
-        if (not _text(verdict) or verdict not in {'required', 'follow_up', 'not_applicable', 'unknown'}
-                or not _text(row.get('reason')) or not _texts(row.get('evidence'))):
-            raise PlanningBlocked('scope review lacks grounded decision evidence')
-        if verdict == 'required' and (
-            not _text(row.get('obligation_id')) or row.get('obligation_id') not in experiment.contract_obligation_ids
-            or row.get('obligation_id') != finding.get('causal_obligation_id')
-            or not all(_text(row.get(key)) for key in ('trigger', 'consequence', 'support_basis'))):
-            raise PlanningBlocked('required scope decision lacks original requirement or supported trigger')
-        protected = (finding.get('disposition') == 'candidate_regression'
-                     or str(finding.get('causal_obligation_id', '')).startswith('safety:'))
-        if protected and verdict in {'follow_up', 'not_applicable'}:
-            if verdict != 'not_applicable' or not _text(row.get('disproof')):
-                raise PlanningBlocked('scope review cannot defer a safety violation or introduced regression')
         validated[row['finding_id']] = {**sanitize_evidence(row), 'policy': POLICY_VERSION,
             'finding': sanitize_evidence(finding),
             'finding_key': finding_key(finding), 'contract': experiment.contract_fingerprint,

@@ -227,6 +227,14 @@ class Store:
         result = dict(row)
         for key in ("payload", "result"):
             result[key] = json.loads(result[key])
+        if include_progress and result["state"] in TERMINAL:
+            receipt = result['result']
+            outcome = receipt.get('result', {})
+            result['terminal'] = {
+                'state': result['state'], 'finished_at': result['updated'],
+                'reason': receipt.get('error') or outcome.get('reason') or receipt.get('reason', ''),
+                'next_action': receipt.get('next_action') or outcome.get('next_action', {}),
+            }
         if include_progress and result["state"] == "repairing":
             with self.connect() as db:
                 # A new repair generation starts with a repairing event. Never

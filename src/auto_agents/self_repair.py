@@ -3610,6 +3610,15 @@ class AutoAgentsSelfRepairRunner:
         self._report_candidate_phase("routing_regression_owner", "repair the blocking regression in " + group["group_id"])
         return True
 
+    def _record_planning_blocker(self, experiment, candidate):
+        experiment.status = 'blocked'
+        experiment.diagnostic_actions['planning_blocker'] = {
+            'reason': candidate.reason, 'group_id': experiment.active_finding_group_id,
+            'failure': candidate.next_action.get('planning_failure', {}),
+            'resume': 'Correct the recorded blocker, then resume the retained repair job.'}
+        self._experiment_store.save(experiment)
+        self._experiment_store.record_health(experiment, status='planning_blocked', detail=candidate.reason)
+
     def _run_search(self) -> SelfRepairResult:
         autonomy = self._autonomy_config()
         mode = str(
@@ -3627,6 +3636,9 @@ class AutoAgentsSelfRepairRunner:
                 reason="autonomous self-repair is disabled",
             )
         store, experiment = self._load_or_create_experiment()
+        if experiment.status == 'blocked' and 'planning_blocker' in experiment.diagnostic_actions:
+            experiment.status = 'active'
+            store.save(experiment)
         if experiment.freeze_contract():
             store.save(experiment)
         if experiment.status == "needs_human":
@@ -3751,7 +3763,7 @@ class AutoAgentsSelfRepairRunner:
             )
             if pending is not None:
                 if pending.status == 'planning_blocked':
-                    store.save(experiment)
+                    self._record_planning_blocker(experiment, pending)
                     return pending
                 pending.attempt = experiment.attempt_count
                 stored_pending = experiment.candidates.get(pending.candidate_id)
@@ -3864,8 +3876,7 @@ class AutoAgentsSelfRepairRunner:
                 # Planning has its own durable identity and budget. Repeating an
                 # exhausted plan must not manufacture failed code candidates.
                 experiment.current_candidate_id = ''
-                store.save(experiment)
-                store.record_health(experiment, status='planning_blocked', detail=candidate.reason)
+                self._record_planning_blocker(experiment, candidate)
                 return candidate
             if not candidate.finding_group_id:
                 candidate.finding_group_id = str(
@@ -8636,15 +8647,8 @@ class AutoAgentsSelfRepairRunner:
             quick = self._guarded_component_checks(commands, workspace)
         quick.payload.update(source_commands=commands[:len(quick.returncodes)], requests=requests,
                              quick_schedule=plan)
-        from .repair_memory import component_key, save_record
-        timings = quick.payload.get('command_timings', [])
-        memory = self._experiment.component_memory.setdefault(component_key(group), {})
-        memory.setdefault('check_timings', {}).update({row['command']: row for row in timings})
-        memory['verification_schedule'] = save_record(self, 'verification_schedule', {
-            'plan': plan, 'timings': timings, 'ok': quick.ok,
-            'certificate_hits': quick.payload.get('certificate_hits', 0),
-            'source_commit': head_ref(workspace)})
-        self._experiment_store.save(self._experiment)
+        from .repair_memory import remember_check_timings
+        remember_check_timings(self, workspace, group, plan, quick, phase='quick')
         if not quick.ok:
             return quick, _VerificationResult(False, 'quick checks failed; semantic review deferred')
         review = self._review_candidate(workspace, base_head,
@@ -8692,6 +8696,9 @@ class AutoAgentsSelfRepairRunner:
             commands = ["git diff --check"]
         result = (self._guarded_component_checks(commands, verification_root)
                   if group.get('planning_receipt') else self._run_verification_commands(commands, verification_root))
+        if isinstance(experiment, SelfRepairExperiment):
+            from .repair_memory import remember_check_timings
+            remember_check_timings(self, verification_root, group, plan, result, phase='expanded')
         result.payload["source_commands"] = commands[: len(result.returncodes)]
         result.payload['requests'] = plan.get('requests', [])
         result.payload['deduplicated_commands'] = plan.get('deduplicated_commands', 0)

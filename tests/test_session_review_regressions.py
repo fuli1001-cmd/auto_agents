@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from execution_marker import ExecutionMarker
+
 from auto_agents.config import load_project_config, save_project_config, save_session_state, save_task_plan, load_session_state, load_run_state, save_run_state
 from auto_agents.git_ops import head_ref
 from auto_agents.models import AgentResult, VerificationStep
@@ -32,10 +34,10 @@ def test_resumed_snapshot_repair_excludes_foreign_pending_gates_already_in_basel
         'import json\nfrom pathlib import Path\n'
         'def test_owned():\n'
         f'    assert json.loads(Path({snapshot!r}).read_text())["request_frame_rate"] is False\n')
-    marker = tmp_path / 'regression-ran'
+    marker = ExecutionMarker(tmp_path / 'regression-ran')
     (root / 'tests/test_concurrency.py').write_text(
         'from pathlib import Path\ndef test_existing():\n'
-        f'    Path({str(marker)!r}).write_text("ran")\n')
+        '    ' + marker.source(repr('ran')) + '\n')
     config = load_project_config(root)
     config.gates.steps[0].impact_paths = ['app/provider.py']
     config.gates.steps[0].levels = ['affected']
@@ -169,10 +171,10 @@ def test_concurrent_provider_window_changes_are_never_claimed_or_rolled_back(tmp
 @pytest.mark.parametrize('intervening', [False, True], ids=['pytest-only', 'mixed'])
 def test_compound_pytest_preflight_checks_later_nodes_before_any_body(tmp_path, monkeypatch, launcher, separator, intervening):
     root, child = project(tmp_path)
-    marker = tmp_path / 'test-body-ran'
+    marker = ExecutionMarker(tmp_path / 'test-body-ran')
     (root / 'tests/test_present.py').write_text(
         'from pathlib import Path\ndef test_present():\n'
-        f'    Path({str(marker)!r}).write_text("executed")\n')
+        '    ' + marker.source(repr('executed')) + '\n')
     (root / 'tests/test_missing.py').write_text('def test_different():\n    pass\n')
     prefix = [sys.executable, '-m', 'pytest', '-q']
     if launcher == 'conda':
@@ -185,10 +187,10 @@ def test_compound_pytest_preflight_checks_later_nodes_before_any_body(tmp_path, 
         prefix = [conda, 'run', '-p', './.conda', 'python', '-m', 'pytest', '-q']
     present, missing = 'tests/test_present.py::test_present', 'tests/test_missing.py::test_missing'
     commands = [shlex.join([*prefix, present]), shlex.join([*prefix, missing])]
-    setup_marker = tmp_path / 'intervening-command-ran'
+    setup_marker = ExecutionMarker(tmp_path / 'intervening-command-ran')
     if intervening:
         commands.insert(1, shlex.join([sys.executable, '-c',
-            f'from pathlib import Path; Path({str(setup_marker)!r}).write_text("executed")']))
+            setup_marker.source(repr('executed'))]))
     child.fix_verify_command = separator.join(commands)
     save_task_plan(root, {'tasks': [{'task_id': 'task-owned', 'title': 'Required compound check',
         'requirement_ids': ['REQ-compound'], 'verification_refs': [present, missing]}]})
@@ -212,10 +214,10 @@ def test_compound_pytest_preflight_checks_later_nodes_before_any_body(tmp_path, 
                          ids=['and', 'sequence', 'or'])
 def test_mixed_command_execution_preserves_conditional_actions(tmp_path, monkeypatch, separator, executes_action):
     root, child = project(tmp_path)
-    marker = tmp_path / 'execution-action'
+    marker = ExecutionMarker(tmp_path / 'execution-action')
     pytest_command = shlex.join([sys.executable, '-m', 'pytest', '-q', 'tests/test_owned.py::test_owned'])
     action = shlex.join([sys.executable, '-c',
-                        f'from pathlib import Path; Path({str(marker)!r}).write_text("executed")'])
+                        marker.source(repr('executed'))])
     child.fix_verify_command = separator.join([pytest_command, action, pytest_command])
     save_session_state(root, child)
     saved, _, _ = run_session(root, monkeypatch)

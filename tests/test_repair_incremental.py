@@ -417,3 +417,138 @@ def test_local_diagnosis_requires_evidence_and_invalidates_when_source_changes(s
         (runner.repo_root / 'source.py').write_text('value = 9\n')
         assert stalled_correction(runner, state, candidate)['kind'] == 'local_repair'
         assert len(responses) == 3
+
+
+def scope_fixture(state):
+    finding = dict(finding_id='shared-inputs', disposition='contract_violation',
+                   causal_obligation_id='safety:target_untouched', evidence=['source.py:1'])
+    if finding['causal_obligation_id'] not in state.contract_obligation_ids:
+        state.contract_obligation_ids.append(finding['causal_obligation_id'])
+    row = dict(finding_id=finding['finding_id'], verdict='required',
+        obligation_id=state.contract_obligation_ids[0], reason='public execution is unconfined',
+        trigger='retained test writes shared hook', consequence='foreign environment changed',
+        support_basis='preserve foreign work', evidence=['source.py:1'])
+    return finding, row
+
+
+def test_scope_binding_mismatch_is_corrected_locally_and_reused(setup):
+    from auto_agents.repair_planning import review_scope
+    runner, state, plan, calls = setup
+    finding, row = scope_fixture(state)
+    stages = []
+    def provider(request):
+        stages.append(request.stage)
+        context = json.loads((request.output_path.parent / 'input.json').read_text())
+        if request.stage == 'self_repair_scope_format':
+            assert context['feedback']['field'] == 'decisions[0].obligation_id'
+            assert context['feedback']['actual'] == row['obligation_id']
+            assert context['feedback']['constraint'] == finding['causal_obligation_id']
+            assert context['previous_scope']['decisions'][0] == row
+            assert 'history' not in context and 'previous_revision' not in context
+            return answer(request, {'decisions': [{**row, 'obligation_id': finding['causal_obligation_id']}]})
+        return answer(request, {'decisions': [row]})
+    runner.target_orchestrator._call_with_failover = provider
+    review_scope(runner, runner.repo_root, [finding])
+    review_scope(runner, runner.repo_root, [finding])
+    assert stages == ['self_repair_scope_review', 'self_repair_scope_format']
+    assert state.scope_decisions['shared-inputs']['obligation_id'] == finding['causal_obligation_id']
+    assert max(state.planning_attempts.values()) == 1
+    assert state.attempt_count == 0 and not state.progress_credits
+
+
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_scope_correction_budget_survives_restart(setup, interrupted):
+    from auto_agents.repair_planning import review_scope
+    runner, state, plan, calls = setup
+    finding, row = scope_fixture(state)
+    stages = []
+    def provider(request):
+        stages.append(request.stage)
+        if interrupted and len(stages) == 2:
+            raise KeyboardInterrupt
+        return answer(request, {'decisions': [row]})
+    runner.target_orchestrator._call_with_failover = provider
+    if interrupted:
+        with pytest.raises(KeyboardInterrupt):
+            review_scope(runner, runner.repo_root, [finding])
+        runner._experiment = runner._experiment_store.load()
+    with pytest.raises(PlanningBlocked, match='scope format corrections exhausted') as failure:
+        review_scope(runner, runner.repo_root, [finding])
+    assert failure.value.detail['field'] == 'decisions[0].obligation_id'
+    runner._experiment = runner._experiment_store.load()
+    with pytest.raises(PlanningBlocked, match='scope format corrections exhausted'):
+        review_scope(runner, runner.repo_root, [finding])
+    assert stages == ['self_repair_scope_review'] + ['self_repair_scope_format'] * 2
+    assert not runner._experiment.scope_decisions
+
+
+def test_scope_format_cannot_change_required_verdict_or_discard_evidence(setup):
+    from auto_agents.repair_planning import review_scope
+    runner, state, plan, calls = setup
+    finding, row = scope_fixture(state)
+    def provider(request):
+        value = row if request.stage == 'self_repair_scope_review' else {
+            **row, 'obligation_id': finding['causal_obligation_id'], 'verdict': 'follow_up'}
+        return answer(request, {'decisions': [value]})
+    runner.target_orchestrator._call_with_failover = provider
+    with pytest.raises(PlanningBlocked, match='changed unreported decision fields'):
+        review_scope(runner, runner.repo_root, [finding])
+    assert not state.scope_decisions
+
+
+def test_expanded_costs_survive_fast_certificate_hits(setup):
+    from auto_agents.repair_memory import remember_check_timings
+    from auto_agents.self_repair import _VerificationResult
+    runner, state, plan, calls = setup
+    group = runner._candidate_group
+    command = plan['quick_checks'][0]
+    slow = dict(command=command, seconds=250, collected_cases=29, cache_hit=False)
+    remember_check_timings(runner, runner.repo_root, group, {},
+        _VerificationResult(True, 'passed', payload={'command_timings': [slow]}), phase='expanded')
+    remember_check_timings(runner, runner.repo_root, group, {},
+        _VerificationResult(True, 'reused', payload={'command_timings': [{**slow, 'seconds': .01, 'cache_hit': True}],
+                                                  'certificate_hits': 1}), phase='quick')
+    memory = state.component_memory[component_key(group)]
+    assert memory['check_timings'][command]['seconds'] == 250
+    assert len(memory['verification_history']) == 2
+    expanded = read_record(runner, memory['verification_history'][0])
+    assert expanded['phase'] == 'expanded' and expanded['slow_commands'] == [slow]
+    assert not state.progress_credits
+
+
+def test_scope_working_input_omits_unrelated_plans_but_retains_full_audit(setup):
+    from auto_agents.repair_planning import _context, _invoke
+    runner, state, plan, calls = setup
+    context = _context(runner, runner.repo_root)
+    context.update(previous_revision={'draft': 'old unrelated plan ' * 2000},
+                   previous_code_review={'findings': ['old unrelated review ' * 2000]})
+    def provider(request):
+        working = json.loads((request.output_path.parent / 'working_input.json').read_text())
+        complete = json.loads((request.output_path.parent / 'input.json').read_text())
+        assert complete['previous_revision'] == context['previous_revision']
+        assert 'draft' not in working['previous_revision']
+        assert working['original_request'] == complete['original_request']
+        assert working['contract'] == complete['contract']
+        assert len(json.dumps(working)) < len(json.dumps(complete)) / 2
+        return answer(request, {'decisions': []})
+    runner.target_orchestrator._call_with_failover = provider
+    _invoke(runner, runner.repo_root, 'self_repair_scope_review', 'review scope', context)
+
+
+def test_incomplete_scope_dependencies_cannot_reuse_a_completed_draft(setup):
+    runner, state, plan, calls = setup
+    finding = dict(finding_id='external', disposition='contract_violation',
+        causal_obligation_id=state.contract_obligation_ids[0], required_test=plan['quick_checks'][0],
+        affected_paths=['external.py'])
+    (runner.repo_root / 'external.py').write_text('VALUE = open("/external/state").read()\n')
+    count = 0
+    def provider(request):
+        nonlocal count
+        count += 1
+        return answer(request, {'decisions': [dict(finding_id='external', verdict='not_applicable',
+                         reason='inspected external inputs this time', evidence=['external.py:1'])]})
+    runner.target_orchestrator._call_with_failover = provider
+    review_scope(runner, runner.repo_root, [finding])
+    review_scope(runner, runner.repo_root, [finding])
+    assert count == 2
+    assert max(state.planning_attempts.values()) == 2
