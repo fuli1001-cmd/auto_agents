@@ -1,5 +1,6 @@
 """Receipt admission through real Git and public child/parent recovery."""
 import base64
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 import shlex
@@ -95,16 +96,18 @@ def fixture(tmp_path, monkeypatch, *, parent=False, gitlink=False):
                            summary=reply, stdout=reply, returncode=0)
     monkeypatch.setattr(Orchestrator, '_call_with_failover', agent)
     context = Session._session_gate_executor_context
+    @contextmanager
     def executor(self, *args, **kwargs):
-        result = context(self, *args, **kwargs)
-        state = self._current_state
-        if state and state.candidate_custody.get('receipt'):
-            prepare = result.prepare_retained_command
-            def observed(*a, **kw):
-                events.append('collection' if '--collect-only' in a[0] else 'execution')
-                return prepare(*a, **kw)
-            result.prepare_retained_command = observed
-        return result
+        # Observe the entered executor, preserving confinement and cleanup.
+        with context(self, *args, **kwargs) as result:
+            state = self._current_state
+            if state and state.candidate_custody.get('receipt'):
+                prepare = result.prepare_retained_command
+                def observed(*a, **kw):
+                    events.append('collection' if '--collect-only' in a[0] else 'execution')
+                    return prepare(*a, **kw)
+                result.prepare_retained_command = observed
+            yield result
     monkeypatch.setattr(Session, '_session_gate_executor_context', executor)
     deliver = candidate.deliver_candidate
     def delivery(*args, **kwargs):
