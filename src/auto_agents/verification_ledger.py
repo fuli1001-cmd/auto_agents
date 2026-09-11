@@ -23,7 +23,7 @@ from .gate_result_cache import GateResultCache
 from .models import CommandResult
 from .repair_control import digest, private_directory, atomic_json
 
-LEDGER_VERSION = 2
+LEDGER_VERSION = 3
 
 
 def engine_command(command):
@@ -88,7 +88,7 @@ def source_identity(root):
 
 
 class VerificationLedger:
-    def __init__(self, root, *, repository=None, environment="", context="", scope="project", mode="on"):
+    def __init__(self, root, *, repository=None, environment="", context="", scope="project", mode="on", manifest_validator=None):
         self.source = Path(root).resolve()
         self.scope = scope
         self.context = context
@@ -97,7 +97,8 @@ class VerificationLedger:
         self.root = private_directory(private_directory(ledger_root()) / digest([scope, repository or repository_identity(root)]))
         self.cache = GateResultCache(root, cache_path=self.root / "proofs.sqlite3",
             environment_fingerprint=environment,
-            context_fingerprint=context or digest([str(self.source), os.environ.get("AUTO_AGENTS_REPAIR_JOB", "")]))
+            context_fingerprint=context or digest([str(self.source), os.environ.get("AUTO_AGENTS_REPAIR_JOB", "")]),
+            manifest_validator=manifest_validator)
         self.events = self.root / "events.jsonl"
 
     def event(self, **details):
@@ -134,7 +135,7 @@ class VerificationLedger:
             result_cache_scope = "candidate"
         source = source or source_identity(self.source)
         metadata = digest([LEDGER_VERSION, metadata])
-        key = digest([command, source, metadata, self.environment, self.context, self.scope])
+        key = digest([command, source, metadata, self.environment, self.cache.context_fingerprint, self.scope])
         started = time.monotonic()
         with self.single_flight(key, cancelled=cancelled):
             queued = time.monotonic() - started
@@ -142,20 +143,29 @@ class VerificationLedger:
                           result_cache_scope=result_cache_scope, metadata_signature=metadata)
             cached, reason = (self.cache.lookup_with_reason(command, **{**kwargs, "result_cache_scope": "candidate"})
                               if not fresh and self.mode != "off" else (None, "fresh" if fresh else "off"))
+            lookups = {'candidate': reason}
             if cached is None and not fresh and self.mode != "off" and not self.context and input_mode != "off":
-                cached, reason = self.cache.lookup_with_reason(command, **{**kwargs, "cache_scope": "source"})
+                cached, input_reason = self.cache.lookup_with_reason(command, **{**kwargs, "cache_scope": "source"})
+                lookups['source'] = input_reason
+                if cached is not None or reason in {'candidate_key_miss', 'not_found'}:
+                    reason = input_reason
             observed_hit = cached is not None and cached.backend == "result-cache-observed-inputs"
             if observed_hit and input_mode == "off":
                 cached, reason = None, "input_reuse_off"
+            lookup_seconds = time.monotonic() - started - queued
             audit = cached is not None and (self.mode == "observe" or (observed_hit and input_mode != "on")
                     or secrets.randbelow(1_000_000) < audit_rate * 1_000_000)
             if cached is not None and not audit:
+                cached.process_snapshot['cache_lookups'] = lookups
+                cached.process_snapshot['cache_lookup_seconds'] = lookup_seconds
                 cached.proof_ref = key
                 cached.queue_seconds = queued
                 self.event(kind="verification", proof=key, cache="hit", queue_seconds=queued,
                            duration_seconds=time.monotonic() - started, executed=0)
                 return cached
             result = run()
+            result.process_snapshot['cache_lookups'] = lookups
+            result.process_snapshot['cache_lookup_seconds'] = lookup_seconds
             result.proof_ref = key
             result.queue_seconds += queued
             result.cache_miss_reason = "audit" if audit else reason

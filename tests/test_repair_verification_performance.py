@@ -245,7 +245,10 @@ def test_report_includes_internal_commands_and_excludes_imported_schedules(tmp_p
         'component_memory': {'component': {'verification_history': histories}}}))
     legacy = report(root, 'job')
     assert len(legacy['verification_commands']) == 1 and legacy['verification_commands'][0]['seconds'] == 15
-    assert legacy['wall_seconds'] == 100 and legacy['cache_hit_commands'] == 1
+    assert legacy['wall_seconds'] == 90 and legacy['cache_hit_commands'] == 1
+    db.execute('UPDATE jobs SET updated=10000 WHERE id=?', ('job',))
+    db.commit()
+    assert report(root, 'job')['wall_seconds'] == 90
     db.execute('INSERT INTO events VALUES(?,?,?,?,?)', (2, 'job', 'verification_command_finished', json.dumps({
         'candidate_id': 'current', 'phase': 'focused_verification', 'command': 'pytest', 'seconds': 14,
         'cache_hit': False, 'input_trace_reason': 'external_input'}), 185))

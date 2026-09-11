@@ -8,7 +8,7 @@ from .repair_memory import component_key
 from .repair_schedule import pytest_parts
 
 
-def run_component_checks(runner, commands, workspace):
+def run_component_checks(runner, commands, workspace, *, parallel=True):
     """Keep every command's cohort/options and stop dispatch after a failure.
 
     Quick checks remain serial. Expanded pytest commands get separate worktrees,
@@ -17,9 +17,11 @@ def run_component_checks(runner, commands, workspace):
     """
     from .self_repair import _FullSuiteShard, _FullSuiteSlots, _VerificationResult
 
-    workers = min(2, max(1, (os.cpu_count() or 2) // 2))
+    workers = min(2, max(1, (os.cpu_count() or 2) // 2)) if parallel else 1
     parsed = [pytest_parts(command) for command in commands]
-    if workers == 1 or len(commands) < 2 or not all(parsed):
+    if not all(parsed) or not commands:
+        return runner._run_verification_commands(commands, workspace)
+    if (workers == 1 or len(commands) < 2) and not getattr(runner, '_continuous_workspace', None):
         return runner._run_verification_commands(commands, workspace)
     clean = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=all'],
                            cwd=workspace, capture_output=True, check=True)
@@ -30,9 +32,13 @@ def run_component_checks(runner, commands, workspace):
     environment = runner._full_suite_environment_fingerprint()
     group = runner._candidate_group
     timings = runner._experiment.component_memory.get(component_key(group), {}).get('check_timings', {})
+    from .repair_verification_pool import prepare_pool, run_in_pool
+    retained_pool = prepare_pool(runner, workspace, commands, timings, environment)
     pending = []
     for index, (command, parts) in enumerate(zip(commands, parsed)):
         resources = set()
+        if retained_pool:
+            resources.add('verification-pool:' + str(retained_pool['assignments'][command]))
         files = {}
         for target in parts[1]:
             files.setdefault(target.split('::', 1)[0], []).append(target)
@@ -48,6 +54,8 @@ def run_component_checks(runner, commands, workspace):
 
     def execute(shard, resources):
         try:
+            if retained_pool:
+                return run_in_pool(runner, workspace, shard, retained_pool)
             return runner._execute_full_suite_shard(workspace, shard)
         finally:
             slots.release(resources)

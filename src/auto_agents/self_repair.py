@@ -5957,6 +5957,13 @@ class AutoAgentsSelfRepairRunner:
         )
         if execution is None or self.diagnosis is None:
             return _VerificationResult(True, "candidate review=legacy-compatible")
+        review_cache_identity = ''
+        if isinstance(getattr(self, '_experiment', None), SelfRepairExperiment):
+            from .repair_review_reuse import reuse_review, review_identity
+            review_cache_identity = review_identity(self, repair_root, self._candidate_group, phase)
+            reused = reuse_review(self, repair_root, self._candidate_group, phase, identity=review_cache_identity)
+            if reused is not None:
+                return reused
         diff = subprocess.run(
             ["git", "diff", "--no-ext-diff", base_head, "--"],
             cwd=str(repair_root),
@@ -5995,7 +6002,7 @@ class AutoAgentsSelfRepairRunner:
                 'contract': contract_payload, 'replay': replay_summary, 'diff': diff,
                 'incremental_context': review_context})
             review_input_ref = str(self._experiment_store.root / 'planning' / reference['id'] / 'memory.json')
-        incremental = review_context.get('mode') == 'incremental' and phase != 'integration'
+        incremental = review_context.get('mode') in {'incremental', 'related_components'} and phase != 'integration'
         if incremental:
             active_findings = set(active_group.get('finding_ids', []))
             prompt_findings = [item for item in blocking_findings if item.finding_id in active_findings
@@ -6220,6 +6227,10 @@ class AutoAgentsSelfRepairRunner:
             from .repair_memory import remember_review
             remember_review(self, repair_root, active_group, normalized_payload)
         review_ok = bool(reason) and not findings and decision in {"APPROVE", "REJECT"}
+        if review_ok and isinstance(experiment, SelfRepairExperiment) and hasattr(self, '_experiment_store'):
+            from .repair_review_reuse import remember_approval
+            remember_approval(self, repair_root, active_group, phase, normalized_payload,
+                              reviewed_identity=review_cache_identity)
         self._candidate_review_completed = bool(reason) and decision in {"APPROVE", "REJECT"}
         rendered_decision = decision or "INVALID"
         return _VerificationResult(
@@ -8676,6 +8687,8 @@ class AutoAgentsSelfRepairRunner:
         remember_check_timings(self, workspace, group, plan, quick, phase='quick')
         if not quick.ok:
             return quick, _VerificationResult(False, 'quick checks failed; semantic review deferred')
+        self._review_verification_binding = {'commands': commands, 'returncodes': quick.returncodes,
+            'proof_refs': quick.payload.get('proof_refs', []), 'executed_tests': quick.payload.get('executed_tests', [])}
         review = self._review_candidate(workspace, base_head,
             progress_lease_seconds=getattr(self._autonomy_config(), 'candidate_review_timeout_seconds', 600),
             replay_summary=quick.summary, phase='quick')
@@ -8692,9 +8705,9 @@ class AutoAgentsSelfRepairRunner:
         from .verification_ledger import source_identity
         before = source_identity(workspace)
         verified = set(getattr(self, '_candidate_verified_check_ids', set()))
-        if parallel and getattr(self, '_real_project_root', None) is not None and self._acceleration_enabled():
+        if getattr(self, '_real_project_root', None) is not None and self._acceleration_enabled():
             from .repair_verification import run_component_checks
-            result = run_component_checks(self, commands, workspace)
+            result = run_component_checks(self, commands, workspace, parallel=parallel)
         else:
             result = self._run_verification_commands(commands, workspace)
         if source_identity(workspace) != before:
@@ -8829,6 +8842,24 @@ class AutoAgentsSelfRepairRunner:
             },
         )
 
+    def _revalidate_verification_manifest(self, root, manifest, dependency_state):
+        """Replay observed inputs with the same filesystem/UID/network policy."""
+        runtime = root / '.auto-agents-gate-runtime'
+        try:
+            if runtime.is_symlink():
+                return False
+            runtime.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=runtime, prefix='manifest-') as temporary:
+                request = Path(temporary) / 'inputs.json'
+                write_json(request, manifest)
+                argv = [self._verification_python(), str(Path(__file__).with_name('verification_manifest.py')),
+                        str(root), str(request)]
+                with self._verification_argv(argv, root, dependency_state=dependency_state) as arguments:
+                    result = subprocess.run(arguments, cwd=root, capture_output=True, text=True, timeout=30)
+                return result.returncode == 0 and json.loads(result.stdout).get('matches') is True
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            return False
+
     def _run_verification_commands(
         self,
         commands: list[str],
@@ -8951,10 +8982,12 @@ class AutoAgentsSelfRepairRunner:
                 try:
                     ledger = VerificationLedger(verification_root,
                         repository=repository_identity(getattr(self, "_engine_source_root", self.repo_root)),
-                        scope="engine", environment=_search_stable_hash(self._full_suite_environment_fingerprint(dependency_state)))
+                        scope="engine", environment=_search_stable_hash(self._full_suite_environment_fingerprint(dependency_state)),
+                        manifest_validator=lambda manifest: self._revalidate_verification_manifest(
+                            verification_root, manifest, dependency_state))
                 except (OSError, RuntimeError):
                     pass  # Unavailable acceleration never supplies a proof.
-            process = (ledger.execute(command, execute, metadata="engine-pytest-v2",
+            process = (ledger.execute(command, execute, metadata="engine-pytest-v3:allow_empty=" + str(bool(allow_pytest_no_tests)),
                                       fresh=bool(getattr(self, "_verification_fresh", False)),
                                       result_cache_scope="observed_inputs",
                                       input_mode=getattr(getattr(self.target_orchestrator.config.execution, "acceleration", None), "verification_input_mode", "observe"))
@@ -8965,6 +8998,8 @@ class AutoAgentsSelfRepairRunner:
                 'passed_cases': len(process.executed_tests), 'cache_hit': bool(getattr(process, 'cached', False)),
                 'queue_seconds': float(getattr(process, 'queue_seconds', 0.0) or 0.0),
                 'cache_miss_reason': getattr(process, 'cache_miss_reason', ''),
+                'cache_lookups': process.process_snapshot.get('cache_lookups', {}),
+                'cache_lookup_seconds': process.process_snapshot.get('cache_lookup_seconds', 0.0),
                 'input_trace_complete': bool(getattr(process, 'input_trace_complete', False)),
                 'input_trace_reason': getattr(process, 'input_trace_reason', ''),
                 'phases': dict(getattr(process, 'phase_seconds', {})),

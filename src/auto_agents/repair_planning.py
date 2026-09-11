@@ -262,7 +262,9 @@ def _correct_scope(runner, workspace, context, scope_key, instruction):
             saved.pop(key, None)
     payload, request_id = saved.get('draft'), saved.get('request_id', '')
     if payload is None and not saved.get('format_error'):
-        if experiment.planning_attempts.get(scope_key, 0) >= MAX_PLAN_REVIEWS:
+        from .repair_probe_recovery import MAX_PROBE_CORRECTIONS
+        extra = min(saved.get('probe_corrections', 0), MAX_PROBE_CORRECTIONS)
+        if experiment.planning_attempts.get(scope_key, 0) >= MAX_PLAN_REVIEWS + extra:
             raise PlanningBlocked('scope diagnosis exhausted its bounded attempts')
         experiment.planning_attempts[scope_key] = experiment.planning_attempts.get(scope_key, 0) + 1
         runner._experiment_store.save(experiment)
@@ -380,8 +382,14 @@ def review_scope(runner, workspace, findings):
                 deltas[commit] = source_delta(workspace, commit)
             row['source_delta'] = deltas[commit]
     scope_key = 'scope:' + digest([context['source'], context['environment'], experiment.base_commit,
-                                   experiment.contract_fingerprint, [finding_key(f) for f in pending]])
+                                   experiment.contract_fingerprint, [finding_key(f) for f in values]])
+    from .repair_probe_recovery import run_pending_probes
+    runner._scope_probe_workspace = workspace
+    run_pending_probes(runner, scope_key)
     context['probe_results'] = experiment.planning_receipts.get(scope_key, {}).get('probe_results', [])
+    from .repair_probe_recovery import probe_id
+    context['probe_results'] = [{**result, 'probe_id': probe_id(result['specification'])}
+                                for result in context['probe_results']]
     payload, request_id, decisions = _correct_scope(runner, workspace, context, scope_key,
         'Independently decide whether each observation MUST block this original repair. '
         'Do not equate a valid obligation ID or a changed file with necessity. Use the original user '
@@ -398,8 +406,10 @@ def review_scope(runner, workspace, findings):
         'equal that finding causal_obligation_id (not another related requirement). Disputing a regression or '
         'safety finding requires concrete disproof, not lack of a reproduction. unknown blocks generation '
         'pending bounded diagnosis; it is not permission to remove the finding. If inspection is insufficient, '
-        'supply probes:[{command,expected:pass|behavior_failure,purpose}], at most three targeted existing-test '
-        'or python -B -c memory diagnostics. The controller executes them in a disposable copy, then asks again.')
+        'supply probes:[{command,expected:pass|behavior_failure,purpose,replaces_probe}], at most three targeted existing-test '
+        'or python -B -c memory diagnostics. Preserve successful probes. Only an inconclusive probe may be '
+        'corrected, at most twice; bind replaces_probe to its probe_id and preserve expected. '
+        'The controller executes them in a disposable copy, then asks again.')
     incoming = {item['finding_id']: item for item in pending}
     validated = {}
     for row in decisions:
@@ -425,13 +435,11 @@ def review_scope(runner, workspace, findings):
     experiment.scope_decisions.update(validated)
     runner._experiment_store.save(experiment)
     if any(row['verdict'] == 'unknown' for row in validated.values()):
-        if payload.get('probes') and not context['probe_results']:
-            probes = validate_probes(payload['probes'])
-            results = [_probe(runner, workspace, specification) for specification in probes]
-            experiment.planning_receipts[scope_key] = {'probe_results': results, 'decision': 'scope_pending'}
-            runner._experiment_store.save(experiment)
-            return review_scope(runner, workspace, findings)
-        raise PlanningBlocked('scope evidence is insufficient; no code change is authorized')
+        if payload.get('probes'):
+            from .repair_probe_recovery import queue_probes
+            if queue_probes(runner, scope_key, payload['probes']):
+                return review_scope(runner, workspace, findings)
+        raise PlanningBlocked('scope evidence is insufficient; no code change is authorized', evidence=scope_key)
 
 
 def _test_command(command, *, probe=False):
@@ -589,6 +597,7 @@ def _review_reuse_failure(runner, receipt, group):
                 and context.get('source') == receipt.get('source')
                 and context.get('source_commit') == receipt.get('source_commit')
                 and result.get('decision') == 'APPROVE' and result.get('issues') == []
+                and receipt.get('execution_mode', receipt['plan'].get('mode', 'implement')) == _review_execution_mode(receipt['plan'], result)
                 and set(result.get('scenario_ids', [])) == {row['scenario_id'] for row in receipt['plan']['scenarios']}
                 and all(probe.get('matches') for probe in receipt.get('probe_results', []))
                 and receipt['plan'] == validate_plan(receipt['plan'], group, set(runner._experiment.contract_obligation_ids))):
@@ -650,6 +659,61 @@ def _format_semantics_changed(original, corrected):
                != semantic_value(key, original.get(key, 'implement' if key == 'mode' else None))
                for key in ('implementation_steps', 'touched_paths', 'scenarios', 'probes', 'mode')
                if key in original or key == 'mode')
+
+
+def normalize_plan_references(runner, workspace, plan, group):
+    """Migrate only identities whose current independent scope decision permits it."""
+    if not isinstance(plan, dict) or not isinstance(plan.get('scenarios'), list):
+        return plan
+    required = set(group.get('finding_ids', []))
+    state = runner._experiment
+    source = source_identity(workspace)
+    environment = digest(runner._full_suite_environment_fingerprint())
+    migrated, changes = deepcopy(plan), []
+    for scenario in migrated['scenarios']:
+        ids = scenario.get('finding_ids', []) if isinstance(scenario, dict) else None
+        if not _texts(ids, empty=True) or not _text(scenario.get('scenario_id')):
+            continue
+        for identity in list(ids):
+            finding = state.findings.get(identity)
+            decision = state.scope_decisions.get(identity, {})
+            if (identity in required or finding is None or not nonblocking_scope(state, finding)
+                    or decision.get('source') != source or decision.get('environment') != environment
+                    or not _retained_scope(runner, decision, finding.to_dict())):
+                continue
+            references = scenario.setdefault('reference_ids', [])
+            if not _texts(references, empty=True):
+                continue
+            ids.remove(identity)
+            if identity not in references:
+                references.append(identity)
+            changes.append({'scenario': scenario['scenario_id'], 'finding': identity,
+                            'scope_request': decision['request_id']})
+    if not changes:
+        return plan
+    if _format_semantics_changed(plan, migrated):
+        raise PlanningBlocked('identity migration changed plan semantics')
+    from .repair_memory import save_record
+    reference = save_record(runner, 'plan_reference_migration', {'source': source, 'changes': changes,
+                'original': plan, 'normalized': migrated})
+    callback = getattr(runner, '_control_phase_callback', None)
+    if callback:
+        callback('plan_references_normalized', {'receipt': reference['id'], 'changes': len(changes)})
+    return migrated
+
+
+def _review_execution_mode(plan, review):
+    if review.get('implementation_required') is False and review.get('remaining_changes') == []:
+        return 'verify_existing'
+    return plan.get('mode', 'implement')
+
+
+def _apply_execution_mode(runner, receipt, source):
+    # An unchanged, independently inspected implementation can go directly to
+    # verification. New failure evidence still authorizes the original writer.
+    if (receipt.get('source') == source and receipt.get('execution_mode') == 'verify_existing'
+            and getattr(runner, '_candidate_next_action', {}).get('kind') not in {'repair_code', 'repair_verification'}):
+        runner._candidate_group['mode'] = 'verify_existing'
 
 
 def _materialize_draft(payload, previous):
@@ -736,6 +800,7 @@ def prepare_component(runner, workspace):
             runner._candidate_group = {**group, **receipt['plan'], 'planning_receipt': receipt['request_id'],
                                        'finding_scenario_bindings': bindings,
                                        'retained_acceptance': experiment.component_memory.get(component_key(group), {}).get('acceptance_inventory', [])}
+            _apply_execution_mode(runner, receipt, context['source'])
             runner._experiment_store.record_health(experiment, status='plan_reused', detail=receipt['request_id'])
             return receipt
         if receipt.get('component_signature') == signature:
@@ -844,7 +909,7 @@ def prepare_component(runner, workspace):
             try:
                 if (episode.get('phase') == 'review' and previous
                         and isinstance(previous.get('draft'), dict)):
-                    payload = previous['draft']
+                    payload = normalize_plan_references(runner, workspace, previous['draft'], group)
                     planner_id = previous['planner_request']
                     plan = validate_plan(payload, group, set(experiment.contract_obligation_ids))
                     context['plan_delta'] = plan_delta(previous, plan)
@@ -864,6 +929,7 @@ def prepare_component(runner, workspace):
                     'Do not expand scope, implement code or approve anything. Return the corrected complete JSON plan.')
                 payload, planner_id = _invoke(runner, workspace, stage, prompt, context)
                 payload = _materialize_draft(payload, previous)
+                payload = normalize_plan_references(runner, workspace, payload, group)
                 context['plan_delta'] = plan_delta(previous, payload)
                 if format_used and previous and isinstance(previous.get('draft'), dict):
                     if _format_semantics_changed(previous['draft'], payload):
@@ -914,7 +980,10 @@ def prepare_component(runner, workspace):
                 'fixtures. Retained scenarios still require an explicit evidence-based decision. '
                 'Every scenario must be reviewed or explicitly retained with evidence; missing dependencies require '
                 'inspection. A current defect with a concrete planned fix does not itself reject the plan. '
-                'Return JSON {decision:APPROVE|REVISE,reason,scenario_ids:[all covered scenario IDs],issues:[...]}. '
+                'Return JSON {decision:APPROVE|REVISE,reason,scenario_ids:[all covered scenario IDs],issues:[...],'
+                'implementation_required:boolean,remaining_changes:[...]}. '
+                'Set implementation_required=false and remaining_changes=[] only after confirming that the '
+                'CURRENT source already implements every planned mechanism; the controller will still run all verification. '
                 'Do not demand unrelated hardening or rewrite the proposed plan.', review_context)
             approved = (review.get('decision') == 'APPROVE' and _text(review.get('reason'))
                         and review.get('issues') == [] and all(p['matches'] for p in probes)
@@ -926,7 +995,7 @@ def prepare_component(runner, workspace):
                 'contract': experiment.contract_fingerprint, 'engine_base': experiment.base_commit,
                 'plan': plan, 'planner_request': planner_id, 'request_id': reviewer_id,
                 'decision': 'APPROVE' if approved else 'REVISE', 'revision': context['revision'],
-                'probe_results': probes, 'feedback': [review]}
+                'probe_results': probes, 'feedback': [review], 'execution_mode': _review_execution_mode(plan, review)}
             experiment.planning_receipts[key] = receipt
             reference = remember_revision(runner, group, {'parent_revision': previous['id'],
                 'draft': plan, 'source': context['source'], 'source_commit': context['source_commit'],
@@ -948,6 +1017,7 @@ def prepare_component(runner, workspace):
                 runner._experiment_store.save(experiment)
                 runner._candidate_group = {**group, **plan, 'planning_receipt': reviewer_id,
                                            'retained_acceptance': memory['acceptance_inventory']}
+                _apply_execution_mode(runner, receipt, context['source'])
                 return receipt
             feedback = [review, {'probe_outcomes': [p['outcome'] for p in probes]}]
             episode['latest_decision'] = 'REVISE'

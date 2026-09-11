@@ -97,7 +97,7 @@ def report(control_root, job):
         'job': job, 'state': row[0], 'terminal_result': json.loads(row[2]),
         'started_at': datetime.fromtimestamp(events[0][2], timezone.utc).isoformat() if events else None,
         'last_state_change': datetime.fromtimestamp(row[1], timezone.utc).isoformat(),
-        'wall_seconds': max(row[1], events[-1][2]) - events[0][2] if events else None,
+        'wall_seconds': max(e[2] for e in events) - min(e[2] for e in events) if events else None,
         'phase_costs': dict(phase), 'candidate_outcomes': dict(outcomes),
         'verification_commands': sorted(commands, key=lambda c: c.get('seconds', 0), reverse=True),
         'cache_hit_commands': sum(bool(c.get('cache_hit')) for c in commands),
@@ -106,7 +106,11 @@ def report(control_root, job):
         'input_trace_reasons': dict(Counter(c.get('input_trace_reason') or 'not_recorded'
                                            for c in commands if not c.get('cache_hit') and not c.get('input_trace_complete'))),
         'command_origins': dict(Counter(c['origin'] for c in commands)),
+        'review_reuses': sum(k == 'review_reused' for k, _, _ in events),
+        'probe_corrections': sum(k == 'scope_probe_correction' for k, _, _ in events),
+        'deterministic_plan_migrations': sum(k == 'plan_references_normalized' for k, _, _ in events),
         'interpretation': 'Phase costs can nest; do not sum them as wall time. Counts describe this job only. '
+                          'Wall time spans retained events, excluding later administrative state updates. '
                           'Command times are nested inside phases, and parallel command times are work, not wall time. '
                           'Legacy schedule attribution uses candidate source and artifact mtime; incomplete evidence is not a cache miss proof. '
                           'No counterfactual run is available to infer net speedup from review costs alone.',
