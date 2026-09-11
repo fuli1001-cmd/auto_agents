@@ -276,6 +276,8 @@ def _repair_progress_message(job, subscriber):
             "candidate_result": "本轮候选已完成",
         }
         label = labels.get(phase, "正在审查候选" if phase.startswith("review_") else "正在修复")
+        if phase == 'candidate_result' and progress.get('status') == 'candidate_group_completed':
+            label = '当前组件已通过验收，继续后续组件与集成验证'
         if progress.get("candidate"):
             label = f"第 {progress['candidate']} 轮：" + label
         previous = progress.get("last_result") or {}

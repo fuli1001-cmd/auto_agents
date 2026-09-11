@@ -132,3 +132,62 @@ def test_accepted_component_allows_a_new_correction_window():
         candidate_commit="commit",
     ))
     assert state.accepted_progress_anchor() != before
+
+
+@pytest.mark.parametrize('patience', [2, 3])
+@pytest.mark.parametrize('next_passes', [False, True])
+def test_completed_revalidation_advances_without_diagnosing_a_passed_component(tmp_path, patience, next_passes):
+    from test_repair_routing import make_runner
+    runner, state, _ = make_runner(tmp_path)
+    store = runner._experiment_store
+    first, second = state.finding_groups
+    state.register_candidate(SelfRepairCandidateRecord('historical', status='candidate_group_completed',
+        finding_group_id=first['group_id'], candidate_commit=state.base_commit))
+    state.candidates['historical'].fatal = True
+    state.candidates['historical'].component_receipts = {}
+    state.consecutive_non_improvements = patience
+    anchor, credits = state.accepted_progress_anchor(), dict(state.progress_credits)
+    stages, diagnoses = [], []
+    def candidate(**kwargs):
+        group = runner._candidate_group['group_id']
+        stages.append(group)
+        if len(stages) == 1:
+            assert not runner._candidate_is_final_group
+            return SelfRepairResult(False, 'candidate_group_completed', 'component passed; integration remains',
+                candidate_id='revalidated', candidate_ref=state.base_commit, candidate_commit=state.base_commit,
+                finding_group_id=group, review_completed=True)
+        assert stages == [first['group_id'], second['group_id']]
+        assert runner._candidate_is_final_group  # The remaining component still enters the final gate path.
+        assert state.consecutive_non_improvements == patience
+        assert state.accepted_progress_anchor() == anchor and state.progress_credits == credits
+        assert state.candidates['revalidated'].net_progress == 0
+        return SelfRepairResult(next_passes, 'approved_candidate' if next_passes else 'candidate_review_rejected',
+            'next component verdict', candidate_id='next', candidate_ref=state.base_commit,
+            candidate_commit=state.base_commit, finding_group_id=group)
+    def diagnose(_runner, _state, result):
+        diagnoses.append(result.finding_group_id)
+        assert result.finding_group_id == second['group_id']
+        return {'kind': 'blocked', 'reason': 'actual next-component failure'}
+    with (patch.object(runner, '_load_or_create_experiment', return_value=(store, state)),
+          patch.object(runner, '_ensure_approved_repair_design', return_value=True),
+          patch.object(runner, '_migrate_recoverable_candidate_to_pending'),
+          patch.object(runner, '_resume_pending_validation_candidate', return_value=None),
+          patch.object(runner, '_run_candidate', side_effect=candidate),
+          patch('auto_agents.repair_actions.stalled_correction', side_effect=diagnose),
+          patch.object(runner, '_automatic_contract_reanalysis', side_effect=AssertionError('redesigned a passed group'))):
+        result = runner._run_search()
+    assert result.ok == next_passes
+    assert stages == [first['group_id'], second['group_id']]
+    assert diagnoses == ([] if next_passes else [second['group_id']])
+    assert state.finding_groups[0]['status'] == 'completed'
+    assert not state.automatic_corrections
+    restored = store.load()
+    assert restored.candidates['revalidated'].status == 'candidate_group_completed'
+    assert restored.candidates['revalidated'].progress_keys == []
+
+
+def test_component_completion_message_does_not_claim_whole_repair_finished():
+    from auto_agents.repair_client import _repair_progress_message
+    message = _repair_progress_message({'state': 'repairing', 'progress': {
+        'kind': 'candidate_result', 'status': 'candidate_group_completed', 'candidate': 75}}, {'state': 'waiting'})
+    assert '当前组件已通过验收' in message and '集成验证' in message

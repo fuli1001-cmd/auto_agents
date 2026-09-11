@@ -3933,6 +3933,13 @@ class AutoAgentsSelfRepairRunner:
                 experiment.current_candidate_id = ""
                 store.save(experiment)
                 return candidate
+            if (candidate.status == 'candidate_group_completed' and not candidate.failed_obligations
+                    and not candidate.infrastructure_failure and not candidate.recoverable_validation):
+                # Component completion is a scheduling transition, not failure.
+                # Old checks can earn zero new credit after restart; exhaustion
+                # must not send a passed component to failure diagnosis. The next
+                # component and final integration still run their normal gates.
+                continue
             if candidate.infrastructure_failure:
                 underlying_reason = candidate.reason.strip()
                 preserved = self._candidate_partial_path
