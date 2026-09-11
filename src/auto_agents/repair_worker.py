@@ -180,6 +180,24 @@ def repair(request):
     prepared = request.get("prepared_runtime")
     revision, fresh = (prepared["revision"], prepared["fresh"]) if prepared else repository.fetch()
     store.event(job["id"], "remote_checked", {"revision": revision, "fresh": fresh})
+    base = payload["base"]
+    repository.import_commit(config["source_root"], base)
+    contains = git(repository.cache, "merge-base", "--is-ancestor", base, revision, check=False)
+    if contains.returncode:
+        if contains.returncode != 1:
+            raise RuntimeError("could not verify requested engine ancestry before worker replacement")
+        details = {"requested_revision": base, "selected_revision": revision,
+                   "ref": config["ref"], "fresh": fresh}
+        store.event(job["id"], "runtime_revision_mismatch", details)
+        return {"ok": False, "status": "runtime_revision_mismatch",
+                "error": "selected repair engine does not contain the requested installation revision",
+                "runtime_selection": details,
+                "next_action": {"kind": "synchronize_engine",
+                                "reason": "Publish or integrate the requested installation into the configured "
+                                          "remote branch, then retry the original command. Retained repair "
+                                          "source and evidence have not been changed."}}
+    store.event(job["id"], "runtime_selected", {"requested_revision": base,
+                "selected_revision": revision, "contains_requested": True, "fresh": fresh})
     checkout = repository.worktree(revision, job["id"] + "-base-" + revision[:12])
     python, environment = ((prepared["python"], prepared["environment"]) if prepared else engine_environment(config, checkout))
     request["prepared_runtime"] = {"revision": revision, "fresh": fresh, "python": python, "environment": environment}
@@ -208,8 +226,6 @@ def repair(request):
         payload = {**payload, "request_contract": request_contract}
         store.event(job["id"], "request_contract_ready", {"revision": revision})
     import_legacy_experiment(payload, working, repository, directory)
-    base = payload["base"]
-    repository.import_commit(config["source_root"], base)
     original = repository.worktree(base, job["id"] + "-original")
     verifier = make_runner(payload, original, working, python)
     fixed, proof = check_revision(verifier, checkout, base)

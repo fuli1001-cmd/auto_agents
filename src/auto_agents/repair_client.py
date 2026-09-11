@@ -209,6 +209,11 @@ def _repair_failure_detail(job, subscriber):
             phase = {"validation": "验证未通过", "resume": "原任务恢复失败"}.get(failure.get("phase"), "")
             return f"{phase}：{detail}" if phase else detail
     result = job.get("result") or {}
+    if result.get("status") == "runtime_revision_mismatch":
+        selection = result.get("runtime_selection", {})
+        requested = _repair_text(selection.get("requested_revision", ""), 12)
+        selected = _repair_text(selection.get("selected_revision", ""), 12)
+        return f"远端修复引擎 {selected} 不包含本次版本 {requested}，请先同步远端分支再重试"
     detail = result.get("control_error") or result.get("error")
     known = {
         "workflow registration must be restored before repair": "任务登记已失效，需要恢复登记后继续",

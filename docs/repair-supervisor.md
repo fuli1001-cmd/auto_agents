@@ -52,6 +52,18 @@ with the installation HEAD, even when their IPC protocol is identical. An idle
 older controller is replaced without resetting jobs or recovery evidence. Active
 work defers the update with an explicit error. Repair progress and stop reasons
 use the normal user-event renderer and are saved in the invocation's user log.
+
+The repair worker separately selects its engine from the configured remote branch.
+A local commit and an updated controller therefore do not establish that the worker
+will load that commit. Before environment setup or worker replacement, the controller
+imports the requested installation commit and requires it to be an ancestor of the
+selected remote revision. A behind or divergent remote, including a prepared cached
+runtime, stops with `runtime_revision_mismatch`. The result names both revisions and
+asks the operator to publish/integrate the installation into the configured branch.
+It does not silently select unpublished local code or discard retained repair work.
+Successful selection records `runtime_selected` with both revisions. The existing
+runtime compatibility, behavioral proof and publication checks still apply.
+
 The foreground shows an eight-character job ID and explains the problem once,
 using the current workflow's engine request or approved diagnosis. Without an
 approved diagnosis it labels the error as a symptom under investigation. Later
