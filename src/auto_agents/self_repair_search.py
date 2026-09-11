@@ -432,6 +432,8 @@ class SelfRepairExperiment:
                     raise ValueError('repair episode counters must be nonnegative integers')
             if 'pending_round' in episode and type(episode['pending_round']) is not bool:
                 raise ValueError('repair episode pending_round must be boolean')
+            if 'approval_recovery_used' in episode and type(episode['approval_recovery_used']) is not bool:
+                raise ValueError('repair episode approval_recovery_used must be boolean')
         findings = {
             str(key): SelfRepairFinding.from_dict(value)
             for key, value in raw_findings.items()

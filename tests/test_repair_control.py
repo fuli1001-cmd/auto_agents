@@ -366,7 +366,8 @@ def test_cancel_running_worker_never_starts_resume(tmp_path):
         assert supervisor.store.job(job)["state"] == "cancelled"
 
 
-def test_boundary_requires_correct_process_runtime_and_exact_command(tmp_path):
+@pytest.mark.parametrize('repair_status', ['repaired', 'already_repaired'])
+def test_boundary_requires_correct_process_runtime_and_exact_command(tmp_path, repair_status):
     config = configuration(tmp_path)
     supervisor = Supervisor(config)
     project = tmp_path / "project"
@@ -375,7 +376,8 @@ def test_boundary_requires_correct_process_runtime_and_exact_command(tmp_path):
         subscriber = supervisor.register({"payload": registration(project, lock.run_token)}, [os.dup(lock.fileno)])["subscriber"]
         payload = {**failure(project), "boundary": {"kind": "gate", "command": "pytest exact.py"}}
         job = supervisor.store.submit(subscriber, payload)
-        supervisor.store.transition(job, "ready", {"runtime": str(tmp_path / "verified"), "commit": "verified", "status": "repaired"})
+        supervisor.store.transition(job, "ready", {"runtime": str(tmp_path / "verified"), "commit": "verified",
+                                                "status": repair_status, 'source_delivery_needed': True})
         with supervisor.store.connect() as db:
             db.execute("UPDATE subscribers SET state='resuming' WHERE id=?", (subscriber,))
         request = {"version": 1, "op": "boundary", "subscriber": subscriber, "kind": "gate",
@@ -418,10 +420,22 @@ def test_continuous_mode_keeps_worktree_and_provider_receipt(tmp_path):
 
 def test_publication_disabled_cannot_use_cached_receipt_to_push(tmp_path):
     from auto_agents.repair_worker import publish
-    with patch("auto_agents.repair_worker.Repository") as repository:
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    repository = Repository(config)
+    base, _ = repository.fetch()
+    candidate = repository.worktree(base, 'local-delivery')
+    (candidate / 'bug.py').write_text('fixed\n')
+    git(candidate, 'add', 'bug.py')
+    git(candidate, 'commit', '-m', 'verified fix')
+    fixed = git(candidate, 'rev-parse', 'HEAD')
+    config['publish'] = False
+    with patch.object(Repository, 'push', side_effect=AssertionError('publication was revoked')):
         with pytest.raises(PermissionError):
-            publish({"config": {"publish": False}, "job": {}})
-        repository.assert_not_called()
+            publish({'config': config, 'job': {'id': 'local-only', 'payload': {'base': base},
+                     'result': {'commit': fixed, 'base': base}}})
+    assert git(engine, 'rev-parse', 'HEAD') == fixed  # Local delivery is independent of remote permission.
+    assert git(Path(config['remote']), 'rev-parse', 'master') == base
 
 
 def test_remote_reuse_runs_actual_behavior_without_a_repair_model(tmp_path):
@@ -443,11 +457,12 @@ def test_remote_reuse_runs_actual_behavior_without_a_repair_model(tmp_path):
     (project / "input.txt").write_text("unchanged")
     def behavior(root):
         return subprocess.run([sys.executable, "-c", "import bug; assert bug.value == 'fixed'"], cwd=root, capture_output=True).returncode == 0
+    original = repository.worktree(base, 'original-fixture')
     class Oracle:
         def _load_or_create_experiment(self):
             return None, None
         def _diagnosis_differential(self, old, candidate):
-            return SimpleNamespace(ok=not behavior(engine) and behavior(candidate), summary="actual old failure/new pass")
+            return SimpleNamespace(ok=not behavior(original) and behavior(candidate), summary="actual old failure/new pass")
         def _replay_candidate(self, candidate, *args):
             return SimpleNamespace(ok=behavior(candidate), summary="actual boundary")
         def _full_suite_differential(self, old, candidate):
@@ -460,9 +475,10 @@ def test_remote_reuse_runs_actual_behavior_without_a_repair_model(tmp_path):
          patch("auto_agents.root_cause.RootCauseCoordinator._copy_diagnostic_tree", side_effect=lambda src, dst: shutil.copytree(src, dst)):
         result = repair({"config": config, "job": {"id": "reuse", "payload": payload}})
     assert result["status"] == "already_repaired"
+    assert result['source_delivery_needed']
     assert result["commit"] == commit
     assert (project / "input.txt").read_text() == "unchanged"
-    assert git(engine, "rev-parse", "HEAD") == base
+    assert git(engine, "rev-parse", "HEAD") == commit
 
 
 def test_publication_integrates_upstream_and_reuses_proof_after_network_failure(tmp_path):

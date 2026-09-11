@@ -209,8 +209,20 @@ def _repair_failure_detail(job, subscriber):
             phase = {"validation": "验证未通过", "resume": "原任务恢复失败"}.get(failure.get("phase"), "")
             return f"{phase}：{detail}" if phase else detail
     result = job.get("result") or {}
+    if result.get("status") == "runtime_revision_mismatch":
+        selection = result.get("runtime_selection", {})
+        requested = _repair_text(selection.get("requested_revision", ""), 12)
+        selected = _repair_text(selection.get("selected_revision", ""), 12)
+        return f"远端修复引擎 {selected} 不包含本次版本 {requested}，请先同步远端分支再重试"
     detail = result.get("control_error") or result.get("error")
+    if isinstance(detail, str) and detail.startswith('engine source merge requires resolution'):
+        return '引擎版本合并存在冲突，请在详细日志所示隔离目录解决并提交后重试；日常工作区未改动'
     known = {
+        "engine workspace has uncommitted changes; commit them before self-repair or integration": "引擎工作区有未提交改动，请先提交，再运行或整合修复",
+        "engine workspace branch changed; retained repair is waiting for integration": "引擎工作区已切换分支，修复提交已保留，等待整合到原分支",
+        "engine workspace advanced during verification; retry integration with its new commits": "验证期间本地又有新提交，需要整合新提交并复验，修复成果已保留",
+        "engine synchronization requires a successful remote refresh": "无法确认远端最新版本，请恢复远端连接后重试",
+        "engine branch upstream differs from the configured repair destination": "当前引擎分支的上游与修复配置不一致，请先确认目标分支",
         "workflow registration must be restored before repair": "任务登记已失效，需要恢复登记后继续",
         "repair worker exited without a receipt": "修复进程退出，未返回结果",
         "stale worker receipt": "修复进程返回了过期结果",
@@ -247,6 +259,7 @@ def _repair_progress_message(job, subscriber):
         progress = job.get("progress") or {}
         phase = progress.get("phase") or progress.get("kind", "")
         labels = {
+            "engine_source_sync": "正在同步本地与远端引擎版本",
             "request_contract_planning": "正在规划验收检查", "request_contract_ready": "验收检查已就绪",
             "candidate_generation": "正在生成修复代码", "candidate_correction": "正在修正候选",
             "repair_design": "正在设计修复方案", "contract_reanalysis": "正在重新分析验收要求",
