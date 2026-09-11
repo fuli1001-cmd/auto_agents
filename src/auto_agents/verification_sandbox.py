@@ -66,7 +66,8 @@ def namespace_exec(payload):
             path = Path(value).resolve()
             if str(path).startswith("/tmp/") and path.is_dir():
                 kept.append((str(path), os.open(path, os.O_PATH | os.O_CLOEXEC)))
-        subprocess.run([payload["ip"], "link", "set", "lo", "up"], check=True)
+        if payload.get("ip"):
+            subprocess.run([payload["ip"], "link", "set", "lo", "up"], check=True)
         subprocess.run([payload["mount"], "-t", "tmpfs", "-o", "mode=1777", "tmpfs", "/tmp"], check=True)
         for path, fd in kept:
             Path(path).mkdir(parents=True, exist_ok=True)
@@ -80,7 +81,7 @@ def namespace_exec(payload):
 
 @contextmanager
 def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=(), path_entries=(),
-                      python_paths=(), node_paths=(), library_paths=()):
+                      python_paths=(), node_paths=(), library_paths=(), execution_environment=None):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     if root == target or root in target.parents or target in root.parents:
         raise RuntimeError("verification workspace overlaps the live target project")
@@ -116,7 +117,17 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
                 raise RuntimeError("read-only verification input overlaps the writable workspace")
             entries[str(readonly)] = "read"
             preserve.append(str(readonly))
-        for name in (".ssh", ".gnupg", ".codex"):
+        if execution_environment is not None:
+            # Preserve retained launchers/import paths under the private /tmp mount.
+            # Environment values stay in env, never in command-line audit records.
+            for key in ('PATH', 'PYTHONPATH', 'NODE_PATH', 'LD_LIBRARY_PATH', 'CONDA_PREFIX'):
+                for value in execution_environment.get(key, '').split(os.pathsep):
+                    if value and Path(value).is_dir():
+                        extra = Path(value).resolve()
+                        preserve.append(str(extra))
+                        if str(extra).startswith('/tmp/') and str(extra) not in entries:
+                            entries[str(extra)] = 'read'
+        for name in (() if execution_environment is not None else (".ssh", ".gnupg", ".codex")):
             sensitive = Path.home() / name
             if sensitive.exists():
                 entries[str(sensitive)] = "deny"
@@ -126,7 +137,7 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
             entries[str(Path(config["root"]).resolve())] = "read"
             entries[str(root)] = "write"
             preserve.append(str(Path(config["root"]).resolve()))
-        for directory in (root, target):
+        for directory in (() if execution_environment is not None else (root, target)):
             if (directory / ".env").exists():
                 entries[str(directory / ".env")] = "deny"
         for name in (".git", ".agents", ".codex"):
@@ -143,25 +154,36 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
                              "PYTHONDONTWRITEBYTECODE=1",
                              "AUTO_AGENTS_TEST=True", "TESTING=True", "AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1",
                              "AUTO_AGENTS_VERIFICATION_SANDBOX=1"]
+        if execution_environment is not None:
+            # Project verification retains operator inputs, activation and networking.
+            # Only sandbox bookkeeping goes to a fresh private home.
+            clean_environment = ['env', 'CODEX_HOME=' + str(codex_home),
+                                 'AUTO_AGENTS_VERIFICATION_SANDBOX=1']
         if node_paths:
             clean_environment.append("NODE_PATH=" + os.pathsep.join(map(str, node_paths)))
         if library_paths:
             clean_environment.append("LD_LIBRARY_PATH=" + os.pathsep.join(map(str, library_paths)))
         if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
-            yield [sys.executable, str(Path(__file__).resolve()), "--landlock", json.dumps(writable), *clean_environment, *argv]
+            launcher = Path(__file__).resolve()
+            if execution_environment is not None:
+                launcher = launcher.with_name('gate_verification.py')
+            yield [sys.executable, str(launcher), "--landlock", json.dumps(writable), *clean_environment, *argv]
             return
         sandbox = [executable, "sandbox", "-c", "features.network_proxy=false",
                    "-c", "permissions.autoagents_verify=" + profile,
                    "-P", "autoagents_verify", "-C", str(root), "--include-managed-config", "--", *clean_environment, *argv]
         if not os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
             unshare, ip, mount = shutil.which("unshare"), shutil.which("ip"), shutil.which("mount")
-            if not unshare or not ip or not mount:
+            required = [("unshare", unshare), ("mount", mount)]
+            if execution_environment is None:
+                required.append(("ip", ip))
+            if any(not value for _, value in required):
                 from auto_agents.verification_dependencies import MissingDependency, VerificationDependencyError
-                missing = next(name for name, value in (("unshare", unshare), ("ip", ip), ("mount", mount)) if not value)
+                missing = next(name for name, value in required if not value)
                 raise VerificationDependencyError(MissingDependency("executable", missing),
-                    "verification requires unshare, mount and ip for private test namespaces")
-            payload = {"cwd": str(root), "preserve": preserve, "command": sandbox, "ip": ip, "mount": mount}
-            sandbox = [unshare, "--user", "--map-root-user", "--mount", "--net", "--pid", "--fork", "--mount-proc",
+                    "verification requires " + ', '.join(name for name, _ in required) + " for private test namespaces")
+            payload = {"cwd": str(root), "preserve": preserve, "command": sandbox, "ip": ip if execution_environment is None else None, "mount": mount}
+            sandbox = [unshare, "--user", "--map-root-user", "--mount", *(["--net"] if execution_environment is None else []), "--pid", "--fork", "--mount-proc",
                        sys.executable, str(Path(__file__).resolve()), "--namespace", json.dumps(payload)]
         yield ["env", "TMPDIR=" + temporary, *sandbox]
 

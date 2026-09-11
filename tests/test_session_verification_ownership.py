@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from execution_marker import ExecutionMarker
+
 from auto_agents.config import (load_project_config, save_project_config, save_session_state,
                                 load_session_state, save_task_plan)
 from auto_agents.git_ops import head_ref
@@ -400,10 +402,10 @@ def test_public_resume_executes_complete_owned_proof_inventory(tmp_path, monkeyp
     from auto_agents.config import load_task_plan
 
     root, child = project(tmp_path)
-    marker = tmp_path / 'owned-proof-executed'
+    marker = ExecutionMarker(tmp_path / 'owned-proof-executed')
     proof = root / 'tests/test_owned.py'
     proof.write_text(proof.read_text() +
-                     f'    Path({str(marker)!r}).write_text("executed")\n')
+                     '    ' + marker.source(repr('executed')) + '\n')
     config = load_project_config(root)
     config.gates.release_blocking_paths = []
     config.gates.unmapped_change_policy = 'fallback'
@@ -608,12 +610,11 @@ def test_public_resume_recovers_release_proof_removed_from_generated_config(tmp_
     from auto_agents.config import load_task_plan
 
     root, child = project(tmp_path)
-    marker = tmp_path / 'executed-invocations'
+    marker = ExecutionMarker(tmp_path / 'executed-invocations')
     (root / 'tests/test_owned.py').write_text(
         'from pathlib import Path\ndef test_owned(request):\n'
         '    assert "VALUE = 1" in Path("value.py").read_text()\n'
-        f'    with Path({str(marker)!r}).open("a") as stream:\n'
-        '        stream.write(str(bool(request.config.getoption("strict_markers"))) + "\\n")\n')
+        '    ' + marker.source('str(bool(request.config.getoption("strict_markers"))) + chr(10)', append=True) + '\n')
     config = load_project_config(root)
     config.gates.steps[0].targets = ['tests/test_owned.py']
     config.gates.steps[0].levels = ['affected']
@@ -768,12 +769,11 @@ def test_public_resume_derived_release_test_retains_prerequisites(tmp_path, monk
     from auto_agents.config import load_task_plan
 
     root, child = project(tmp_path)
-    marker = tmp_path / 'setup-executions'
+    marker = ExecutionMarker(tmp_path / 'setup-executions')
     (root / 'tests/test_release.py').write_text('def test_release(): assert True\n')
     (root / 'tests/test_setup.py').write_text(
         'from pathlib import Path\ndef test_setup():\n'
-        f'    with Path({str(marker)!r}).open("a") as stream:\n'
-        '        stream.write(Path("value.py").read_text())\n'
+        '    ' + marker.source('Path("value.py").read_text()', append=True) + '\n'
         + ('    assert "VALUE = 0" in Path("value.py").read_text()\n'
            if prerequisite == 'candidate_failure' else '    assert True\n'))
     config = load_project_config(root)
@@ -833,15 +833,15 @@ def test_public_resume_escalation_retains_failing_affected_regression_and_setup(
     from auto_agents.config import load_task_plan
 
     root, child = project(tmp_path)
-    markers = {key: tmp_path / key for key in ('setup', 'regression', 'release')}
+    markers = {key: ExecutionMarker(tmp_path / key) for key in ('setup', 'regression', 'release')}
     (root / 'tests/test_regression.py').write_text(
         'from pathlib import Path\ndef test_setup():\n'
-        f'    Path({str(markers["setup"])!r}).write_text("ran")\n'
+        '    ' + markers['setup'].source(repr('ran')) + '\n'
         'def test_regression():\n'
-        f'    Path({str(markers["regression"])!r}).write_text("ran")\n'
+        '    ' + markers['regression'].source(repr('ran')) + '\n'
         '    assert "VALUE = 0" in Path("value.py").read_text()\n'
         'def test_release():\n'
-        f'    Path({str(markers["release"])!r}).write_text("ran")\n')
+        '    ' + markers['release'].source(repr('ran')) + '\n')
     config = load_project_config(root)
     config.gates.release_blocking_paths = ['value.py'] if escalation == 'blocking' else []
     config.gates.unmapped_change_policy = 'release'
@@ -894,10 +894,10 @@ def test_public_resume_preserves_existing_foreign_pending_regression_prerequisit
     from auto_agents.config import load_task_plan
 
     root, child = project(tmp_path)
-    marker = tmp_path / 'foreign-prerequisite-executed'
+    marker = ExecutionMarker(tmp_path / 'foreign-prerequisite-executed')
     (root / 'tests/test_shared.py').write_text(
         'from pathlib import Path\ndef test_shared():\n'
-        f'    Path({str(marker)!r}).write_text("ran")\n'
+        '    ' + marker.source(repr('ran')) + '\n'
         '    assert "VALUE = 0" in Path("value.py").read_text()\n'
         'def test_regression():\n    assert True\n')
     config = load_project_config(root)
@@ -1275,9 +1275,9 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     import auto_agents.session as session_module
 
     root, child = project(tmp_path)
-    marker = tmp_path / 'required-node-executed'
+    marker = ExecutionMarker(tmp_path / 'required-node-executed')
     proof = root / 'tests/test_owned.py'
-    proof.write_text(proof.read_text() + f'    Path({str(marker)!r}).write_text("owned")\n'
+    proof.write_text(proof.read_text() + '    ' + marker.source(repr('owned')) + '\n'
                      '\ndef test_control(): assert True\n')
     inclusive = selector in {'unfiltered', 'discovery_inclusive', 'norecurse_override',
                              'norecurse_explicit', 'norecurse_unrelated'}
@@ -1433,11 +1433,11 @@ def test_public_resume_protects_manual_regression_sources(tmp_path, monkeypatch,
     import auto_agents.session as session_module
 
     root, child = project(tmp_path)
-    marker = tmp_path / 'manual-regression-executed'
+    marker = ExecutionMarker(tmp_path / 'manual-regression-executed')
     path = 'tests/test_regression.py'
     (root / path).write_text(
         'from pathlib import Path\ndef test_regression():\n'
-        f'    Path({str(marker)!r}).write_text(Path("value.py").read_text())\n'
+        '    ' + marker.source('Path("value.py").read_text()') + '\n'
         '    assert "VALUE = 0" in Path("value.py").read_text()\n')
     command = './.conda/bin/python -m pytest -q ' + path
     config = load_project_config(root)
@@ -1507,12 +1507,11 @@ def test_public_resume_retains_manual_regression_sharing_foreign_future_file(
     from auto_agents.models import GateParallelGroup
 
     root, child = project(tmp_path)
-    marker = tmp_path / 'shared-regression-executed'
+    marker = ExecutionMarker(tmp_path / 'shared-regression-executed')
     path = 'tests/test_regression.py'
     (root / path).write_text(
         'from pathlib import Path\ndef test_regression():\n'
-        f'    with Path({str(marker)!r}).open("a") as evidence:\n'
-        '        evidence.write(Path("value.py").read_text())\n'
+        '    ' + marker.source('Path("value.py").read_text()', append=True) + '\n'
         + ('    assert "VALUE = 0" in Path("value.py").read_text()\n'
            if regression == 'fails_candidate' else '    assert True\n'))
     retained_source = (root / path).read_bytes()
@@ -1572,12 +1571,11 @@ def test_public_resume_retains_existing_foreign_release_regression(
     from auto_agents.config import load_task_plan
 
     root, child = project(tmp_path)
-    marker = tmp_path / 'structured-regression-executed'
+    marker = ExecutionMarker(tmp_path / 'structured-regression-executed')
     path = 'tests/test_regression.py'
     (root / path).write_text(
         'from pathlib import Path\ndef test_regression():\n'
-        f'    with Path({str(marker)!r}).open("a") as evidence:\n'
-        '        evidence.write(Path("value.py").read_text())\n'
+        '    ' + marker.source('Path("value.py").read_text()', append=True) + '\n'
         + ('    assert "VALUE = 0" in Path("value.py").read_text()\n'
            if regression == 'fails_candidate' else '    assert True\n'))
     if coverage.startswith('parameterized_'):

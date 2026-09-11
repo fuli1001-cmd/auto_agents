@@ -1033,3 +1033,19 @@ def test_operator_can_revoke_publication_without_restarting_daemon(tmp_path):
     atomic_json(Path(config["root"]) / "operator.json", {**config, "publish": False})
     with pytest.raises(PermissionError, match="not authorized"):
         repository.push(base)
+
+
+def test_terminal_status_exposes_blocker_without_a_running_phase(tmp_path):
+    store = Store(tmp_path / 'state')
+    subscriber = store.register(registration(tmp_path / 'project'))
+    job = store.submit(subscriber, failure(tmp_path / 'project'))
+    store.transition(job, 'repairing')
+    store.event(job, 'phase_started', {'phase': 'scope_review'})
+    error = {'code': 'scope_format_exhausted', 'field': 'decisions[0].obligation_id'}
+    store.transition(job, 'blocked', {'error': 'scope binding mismatch',
+                                     'next_action': {'kind': 'blocked', 'planning_failure': error}})
+    status = store.job(job, include_progress=True)
+    assert 'progress' not in status
+    assert status['terminal']['reason'] == 'scope binding mismatch'
+    assert status['terminal']['next_action']['planning_failure'] == error
+    assert status['terminal']['finished_at'] == status['updated']

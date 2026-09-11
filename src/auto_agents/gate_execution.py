@@ -1492,6 +1492,9 @@ class LocalGatePlanExecutor:
                         capture.protect(tuple(merged_overrides.values()))
                         if getattr(self, "sandbox_target", None) is not None:
                             from .verification_sandbox import verification_argv
+                            if getattr(self, 'retain_execution_environment', False):
+                                from functools import partial
+                                verification_argv = partial(verification_argv, execution_environment=env)
                             # Runtime variables describe disposable directories
                             # and private loopback ports, never operator secrets.
                             safe = {key: value for key, value in env.items() if key.startswith("AUTO_AGENTS_GATE_")

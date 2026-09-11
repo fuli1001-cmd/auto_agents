@@ -3979,6 +3979,7 @@ class Session:
             kwargs['contract_fingerprint'] = verification_fingerprint([
                 state.verification_binding.get('binding_fingerprint', ''),
                 state.candidate_custody.get('receipt', {}).get('fingerprint', ''),
+                'session-write-boundary-v1',
             ])
         executor = self.orch._gate_executor_context(
             metadata, source_ref=source_ref or getattr(self, "_candidate_source_ref", ""), **kwargs
@@ -3989,6 +3990,15 @@ class Session:
                 executor.source_file_modes = {path: entry['postimage']['worktree']['mode']
                     for path, entry in receipt.get('manifest', {}).items()
                     if entry['postimage']['worktree']['kind'] in {'file', 'directory'}}
+        if state is not None and state.verification_binding:
+            from .gate_execution import LocalGatePlanExecutor
+            from .session_verification import ownership_error
+            if not isinstance(executor, LocalGatePlanExecutor):
+                raise ownership_error(state, 'session verification requires a confined local executor')
+            executor.sandbox_target = Path(state.verification_binding['repository'])
+            executor.retain_execution_environment = True
+            from .gate_verification import confined_session_executor
+            return confined_session_executor(executor)
         return executor
 
     def _run_verify_inner(self, scope: str = "final") -> Dict[str, object]:
