@@ -91,12 +91,30 @@ single-CPU hosts and disabled acceleration retain serial execution. Quick checks
 and final recovery/proof requirements are unchanged.
 
 The Python input observer records supported stat/lstat/access/readlink/getcwd
-results, including missing paths and metadata. Content, permission, symlink,
-working-directory or observed-input changes invalidate reuse. Native aliases,
-descriptor-relative probes, custom path callbacks, subprocesses and unknown
-inputs still decline cross-snapshot proof. Verification ledger policy version 2
-invalidates older certificates. Input reuse remains in observation mode by
-default; metadata support does not make subprocess-heavy tests reusable.
+results, including missing paths and metadata. Managed cache validation replays
+the complete observed manifest inside the same verification namespace and
+permission policy. Host UID/GID values are never compared with namespace-mapped
+values or silently omitted. Content, permission, symlink, working-directory or
+observed-input changes invalidate reuse. Native aliases, descriptor-relative
+probes, custom path callbacks, subprocesses and unknown inputs still decline
+cross-snapshot proof. Verification ledger policy version 3 invalidates older
+certificates. Input reuse remains in observation mode by default; an incomplete
+input trace can only use the existing exact-snapshot/context certificate path.
+
+Managed continuous repairs retain at most two verification worktrees per
+source/environment/generation snapshot under their job directory. Command-to-slot
+assignments survive component transitions and restarts, preserving the execution
+context used by exact-input certificates. Quick checks use the same pool serially;
+expanded checks use its bounded parallel workers. Locks protect each slot, and a
+modified or mismatched retained tree is preserved and replaced by a disposable
+verification run, never reset over existing evidence. A new snapshot gets a new
+pool; cancelled-job imports do not import these verification workspaces.
+
+Selector collection still validates each requested invocation and keeps command
+cohorts distinct. Successful collection certificates retain the collected node IDs
+and can avoid another pytest launch when source, environment, policy and observed
+inputs remain valid. They carry no executed-test IDs and cannot attest behavioral
+success. Failed/incomplete collection is never promoted to a passed certificate.
 
 Full repair prompt fallback uses the complete current feedback already present
 in the canonical prompt instead of appending another copy of native continuation
@@ -107,6 +125,32 @@ Scope review and format correction retain current findings, prior disproof and
 original obligations inline, while repeated component plans remain referenced.
 An incomplete factual dependency closure still requires independent review.
 
+Scope diagnostics can correct an inconclusive probe at most twice. A correction
+names the failed `probe_id` in `replaces_probe` (the sole inconclusive probe is
+unambiguous), changes the executable diagnostic, and preserves its expected
+outcome. Passing probes are retained. Batch reservations and individual starts
+are saved before execution; an interrupted probe becomes inconclusive on restart,
+never a free repeat. Successful probe corrections do not authorize code by
+themselves: an independent scope decision must still resolve `unknown`.
+
+Plans migrate historical finding IDs to `reference_ids` without a formatting
+model call only when a current, intact independent scope receipt permits the
+change. The controller records both versions and the scope provenance. Scenarios,
+mechanisms, obligations, executable checks and assertions stay intact; unknown
+IDs still fail validation. The normalized plan still receives independent review.
+An approving plan reviewer may explicitly return `implementation_required=false`
+and `remaining_changes=[]`, selecting `verify_existing` on that exact source.
+New failure evidence restores the original implementation path for an implement
+plan; a changed source cannot inherit that validation-only override.
+
+Successful component reviews may be reused only for identical component coverage,
+source, contract, environment, policy, authorization, next-action evidence and
+verification binding. Input changes during review cannot seed this cache.
+Related approved reviews on the same source/environment are indexed as inspection
+context for other components, never approval of their new scenarios. Integration
+still performs its required complete review. Display labels and completion
+timestamps are not new review scope; component identity and dependencies are.
+
 The performance report includes internal quick/expanded commands as well as
 provider verification tools. New command events bind candidate, phase/span and
 generation, cache decisions, input tracing, queue time and pytest phase costs.
@@ -114,7 +158,10 @@ Older jobs use retained schedule records matched to the job's candidates and
 artifact timestamps, explicitly labeled as legacy attribution. Imported history
 is excluded. Command durations are nested work and can overlap; they are never
 added to phase durations to infer wall time. Candidate preflight now has its own
-phase timing.
+phase timing. Reports count review reuse, probe corrections and deterministic
+identity migrations. Cache lookup reasons retain both candidate and source
+attempts, and lookup latency is separate from command execution. Wall time spans
+the retained events rather than a later administrative cancellation timestamp.
 
 ### Offline acceptance and performance
 

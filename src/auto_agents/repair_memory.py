@@ -339,6 +339,13 @@ def review_context(runner, root, group):
     memory = runner._experiment.component_memory.get(component_key(group), {})
     previous = read_record(runner, memory.get('code_review', {}))
     if not previous:
+        from .repair_review_reuse import related_reviews
+        related = related_reviews(runner, root, group)
+        if related:
+            return {'mode': 'related_components', 'related_reviews': related,
+                'instruction': 'Reuse established source facts as inspection context. Review EVERY active scenario '
+                               'and its interactions independently; a shared obligation ID does not mean another '
+                               'component approved this behavior. Retrieve the bound review when relevant.'}
         return {'mode': 'initial'}
     commit = previous.get('source_commit', '')
     ancestor = subprocess.run(['git', 'merge-base', '--is-ancestor', commit, 'HEAD'],
@@ -358,6 +365,7 @@ def remember_review(runner, root, group, payload):
     from .git_ops import head_ref
     reference = save_record(runner, 'code_review', {'source_commit': head_ref(root),
         'source': source_identity(root), 'contract': runner._experiment.contract_fingerprint,
+        'environment': digest(runner._full_suite_environment_fingerprint()),
         'component': deepcopy(group), 'result': deepcopy(payload)})
     runner._experiment.component_memory.setdefault(component_key(group), {})['code_review'] = reference
     runner._experiment.review_facts[reference['id']] = reference

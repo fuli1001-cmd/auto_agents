@@ -25,7 +25,7 @@ def execution_policy_fingerprint() -> str:
     paths = [Path(__file__).with_name(name) for name in (
         "gate_execution.py", "gate_result_cache.py", "gates.py", "workers.py",
         "verification_sandbox.py", "verification_inputs.py", "verification_probes.py",
-        "verification_pytest.py", "verification_trace.py")]
+        "verification_manifest.py", "verification_pytest.py", "verification_trace.py")]
     identity = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in paths if path.exists())
     if _POLICY_CACHE[0] != identity:
         _POLICY_CACHE = (identity, _stable_hash([(path.name, hashlib.sha256(path.read_bytes()).hexdigest())
@@ -107,12 +107,14 @@ class GateResultCache:
         environment_fingerprint: str = "",
         context_fingerprint: str = "",
         max_age_seconds: int = MAX_AGE_SECONDS,
+        manifest_validator=None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.cache_path = cache_path or gate_baseline_cache_path(self.project_root)
         self.environment_fingerprint = str(environment_fingerprint)
         self.context_fingerprint = str(context_fingerprint)
         self.max_age_seconds = max(1, int(max_age_seconds))
+        self.manifest_validator = manifest_validator
         self.disabled = False
         self._lock = threading.Lock()
 
@@ -279,6 +281,7 @@ class GateResultCache:
                                 "stderr": result.stderr[-200_000:],
                                 "comparable_failures": bool(result.comparable_failures),
                                 "executed_tests": result.executed_tests,
+                                "collected_tests": result.process_snapshot.get("collected_tests"),
                                 "phase_seconds": result.phase_seconds,
                                 "artifacts": result.artifacts,
                                 "artifact_modes": {name: (self.project_root / name).stat().st_mode & 0o777 for name in result.artifacts},
@@ -345,46 +348,11 @@ class GateResultCache:
             self.disabled = True
 
     def _manifest_matches(self, manifest: Mapping[str, object]) -> bool:
-        from .verification_probes import PREFIX, matches
-        if not manifest:
-            return False
-        for raw_path, expected in manifest.items():
-            if str(raw_path).startswith(PREFIX):
-                if not matches(self.project_root, str(raw_path), expected):
-                    return False
-                continue
-            relative = str(raw_path).replace("\\", "/").strip()
-            denied = relative.startswith("?")
-            if denied:
-                relative = relative[1:]
-            missing = relative.startswith("!")
-            if missing:
-                relative = relative[1:]
-            external = relative.startswith("@/")
-            if (
-                not relative
-                or relative.startswith("/")
-                or ".." in Path(relative).parts
-            ):
-                return False
-            path = Path(relative[1:]) if external else self.project_root / relative
-            if denied:
-                try:
-                    path.stat()
-                    return False  # Host visibility differs; do not read content.
-                except PermissionError as error:
-                    if str(error.errno) == str(expected):
-                        continue
-                    return False
-                except OSError:
-                    return False
-            if missing:
-                if path.exists():
-                    return False
-                continue
-            if _path_digest(path) != str(expected):
-                return False
-        return True
+        validator = getattr(self, 'manifest_validator', None)
+        if validator is not None:
+            return bool(validator(manifest))
+        from .verification_manifest import manifest_matches
+        return manifest_matches(self.project_root, manifest)
 
     def _store_artifacts(self, artifacts):
         if not artifacts:
@@ -488,6 +456,7 @@ class GateResultCache:
             stderr=str(payload.get("stderr", "")),
             comparable_failures=bool(payload.get("comparable_failures", False)),
             executed_tests=list(payload.get("executed_tests", [])),
+            process_snapshot={"collected_tests": payload.get("collected_tests")},
             phase_seconds=dict(payload.get("phase_seconds", {})),
             artifacts=dict(payload.get("artifacts", {})),
             input_trace_complete=bool(payload.get("input_trace_complete", False)),
