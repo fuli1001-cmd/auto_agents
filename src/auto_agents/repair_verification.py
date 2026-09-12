@@ -16,6 +16,10 @@ def run_component_checks(runner, commands, workspace, *, parallel=True):
     Shell preparation or uncommitted inputs retain the original serial path.
     """
     from .self_repair import _FullSuiteShard, _FullSuiteSlots, _VerificationResult
+    from .repair_concurrent_validation import cancelled, cancellation_result
+
+    if cancelled():
+        return cancellation_result()
 
     workers = min(2, max(1, (os.cpu_count() or 2) // 2)) if parallel else 1
     parsed = [pytest_parts(command) for command in commands]
@@ -54,9 +58,15 @@ def run_component_checks(runner, commands, workspace, *, parallel=True):
 
     def execute(shard, resources):
         try:
+            if cancelled():
+                return cancellation_result(shard.command)
             if retained_pool:
                 return run_in_pool(runner, workspace, shard, retained_pool)
             return runner._execute_full_suite_shard(workspace, shard)
+        except (OSError, RuntimeError):
+            if cancelled():
+                return cancellation_result(shard.command)
+            raise
         finally:
             slots.release(resources)
 
@@ -66,6 +76,7 @@ def run_component_checks(runner, commands, workspace, *, parallel=True):
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {}
             while batch or futures:
+                stopped = stopped or cancelled()
                 for index, shard in list(batch):
                     if stopped or len(futures) >= workers:
                         break
@@ -91,7 +102,7 @@ def run_component_checks(runner, commands, workspace, *, parallel=True):
         if stopped:
             break
 
-    if runner._full_suite_environment_fingerprint() != environment:
+    if not cancelled() and runner._full_suite_environment_fingerprint() != environment:
         # A prerequisite prepared by one worker invalidates mixed-environment
         # results. Revalidate the same retained source in the now-ready runtime.
         return runner._run_verification_commands(commands, workspace)
@@ -99,14 +110,14 @@ def run_component_checks(runner, commands, workspace, *, parallel=True):
     payload = {key: [] for key in ('source_commands', 'command_timings', 'failure_evidence',
                                   'proof_refs', 'executed_tests', 'nonfatal_source_commands')}
     payload.update(parallel_workers=workers, planned_commands=len(commands),
-                   completed_commands=len(ordered), certificate_hits=0)
+                   completed_commands=len(ordered), certificate_hits=0, cancelled=cancelled())
     for index, result in ordered:
         payload['source_commands'].append(commands[index])
         for key in ('command_timings', 'failure_evidence', 'proof_refs', 'executed_tests', 'nonfatal_source_commands'):
             payload[key].extend(result.payload.get(key, []))
         payload['certificate_hits'] += result.payload.get('certificate_hits', 0)
     return _VerificationResult(
-        not stopped and len(ordered) == len(commands),
+        not stopped and not cancelled() and len(ordered) == len(commands),
         '\n\n'.join(result.summary for _, result in ordered),
         commands=tuple(command for _, result in ordered for command in result.commands),
         returncodes=tuple(code for _, result in ordered for code in result.returncodes),

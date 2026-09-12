@@ -41,6 +41,38 @@ writing or `verify_existing` validation is admitted. Planning is not a successfu
 repair, and format correction, scope reclassification and introduced-regression
 repair do not mint achievement credits. Existing cumulative counts remain intact.
 
+## Concurrent code review and component verification
+
+After quick checks pass, the controller starts independent code review and
+expanded component verification together on the same frozen candidate. Review
+runs to completion even when verification fails first. Rejection cancels running
+verification processes and stops further command dispatch; the controller joins
+verification before returning for code changes. An approval waits for expanded
+verification, and both must pass. Quick-check failure still prevents both stages.
+Resumed candidates use the same entry point; final integration gates remain.
+
+Verification uses a separate checkout and a private snapshot of runner feedback.
+The foreground reviewer owns experiment writes; check timings and worker feedback
+are merged after joining. Source or environment changes invalidate concurrent
+success. Completed test failures are retained alongside review findings; pytest
+failure checkpoints preserve diagnostics even when cancellation precedes the
+final receipt. Cancellation alone is not a new code defect or successful proof.
+
+Successful command certificates survive rejection of another command or the code
+review. On the next candidate, existing ledger rules decide reuse: exact source
+and execution context may reuse an unchanged success, while reuse across source
+changes requires a complete observed-input manifest whose inputs still match,
+plus matching execution policy and environment. Failure, cancellation, incomplete
+cleanup and incomplete input observations never supply cross-source success.
+Only whole original command cohorts are reused; passing cases inside an aborted
+command do not authorize skipping that command's remaining fixtures or cases.
+
+The existing `execution.acceleration.verification_input_mode` setting remains in
+force: `on` permits validated observed-input reuse, `observe` executes to audit
+potential hits, and `off` disables that reuse. This change does not override those
+choices or weaken input validation to manufacture more cache hits. The concurrency
+change reduces waiting; it does not add another model review per candidate.
+
 Planning inputs include native capability observations from a disposable child of
 the verification interpreter (Python APIs and seccomp notification-listener
 compatibility). The child has a ten-second timeout and installs only an ALLOW

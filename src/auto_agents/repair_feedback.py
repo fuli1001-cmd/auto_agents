@@ -68,6 +68,10 @@ def command_evidence(process, command, *, phase, root, candidate='', environment
         kind, action = 'dependency', 'prepare_environment'
     elif getattr(process, "infrastructure_failure_id", "") == "verification_source_changed":
         kind, action = "verification", "repair_verification"
+    elif termination == 'cancelled' and failures:
+        kind, action = 'assertion', 'repair_code'
+    elif termination == 'cancelled':
+        kind, action = 'cancelled', 'revalidate'
     elif termination:
         kind, action = 'execution', 'diagnose_execution'
     elif failures or re.search(r'(?i)(AssertionError|\bFAILED\b|assert )', output):
@@ -124,6 +128,10 @@ def record_stage_failure(runner, phase, result, role):
     """A successful process can still return a failed domain-level replay."""
     if result.ok or result.payload.get('outcome') == 'deferred':
         return
+    if result.payload.get('cancelled') or 'cancelled' in result.termination_reasons:
+        from .self_repair import AutoAgentsSelfRepairRunner
+        if not AutoAgentsSelfRepairRunner._failed_source_commands(result):
+            return  # Review rejection cancelled work; no new verification defect.
     from .repair_control import atomic_json
     from .verification_ledger import ledger_root
 
@@ -152,5 +160,5 @@ def record_stage_failure(runner, phase, result, role):
         entry['artifacts']['result'] = str(path)
     except OSError as error:
         entry['artifact_error'] = str(error)
-    result.payload['failure_evidence'] = [entry]
+    result.payload['failure_evidence'] = [*result.payload.get('failure_evidence', []), entry]
     runner._candidate_failure_evidence = [*getattr(runner, '_candidate_failure_evidence', []), entry]

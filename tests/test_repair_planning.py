@@ -246,15 +246,16 @@ def test_probe_cannot_mutate_original_or_claim_changed_source_as_evidence(setup)
 
 
 @pytest.mark.parametrize('quick_ok,review_ok', [(False, True), (True, False), (True, True)])
-def test_small_check_precedes_review_and_does_not_run_expanded_suite(setup, quick_ok, review_ok):
+def test_small_check_precedes_both_review_and_expanded_suite(setup, quick_ok, review_ok):
     runner, state, plan, calls = setup
     runner._candidate_group.update(plan, planning_receipt='reviewed')
     sequence = []
     runner._run_verification_commands = lambda *a, **kw: (sequence.append('quick') or _VerificationResult(quick_ok, 'quick'))
     runner._review_candidate = lambda *a, **kw: (sequence.append('review') or _VerificationResult(review_ok, 'review'))
-    runner._run_active_group_verification = lambda *a: pytest.fail('expanded verification ran early')
+    runner._run_active_group_verification = lambda *a, **kw: (sequence.append('expanded') or _VerificationResult(True, 'expanded'))
     quick, review = runner._early_candidate_checks(runner.repo_root, state.base_commit)
-    assert sequence == (['quick', 'review'] if quick_ok else ['quick'])
+    assert sequence[0] == 'quick'
+    assert sorted(sequence[1:]) == (['expanded', 'review'] if quick_ok else [])
     assert quick.ok == quick_ok
     assert review.ok == (quick_ok and review_ok)
 
@@ -291,9 +292,10 @@ def test_actual_candidate_pipeline_stops_before_later_stages(setup, stage):
     def review(*args, **kwargs):
         sequence.append('review')
         return _VerificationResult(stage != 'review', 'semantic review', payload={'findings': []})
-    def expanded(*args):
+    def expanded(*args, **kwargs):
         sequence.append('expanded')
-        return _VerificationResult(False, 'expanded regression failed', returncodes=[1])
+        return _VerificationResult(False, 'expanded regression failed', returncodes=[1],
+            payload={'source_commands': plan['quick_checks']})
     runner.target_orchestrator._call_with_failover = writer
     with (patch.object(runner, '_prepare_component_plan', side_effect=prepare),
           patch.object(runner, '_build_prompt', return_value='repair this candidate'),
@@ -306,9 +308,13 @@ def test_actual_candidate_pipeline_stops_before_later_stages(setup, stage):
           patch.object(runner, '_full_suite_differential', side_effect=AssertionError('full suite ran too early'))):
         result = runner._run_candidate(experiment_id=state.experiment_id, attempt=1,
                                       deadline=None, prior_failures=[], seen_fingerprints=set())
-    expected = ['plan', 'writer', 'quick', 'review', 'expanded']
-    stop = {'plan': 1, 'quick': 3, 'review': 4, 'expanded': 5}[stage]
-    assert sequence == expected[:stop]
+    expected = ['plan', 'writer', 'quick']
+    assert sequence[:3] == expected[:1 if stage == 'plan' else 3]
+    assert sorted(sequence[3:]) == ([] if stage in {'plan', 'quick'} else ['expanded', 'review'])
+    if stage == 'review':
+        assert result.status == 'candidate_review_rejected'
+        assert 'semantic review' in result.verification and 'expanded regression failed' in result.verification
+        assert result.sticky_verification_commands == plan['quick_checks']
     assert not result.ok and result.status != 'candidate_group_completed'
     assert 'validation:focused' not in result.passed_obligations
 

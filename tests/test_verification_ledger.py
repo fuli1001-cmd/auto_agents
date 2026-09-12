@@ -59,7 +59,7 @@ def test_proof_identity_invalidates_actual_inputs(repository, change):
     assert not result.cached
 
 
-@pytest.mark.parametrize("kind", ["failure", "timeout", "cleanup", "mutation"])
+@pytest.mark.parametrize("kind", ["failure", "timeout", "cancelled", "cleanup", "mutation"])
 def test_uncertain_and_failed_results_are_not_cached(repository, kind):
     ledger = VerificationLedger(repository)
     def run():
@@ -68,6 +68,8 @@ def test_uncertain_and_failed_results_are_not_cached(repository, kind):
             result.ok, result.returncode = False, 1
         if kind == "timeout":
             result.termination_reason = "timeout"
+        if kind == "cancelled":
+            result.termination_reason = "cancelled"
         if kind == "cleanup":
             result.cleanup_incomplete = True
         if kind == "mutation":
@@ -75,6 +77,38 @@ def test_uncertain_and_failed_results_are_not_cached(repository, kind):
         return result
     ledger.execute("pytest", run)
     assert not ledger.execute("pytest", passed).cached
+
+
+@pytest.mark.parametrize('change', ['unrelated', 'dependency', 'missing_created', 'incomplete'])
+def test_retry_reuses_only_successes_with_unchanged_complete_inputs(repository, change):
+    from auto_agents.verification_manifest import path_digest
+    ledger = VerificationLedger(repository)
+    def run():
+        result = passed()
+        result.observed_inputs = {'code.py': path_digest(repository / 'code.py'), '!optional.cfg': 'missing'}
+        result.input_trace_complete = change != 'incomplete'
+        return result
+    ledger.execute('pytest', run, result_cache_scope='observed_inputs', input_mode='on')
+    if change == 'dependency':
+        (repository / 'code.py').write_text('VALUE=2\n')
+    elif change == 'missing_created':
+        (repository / 'optional.cfg').write_text('new configuration')
+    else:
+        (repository / 'unrelated.md').write_text('unrelated documentation')
+    subprocess.run(['git', 'add', '.'], cwd=repository, check=True)
+    subprocess.run(['git', 'commit', '-qm', 'candidate correction'], cwd=repository, check=True)
+    result = ledger.execute('pytest', run, result_cache_scope='observed_inputs', input_mode='on')
+    assert result.cached == (change == 'unrelated')
+
+
+def test_completed_command_survives_cancellation_of_a_different_command(repository):
+    ledger = VerificationLedger(repository)
+    ledger.execute('completed', passed)
+    cancelled = passed()
+    cancelled.ok, cancelled.returncode, cancelled.termination_reason = False, 130, 'cancelled'
+    ledger.execute('interrupted', lambda: cancelled)
+    assert ledger.execute('completed', passed).cached
+    assert not ledger.execute('interrupted', passed).cached
 
 
 def test_audit_disagreement_revokes_namespace(repository):
