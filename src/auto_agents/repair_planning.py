@@ -785,6 +785,13 @@ def prepare_component(runner, workspace):
     context['findings'] = [f.to_dict() for f in findings if not nonblocking_scope(experiment, f)]
     group['finding_ids'] = [f['finding_id'] for f in context['findings']]
     context['component'] = group
+    from .repair_completion import _memory as completion_memory
+    completed = completion_memory(runner, group)
+    if completed.get('completion') or group.get('status') == 'needs_revalidation':
+        context['completed_component'] = {
+            'receipt': completed.get('completion'), 'assessment': completed.get('completion_assessment'),
+            'instruction': 'Retain the existing implementation. Revalidate changed evidence; select verify_existing '
+                           'unless a concrete current defect requires code changes. Do not rewrite completed mechanisms.'}
     signature = _component_signature(group)
     strategy = digest([POLICY_VERSION, experiment.base_commit, experiment.contract_fingerprint,
                        signature, context['environment'], digest(context['runtime_capabilities']),

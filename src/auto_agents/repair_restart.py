@@ -1,4 +1,4 @@
-"""Carry cancelled repair work into a newly authorized invocation as unverified input."""
+"""Carry stopped work and conditionally reusable component evidence into a new invocation."""
 from __future__ import annotations
 
 import hashlib
@@ -16,7 +16,7 @@ _HISTORY_FILES = ("result.json", "review-receipt.json", "candidate.diff", "parti
 
 
 def _identity(payload):
-    # A new engine revision requires new proof, but need not erase repair work.
+    # An engine revision is evaluated by component proof guards after import.
     # Every other input, including project, workflow, scope and environment,
     # must match. This is deliberately stricter than cross-project job dedup.
     return digest({key: value for key, value in payload.items() if key != "base"})
@@ -134,7 +134,7 @@ def _wait_for_quiescence(source):
 
 
 def import_cancelled_repair(store, job, working, repository, *, revision=None):
-    """Seed stopped work only; never reactivate the prior job or its receipts."""
+    """Seed stopped work; the new runner checks component evidence after merging."""
     payload = job["payload"]
     invocation = payload.get("invocation", {})
     subject = ("session-" + invocation["session_id"] if invocation.get("session_id")
@@ -201,8 +201,9 @@ def import_cancelled_repair(store, job, working, repository, *, revision=None):
                 shutil.copy2(source_worktree / name, target, follow_symlinks=False)
             if not _quiescent(source) or (snapshot, source_candidate) != _restart_snapshot(source, source_worktree, source_store, experiment, repository):
                 raise RuntimeError("cancelled repair changed during recovery; retained source is untouched")
-            # Only history and code cross the invocation boundary. Old replay,
-            # approval, provider-session and full-suite receipts do not.
+            # Component proof records can cross this boundary but are not
+            # admitted here. Whole-repair replay, native provider sessions and
+            # full-suite promotion remain invalidated.
             for candidate_id in candidate_ids:
                 candidate = source_store.candidate_root(candidate_id)
                 artifacts = candidate / "verification-evidence"
@@ -245,7 +246,11 @@ def import_cancelled_repair(store, job, working, repository, *, revision=None):
                                  and experiment.repair_design.get("contract_fingerprint") == experiment.contract_fingerprint)
             if retain_design:
                 for group in experiment.finding_groups:
-                    group["status"] = "pending"
+                    if group.get('status') == 'completed':
+                        group['status'] = 'needs_revalidation'
+                    # Completion receipts travel as immutable evidence. The
+                    # new runner evaluates them after upstream integration and
+                    # runtime preparation, never against this pre-merge tree.
             else:
                 experiment.repair_design = {}
                 experiment.repair_design_fingerprint = ""

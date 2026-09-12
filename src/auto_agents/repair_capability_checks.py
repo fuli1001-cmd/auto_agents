@@ -15,10 +15,17 @@ def _probe_environment():
     return env
 
 
+def _cancel_event():
+    from .repair_concurrent_validation import verification_cancel
+    return verification_cancel.get()
+
+
 def metadata_observation(runner, workspace):
     from . import artifact_temp as tempfile
     from .verification_ledger import source_identity
     try:
+        if _cancel_event() is not None and _cancel_event().is_set():
+            raise InterruptedError('capability observation cancelled')
         # Candidate launchers are untrusted. Their real dispatch must never
         # run against the retained implementation workspace during planning.
         dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=all'], cwd=workspace,
@@ -77,7 +84,7 @@ def _metadata_observation_in_snapshot(runner, workspace):
                     runner._verification_python(), '-I', '-c', program]
             with runner._verification_argv(argv, root) as arguments:
                 process = run_supervised_shell_command('exec ' + shlex.join(arguments), cwd=root,
-                    env=_probe_environment(), timeout_seconds=15, kind='repair-metadata-capability')
+                    env=_probe_environment(), timeout_seconds=15, kind='repair-metadata-capability', cancel_event=_cancel_event())
             if process.termination_reason or process.cleanup_incomplete or process.returncode:
                 return {**result, 'status': 'inconclusive', 'reason': process.termination_reason or process.stderr[-1600:]}
             observed = json.loads(process.stdout)
@@ -108,7 +115,7 @@ def namespace_observation(runner, workspace):
     try:
         with runner._verification_argv(argv, Path(workspace)) as arguments:
             process = run_supervised_shell_command('exec ' + shlex.join(arguments), cwd=Path(workspace),
-                env=_probe_environment(), timeout_seconds=15, kind='repair-capability')
+                env=_probe_environment(), timeout_seconds=15, kind='repair-capability', cancel_event=_cancel_event())
         if process.termination_reason or process.cleanup_incomplete:
             return {**result, 'status': 'inconclusive', 'reason': process.termination_reason or 'cleanup incomplete'}
         if process.returncode == 0:
@@ -130,5 +137,6 @@ def production_capabilities(runner, workspace):
         return cached[1]
     result = namespace_observation(runner, workspace)
     result['nested_gate_metadata'] = metadata_observation(runner, workspace)
-    runner._production_capability_cache = (key, result)
+    if _cancel_event() is None or not _cancel_event().is_set():
+        runner._production_capability_cache = (key, result)
     return result

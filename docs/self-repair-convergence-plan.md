@@ -41,6 +41,53 @@ writing or `verify_existing` validation is admitted. Planning is not a successfu
 repair, and format correction, scope reclassification and introduced-regression
 repair do not mint achievement credits. Existing cumulative counts remain intact.
 
+## Conditional component completion
+
+A component that passes independent code review and its complete expanded
+acceptance can receive an immutable controller-owned completion receipt. The
+receipt binds its contract, plan/acceptance inventory, source and metadata,
+execution/reviewer policy, runtime and project inputs, original review and
+verification artifacts, and known findings. Receipts are owned by a component;
+overlapping groups cannot approve each other merely by sharing file paths.
+
+Cancellation/import retains these artifacts but initially marks completed groups
+`needs_revalidation`. After upstream integration and runtime preparation, the
+runner checks the receipt before choosing the next group:
+
+* Valid evidence restores `completed` and bypasses that group's planning, writer,
+  review and acceptance stages. No new candidate or progress credit is created.
+* Changed conditions produce `needs_revalidation`, with explicit reasons and
+  affected commands. Retain the implementation and prefer `verify_existing`
+  unless a concrete defect requires a code change.
+* Confirmed new/reopened defects produce `pending`; affected dependants cannot
+  remain completed while their prerequisites need revalidation.
+
+Known-complete static dependencies may establish independence from an unrelated
+source edit. Complete runtime observations may retain whole pytest command
+cohorts according to the existing verification_input_mode policy. Observed
+filesystem metadata is rechecked inside the verification namespace. Opaque
+checks require their original source and execution context; identical source
+alone cannot carry them across jobs. Missing/changed artifacts, policy, runtime,
+project inputs, ledger revocation or unresolved dependency independence prevent
+reuse. Shell preparation barriers and original fixture cohorts are preserved.
+
+An affected component can reuse independent successful command cohorts while
+running the rest. These results are recorded as retained completion evidence,
+not newly executed tests. Quick checks, independent review and the final global
+integration/replay/full-suite gates still apply where required; a completion
+receipt cannot publish a repair or replace final integrated verification.
+
+Older archives have no portable completion receipt and need initial revalidation.
+Even afterward, incomplete dependency observations may still require revalidation
+on a new job. A fresh successful run that cannot seal a portable receipt remains
+valid only for its current process/source; it does not cause a loop on a stale
+receipt or silently acquire portability. History and search budgets are retained.
+
+`component_completion_checked` records the final decision and its reason after
+dependency propagation; `component_checks_reused` identifies retained cohorts.
+The performance report includes these decisions and restored completed-group IDs,
+without counting routine checks of an already-completed flag as new time savings.
+
 ## Concurrent code review and component verification
 
 After quick checks pass, the controller starts independent code review and
@@ -110,9 +157,8 @@ replace the sandbox architecture, remove metadata restrictions, or mark g04 done
 Current group state after that run: g01 and g02 completed; g04 had historical
 completion but is pending again because of the confirmed compatibility defect;
 g03 and g05 through g09 remain pending. Cancellation followed by a new collab
-imports retained code/history and invalidates old acceptance status. It can use
-verify_existing to avoid another writer, but does not promise to skip current
-review or verification of an already implemented group.
+imports retained code/history and conditionally checks component completion as
+described above. Older records without those receipts still require revalidation.
 
 Planning inputs include native capability observations from a disposable child of
 the verification interpreter (Python APIs and seccomp notification-listener
@@ -156,8 +202,9 @@ proof schema 4 and old counters. Matching original request/input/result artifact
 can recover a legacy draft and an interrupted review slot; an old approval flag
 never manufactures a new approval. New memory artifacts use the existing
 transactional restart-copy mechanism. Future-schema state cannot be overwritten.
-The existing trusted verification ledger continues to govern all proof reuse;
-cross-environment or unproved cross-snapshot reuse is not enabled by this work.
+The trusted verification ledger governs command-cache reuse; conditional component
+receipts add the checks described above. Neither permits unproved cross-environment
+or cross-snapshot reuse.
 
 ## Component verification latency
 

@@ -107,13 +107,13 @@ def run_component_checks(runner, commands, workspace, *, parallel=True):
         # results. Revalidate the same retained source in the now-ready runtime.
         return runner._run_verification_commands(commands, workspace)
     ordered = sorted(results.items())
-    payload = {key: [] for key in ('source_commands', 'command_timings', 'failure_evidence',
+    payload = {key: [] for key in ('source_commands', 'command_timings', 'completion_inputs', 'failure_evidence',
                                   'proof_refs', 'executed_tests', 'nonfatal_source_commands')}
     payload.update(parallel_workers=workers, planned_commands=len(commands),
                    completed_commands=len(ordered), certificate_hits=0, cancelled=cancelled())
     for index, result in ordered:
         payload['source_commands'].append(commands[index])
-        for key in ('command_timings', 'failure_evidence', 'proof_refs', 'executed_tests', 'nonfatal_source_commands'):
+        for key in ('command_timings', 'completion_inputs', 'failure_evidence', 'proof_refs', 'executed_tests', 'nonfatal_source_commands'):
             payload[key].extend(result.payload.get(key, []))
         payload['certificate_hits'] += result.payload.get('certificate_hits', 0)
     return _VerificationResult(
