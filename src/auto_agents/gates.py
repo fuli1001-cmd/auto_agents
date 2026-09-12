@@ -1525,6 +1525,7 @@ def run_commands(
     adaptive_timeout_enabled: bool = False,
     command_idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
     progress: Optional[GateProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> GateResult:
     results: List[CommandResult] = []
     ok = True
@@ -1533,7 +1534,8 @@ def run_commands(
         result = _run_command(
             command, cwd, timeout_seconds=command_timeout_seconds,
             adaptive_timeout_enabled=adaptive_timeout_enabled,
-            idle_timeout_seconds=command_idle_timeout_seconds, progress=progress
+            idle_timeout_seconds=command_idle_timeout_seconds, progress=progress,
+            **({'cancel_event': cancel_event} if cancel_event is not None else {})
         )
         results.append(result)
         if not result.ok:

@@ -27,7 +27,7 @@ class Recorder:
         if self.output is not None:
             path = Path(str(self.output) + ".progress.json")
             temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps({"checkpoints": [identity]}))
+            temporary.write_text(json.dumps({"checkpoints": [identity], "failures": self.failures}))
             temporary.replace(path)
 
     def pytest_runtest_logstart(self, nodeid, location):
@@ -43,10 +43,10 @@ class Recorder:
         node["phases"][report.when] = report.outcome
         node["seconds"] += report.duration
         self.phases[report.when] = self.phases.get(report.when, 0.0) + report.duration
-        self.checkpoint(f"{report.nodeid}:{report.when}:{report.outcome}")
         if report.failed:
             self.failures.append({"nodeid": report.nodeid, "phase": report.when,
                                   "detail": str(report.longreprtext)})
+        self.checkpoint(f"{report.nodeid}:{report.when}:{report.outcome}")
 
     def pytest_exception_interact(self, node, call, report):
         if not report.failed or call.excinfo is None:

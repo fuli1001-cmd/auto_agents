@@ -48,6 +48,28 @@ class PlanFormatError(PlanningBlocked):
         super().__init__(message, code='plan_format', retry_kind='format', **details)
 
 
+def _exhausted_plan(episode):
+    feedback = episode.get('feedback', [])
+    review = next((item for item in feedback if isinstance(item, dict) and item.get('decision')), {})
+    issues = review.get('issues') or []
+    issue = issues[0] if isinstance(issues, list) and issues else None
+    if isinstance(issue, dict):
+        reason = str(issue.get('reason') or review.get('reason') or issue)
+        scenario = str(issue.get('scenario_id') or '')
+        codes = sorted(set(re.findall(r'\bE[A-Z]{2,}\b', json.dumps(issue, ensure_ascii=False))))
+        summary = ' '.join(part for part in (scenario, '/'.join(codes), reason) if part)
+    else:
+        diagnostic = next((item.get('message') for item in feedback
+                           if isinstance(item, dict) and item.get('message')), None)
+        summary = str(issue or review.get('reason') or diagnostic or feedback or 'no valid independent approval')
+    summary = ' '.join(summary.split())[:480]
+    return PlanningBlocked(f'{summary}; component plan episode exhausted after '
+                           f'{episode.get("semantic_attempts", 0)} semantic attempts',
+                           code='planning_exhausted', actual=feedback,
+                           constraint='new causal evidence or a corrected protocol is required',
+                           evidence=episode.get('latest_revision', {}).get('id', ''))
+
+
 def _text(value):
     return isinstance(value, str) and bool(value.strip())
 
@@ -76,11 +98,13 @@ def nonblocking_scope(experiment, finding):
 def _context(runner, workspace):
     experiment = runner._experiment
     from .repair_memory import compact_context
+    from .planning_capabilities import planning_capabilities
     return compact_context(runner, sanitize_evidence({
         'policy': POLICY_VERSION,
         'source': source_identity(workspace), 'source_commit': head_ref(workspace),
         'workspace': str(workspace), 'engine_base': experiment.base_commit,
         'environment': digest(runner._full_suite_environment_fingerprint()),
+        'runtime_capabilities': planning_capabilities(runner),
         'original_request': getattr(runner, '_invocation_context', None) or
                             getattr(runner.target_orchestrator, '_invocation_context', {}),
         'root_cause': runner._compact_diagnosis_payload() if hasattr(runner.diagnosis, 'to_dict') else {'error': str(runner.error)},
@@ -596,6 +620,8 @@ def _review_reuse_failure(runner, receipt, group):
                 and context.get('planner_request') == planner
                 and context.get('source') == receipt.get('source')
                 and context.get('source_commit') == receipt.get('source_commit')
+                and ('runtime_capabilities' not in receipt
+                     or receipt['runtime_capabilities'] == digest(context.get('runtime_capabilities')))
                 and result.get('decision') == 'APPROVE' and result.get('issues') == []
                 and receipt.get('execution_mode', receipt['plan'].get('mode', 'implement')) == _review_execution_mode(receipt['plan'], result)
                 and set(result.get('scenario_ids', [])) == {row['scenario_id'] for row in receipt['plan']['scenarios']}
@@ -757,13 +783,16 @@ def prepare_component(runner, workspace):
     context['component'] = group
     signature = _component_signature(group)
     strategy = digest([POLICY_VERSION, experiment.base_commit, experiment.contract_fingerprint,
-                       signature, context['environment'], [finding_key(f) for f in context['findings']]])
+                       signature, context['environment'], digest(context['runtime_capabilities']),
+                       [finding_key(f) for f in context['findings']]])
     reuse_failures, invalid_approvals = [], set()
     for receipt in experiment.planning_receipts.values():
         original_group = receipt.get('component', group)
         if receipt.get('decision') != 'APPROVE':
             continue
         failure = _review_reuse_failure(runner, receipt, original_group)
+        if receipt.get('runtime_capabilities') != digest(context['runtime_capabilities']):
+            failure = failure or 'planning runtime capabilities changed or were not recorded'
         if receipt.get('component_signature') == signature:
             if (failure and receipt.get('engine_base') == experiment.base_commit
                     and receipt.get('contract') == experiment.contract_fingerprint
@@ -847,8 +876,7 @@ def prepare_component(runner, workspace):
         if approved_draft:
             raise PlanningBlocked('approved plan evidence recovery exhausted; ' + json.dumps(reuse_failures),
                                   code='plan_approval_invalid', evidence=previous['id'])
-        raise PlanningBlocked('planning episode exhausted; new causal evidence or a corrected protocol is required',
-                              code='planning_exhausted', evidence=episode.get('latest_revision', {}).get('id', ''))
+        raise _exhausted_plan(episode)
     previous = previous or latest_revision(runner, group)
     if episode.get('phase') == 'draft' and episode.get('last_request'):
         from .repair_memory import recover_draft_output
@@ -869,7 +897,13 @@ def prepare_component(runner, workspace):
         ' Alternatively return {amendment:{parent_revision:previous_revision.id,set:{only_changed_plan_fields},'
         'replace_steps:{existing_step_id:new_text}}}. Use previous_revision.step_ids for local step edits. '
         'When a previous draft exists, prefer an amendment; read its draft_ref only for fields you need '
-        'to change. Retain all other fields through controller materialization. Do not restate completed '
+        'to change. Retain all other fields through controller materialization. Read runtime_capabilities '
+        'before proposing OS mechanisms or diagnostic APIs. If additional_listener_supported=false, '
+        'do not install a second notification listener in an inherited filter chain: any nested design '
+        'must preserve ancestor restrictions through an existing authenticated supervisor/policy owner, '
+        'or identify a supported alternative with concrete diagnostics. Unknown capabilities require '
+        'bounded diagnostics, not assumed support. Capability observations do not prove the repair. '
+        'Do not restate completed '
         'investigations. For a discovered compatibility pattern, inspect the related acceptance fixtures '
         'for the same pattern and require a representative check before code review. '
         'Keep stable scenario IDs. mode=verify_existing skips writing when retained code only needs validation. '
@@ -976,7 +1010,10 @@ def prepare_component(runner, workspace):
                 'Independently audit the proposed component plan. Inspect its changes, previous feedback and '
                 'affected interactions; retain unchanged established decisions instead of reconstructing history. '
                 'Start from plan_delta, source_delta and unresolved feedback. Challenge the changed mechanisms '
-                'with concrete counterexamples, including the same failure pattern in related acceptance '
+                'against runtime_capabilities and the actual inherited execution topology, including the '
+                'outer production verification wrapper. Check shared-operation denial AND required private '
+                'operations; isolated helper simulations cannot certify nested compatibility. '
+                'Give concrete counterexamples, including the same failure pattern in related acceptance '
                 'fixtures. Retained scenarios still require an explicit evidence-based decision. '
                 'Every scenario must be reviewed or explicitly retained with evidence; missing dependencies require '
                 'inspection. A current defect with a concrete planned fix does not itself reject the plan. '
@@ -994,6 +1031,7 @@ def prepare_component(runner, workspace):
                 'component_signature': signature, 'component': group, 'findings': context['findings'],
                 'contract': experiment.contract_fingerprint, 'engine_base': experiment.base_commit,
                 'plan': plan, 'planner_request': planner_id, 'request_id': reviewer_id,
+                'runtime_capabilities': digest(context['runtime_capabilities']),
                 'decision': 'APPROVE' if approved else 'REVISE', 'revision': context['revision'],
                 'probe_results': probes, 'feedback': [review], 'execution_mode': _review_execution_mode(plan, review)}
             experiment.planning_receipts[key] = receipt
@@ -1029,9 +1067,7 @@ def prepare_component(runner, workspace):
     if previous and previous.get('status') == 'APPROVE':
         raise PlanningBlocked('approved plan evidence recovery exhausted; ' + json.dumps(reuse_failures),
                               code='plan_approval_invalid', evidence=previous['id'])
-    raise PlanningBlocked(f'component plan exhausted after {episode["semantic_attempts"]} semantic attempts; '
-                          + json.dumps(feedback, ensure_ascii=False),
-                          code='planning_exhausted', evidence=episode.get('latest_revision', {}).get('id', ''))
+    raise _exhausted_plan(episode)
 
 
 def history_report(experiment):

@@ -92,6 +92,56 @@ def test_rejection_is_bounded_and_persisted_without_writing_code(setup):
     assert len(calls) == 6 and not state.progress_credits
 
 
+def test_rejection_exposes_current_blocker_after_restart(setup):
+    runner, state, plan, calls = setup
+    original = runner.target_orchestrator._call_with_failover
+    issue = dict(scenario_id='dirty_repository', reason='nested listener cannot start',
+                 counterexample='inherited listener makes NEW_LISTENER fail with EBUSY',
+                 requested_change='narrow policy through existing authenticated supervisor')
+    def reject(request):
+        result = original(request)
+        if request.stage == 'self_repair_plan_review':
+            result.summary = json.dumps(dict(decision='REVISE', reason='incompatible topology',
+                                             issues=[issue], scenario_ids=[]))
+        return result
+    runner.target_orchestrator._call_with_failover = reject
+    with patch('auto_agents.repair_planning._probe', return_value={'matches': True, 'outcome': 'pass'}):
+        for _ in range(2):
+            with pytest.raises(PlanningBlocked, match='dirty_repository EBUSY') as caught:
+                prepare_component(runner, runner.repo_root)
+            assert caught.value.detail['actual'][0]['issues'] == [issue]
+            assert caught.value.detail['code'] == 'planning_exhausted'
+            assert caught.value.detail['evidence']
+            assert len(str(caught.value)) < 600
+            runner._experiment = runner._experiment_store.load()
+    assert len(calls) == 6 and not state.progress_credits and state.attempt_count == 0
+
+
+@pytest.mark.parametrize('mutation', ['changed', 'legacy', 'tampered'])
+def test_runtime_capabilities_bind_independent_approval(setup, mutation):
+    from auto_agents.repair_planning import _review_reuse_failure, digest
+    runner, state, plan, calls = setup
+    observed = {'version': 1, 'acceptance_proof': False,
+                'seccomp_notification': {'additional_listener_supported': False}}
+    with patch('auto_agents.planning_capabilities.planning_capabilities', return_value=observed), \
+         patch('auto_agents.repair_planning._probe', return_value={'matches': True, 'outcome': 'pass'}):
+        first = prepare_component(runner, runner.repo_root)
+        assert all(context['runtime_capabilities'] == observed for _, context in calls)
+        assert first['runtime_capabilities'] == digest(observed)
+        assert not _review_reuse_failure(runner, first, first['component'])
+        if mutation == 'changed':
+            observed['seccomp_notification']['additional_listener_supported'] = None
+        elif mutation == 'legacy':
+            first.pop('runtime_capabilities')
+        else:
+            first['runtime_capabilities'] = 'forged'
+            assert _review_reuse_failure(runner, first, first['component'])
+        runner._candidate_group = dict(state.finding_groups[0])
+        second = prepare_component(runner, runner.repo_root)
+    assert second['request_id'] != first['request_id']
+    assert len(calls) == 3  # Re-audit the retained draft without another planner call.
+
+
 @pytest.mark.parametrize('mutation', ['environment', 'foreign_source', 'new_counterexample'])
 def test_approval_reuse_requires_unchanged_assumptions(setup, mutation):
     runner, state, plan, calls = setup
@@ -196,15 +246,16 @@ def test_probe_cannot_mutate_original_or_claim_changed_source_as_evidence(setup)
 
 
 @pytest.mark.parametrize('quick_ok,review_ok', [(False, True), (True, False), (True, True)])
-def test_small_check_precedes_review_and_does_not_run_expanded_suite(setup, quick_ok, review_ok):
+def test_small_check_precedes_both_review_and_expanded_suite(setup, quick_ok, review_ok):
     runner, state, plan, calls = setup
     runner._candidate_group.update(plan, planning_receipt='reviewed')
     sequence = []
     runner._run_verification_commands = lambda *a, **kw: (sequence.append('quick') or _VerificationResult(quick_ok, 'quick'))
     runner._review_candidate = lambda *a, **kw: (sequence.append('review') or _VerificationResult(review_ok, 'review'))
-    runner._run_active_group_verification = lambda *a: pytest.fail('expanded verification ran early')
+    runner._run_active_group_verification = lambda *a, **kw: (sequence.append('expanded') or _VerificationResult(True, 'expanded'))
     quick, review = runner._early_candidate_checks(runner.repo_root, state.base_commit)
-    assert sequence == (['quick', 'review'] if quick_ok else ['quick'])
+    assert sequence[0] == 'quick'
+    assert sorted(sequence[1:]) == (['expanded', 'review'] if quick_ok else [])
     assert quick.ok == quick_ok
     assert review.ok == (quick_ok and review_ok)
 
@@ -241,9 +292,10 @@ def test_actual_candidate_pipeline_stops_before_later_stages(setup, stage):
     def review(*args, **kwargs):
         sequence.append('review')
         return _VerificationResult(stage != 'review', 'semantic review', payload={'findings': []})
-    def expanded(*args):
+    def expanded(*args, **kwargs):
         sequence.append('expanded')
-        return _VerificationResult(False, 'expanded regression failed', returncodes=[1])
+        return _VerificationResult(False, 'expanded regression failed', returncodes=[1],
+            payload={'source_commands': plan['quick_checks']})
     runner.target_orchestrator._call_with_failover = writer
     with (patch.object(runner, '_prepare_component_plan', side_effect=prepare),
           patch.object(runner, '_build_prompt', return_value='repair this candidate'),
@@ -256,9 +308,13 @@ def test_actual_candidate_pipeline_stops_before_later_stages(setup, stage):
           patch.object(runner, '_full_suite_differential', side_effect=AssertionError('full suite ran too early'))):
         result = runner._run_candidate(experiment_id=state.experiment_id, attempt=1,
                                       deadline=None, prior_failures=[], seen_fingerprints=set())
-    expected = ['plan', 'writer', 'quick', 'review', 'expanded']
-    stop = {'plan': 1, 'quick': 3, 'review': 4, 'expanded': 5}[stage]
-    assert sequence == expected[:stop]
+    expected = ['plan', 'writer', 'quick']
+    assert sequence[:3] == expected[:1 if stage == 'plan' else 3]
+    assert sorted(sequence[3:]) == ([] if stage in {'plan', 'quick'} else ['expanded', 'review'])
+    if stage == 'review':
+        assert result.status == 'candidate_review_rejected'
+        assert 'semantic review' in result.verification and 'expanded regression failed' in result.verification
+        assert result.sticky_verification_commands == plan['quick_checks']
     assert not result.ok and result.status != 'candidate_group_completed'
     assert 'validation:focused' not in result.passed_obligations
 

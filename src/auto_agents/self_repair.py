@@ -2392,14 +2392,21 @@ class AutoAgentsSelfRepairRunner:
                         recoverable_validation=True)
                 if getattr(self, '_candidate_group', {}).get('planning_receipt'):
                     quick, early = self._early_candidate_checks(candidate_root, base_head)
+                    if quick.payload.get('cleanup_incomplete'):
+                        return SelfRepairResult(False, 'candidate_rejected', category=self.decision.category,
+                            reason=quick.summary, verification=early.summary + '\n\n' + quick.summary,
+                            candidate_id=candidate_id, candidate_ref=candidate_ref, candidate_commit=candidate_commit,
+                            experiment_id=experiment_id, fatal_candidate=True, recoverable_validation=True)
                     if not quick.ok or not early.ok:
                         rejected_ref = self._reject_pending_validation_ref(candidate_ref, candidate_commit, candidate_id)
-                        return SelfRepairResult(False, 'candidate_review_rejected' if quick.ok else 'candidate_verification_failed',
-                            category=self.decision.category, reason=early.summary if quick.ok else quick.summary,
-                            verification=early.summary if quick.ok else quick.summary,
+                        review_rejected = early.payload.get('early_review') and not early.ok
+                        return SelfRepairResult(False, 'candidate_review_rejected' if review_rejected else 'candidate_verification_failed',
+                            category=self.decision.category, reason=early.summary if review_rejected else quick.summary,
+                            verification=early.summary + '\n\n' + quick.summary,
                             candidate_id=candidate_id, candidate_ref=rejected_ref, candidate_commit=candidate_commit,
                             experiment_id=experiment_id, review_findings=early.payload.get('findings', []),
-                            resolved_finding_ids=early.payload.get('resolved_finding_ids', []))
+                            resolved_finding_ids=early.payload.get('resolved_finding_ids', []),
+                            sticky_verification_commands=self._failed_source_commands(quick))
                 focused = self._run_verification(candidate_root)
                 if not focused.ok:
                     rejected_ref = self._reject_pending_validation_ref(candidate_ref, candidate_commit, candidate_id)
@@ -4906,18 +4913,23 @@ class AutoAgentsSelfRepairRunner:
                     "quick_verification", "running current counterexamples before model review",
                 )
                 verification, early_review = self._early_candidate_checks(repair_root, base_head)
-                if verification.ok and not early_review.ok:
+                if verification.payload.get('cleanup_incomplete'):
+                    return SelfRepairResult(False, 'candidate_rejected', category=self.decision.category,
+                        reason=verification.summary, verification=early_review.summary + '\n\n' + verification.summary,
+                        experiment_id=experiment_id, candidate_id=candidate_id, base_commit=base_head,
+                        candidate_commit=candidate_commit, candidate_ref=candidate_ref, fatal_candidate=True)
+                if early_review.payload.get('early_review') and not early_review.ok:
                     return SelfRepairResult(False, 'candidate_review_rejected', category=self.decision.category,
-                        reason=early_review.summary, summary=summary, verification=early_review.summary,
+                        reason=early_review.summary, summary=summary,
+                        verification=early_review.summary + '\n\n' + verification.summary,
                         experiment_id=experiment_id, candidate_id=candidate_id, base_commit=base_head,
                         candidate_commit=candidate_commit, candidate_ref=candidate_ref,
                         patch_fingerprint=fingerprint, strategy_fingerprint=strategy_fingerprint,
                         review_findings=early_review.payload.get('findings', []),
                         finding_ids=[f['finding_id'] for f in early_review.payload.get('findings', [])],
                         resolved_finding_ids=early_review.payload.get('resolved_finding_ids', []),
-                        diff_line_count=diff_line_count, passed_obligations=['validation:quick'])
-                if verification.ok and self._candidate_group.get('planning_receipt'):
-                    verification = self._run_active_group_verification(repair_root)
+                        diff_line_count=diff_line_count, passed_obligations=['validation:quick'],
+                        sticky_verification_commands=self._failed_source_commands(verification))
                 if not verification.ok:
                     sticky = set(self._experiment.sticky_verification_commands)
                     failed_commands = self._failed_source_commands(verification)
@@ -8689,17 +8701,20 @@ class AutoAgentsSelfRepairRunner:
             return quick, _VerificationResult(False, 'quick checks failed; semantic review deferred')
         self._review_verification_binding = {'commands': commands, 'returncodes': quick.returncodes,
             'proof_refs': quick.payload.get('proof_refs', []), 'executed_tests': quick.payload.get('executed_tests', [])}
-        review = self._review_candidate(workspace, base_head,
-            progress_lease_seconds=getattr(self._autonomy_config(), 'candidate_review_timeout_seconds', 600),
-            replay_summary=quick.summary, phase='quick')
-        unresolved = {finding.finding_id for finding in self._experiment.blocking_findings()
-                      if finding.finding_id in group.get('finding_ids', [])}
-        unresolved.difference_update(review.payload.get('resolved_finding_ids', []))
-        if review.ok and unresolved:
-            review.ok = False
-            review.summary += '\nRequired findings were not resolved: ' + ', '.join(sorted(unresolved))
-        review.payload['early_review'] = True
-        return quick, review
+        def audit():
+            review = self._review_candidate(workspace, base_head,
+                progress_lease_seconds=getattr(self._autonomy_config(), 'candidate_review_timeout_seconds', 600),
+                replay_summary=quick.summary, phase='quick')
+            unresolved = {finding.finding_id for finding in self._experiment.blocking_findings()
+                          if finding.finding_id in group.get('finding_ids', [])}
+            unresolved.difference_update(review.payload.get('resolved_finding_ids', []))
+            if review.ok and unresolved:
+                review.ok = False
+                review.summary += '\nRequired findings were not resolved: ' + ', '.join(sorted(unresolved))
+            review.payload['early_review'] = True
+            return review
+        from .repair_concurrent_validation import review_and_verify
+        return review_and_verify(self, workspace, audit)
 
     def _guarded_component_checks(self, commands, workspace, *, parallel=False):
         from .verification_ledger import source_identity
@@ -8721,6 +8736,7 @@ class AutoAgentsSelfRepairRunner:
     def _run_active_group_verification(
         self,
         verification_root: Path,
+        *, record=True,
     ) -> "_VerificationResult":
         group = dict(getattr(self, "_candidate_group", {}) or {})
         from .repair_schedule import verification_plan
@@ -8738,7 +8754,7 @@ class AutoAgentsSelfRepairRunner:
             commands = ["git diff --check"]
         result = (self._guarded_component_checks(commands, verification_root, parallel=True)
                   if group.get('planning_receipt') else self._run_verification_commands(commands, verification_root))
-        if isinstance(experiment, SelfRepairExperiment):
+        if record and isinstance(experiment, SelfRepairExperiment):
             from .repair_memory import remember_check_timings
             remember_check_timings(self, verification_root, group, plan, result, phase='expanded')
         result.payload.setdefault("source_commands", commands[: len(result.returncodes)])
@@ -8844,6 +8860,10 @@ class AutoAgentsSelfRepairRunner:
 
     def _revalidate_verification_manifest(self, root, manifest, dependency_state):
         """Replay observed inputs with the same filesystem/UID/network policy."""
+        from .repair_concurrent_validation import verification_cancel
+        event = verification_cancel.get()
+        if event is not None and event.is_set():
+            return False
         runtime = root / '.auto-agents-gate-runtime'
         try:
             if runtime.is_symlink():
@@ -8855,7 +8875,12 @@ class AutoAgentsSelfRepairRunner:
                 argv = [self._verification_python(), str(Path(__file__).with_name('verification_manifest.py')),
                         str(root), str(request)]
                 with self._verification_argv(argv, root, dependency_state=dependency_state) as arguments:
-                    result = subprocess.run(arguments, cwd=root, capture_output=True, text=True, timeout=30)
+                    if event is None:
+                        result = subprocess.run(arguments, cwd=root, capture_output=True, text=True, timeout=30)
+                    else:
+                        from .process_supervision import run_supervised_shell_command
+                        result = run_supervised_shell_command('exec ' + shlex.join(arguments), cwd=root,
+                            env=dict(os.environ), timeout_seconds=30, cancel_event=event, kind='verification-manifest')
                 return result.returncode == 0 and json.loads(result.stdout).get('matches') is True
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             return False
@@ -8871,6 +8896,8 @@ class AutoAgentsSelfRepairRunner:
         command_idle_timeout_seconds: int = SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS,
     ) -> "_VerificationResult":
         from .repair_feedback import prompt_evidence
+        from .repair_concurrent_validation import verification_cancel, cancellation_result
+        cancel_event = verification_cancel.get()
         summaries = []
         command_failures = []
         rendered_commands: list[str] = []
@@ -8883,6 +8910,16 @@ class AutoAgentsSelfRepairRunner:
         command_timings = []
         certificate_hits = 0
         for command in commands:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = cancellation_result(command)
+                cancelled.summary = '\n\n'.join([*summaries, cancelled.summary])
+                cancelled.commands = (*rendered_commands, command)
+                cancelled.returncodes = (*returncodes, 130)
+                cancelled.termination_reasons = (*termination_reasons, 'cancelled')
+                cancelled.payload.update(failure_evidence=prompt_evidence(command_failures),
+                    source_commands=list(commands[:len(returncodes) + 1]), command_timings=command_timings,
+                    proof_refs=proof_refs, executed_tests=executed_tests, certificate_hits=certificate_hits)
+                return cancelled
             source_command = command
             from .repair_dependencies import verification_dependency_state
             dependency_state = verification_dependency_state(self._verification_python())
@@ -8938,7 +8975,8 @@ class AutoAgentsSelfRepairRunner:
                     for test_file, targets in by_file.items():
                         resources.update(self._full_suite_shard_resources(verification_root, test_file, tuple(targets))[0])
                     runtime.mkdir(exist_ok=True)
-                with (verification_resources(self._real_project_root, resources=resources) if managed else nullcontext(0.0)) as queued:
+                with (verification_resources(self._real_project_root, resources=resources,
+                        **({'cancel_event': cancel_event} if cancel_event is not None else {})) if managed else nullcontext(0.0)) as queued:
                     with (tempfile.TemporaryDirectory(dir=runtime, prefix="proof-") if managed else nullcontext(None)) as temporary:
                         args = shlex.split(command)
                         receipt = Path(temporary) / "pytest.json" if temporary else None
@@ -8955,7 +8993,8 @@ class AutoAgentsSelfRepairRunner:
                                 command_timeout_seconds=max(60, int(command_timeout_seconds)),
                                 adaptive_timeout_enabled=adaptive_timeout_enabled,
                                 command_idle_timeout_seconds=max(60, int(command_idle_timeout_seconds)),
-                                progress=diagnostic_progress)
+                                progress=diagnostic_progress,
+                                **({'cancel_event': cancel_event} if cancel_event is not None else {}))
                         process = gate.commands[0]
                         process.queue_seconds = queued
                         if profiled and receipt.exists():
@@ -8972,6 +9011,11 @@ class AutoAgentsSelfRepairRunner:
                             process.process_snapshot["verification_missing_dependencies"] = recorded.get("missing_dependencies", [])
                             if not recorded.get("collected") and process.ok and not allow_pytest_no_tests:
                                 process.ok, process.returncode = False, 5
+                        elif profiled and process.termination_reason == 'cancelled':
+                            # Partial reports are diagnostics only, never a success certificate.
+                            partial_path = Path(str(receipt) + '.progress.json')
+                            partial = read_json(partial_path, default={})
+                            process.process_snapshot['verification_failures'] = partial.get('failures', [])
                         elif profiled and process.ok:
                             process.ok, process.returncode = False, 125
                             process.stderr += "\ntrusted pytest receipt missing"
@@ -8987,12 +9031,26 @@ class AutoAgentsSelfRepairRunner:
                             verification_root, manifest, dependency_state))
                 except (OSError, RuntimeError):
                     pass  # Unavailable acceleration never supplies a proof.
-            process = (ledger.execute(command, execute, metadata="engine-pytest-v3:allow_empty=" + str(bool(allow_pytest_no_tests)),
-                                      fresh=bool(getattr(self, "_verification_fresh", False)),
-                                      result_cache_scope="observed_inputs",
-                                      input_mode=getattr(getattr(self.target_orchestrator.config.execution, "acceleration", None), "verification_input_mode", "observe"))
-                       if ledger is not None else execute())
+            try:
+                process = (ledger.execute(command, execute, metadata="engine-pytest-v3:allow_empty=" + str(bool(allow_pytest_no_tests)),
+                                          fresh=bool(getattr(self, "_verification_fresh", False)),
+                                          cancelled=cancel_event.is_set if cancel_event is not None else None,
+                                          result_cache_scope="observed_inputs",
+                                          input_mode=getattr(getattr(self.target_orchestrator.config.execution, "acceleration", None), "verification_input_mode", "observe"))
+                           if ledger is not None else execute())
+            except (OSError, RuntimeError):
+                if cancel_event is None or not cancel_event.is_set():
+                    raise
+                from .models import CommandResult
+                process = CommandResult(command, False, 130, termination_reason='cancelled',
+                                        stderr='expanded verification cancelled before execution')
             collected = process.process_snapshot.get('collected_tests')
+            if process.cleanup_incomplete:
+                self._verification_cleanup_incomplete = True
+                process.ok = False
+                process.returncode = process.returncode or 125
+                if cancel_event is not None:
+                    cancel_event.set()
             timing = {'command': source_command, 'seconds': float(process.duration_seconds),
                 'collected_cases': len(collected) if isinstance(collected, list) else None,
                 'passed_cases': len(process.executed_tests), 'cache_hit': bool(getattr(process, 'cached', False)),
@@ -9024,9 +9082,10 @@ class AutoAgentsSelfRepairRunner:
                     phase=_verification_role.get(), root=verification_root,
                     candidate=getattr(self, "_candidate_id", ""), environment=dependency_state.get("fingerprint", ""))
                 command_failures.append(evidence)
-                with self._feedback_lock:
-                    self._candidate_failure_evidence = [*getattr(self, "_candidate_failure_evidence", []), evidence]
-                if not getattr(self, '_planning_probe', False) and self._handle_verification_dependencies(process.stdout + "\n" + process.stderr, verification_root,
+                if evidence.get('failure_kind') != 'cancelled':
+                    with self._feedback_lock:
+                        self._candidate_failure_evidence = [*getattr(self, "_candidate_failure_evidence", []), evidence]
+                if not process.termination_reason and not getattr(self, '_planning_probe', False) and self._handle_verification_dependencies(process.stdout + "\n" + process.stderr, verification_root,
                         structured=process.process_snapshot.get("verification_missing_dependencies"), dependency_state=dependency_state):
                     # The candidate and its proof obligations stay identical. A
                     # changed toolchain gets a fresh environment-bound ledger.
@@ -9183,15 +9242,19 @@ class AutoAgentsSelfRepairRunner:
             or []
             if str(command).strip()
         }
+        partial_failures = {str(row.get('command', '')).strip() for row in result.payload.get('failure_evidence', [])
+                            if row.get('failures') or row.get('failure_count', 0)}
         return list(
             dict.fromkeys(
                 command
-                for command, returncode in zip(
+                for index, (command, returncode) in enumerate(zip(
                     source_commands,
                     result.returncodes,
-                )
+                ))
                 if int(returncode) != 0
                 and command not in nonfatal
+                and (index >= len(result.termination_reasons)
+                     or result.termination_reasons[index] != 'cancelled' or command in partial_failures)
             )
         )
 

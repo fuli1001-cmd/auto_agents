@@ -13,8 +13,17 @@ from .verification_ledger import source_identity, repository_identity
 
 @contextmanager
 def locked(path):
+    from .repair_concurrent_validation import verification_cancel
     with os.fdopen(os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), 'a+') as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        event = verification_cancel.get()
+        while True:
+            if event is not None and event.is_set():
+                raise InterruptedError('verification pool acquisition cancelled')
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if event is not None else 0))
+                break
+            except BlockingIOError:
+                event.wait(0.05)
         yield
 
 

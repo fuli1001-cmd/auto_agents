@@ -663,6 +663,7 @@ def exclusive_resource_lease(
     resources: Sequence[str],
     *,
     worker_id: str,
+    cancel_event: Optional[threading.Event] = None,
 ) -> object:
     handles: list[object] = []
     root = auto_agents_state_root() / "resource-locks"
@@ -677,8 +678,18 @@ def exclusive_resource_lease(
             )
             digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
             handle = (root / f"{digest}.lock").open("a+")
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             handles.append(handle)
+            if cancel_event is None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            else:
+                while True:
+                    if cancel_event.is_set():
+                        raise InterruptedError('resource acquisition cancelled')
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        cancel_event.wait(0.05)
         yield
     finally:
         for handle in reversed(handles):
