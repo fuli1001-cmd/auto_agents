@@ -1763,12 +1763,28 @@ class AutoAgentsSelfRepairRunner:
         self._invocation_context = dict(getattr(target_orchestrator, "_invocation_context", {}) or {})
         self._session_scoped = bool(self._invocation_context.get("session_id") and not self._invocation_context.get("run_id"))
 
+    def _group_progress(self) -> dict:
+        experiment = getattr(self, "_experiment", None)
+        groups = getattr(experiment, "finding_groups", [])
+        if not groups:
+            return {}
+        completed = sum(group.get("status") == "completed" for group in groups)
+        progress = {"total": len(groups), "completed": completed}
+        active = next((group for group in groups
+                       if group.get("group_id") == experiment.active_finding_group_id), None)
+        if active and active.get("status") != "completed":
+            # Scheduling follows dependencies and regression ownership, not list order.
+            progress.update(current=completed + 1, group_id=active["group_id"],
+                            title=redact_incident_text(str(active.get("title") or active["group_id"])))
+        return {"group_progress": progress}
+
     @contextmanager
     def _phase_timer(self, phase: str) -> Iterator[None]:
         started = time.perf_counter()
         identity = {'phase': phase, 'span_id': uuid.uuid4().hex,
                     'parent_span_id': _repair_phase_context.get().get('span_id', ''),
-                    'candidate': getattr(self, '_candidate_attempt', 0), 'candidate_id': getattr(self, '_candidate_id', '')}
+                    'candidate': getattr(self, '_candidate_attempt', 0), 'candidate_id': getattr(self, '_candidate_id', ''),
+                    **self._group_progress()}
         token = _repair_phase_context.set(identity)
         callback = getattr(self, "_control_phase_callback", None)
         if callback:
@@ -2914,7 +2930,8 @@ class AutoAgentsSelfRepairRunner:
         callback = getattr(self, "_control_phase_callback", None)
         if callback:
             callback("phase_started", {"phase": normalized_phase, "candidate_id": candidate_id,
-                                       "candidate": getattr(self, "_candidate_attempt", 0), "progress_only": True})
+                                       "candidate": getattr(self, "_candidate_attempt", 0), "progress_only": True,
+                                       **self._group_progress()})
         rendered_detail = " ".join(str(detail).split())
         message = (
             f"candidate={candidate_id or 'unknown'} "
@@ -3764,6 +3781,9 @@ class AutoAgentsSelfRepairRunner:
                 store.save(experiment)
                 continue
             self._candidate_group = dict(active_group)
+            callback = getattr(self, "_control_phase_callback", None)
+            if callback:
+                callback("phase_started", {"phase": "component_selected", **self._group_progress()})
             from .repair_actions import prepare_action
             self._candidate_next_action = prepare_action(self, experiment)
             if self._candidate_next_action.get("kind") == "blocked":
@@ -3905,11 +3925,13 @@ class AutoAgentsSelfRepairRunner:
                 candidate.base_commit = self._candidate_base_ref or experiment.best_search_ref
             candidate.parent_candidate_id = self._candidate_parent_id(candidate.base_commit)
             self._decorate_candidate_result(candidate, attempt=attempt)
+            group_progress = self._group_progress()
             self._register_search_result(candidate)
             callback = getattr(self, "_control_phase_callback", None)
             if callback:
                 callback("candidate_result", {"candidate": attempt, "candidate_id": candidate.candidate_id,
-                    "status": candidate.status, "reason": redact_incident_text(candidate.reason)[:400]})
+                    "status": candidate.status, "reason": redact_incident_text(candidate.reason)[:400],
+                    **group_progress})
             if reporter is not None and hasattr(reporter, "emit"):
                 record = experiment.candidates[candidate.candidate_id]
                 reporter.emit("repair.candidate_result", candidate=attempt,

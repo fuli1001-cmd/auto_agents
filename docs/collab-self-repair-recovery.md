@@ -4,6 +4,14 @@ An explicit `collab --session ID` resumes that collab workflow. The presence of
 an unrelated saved run never changes the command into `run` or authorizes
 clearing that run's blocker.
 
+After self-repair stops, repeat the original `collab --project PROJECT --session
+ID` command with the same provider and authorization options. The foreground
+workflow runs first; an old repair failure cannot by itself stop that new
+invocation. A newly observed failure automatically retries an equivalent blocked
+repair or starts a new request after input changes, retaining compatible candidate
+work for revalidation. Manual cancellation is not required. This does not reset
+historical search progress or authorize automatic retries within the same run.
+
 If the requested session's control files are missing, recovery inspects hashed
 checkpoint blobs and committed history. It selects the newest complete journal
 boundary, validates its hash chain and session/handoff identities, and restores

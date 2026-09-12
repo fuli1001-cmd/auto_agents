@@ -84,10 +84,15 @@ def _new_job(restart, payload):
     return job, working
 
 
-@pytest.mark.parametrize("advance", [False, True, "stale-receipt"])
+@pytest.mark.parametrize("advance", [False, True, "stale-receipt", "blocked"])
 def test_cancel_then_original_invocation_retains_code_and_history_but_requires_new_proof(restart, advance):
     before = (git(restart.source, "status", "--porcelain"), git(restart.source, "diff"), git(restart.source, "diff", "--cached"))
     revision = restart.payload["base"]
+    if advance == "blocked":
+        # The user reruns collab after an engine update, without repair cancel.
+        with restart.store.connect() as db:
+            db.execute("UPDATE jobs SET state='blocked' WHERE id=?", (restart.old,))
+            db.execute("UPDATE subscribers SET state='blocked' WHERE job=?", (restart.old,))
     if advance:
         (restart.engine / "upstream.txt").write_text("new engine version\n")
         git(restart.engine, "add", "upstream.txt")
