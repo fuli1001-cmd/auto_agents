@@ -109,6 +109,11 @@ def report(control_root, job):
         'review_reuses': sum(k == 'review_reused' for k, _, _ in events),
         'probe_corrections': sum(k == 'scope_probe_correction' for k, _, _ in events),
         'deterministic_plan_migrations': sum(k == 'plan_references_normalized' for k, _, _ in events),
+        'component_completion_checks': [payload for kind, payload, _ in events
+                                        if kind == 'component_completion_checked'],
+        'reused_completed_groups': sorted({payload['component'] for kind, payload, _ in events
+                                          if kind == 'component_completion_checked' and payload.get('restored_completion')}),
+        'completion_check_reuses': [payload for kind, payload, _ in events if kind == 'component_checks_reused'],
         'interpretation': 'Phase costs can nest; do not sum them as wall time. Counts describe this job only. '
                           'Wall time spans retained events, excluding later administrative state updates. '
                           'Command times are nested inside phases, and parallel command times are work, not wall time. '

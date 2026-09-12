@@ -237,7 +237,7 @@ def _repair_failure_detail(job, subscriber):
     return known.get(detail) or _repair_text(detail) or "未返回具体原因，请查看详细日志"
 
 
-def _repair_progress_message(job, subscriber):
+def _repair_progress_message(job, subscriber, *, include_imported=True):
     state, workflow = job["state"], subscriber["state"]
     if workflow == "finished":
         return "原任务已完成"
@@ -264,6 +264,7 @@ def _repair_progress_message(job, subscriber):
             "candidate_generation": "正在生成修复代码", "candidate_correction": "正在修正候选",
             "repair_design": "正在设计修复方案", "contract_reanalysis": "正在重新分析验收要求",
             "component_plan": "正在细化当前组件方案", "scope_format": "正在纠正范围审核字段",
+            "component_selected": "正在准备当前组修复",
             "scope_review": "正在独立判断问题是否必须修复",
             "plan_format": "正在局部纠正规划格式", "local_correction": "正在分析当前组件的局部修正",
             "plan_review": "正在独立审查组件方案", "planning_probe": "正在运行实施前诊断探针",
@@ -280,12 +281,21 @@ def _repair_progress_message(job, subscriber):
             label = '当前组件已通过验收，继续后续组件与集成验证'
         if progress.get("candidate"):
             label = f"第 {progress['candidate']} 轮：" + label
+        group = progress.get("group_progress") or {}
+        if group.get("total"):
+            if group.get("current"):
+                title = _repair_text(group.get("title") or group.get("group_id"))
+                label = f"{group['current']}/{group['total']}「{title}」；" + label
+            else:
+                label = f"已验收 {group.get('completed', 0)}/{group['total']}；" + label
+        elif phase == "repair_design":
+            label = "正在划分修复组；" + label
         previous = progress.get("last_result") or {}
         if previous and previous.get("status") not in {"approved", "candidate_group_completed"}:
             reason = _repair_text(previous.get("reason", ""))
             label += f"；第 {previous.get('candidate', '?')} 轮未通过：{reason}"
         imported = job.get("prior_repair_input") or {}
-        if imported.get("source_job"):
+        if include_imported and imported.get("source_job"):
             label = f"已接续上次候选（{_repair_text(imported['source_job'])[:8]}）；" + label
         return label
     return "等待修复进展"
@@ -362,6 +372,8 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     job = response["job"]
     last = None
     announced = set()
+    imported_announced = set()
+    group_totals = {}
     previous_term = signal.getsignal(signal.SIGTERM)
     def interrupted(signum, frame):
         from .process_supervision import RunInterruptedError
@@ -382,7 +394,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
             subscriber = next(item for item in response["subscribers"] if item["id"] == registration["subscriber"])
             prefix = f"Self-repair {job[:8]}："
             log_path = f"详细日志：{registration['config']['root']}/jobs/{job}"
-            message = _repair_progress_message(response["job"], subscriber)
+            message = _repair_progress_message(response["job"], subscriber, include_imported=False)
             first = job not in announced
             if first:
                 # A resumed workflow can submit another repair while this relay waits.
@@ -393,6 +405,18 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                 _report_repair_progress(project, prefix + action + "：" + problem)
                 _report_repair_progress(project, log_path)
                 announced.add(job)
+            imported = response["job"].get("prior_repair_input") or {}
+            source_job = _repair_text(imported.get("source_job"))
+            if source_job and (job, source_job) not in imported_announced:
+                _report_repair_progress(project, prefix + f"已接续上次候选（{source_job[:8]}）")
+                imported_announced.add((job, source_job))
+            group = (response["job"].get("progress") or {}).get("group_progress") or {}
+            total = group.get("total")
+            if total:
+                previous_total = group_totals.get(job)
+                if previous_total and previous_total != total:
+                    _report_repair_progress(project, prefix + f"修复分组已调整：{previous_total} → {total} 组")
+                group_totals[job] = total
             if (job, message) != last:
                 if not (first and status == "repairing" and subscriber["state"] == "waiting"
                         and not response["job"].get("progress")):

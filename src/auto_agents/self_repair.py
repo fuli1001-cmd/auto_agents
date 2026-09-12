@@ -90,6 +90,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "design_review_exhausted": 0,
     "candidate_exception": 0,
     "candidate_failed": 10,
+    "candidate_not_ready": 0,
     "candidate_noop": 20,
     "candidate_duplicate": 20,
     "failed": 25,
@@ -111,6 +112,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_STAGES = {
     "design_review_exhausted": "design_review",
     "candidate_exception": "generation",
     "candidate_failed": "generation",
+    "candidate_not_ready": "candidate_admission",
     "candidate_noop": "generation",
     "candidate_duplicate": "generation",
     "failed": "generation",
@@ -1761,12 +1763,28 @@ class AutoAgentsSelfRepairRunner:
         self._invocation_context = dict(getattr(target_orchestrator, "_invocation_context", {}) or {})
         self._session_scoped = bool(self._invocation_context.get("session_id") and not self._invocation_context.get("run_id"))
 
+    def _group_progress(self) -> dict:
+        experiment = getattr(self, "_experiment", None)
+        groups = getattr(experiment, "finding_groups", [])
+        if not groups:
+            return {}
+        completed = sum(group.get("status") == "completed" for group in groups)
+        progress = {"total": len(groups), "completed": completed}
+        active = next((group for group in groups
+                       if group.get("group_id") == experiment.active_finding_group_id), None)
+        if active and active.get("status") != "completed":
+            # Scheduling follows dependencies and regression ownership, not list order.
+            progress.update(current=completed + 1, group_id=active["group_id"],
+                            title=redact_incident_text(str(active.get("title") or active["group_id"])))
+        return {"group_progress": progress}
+
     @contextmanager
     def _phase_timer(self, phase: str) -> Iterator[None]:
         started = time.perf_counter()
         identity = {'phase': phase, 'span_id': uuid.uuid4().hex,
                     'parent_span_id': _repair_phase_context.get().get('span_id', ''),
-                    'candidate': getattr(self, '_candidate_attempt', 0), 'candidate_id': getattr(self, '_candidate_id', '')}
+                    'candidate': getattr(self, '_candidate_attempt', 0), 'candidate_id': getattr(self, '_candidate_id', ''),
+                    **self._group_progress()}
         token = _repair_phase_context.set(identity)
         callback = getattr(self, "_control_phase_callback", None)
         if callback:
@@ -2005,7 +2023,8 @@ class AutoAgentsSelfRepairRunner:
         experiment = self._experiment
         result.review_completed = result.review_completed or bool(getattr(self, "_candidate_review_completed", False))
         result.failure_evidence = list(getattr(self, "_candidate_failure_evidence", []))
-        result.next_action = next_action(result.failure_evidence)
+        if result.status != 'candidate_not_ready':
+            result.next_action = next_action(result.failure_evidence)
         findings = [
             SelfRepairFinding.from_dict(item)
             for item in result.review_findings
@@ -2911,7 +2930,8 @@ class AutoAgentsSelfRepairRunner:
         callback = getattr(self, "_control_phase_callback", None)
         if callback:
             callback("phase_started", {"phase": normalized_phase, "candidate_id": candidate_id,
-                                       "candidate": getattr(self, "_candidate_attempt", 0), "progress_only": True})
+                                       "candidate": getattr(self, "_candidate_attempt", 0), "progress_only": True,
+                                       **self._group_progress()})
         rendered_detail = " ".join(str(detail).split())
         message = (
             f"candidate={candidate_id or 'unknown'} "
@@ -3746,6 +3766,9 @@ class AutoAgentsSelfRepairRunner:
                 return self._design_review_exhausted_result(experiment)
             if not self._ensure_approved_repair_design(experiment):
                 continue
+            if self._continuous_mode():
+                from .repair_completion import refresh
+                refresh(self, Path(self._continuous_workspace) / 'repair')
             active_group = experiment.next_finding_group()
             if active_group is None:
                 stalled = self._stalled_search_result(experiment)
@@ -3758,6 +3781,9 @@ class AutoAgentsSelfRepairRunner:
                 store.save(experiment)
                 continue
             self._candidate_group = dict(active_group)
+            callback = getattr(self, "_control_phase_callback", None)
+            if callback:
+                callback("phase_started", {"phase": "component_selected", **self._group_progress()})
             from .repair_actions import prepare_action
             self._candidate_next_action = prepare_action(self, experiment)
             if self._candidate_next_action.get("kind") == "blocked":
@@ -3899,11 +3925,13 @@ class AutoAgentsSelfRepairRunner:
                 candidate.base_commit = self._candidate_base_ref or experiment.best_search_ref
             candidate.parent_candidate_id = self._candidate_parent_id(candidate.base_commit)
             self._decorate_candidate_result(candidate, attempt=attempt)
+            group_progress = self._group_progress()
             self._register_search_result(candidate)
             callback = getattr(self, "_control_phase_callback", None)
             if callback:
                 callback("candidate_result", {"candidate": attempt, "candidate_id": candidate.candidate_id,
-                    "status": candidate.status, "reason": redact_incident_text(candidate.reason)[:400]})
+                    "status": candidate.status, "reason": redact_incident_text(candidate.reason)[:400],
+                    **group_progress})
             if reporter is not None and hasattr(reporter, "emit"):
                 record = experiment.candidates[candidate.candidate_id]
                 reporter.emit("repair.candidate_result", candidate=attempt,
@@ -4720,6 +4748,21 @@ class AutoAgentsSelfRepairRunner:
                         ),
                     )
                 summary = (result.summary or result.stdout).strip()
+                from .repair_candidate_admission import admission_blocker
+                blocker = admission_blocker(self, repair_root, summary)
+                if blocker is not None:
+                    target_paths = changed_guard_paths(target_before, capture_repository_guard(
+                        self.target_project_root, ignore_run_artifacts=True))
+                    if target_paths:
+                        return SelfRepairResult(False, 'candidate_rejected', category=self.decision.category,
+                            reason='live target changed before not-ready handoff: ' + str(target_paths[:12]),
+                            summary=summary, experiment_id=experiment_id, candidate_id=candidate_id,
+                            base_commit=base_head, fatal_candidate=True)
+                    return SelfRepairResult(False, 'candidate_not_ready', category=self.decision.category,
+                        reason=blocker['reason'], summary=summary, experiment_id=experiment_id,
+                        candidate_id=candidate_id, base_commit=base_head, candidate_commit=head_ref(repair_root),
+                        next_action=blocker, recoverable_validation=True,
+                        finding_group_id=self._candidate_group.get('group_id', ''))
                 changed = changed_paths(repair_root)
                 if not changed and self._continuous_mode():
                     changed = subprocess.run(["git", "diff", "--name-only", self._experiment.base_commit, "HEAD"],
@@ -5015,10 +5058,9 @@ class AutoAgentsSelfRepairRunner:
                         or 600
                     ),
                 )
-                self._report_candidate_phase(
-                    "reviewing_candidate",
-                    "differential proof completed; starting adversarial review",
-                )
+                if not early_review.payload.get('early_review'):
+                    self._report_candidate_phase(
+                        "reviewing_candidate", "differential proof completed; starting adversarial review")
                 review_phase = (
                     "integration"
                     if self._acceleration_enabled()
@@ -5115,8 +5157,8 @@ class AutoAgentsSelfRepairRunner:
                     )
                 boundary_passed_obligations.append("validation:adversarial_review")
                 self._report_candidate_phase(
-                    "validating_focused_tests",
-                    "adversarial review approved; running focused verification",
+                    "component_validation_complete",
+                    "component review and expanded verification completed",
                 )
                 if not verification.ok:
                     return SelfRepairResult(
@@ -5149,6 +5191,11 @@ class AutoAgentsSelfRepairRunner:
                         ),
                     )
                 if not bool(getattr(self, "_candidate_is_final_group", True)):
+                    from .repair_completion import seal
+                    try:
+                        seal(self, repair_root, review, verification)
+                    except (OSError, RuntimeError, ValueError, TypeError):
+                        pass  # Missing reusable evidence cannot invalidate a fresh successful run.
                     return SelfRepairResult(
                         ok=False,
                         status="candidate_group_completed",
@@ -6042,8 +6089,9 @@ class AutoAgentsSelfRepairRunner:
                 "approved component, identify its repair_group_id (legacy defer_until is also accepted). "
                 "The controller will schedule its correction without waiving the regression. "
                 "Distinguish the cumulative diff from this attempt's parent when identifying its origin.",
-                ("Only the small counterexample and safety checks passed. Full component regression is REQUIRED "
-                 "AFTER this review, not evidence to demand now. Inspect changed behavior, approved scenarios and "
+                ("The small counterexample and safety checks passed. Full component regression runs concurrently "
+                 "and must pass before component acceptance; its pending result is not a finding. "
+                 "Inspect changed behavior, approved scenarios and "
                  "their dependencies; use retained review conclusions without rebuilding unchanged background. "
                  if phase == 'quick' else "Focused checks already passed. ") + "Whole-repair boundary proof belongs to "
                 "integration, and the full suite runs after semantic review; absence of "
@@ -8624,6 +8672,10 @@ class AutoAgentsSelfRepairRunner:
             "",
             "Final response:",
             "- Briefly summarize the root cause and generic fix.",
+            "- If no candidate is ready, return a fenced JSON object with component (active group ID), "
+            "candidate_ready:false, status:capability_blocked|not_ready, and reason. "
+            "For an unavailable nested user/mount namespace also specify capability:nested_user_mount_namespace. "
+            "The controller will verify supported capability claims; this declaration grants no repair credit.",
             "- Include exactly one COMMIT_MESSAGE line under 72 chars.",
         ]
         from .prompting import ContextBlock, compose_prompt
@@ -8692,15 +8744,23 @@ class AutoAgentsSelfRepairRunner:
         commands, requests = plan['commands'], plan['requests']
         self._candidate_quick_plan = plan
         with self._phase_timer('quick_verification'):
-            quick = self._guarded_component_checks(commands, workspace)
-        quick.payload.update(source_commands=commands[:len(quick.returncodes)], requests=requests,
-                             quick_schedule=plan)
+            from .repair_completion import execute_checks
+            quick = execute_checks(self, workspace, commands)
+        quick.payload.setdefault('source_commands', commands[:len(quick.returncodes)])
+        quick.payload.update(requests=requests, quick_schedule=plan)
+        if quick.payload.get('retained_commands'):
+            executed = quick.payload['source_commands']
+            quick.payload['requests'] = [
+                {**request, 'planned_execution_index': request.get('execution_index'),
+                 'execution_index': executed.index(request['command']) if request.get('command') in executed else None}
+                for request in requests]
         from .repair_memory import remember_check_timings
         remember_check_timings(self, workspace, group, plan, quick, phase='quick')
         if not quick.ok:
             return quick, _VerificationResult(False, 'quick checks failed; semantic review deferred')
-        self._review_verification_binding = {'commands': commands, 'returncodes': quick.returncodes,
-            'proof_refs': quick.payload.get('proof_refs', []), 'executed_tests': quick.payload.get('executed_tests', [])}
+        self._review_verification_binding = {'commands': quick.payload['source_commands'], 'returncodes': quick.returncodes,
+            'proof_refs': quick.payload.get('proof_refs', []), 'executed_tests': quick.payload.get('executed_tests', []),
+            'retained_completion': quick.payload.get('retained_completion')}
         def audit():
             review = self._review_candidate(workspace, base_head,
                 progress_lease_seconds=getattr(self._autonomy_config(), 'candidate_review_timeout_seconds', 600),
@@ -8752,13 +8812,21 @@ class AutoAgentsSelfRepairRunner:
                             repository_aliases={self.repo_root.name, verification_root.name})]
         if not commands:
             commands = ["git diff --check"]
-        result = (self._guarded_component_checks(commands, verification_root, parallel=True)
-                  if group.get('planning_receipt') else self._run_verification_commands(commands, verification_root))
+        from .repair_completion import execute_checks
+        result = (execute_checks(self, verification_root, commands, parallel=True) if group.get('planning_receipt')
+                  else self._run_verification_commands(commands, verification_root))
+        retained = result.payload.get('retained_commands', [])
         if record and isinstance(experiment, SelfRepairExperiment):
             from .repair_memory import remember_check_timings
             remember_check_timings(self, verification_root, group, plan, result, phase='expanded')
         result.payload.setdefault("source_commands", commands[: len(result.returncodes)])
         result.payload['requests'] = plan.get('requests', [])
+        if retained:
+            executed = result.payload.get('source_commands', [])
+            result.payload['requests'] = [
+                {**request, 'planned_execution_index': request.get('execution_index'),
+                 'execution_index': executed.index(request['command']) if request.get('command') in executed else None}
+                for request in plan.get('requests', [])]
         result.payload['deduplicated_commands'] = plan.get('deduplicated_commands', 0)
         return result
 
@@ -8908,6 +8976,7 @@ class AutoAgentsSelfRepairRunner:
         proof_refs = []
         executed_tests = []
         command_timings = []
+        completion_inputs = []
         certificate_hits = 0
         for command in commands:
             if cancel_event is not None and cancel_event.is_set():
@@ -8919,6 +8988,7 @@ class AutoAgentsSelfRepairRunner:
                 cancelled.payload.update(failure_evidence=prompt_evidence(command_failures),
                     source_commands=list(commands[:len(returncodes) + 1]), command_timings=command_timings,
                     proof_refs=proof_refs, executed_tests=executed_tests, certificate_hits=certificate_hits)
+                cancelled.payload['completion_inputs'] = completion_inputs
                 return cancelled
             source_command = command
             from .repair_dependencies import verification_dependency_state
@@ -9063,6 +9133,10 @@ class AutoAgentsSelfRepairRunner:
                 'phases': dict(getattr(process, 'phase_seconds', {})),
                 'returncode': process.returncode, 'ok': bool(process.ok)}
             command_timings.append(timing)
+            if process.ok and not process.termination_reason and not process.cleanup_incomplete:
+                completion_inputs.append({'command': source_command, 'root': str(verification_root),
+                    'complete': bool(process.input_trace_complete), 'network': bool(process.network_observed),
+                    'manifest': dict(process.observed_inputs)})
             callback = getattr(self, '_control_phase_callback', None)
             if callback:
                 callback('verification_command_finished', {**_repair_phase_context.get(), **timing,
@@ -9154,6 +9228,7 @@ class AutoAgentsSelfRepairRunner:
                         "nonfatal_source_commands": nonfatal_source_commands,
                         "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
                         "command_timings": command_timings,
+                        "completion_inputs": completion_inputs,
                     },
                 )
         return _VerificationResult(
@@ -9169,6 +9244,7 @@ class AutoAgentsSelfRepairRunner:
                 "nonfatal_source_commands": nonfatal_source_commands,
                 "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
                 "command_timings": command_timings,
+                "completion_inputs": completion_inputs,
             },
         )
 

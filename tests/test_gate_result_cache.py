@@ -21,6 +21,15 @@ def _cache(tmp_path: Path) -> GateResultCache:
     )
 
 
+@pytest.mark.parametrize('network', [False, True])
+def test_cached_success_preserves_network_dependency_metadata(tmp_path, network):
+    cache = _cache(tmp_path)
+    metadata = dict(source_fingerprint='source', cache_scope='run_context', result_cache_scope='candidate', metadata_signature='policy')
+    cache.record('check', CommandResult('check', True, 0, input_trace_complete=True, network_observed=network), **metadata)
+    result = cache.lookup('check', **metadata)
+    assert result is not None and result.network_observed is network
+
+
 def test_candidate_cache_never_reuses_failed_proof(tmp_path: Path) -> None:
     cache = _cache(tmp_path)
     failed = CommandResult(command="check", ok=False, returncode=1)

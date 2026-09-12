@@ -148,6 +148,8 @@ def test_completed_revalidation_advances_without_diagnosing_a_passed_component(t
     state.consecutive_non_improvements = patience
     anchor, credits = state.accepted_progress_anchor(), dict(state.progress_credits)
     stages, diagnoses = [], []
+    events = []
+    runner._control_phase_callback = lambda kind, payload: events.append((kind, payload))
     def candidate(**kwargs):
         group = runner._candidate_group['group_id']
         stages.append(group)
@@ -184,6 +186,16 @@ def test_completed_revalidation_advances_without_diagnosing_a_passed_component(t
     restored = store.load()
     assert restored.candidates['revalidated'].status == 'candidate_group_completed'
     assert restored.candidates['revalidated'].progress_keys == []
+    from auto_agents.repair_client import _repair_progress_message
+    selected = [payload for kind, payload in events if payload.get('phase') == 'component_selected']
+    results = [payload for kind, payload in events if kind == 'candidate_result']
+    for index, (selection, outcome) in enumerate(zip(selected, results), start=1):
+        for progress in (selection, outcome):
+            assert progress['group_progress']['current'] == index
+            assert progress['group_progress']['total'] == 2
+            message = _repair_progress_message({'state': 'repairing', 'progress': progress}, {'state': 'waiting'})
+            assert message.startswith(f'{index}/2「{stages[index - 1]}」；')
+    assert len(selected) == len(results) == 2
 
 
 def test_component_completion_message_does_not_claim_whole_repair_finished():

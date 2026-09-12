@@ -99,12 +99,16 @@ def _context(runner, workspace):
     experiment = runner._experiment
     from .repair_memory import compact_context
     from .planning_capabilities import planning_capabilities
+    capabilities = dict(planning_capabilities(runner))
+    if getattr(runner, '_real_project_root', None) is not None:
+        from .repair_capability_checks import production_capabilities
+        capabilities['production_namespace'] = production_capabilities(runner, workspace)
     return compact_context(runner, sanitize_evidence({
         'policy': POLICY_VERSION,
         'source': source_identity(workspace), 'source_commit': head_ref(workspace),
         'workspace': str(workspace), 'engine_base': experiment.base_commit,
         'environment': digest(runner._full_suite_environment_fingerprint()),
-        'runtime_capabilities': planning_capabilities(runner),
+        'runtime_capabilities': capabilities,
         'original_request': getattr(runner, '_invocation_context', None) or
                             getattr(runner.target_orchestrator, '_invocation_context', {}),
         'root_cause': runner._compact_diagnosis_payload() if hasattr(runner.diagnosis, 'to_dict') else {'error': str(runner.error)},
@@ -781,6 +785,13 @@ def prepare_component(runner, workspace):
     context['findings'] = [f.to_dict() for f in findings if not nonblocking_scope(experiment, f)]
     group['finding_ids'] = [f['finding_id'] for f in context['findings']]
     context['component'] = group
+    from .repair_completion import _memory as completion_memory
+    completed = completion_memory(runner, group)
+    if completed.get('completion') or group.get('status') == 'needs_revalidation':
+        context['completed_component'] = {
+            'receipt': completed.get('completion'), 'assessment': completed.get('completion_assessment'),
+            'instruction': 'Retain the existing implementation. Revalidate changed evidence; select verify_existing '
+                           'unless a concrete current defect requires code changes. Do not rewrite completed mechanisms.'}
     signature = _component_signature(group)
     strategy = digest([POLICY_VERSION, experiment.base_commit, experiment.contract_fingerprint,
                        signature, context['environment'], digest(context['runtime_capabilities']),
@@ -873,6 +884,10 @@ def prepare_component(runner, workspace):
                        status='active', feedback=[])
         runner._experiment_store.save(experiment)
     if episode.get('status') == 'blocked':
+        detail = episode.get('blocker', {})
+        if detail.get('code') in {'capability_unavailable', 'plan_unavailable'}:
+            raise PlanningBlocked(detail['message'], **{key: detail[key] for key in (
+                'code', 'field', 'actual', 'constraint', 'retry_kind', 'evidence') if key in detail})
         if approved_draft:
             raise PlanningBlocked('approved plan evidence recovery exhausted; ' + json.dumps(reuse_failures),
                                   code='plan_approval_invalid', evidence=previous['id'])
@@ -902,7 +917,11 @@ def prepare_component(runner, workspace):
         'do not install a second notification listener in an inherited filter chain: any nested design '
         'must preserve ancestor restrictions through an existing authenticated supervisor/policy owner, '
         'or identify a supported alternative with concrete diagnostics. Unknown capabilities require '
-        'bounded diagnostics, not assumed support. Capability observations do not prove the repair. '
+        'bounded diagnostics before relying on them. If production_namespace.supported=false, do not '
+        'propose a launcher that requires a new nested user/mount namespace in that wrapper. '
+        'If no supported plan can be proposed, return {decision:BLOCKED,reason,capability:'
+        '"nested_user_mount_namespace"}; this grants no implementation or acceptance credit. '
+        'Capability observations do not prove the repair. '
         'Do not restate completed '
         'investigations. For a discovered compatibility pattern, inspect the related acceptance fixtures '
         'for the same pattern and require a representative check before code review. '
@@ -962,6 +981,18 @@ def prepare_component(runner, workspace):
                     'invalid output artifact). Preserve mechanisms, paths, scenarios, obligations and checks. '
                     'Do not expand scope, implement code or approve anything. Return the corrected complete JSON plan.')
                 payload, planner_id = _invoke(runner, workspace, stage, prompt, context)
+                if payload.get('decision') == 'BLOCKED' and _text(payload.get('reason')):
+                    observed = context['runtime_capabilities'].get('production_namespace', {})
+                    verified = (payload.get('capability') == 'nested_user_mount_namespace'
+                                and observed.get('supported') is False)
+                    episode['status'] = 'blocked'
+                    episode['feedback'] = [{'decision': 'BLOCKED', 'reason': payload['reason'],
+                                            'capability_verified': verified}]
+                    error = PlanningBlocked(payload['reason'], code='capability_unavailable' if verified else 'plan_unavailable',
+                                            actual={'declaration': payload, 'observation': observed}, evidence=planner_id)
+                    episode['blocker'] = error.detail
+                    runner._experiment_store.save(experiment)
+                    raise error
                 payload = _materialize_draft(payload, previous)
                 payload = normalize_plan_references(runner, workspace, payload, group)
                 context['plan_delta'] = plan_delta(previous, payload)
@@ -991,7 +1022,8 @@ def prepare_component(runner, workspace):
                 episode['pending_format'] = format_used
                 runner._experiment_store.save(experiment)
             except PlanningBlocked as error:
-                if payload is None or error.detail['code'] in {'source_changed', 'format_scope_changed', 'stale_revision', 'format_exhausted'}:
+                if payload is None or error.detail['code'] in {'source_changed', 'format_scope_changed', 'stale_revision', 'format_exhausted',
+                                                               'capability_unavailable', 'plan_unavailable'}:
                     episode['status'] = 'blocked'
                     runner._experiment_store.save(experiment)
                     raise

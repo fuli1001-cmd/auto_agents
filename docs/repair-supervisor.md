@@ -189,6 +189,19 @@ auto-agents repair retry-publish --job JOB
 auto-agents stop --project PROJECT
 ```
 
+For ordinary recovery, rerun the original command with the same session, for
+example `auto-agents collab --project PROJECT --provider codex --auto-approve
+--session SESSION`. There is no prerequisite `repair cancel` or `repair resume`:
+the command first continues the saved workflow using the current installation.
+If the failure is gone, no repair is submitted. If repair is still required, a
+new project-lock owner automatically retries the same blocked request using its
+existing candidate history. Changed requests retire the same workflow's old
+blocked subscriptions and receive fresh evidence; compatible stopped candidates
+are imported under the existing proof guards. Other projects and sessions are
+not cancelled. Automatic recovery within the same invocation cannot renew a
+blocked search, and starting another command does not cancel active work.
+The `repair` commands above remain available for inspection and explicit control.
+
 The default is automatic publication to the explicitly tracked upstream after
 proof and recovery. Set `publish` to false to disable writes to that remote.
 `--autonomy off` disables enrollment; guarded mode may reuse proven remote fixes

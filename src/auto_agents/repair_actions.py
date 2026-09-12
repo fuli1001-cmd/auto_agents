@@ -40,6 +40,18 @@ def prepare_action(runner, experiment):
     evidence = record.failure_evidence if record else []
     from .repair_test_refs import review_action
     action = review_action(experiment, next_action(evidence))
+    if action['kind'] == 'blocked' and evidence and evidence[-1].get('phase') == 'candidate_admission':
+        admission = evidence[-1]
+        with diagnosis_workspace(runner, record) as root:
+            changed = (admission.get('admission_source') != source_identity(root)
+                       or admission.get('admission_environment') != digest(runner._full_suite_environment_fingerprint()))
+            if not changed and admission.get('capability_requested'):
+                from .repair_capability_checks import namespace_observation
+                changed = namespace_observation(runner, root).get('supported') is True
+            if changed:
+                return {'kind': 'repair_code', 'evidence_ids': action['evidence_ids'],
+                        'cause': 'candidate or runtime changed; revalidate the retained plan and readiness'}
+        return action
     if action['kind'] not in {'diagnose_failure', 'diagnose_execution'}:
         return action
     try:
@@ -102,8 +114,12 @@ def stalled_correction(runner, experiment, candidate):
     identity = 'stall:' + digest([experiment.accepted_progress_anchor(), component_key(group),
                                  candidate.candidate_commit, candidate.patch_fingerprint,
                                  candidate.review_findings, candidate.failure_evidence])
+    reviewed_ids = (set(getattr(candidate, 'finding_ids', []))
+                    if getattr(candidate, 'finding_group_id', '') == group.get('group_id') else set())
     facts = {f.finding_id: f.to_dict() for f in experiment.blocking_findings()
-             if f.finding_id in group.get('finding_ids', []) or f.repair_group_id == group.get('group_id')}
+             if f.finding_id in group.get('finding_ids', []) or f.repair_group_id == group.get('group_id')
+             or (f.finding_id in reviewed_ids
+                 and f.causal_obligation_id in group.get('contract_obligation_ids', []))}
     evidence = {str(item.get('evidence_id')): item for item in candidate.failure_evidence if item.get('evidence_id')}
     known = set(facts) | set(evidence)
     if not known:

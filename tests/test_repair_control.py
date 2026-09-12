@@ -50,6 +50,80 @@ def test_job_deduplication_includes_contract_base_and_environment(tmp_path):
     assert store.submit(b, {**failure(tmp_path / "b"), "environment": "other"}) != first
 
 
+@pytest.mark.parametrize("repair_ok", [False, True])
+def test_original_command_retries_blocked_repair_once_for_new_lock_owner(tmp_path, repair_ok):
+    store = Store(tmp_path / "state")
+    payload = {**failure(tmp_path), "invocation": {"command": "collab", "session_id": "session"}}
+    old = store.register(registration(tmp_path, "old"))
+    job = store.submit(old, payload)
+    receipt = {"ok": repair_ok, "error": "no concrete failure evidence authorizes another design"}
+    store.transition(job, "blocked", receipt)
+    with store.connect() as db:
+        db.execute("UPDATE subscribers SET state='blocked' WHERE id=?", (old,))
+    generation = store.job(job)["generation"]
+    current = store.register(registration(tmp_path, "new"))
+    assert store.submit(current, payload) == job
+    restarted = store.job(job)
+    assert restarted["state"] == ("ready" if repair_ok else "queued")
+    assert restarted["generation"] == generation + 1
+    assert restarted["result"] == receipt
+    assert next(s for s in store.subscriptions(job) if s["id"] == old)["state"] == "cancelled"
+    assert not store.transition(job, "blocked", {"error": "late worker"}, generation=generation)
+    store.transition(job, "blocked", receipt)
+    # Automatic recovery and RPC retries are still the same invocation.
+    store.register(registration(tmp_path, "new"))
+    assert store.submit(current, payload) == job
+    assert store.job(job)["state"] == "blocked"
+    assert store.job(job)["generation"] == generation + 1
+
+
+@pytest.mark.parametrize("change", ["base", "contract", "provider", "session", "project"])
+def test_new_invocation_does_not_inherit_an_incompatible_blocked_result(tmp_path, change):
+    store = Store(tmp_path / "state")
+    payload = {**failure(tmp_path), "provider": "codex",
+               "invocation": {"command": "collab", "session_id": "session"}}
+    old = store.register(registration(tmp_path, "old"))
+    job = store.submit(old, payload)
+    store.transition(job, "blocked", {"ok": False, "error": "old blocker"})
+    with store.connect() as db:
+        db.execute("UPDATE subscribers SET state='blocked' WHERE id=?", (old,))
+    changed = json.loads(json.dumps(payload))
+    if change == "session":
+        changed["invocation"]["session_id"] = "another-session"
+    elif change == "project":
+        changed["project"] = str(tmp_path / "another-project")
+    elif change == "contract":
+        changed["contract"] = {"checks": ["different-check"]}
+    else:
+        changed[change] = "new-value"
+    current = store.register(registration(Path(changed["project"]), "new"))
+    new_job = store.submit(current, changed)
+    assert new_job != job
+    assert store.job(new_job)["state"] == "queued"
+    assert store.job(new_job)["payload"] == changed
+    assert store.job(job)["state"] == ("blocked" if change in {"session", "project"} else "cancelled")
+
+
+def test_automatic_restart_preserves_other_projects_and_active_repairs(tmp_path):
+    store = Store(tmp_path / "state")
+    payload = {**failure(tmp_path), "invocation": {"command": "collab", "session_id": "session"}}
+    old = store.register(registration(tmp_path, "old"))
+    job = store.submit(old, payload)
+    other = store.register(registration(tmp_path / "other", "other"))
+    assert store.submit(other, {**payload, "project": str(tmp_path / "other")}) == job
+    current = store.register(registration(tmp_path, "new"))
+    assert store.submit(current, payload) == job  # Active work is not restarted.
+    assert store.job(job)["generation"] == 1
+    store.transition(job, "blocked", {"error": "stopped"})
+    with store.connect() as db:
+        db.execute("UPDATE subscribers SET state='blocked' WHERE job=?", (job,))
+    current = store.register(registration(tmp_path, "newer"))
+    new_job = store.submit(current, {**payload, "base": "new-code"})
+    assert new_job != job
+    assert store.job(job)["state"] == "blocked"
+    assert next(s for s in store.subscriptions(job) if s["id"] == other)["state"] == "blocked"
+
+
 def test_status_exposes_phase_and_previous_failure_without_stale_generation(tmp_path):
     from auto_agents.repair_client import _repair_progress_message
     store = Store(tmp_path / "state")
@@ -789,7 +863,8 @@ def test_foreground_observes_terminal_result_after_registration_cleanup(
         assert expected in capsys.readouterr().err
 
 
-def test_foreground_explains_each_problem_once_and_only_reports_progress_changes(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('grouped', [False, True])
+def test_foreground_explains_each_problem_once_and_only_reports_progress_changes(tmp_path, monkeypatch, capsys, grouped):
     from auto_agents import repair_client
     from auto_agents.self_repair import SelfRepairDecision
 
@@ -831,9 +906,13 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
         job, state, workflow, phase, candidate, elapsed = next(states)
         monkeypatch.setattr(repair_client.time, "time", lambda: 1000 + elapsed)
         progress = {"phase": phase, "candidate": candidate, "started_at": 1000} if phase else {}
+        if grouped and phase:
+            progress['group_progress'] = {'total': 5 if candidate == 1 else 6, 'completed': 2,
+                                          'current': 3, 'group_id': 'recovery', 'title': '任务恢复边界'}
         payload = {"invocation": {"engine_route": {"issue_seed": {"summary": problems[job]}}}}
         return {"job": {"id": job, "state": state, "payload": {"error": "wrong shared-job symptom"},
-                        "result": {"error": "修复环境依赖安装失败"}, "progress": progress},
+                        "result": {"error": "修复环境依赖安装失败"}, "progress": progress,
+                        "prior_repair_input": {'source_job': '2cc79b53'} if grouped and job == first else {}},
                 "subscribers": [{"id": "workflow", "state": workflow, "payload": {"repair": payload}}],
                 "registered": ["workflow"]}
 
@@ -843,7 +922,7 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
         SimpleNamespace(command="run"), SimpleNamespace(),
     ) == 3
     lines = capsys.readouterr().err.splitlines()
-    assert lines == [
+    expected = [
         f"Self-repair 223d4c02：正在修复：{problems[first]}",
         f"详细日志：{config['root']}/jobs/{first}",
         "Self-repair 223d4c02：第 1 轮：正在生成修复代码",
@@ -858,6 +937,12 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
         "Self-repair f28ccccd：修复受阻：修复环境依赖安装失败",
         f"详细日志：{config['root']}/jobs/{second}",
     ]
+    if grouped:
+        expected.insert(2, 'Self-repair 223d4c02：已接续上次候选（2cc79b53）')
+        expected = [line.replace('：第 1 轮：', '：3/5「任务恢复边界」；第 1 轮：')
+                    .replace('：第 2 轮：', '：3/6「任务恢复边界」；第 2 轮：') for line in expected]
+        expected.insert(5, 'Self-repair 223d4c02：修复分组已调整：5 → 6 组')
+    assert lines == expected
 
 
 def test_repair_problem_uses_approved_diagnosis_and_redacts_before_shortening(monkeypatch):

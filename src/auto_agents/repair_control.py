@@ -42,6 +42,13 @@ def contract_identity(payload):
     return json.loads(encoded)
 
 
+def workflow_identity(payload):
+    invocation = payload.get("invocation", {})
+    if not (invocation.get("session_id") or invocation.get("run_id")):
+        return None
+    return tuple(invocation.get(key, "") for key in ("command", "session_id", "run_id", "workflow_id"))
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,7 +210,14 @@ class Store:
             subscription = db.execute("SELECT * FROM subscribers WHERE id=?", (subscriber,)).fetchone()
             if not subscription or subscription["state"] == "cancelled":
                 raise RuntimeError("missing or cancelled workflow registration")
+            fresh_invocation = not subscription["job"] and workflow_identity(payload) is not None
+            if fresh_invocation:
+                self._retry_previous_invocation(db, subscription, payload)
             existing = db.execute("SELECT id,state,result FROM jobs WHERE dedup=? AND state!='cancelled' ORDER BY updated DESC LIMIT 1", (key,)).fetchone()
+            if fresh_invocation and existing and existing["state"] == "blocked":
+                # A different workflow's terminal failure is not the outcome of
+                # this new invocation. Active and successful jobs remain shared.
+                existing = None
             identity = existing["id"] if existing else uuid4().hex[:24]
             if (existing and existing["state"] == "completed" and subscription["job"] == identity
                     and subscription["state"] == "resuming"):
@@ -223,6 +237,46 @@ class Store:
             db.execute("UPDATE subscribers SET payload=? WHERE id=?", (json.dumps(registered), subscriber))
         self.event(identity, "subscribed", {"subscriber": subscriber})
         return identity
+
+    def _retry_previous_invocation(self, db, subscription, payload):
+        """One explicit new project-lock owner may retry its stopped workflow.
+
+        Re-registration and automatic live recovery keep the same subscriber,
+        so they cannot renew a blocked search by repeatedly submitting it.
+        """
+        previous = db.execute(
+            "SELECT s.id,s.payload,j.id AS job,j.payload AS job_payload,j.result "
+            "FROM subscribers s JOIN jobs j ON j.id=s.job "
+            "WHERE s.project=? AND s.token!=? AND s.state NOT IN ('cancelled','finished') "
+            "AND j.state='blocked' ORDER BY j.updated DESC",
+            (subscription["project"], subscription["token"])).fetchall()
+        retry_job = None
+        retired = set()
+        for row in previous:
+            old_payload = json.loads(row["payload"]).get("repair", {})
+            if workflow_identity(old_payload) != workflow_identity(payload):
+                continue
+            db.execute("UPDATE subscribers SET state='cancelled',updated=? WHERE id=?",
+                       (time.time(), row["id"]))
+            retired.add(row["job"])
+            if retry_job is None and json.loads(row["job_payload"]) == payload:
+                retry_job = row
+        for identity in retired:
+            if retry_job is not None and identity == retry_job["job"]:
+                # Reuse successful repair output when only workflow validation
+                # was blocked; otherwise re-enter repair with its saved history.
+                state = "ready" if json.loads(retry_job["result"]).get("ok") else "queued"
+                db.execute("UPDATE jobs SET state=?,generation=generation+1,updated=? WHERE id=?",
+                           (state, time.time(), identity))
+                db.execute("INSERT INTO events(job,kind,payload,created) VALUES(?,?,?,?)",
+                           (identity, "invocation_retried", json.dumps({"subscriber": subscription["id"]}), time.time()))
+            elif not db.execute("SELECT 1 FROM subscribers WHERE job=? AND state NOT IN ('cancelled','finished')",
+                                (identity,)).fetchone():
+                # A changed request gets fresh evidence. Keep the stopped
+                # workspace available to the existing guarded candidate import.
+                db.execute("UPDATE jobs SET state='cancelled',generation=generation+1,updated=? WHERE id=?",
+                           (time.time(), identity))
+                db.execute("UPDATE outbox SET state='cancelled' WHERE job=? AND state!='published'", (identity,))
 
     def job(self, identity, *, include_progress=False):
         with self.connect() as db:
