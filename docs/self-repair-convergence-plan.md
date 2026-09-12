@@ -41,6 +41,19 @@ writing or `verify_existing` validation is admitted. Planning is not a successfu
 repair, and format correction, scope reclassification and introduced-regression
 repair do not mint achievement credits. Existing cumulative counts remain intact.
 
+Planning inputs include native capability observations from a disposable child of
+the verification interpreter (Python APIs and seccomp notification-listener
+compatibility). The child has a ten-second timeout and installs only an ALLOW
+filter that cannot relax inherited restrictions. Results are cached per runner
+and interpreter/script identity; missing support or inconclusive probes remain
+explicit. These observations constrain designs, not certify sandbox behavior or
+grant acceptance credit. Nested designs still require production-wrapper checks
+covering both shared-file denial and necessary private-file metadata operations.
+The observations bind the planning episode and independent approval; missing or
+changed observations require another review of the retained draft. Exhaustion
+reports the current scenario and reason first, retaining complete feedback in the
+structured blocker, including after restart. The three-review limit remains.
+
 Scope decisions remain independent of code review. `required`, `follow_up`,
 `not_applicable` and `unknown` preserve their previous meaning. A safety violation
 or introduced regression requires explicit disproof to become nonblocking.

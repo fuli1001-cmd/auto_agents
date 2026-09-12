@@ -92,6 +92,56 @@ def test_rejection_is_bounded_and_persisted_without_writing_code(setup):
     assert len(calls) == 6 and not state.progress_credits
 
 
+def test_rejection_exposes_current_blocker_after_restart(setup):
+    runner, state, plan, calls = setup
+    original = runner.target_orchestrator._call_with_failover
+    issue = dict(scenario_id='dirty_repository', reason='nested listener cannot start',
+                 counterexample='inherited listener makes NEW_LISTENER fail with EBUSY',
+                 requested_change='narrow policy through existing authenticated supervisor')
+    def reject(request):
+        result = original(request)
+        if request.stage == 'self_repair_plan_review':
+            result.summary = json.dumps(dict(decision='REVISE', reason='incompatible topology',
+                                             issues=[issue], scenario_ids=[]))
+        return result
+    runner.target_orchestrator._call_with_failover = reject
+    with patch('auto_agents.repair_planning._probe', return_value={'matches': True, 'outcome': 'pass'}):
+        for _ in range(2):
+            with pytest.raises(PlanningBlocked, match='dirty_repository EBUSY') as caught:
+                prepare_component(runner, runner.repo_root)
+            assert caught.value.detail['actual'][0]['issues'] == [issue]
+            assert caught.value.detail['code'] == 'planning_exhausted'
+            assert caught.value.detail['evidence']
+            assert len(str(caught.value)) < 600
+            runner._experiment = runner._experiment_store.load()
+    assert len(calls) == 6 and not state.progress_credits and state.attempt_count == 0
+
+
+@pytest.mark.parametrize('mutation', ['changed', 'legacy', 'tampered'])
+def test_runtime_capabilities_bind_independent_approval(setup, mutation):
+    from auto_agents.repair_planning import _review_reuse_failure, digest
+    runner, state, plan, calls = setup
+    observed = {'version': 1, 'acceptance_proof': False,
+                'seccomp_notification': {'additional_listener_supported': False}}
+    with patch('auto_agents.planning_capabilities.planning_capabilities', return_value=observed), \
+         patch('auto_agents.repair_planning._probe', return_value={'matches': True, 'outcome': 'pass'}):
+        first = prepare_component(runner, runner.repo_root)
+        assert all(context['runtime_capabilities'] == observed for _, context in calls)
+        assert first['runtime_capabilities'] == digest(observed)
+        assert not _review_reuse_failure(runner, first, first['component'])
+        if mutation == 'changed':
+            observed['seccomp_notification']['additional_listener_supported'] = None
+        elif mutation == 'legacy':
+            first.pop('runtime_capabilities')
+        else:
+            first['runtime_capabilities'] = 'forged'
+            assert _review_reuse_failure(runner, first, first['component'])
+        runner._candidate_group = dict(state.finding_groups[0])
+        second = prepare_component(runner, runner.repo_root)
+    assert second['request_id'] != first['request_id']
+    assert len(calls) == 3  # Re-audit the retained draft without another planner call.
+
+
 @pytest.mark.parametrize('mutation', ['environment', 'foreign_source', 'new_counterexample'])
 def test_approval_reuse_requires_unchanged_assumptions(setup, mutation):
     runner, state, plan, calls = setup
