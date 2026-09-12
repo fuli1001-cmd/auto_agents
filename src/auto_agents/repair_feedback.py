@@ -120,8 +120,11 @@ def next_action(evidence):
     if not active:
         return {'kind': 'implement', 'evidence_ids': []}
     failure = active[-1]
-    return {'kind': failure.get('next_action', 'diagnose_failure'), 'evidence_ids': [failure['evidence_id']],
-            'command': failure.get('command', ''), 'completion': 'repeat the failed check on the retained candidate'}
+    action = {'kind': failure.get('next_action', 'diagnose_failure'), 'evidence_ids': [failure['evidence_id']],
+              'command': failure.get('command', ''), 'completion': 'repeat the failed check on the retained candidate'}
+    if action['kind'] == 'blocked':
+        action['cause'] = failure.get('excerpt') or 'retained candidate is not ready'
+    return action
 
 
 def record_stage_failure(runner, phase, result, role):

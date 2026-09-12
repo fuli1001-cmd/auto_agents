@@ -73,6 +73,47 @@ potential hits, and `off` disables that reuse. This change does not override tho
 choices or weaken input validation to manufacture more cache hits. The concurrency
 change reduces waiting; it does not add another model review per candidate.
 
+## Attributed blockers and candidate readiness
+
+Run `055e012c45e14f25884238f7` retained a confirmed g04 review finding while its
+group membership was empty. Stall diagnosis then reported that no concrete
+failure existed. Accepted contract findings now bind to the reviewed component
+when its frozen obligations include the finding; provider-supplied owner labels
+cannot redirect that binding. Recovery also recognizes the current candidate's
+confirmed review IDs in older archives, without importing unrelated findings or
+granting another automatic correction budget.
+
+Writers may explicitly return a fenced JSON declaration containing the active
+`component`, `candidate_ready:false`, `status:capability_blocked|not_ready`, and a
+reason. A nested namespace claim also names `capability:nested_user_mount_namespace`;
+unrelated capability claims cannot be confirmed by that probe. The controller retains the work as unverified and records admission
+evidence before prechecks, code review or expanded acceptance. A declared
+capability failure triggers a bounded controller-owned namespace probe through
+the actual production verification wrapper. Supported or inconclusive observations
+do not confirm the provider's claim; neither the declaration nor the diagnostic
+awards acceptance credit. The resulting candidate_not_ready blocker survives
+registration and preserves its precise reason and evidence reference.
+
+Production planning inputs now observe nested user/mount namespace creation and
+private chmod/fchmod paired with shared chmod denial through a real gate subprocess.
+The latter closes a diagnostic blind spot of in-process provider replacements;
+it does not certify a corrected enforcement mechanism. Observations are cached
+for the same source/environment. Unsupported mechanisms should not be proposed.
+An explicit BLOCKED plan response preserves a bounded, attributed blocker across
+restart instead of consuming format-correction calls or inventing a candidate.
+
+The observed host rejects nested uid_map setup with EPERM, and the existing gate
+filter rejects private chmod/fchmod. These are still unmet g04 compatibility
+requirements, not successful repair evidence. This control-flow change does not
+replace the sandbox architecture, remove metadata restrictions, or mark g04 done.
+
+Current group state after that run: g01 and g02 completed; g04 had historical
+completion but is pending again because of the confirmed compatibility defect;
+g03 and g05 through g09 remain pending. Cancellation followed by a new collab
+imports retained code/history and invalidates old acceptance status. It can use
+verify_existing to avoid another writer, but does not promise to skip current
+review or verification of an already implemented group.
+
 Planning inputs include native capability observations from a disposable child of
 the verification interpreter (Python APIs and seccomp notification-listener
 compatibility). The child has a ten-second timeout and installs only an ALLOW

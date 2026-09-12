@@ -1031,6 +1031,17 @@ class SelfRepairExperiment:
                 existing.causal_obligation_id = causal_id
                 if causal_id not in record.failed_obligations:
                     record.failed_obligations.append(causal_id)
+            # An independently accepted contract finding belongs to the
+            # component being reviewed, just as a regression has an owner.
+            # Do not let an untrusted owner label redirect work to another group.
+            owner = next((group for group in self.finding_groups
+                          if group.get('group_id') == record.finding_group_id
+                          and causal_id in group.get('contract_obligation_ids', [])), None)
+            retained = self.findings.get(finding.finding_id)
+            if owner is not None and retained is not None:
+                retained.repair_group_id = owner['group_id']
+                owner['finding_ids'] = sorted(set(owner.get('finding_ids', [])) | {finding.finding_id})
+                owner['status'] = 'pending'
         for finding_id in record.resolved_finding_ids:
             finding = self.findings.get(finding_id)
             from .repair_planning import nonblocking_scope

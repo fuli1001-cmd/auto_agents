@@ -90,6 +90,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "design_review_exhausted": 0,
     "candidate_exception": 0,
     "candidate_failed": 10,
+    "candidate_not_ready": 0,
     "candidate_noop": 20,
     "candidate_duplicate": 20,
     "failed": 25,
@@ -111,6 +112,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_STAGES = {
     "design_review_exhausted": "design_review",
     "candidate_exception": "generation",
     "candidate_failed": "generation",
+    "candidate_not_ready": "candidate_admission",
     "candidate_noop": "generation",
     "candidate_duplicate": "generation",
     "failed": "generation",
@@ -2005,7 +2007,8 @@ class AutoAgentsSelfRepairRunner:
         experiment = self._experiment
         result.review_completed = result.review_completed or bool(getattr(self, "_candidate_review_completed", False))
         result.failure_evidence = list(getattr(self, "_candidate_failure_evidence", []))
-        result.next_action = next_action(result.failure_evidence)
+        if result.status != 'candidate_not_ready':
+            result.next_action = next_action(result.failure_evidence)
         findings = [
             SelfRepairFinding.from_dict(item)
             for item in result.review_findings
@@ -4720,6 +4723,21 @@ class AutoAgentsSelfRepairRunner:
                         ),
                     )
                 summary = (result.summary or result.stdout).strip()
+                from .repair_candidate_admission import admission_blocker
+                blocker = admission_blocker(self, repair_root, summary)
+                if blocker is not None:
+                    target_paths = changed_guard_paths(target_before, capture_repository_guard(
+                        self.target_project_root, ignore_run_artifacts=True))
+                    if target_paths:
+                        return SelfRepairResult(False, 'candidate_rejected', category=self.decision.category,
+                            reason='live target changed before not-ready handoff: ' + str(target_paths[:12]),
+                            summary=summary, experiment_id=experiment_id, candidate_id=candidate_id,
+                            base_commit=base_head, fatal_candidate=True)
+                    return SelfRepairResult(False, 'candidate_not_ready', category=self.decision.category,
+                        reason=blocker['reason'], summary=summary, experiment_id=experiment_id,
+                        candidate_id=candidate_id, base_commit=base_head, candidate_commit=head_ref(repair_root),
+                        next_action=blocker, recoverable_validation=True,
+                        finding_group_id=self._candidate_group.get('group_id', ''))
                 changed = changed_paths(repair_root)
                 if not changed and self._continuous_mode():
                     changed = subprocess.run(["git", "diff", "--name-only", self._experiment.base_commit, "HEAD"],
@@ -5015,10 +5033,9 @@ class AutoAgentsSelfRepairRunner:
                         or 600
                     ),
                 )
-                self._report_candidate_phase(
-                    "reviewing_candidate",
-                    "differential proof completed; starting adversarial review",
-                )
+                if not early_review.payload.get('early_review'):
+                    self._report_candidate_phase(
+                        "reviewing_candidate", "differential proof completed; starting adversarial review")
                 review_phase = (
                     "integration"
                     if self._acceleration_enabled()
@@ -5115,8 +5132,8 @@ class AutoAgentsSelfRepairRunner:
                     )
                 boundary_passed_obligations.append("validation:adversarial_review")
                 self._report_candidate_phase(
-                    "validating_focused_tests",
-                    "adversarial review approved; running focused verification",
+                    "component_validation_complete",
+                    "component review and expanded verification completed",
                 )
                 if not verification.ok:
                     return SelfRepairResult(
@@ -6042,8 +6059,9 @@ class AutoAgentsSelfRepairRunner:
                 "approved component, identify its repair_group_id (legacy defer_until is also accepted). "
                 "The controller will schedule its correction without waiving the regression. "
                 "Distinguish the cumulative diff from this attempt's parent when identifying its origin.",
-                ("Only the small counterexample and safety checks passed. Full component regression is REQUIRED "
-                 "AFTER this review, not evidence to demand now. Inspect changed behavior, approved scenarios and "
+                ("The small counterexample and safety checks passed. Full component regression runs concurrently "
+                 "and must pass before component acceptance; its pending result is not a finding. "
+                 "Inspect changed behavior, approved scenarios and "
                  "their dependencies; use retained review conclusions without rebuilding unchanged background. "
                  if phase == 'quick' else "Focused checks already passed. ") + "Whole-repair boundary proof belongs to "
                 "integration, and the full suite runs after semantic review; absence of "
@@ -8624,6 +8642,10 @@ class AutoAgentsSelfRepairRunner:
             "",
             "Final response:",
             "- Briefly summarize the root cause and generic fix.",
+            "- If no candidate is ready, return a fenced JSON object with component (active group ID), "
+            "candidate_ready:false, status:capability_blocked|not_ready, and reason. "
+            "For an unavailable nested user/mount namespace also specify capability:nested_user_mount_namespace. "
+            "The controller will verify supported capability claims; this declaration grants no repair credit.",
             "- Include exactly one COMMIT_MESSAGE line under 72 chars.",
         ]
         from .prompting import ContextBlock, compose_prompt
