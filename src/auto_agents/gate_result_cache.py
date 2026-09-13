@@ -24,7 +24,8 @@ def execution_policy_fingerprint() -> str:
     global _POLICY_CACHE
     paths = [Path(__file__).with_name(name) for name in (
         "gate_execution.py", "gate_result_cache.py", "gates.py", "workers.py",
-        "verification_sandbox.py", "verification_inputs.py", "verification_probes.py",
+        "verification_sandbox.py", "verification_metadata.py", "gate_verification.py",
+        "verification_inputs.py", "verification_probes.py",
         "verification_manifest.py", "verification_pytest.py", "verification_trace.py")]
     identity = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in paths if path.exists())
     if _POLICY_CACHE[0] != identity:

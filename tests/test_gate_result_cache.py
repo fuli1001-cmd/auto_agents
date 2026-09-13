@@ -21,6 +21,23 @@ def _cache(tmp_path: Path) -> GateResultCache:
     )
 
 
+@pytest.mark.parametrize('helper', ['verification_metadata.py', 'gate_verification.py'])
+def test_supervision_policy_changes_invalidate_existing_proofs(tmp_path, monkeypatch, helper):
+    from auto_agents import gate_result_cache as module
+    policy = tmp_path / 'policy'; policy.mkdir()
+    (policy / 'gate_result_cache.py').write_text('cache implementation')
+    source = policy / helper; source.write_text('old supervision')
+    monkeypatch.setattr(module, '__file__', str(policy / 'gate_result_cache.py'))
+    monkeypatch.setattr(module, '_POLICY_CACHE', (None, ''))
+    cache = _cache(tmp_path)
+    identity = dict(source_fingerprint='source', cache_scope='source', result_cache_scope='candidate',
+                    metadata_signature='owned')
+    cache.record('check', CommandResult('check', True, 0), **identity)
+    assert cache.lookup('check', **identity) is not None
+    source.write_text('changed supervision behavior')
+    assert cache.lookup('check', **identity) is None
+
+
 @pytest.mark.parametrize('network', [False, True])
 def test_cached_success_preserves_network_dependency_metadata(tmp_path, network):
     cache = _cache(tmp_path)

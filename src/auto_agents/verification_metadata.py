@@ -269,6 +269,12 @@ def _event(pid, policies, names, tasks):
         elif name in {'chmod', 'fchmod', 'fchmodat', 'fchmodat2', 'utime', 'utimes', 'utimensat', 'futimesat'}:
             result = _change(pid, registers, name, policies)
         elif name in {'kill', 'tkill', 'tgkill'}:
+            number = registers.rdx if name == 'tgkill' else registers.rsi
+            if number == 0:
+                # Native signal-zero checks have no side effects. In particular,
+                # ESRCH must remain distinguishable from EPERM after a group exits;
+                # cleanup and proof admission rely on that distinction.
+                return
             target = ctypes.c_int(registers.rsi if name == 'tgkill' else registers.rdi).value
             group = -target if name == 'kill' and target < -1 else None
             if group and group != os.getpgrp():
@@ -292,6 +298,70 @@ def _event(pid, policies, names, tasks):
         registers.orig_rax = (1 << 64) - 1  # Never continue the original pathname operation.
         registers.rax = result & ((1 << 64) - 1)
         _ptrace(13, pid, data=ctypes.byref(registers))
+
+
+def _trace_loop(leader, tasks, names, pending):
+    """Do not resume an auto-attached child before its parent's creation event.
+
+    waitpid can report the child's initial SIGSTOP before the parent's FORK,
+    VFORK or CLONE event. Only the latter establishes the inherited policy.
+    """
+    def resume(pid, delivered=0):
+        try:
+            _ptrace(7, pid, data=delivered)
+        except OSError as error:
+            if error.errno != errno.ESRCH:
+                raise
+    retired = set()
+    while tasks or pending:
+        pid, status = os.waitpid(-1, 0x40000000)  # __WALL includes traced threads.
+        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+            known = pid in tasks or pid in retired
+            tasks.pop(pid, None)
+            retired.discard(pid)
+            pending.pop(pid, None)
+            if pid == leader:
+                return os.waitstatus_to_exitcode(status)
+            if not known:
+                raise RuntimeError(f'metadata child {pid} exited before its parent policy was registered')
+            continue
+        event = status >> 16
+        delivered = os.WSTOPSIG(status)
+        try:
+            if event == 4:  # exec can replace the thread-group leader.
+                former = ctypes.c_ulonglong()
+                _ptrace(0x4201, pid, data=ctypes.byref(former))
+                if former.value not in tasks:
+                    pending[pid] = status
+                    raise RuntimeError(f'metadata exec task {pid} has no registered origin policy for {former.value}')
+                if former.value != pid:
+                    tasks[pid] = tasks.pop(former.value)
+                    retired.add(former.value)
+                pending.pop(pid, None)
+            if pid not in tasks:
+                pending[pid] = status  # Also retain it for fail-closed cleanup.
+                if event or delivered != signal.SIGSTOP:
+                    raise RuntimeError(f'metadata event {event} for task {pid} arrived without a registered parent policy')
+                continue  # Never PTRACE_CONT with an absent or guessed policy.
+            if event in (1, 2, 3):  # fork, vfork, clone
+                child = ctypes.c_ulonglong()
+                _ptrace(0x4201, pid, data=ctypes.byref(child))
+                if child.value in tasks:
+                    raise RuntimeError('metadata child already has an active policy')
+                retired.discard(child.value)
+                tasks[child.value] = tasks[pid]
+                if child.value in pending:
+                    pending.pop(child.value)
+                    resume(child.value)
+            elif event == 7:
+                _event(pid, tasks[pid], names, tasks)
+            resume(pid, 0 if event or delivered == signal.SIGSTOP else delivered)
+        except OSError as error:
+            if error.errno != errno.ESRCH:
+                raise
+            # SIGKILL can win a race with ptrace. Keep the known identity until
+            # waitpid reports its terminal status; never infer another policy.
+    return 125
 
 
 def metadata_exec(command, roots, readonly=()):
@@ -326,6 +396,7 @@ def metadata_exec(command, roots, readonly=()):
             print('private metadata launcher unavailable: ' + str(error), file=sys.stderr, flush=True)
             os._exit(125)
     tasks = {leader: (policy,)}
+    pending = {}
     exitcode = 125
     try:
         _, status = os.waitpid(leader, 0)
@@ -338,40 +409,21 @@ def metadata_exec(command, roots, readonly=()):
                  ('chmod', 'fchmod', 'fchmodat', 'fchmodat2', 'utime', 'utimes', 'utimensat', 'futimesat',
                   'prctl', 'kill', 'tkill', 'tgkill')}
         _ptrace(7, leader)
-        while tasks:
-            pid, status = os.waitpid(-1, 0x40000000)  # __WALL includes traced threads.
-            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
-                tasks.pop(pid, None)
-                if pid == leader:
-                    exitcode = os.waitstatus_to_exitcode(status)
-                    break
-                continue
-            event = status >> 16
-            if event in (1, 2, 3):  # fork, vfork, clone
-                child = ctypes.c_ulonglong()
-                _ptrace(0x4201, pid, data=ctypes.byref(child))
-                tasks[child.value] = tasks[pid]
-            elif event == 4:  # exec can replace the thread-group leader.
-                former = ctypes.c_ulonglong()
-                _ptrace(0x4201, pid, data=ctypes.byref(former))
-                if former.value != pid and former.value in tasks:
-                    tasks[pid] = tasks.pop(former.value)
-            elif event == 7:
-                _event(pid, tasks[pid], names, tasks)
-            delivered = os.WSTOPSIG(status)
-            _ptrace(7, pid, data=0 if event or delivered == signal.SIGSTOP else delivered)
+        exitcode = _trace_loop(leader, tasks, names, pending)
     finally:
-        for pid in tasks:
+        remaining = set(tasks) | set(pending)
+        for pid in remaining:
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        while tasks:
+        while remaining:
             try:
                 pid, status = os.waitpid(-1, 0x40000000)
                 if os.WIFEXITED(status) or os.WIFSIGNALED(status):
-                    tasks.pop(pid, None)
+                    remaining.discard(pid)
                 else:
+                    remaining.add(pid)
                     _ptrace(7, pid, data=signal.SIGKILL)
             except (ChildProcessError, ProcessLookupError):
                 break

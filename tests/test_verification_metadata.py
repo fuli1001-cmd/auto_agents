@@ -6,6 +6,7 @@ import subprocess
 import sys
 import signal
 import time
+import ctypes
 
 import pytest
 
@@ -130,7 +131,7 @@ def test_tracees_cannot_detach_or_signal_the_supervisor(tmp_path):
 import ctypes, errno, os
 libc=ctypes.CDLL(None,use_errno=True)
 for number,arguments in [(101,(0,0,0,0)), (56,(0x00800000|17,0,0,0,0)),
-                         (62,(os.getppid(),0))]:
+                         (62,(os.getppid(),15))]:
     result=libc.syscall(number,*arguments)
     assert result==-1 and ctypes.get_errno()==errno.EPERM,(number,result,ctypes.get_errno())
 ''')
@@ -261,3 +262,147 @@ def test_supervisor_death_kills_its_tracees(tmp_path):
         if process.poll() is None:
             process.kill()
         process.communicate(timeout=5)
+
+
+def test_concurrent_short_lived_children_keep_metadata_supervision(tmp_path):
+    worker = '''
+import ctypes,errno,os
+from pathlib import Path
+assert ctypes.CDLL(None).prctl(0x41414D44,0,0,0,0)==1
+p=Path('child-'+str(os.getpid())); p.write_text('private'); p.chmod(0o750)
+assert p.stat().st_mode & 0o777 == 0o750
+try: os.chmod(SHARED,0o777)
+except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS)
+else: raise AssertionError('child lost its inherited boundary')
+'''
+    program = '''
+from concurrent.futures import ThreadPoolExecutor
+import subprocess,sys
+code='SHARED='+repr(SHARED)+'\\n'+WORKER
+def run(index):
+    result=subprocess.run([sys.executable,'-c',code],capture_output=True,text=True,timeout=10)
+    assert result.returncode==0,result.stdout+result.stderr
+with ThreadPoolExecutor(max_workers=8) as pool:
+    assert len(list(pool.map(run,range(80))))==80
+'''
+    execute(tmp_path, 'WORKER=' + repr(worker) + '\n' + program)
+
+
+def test_completed_process_groups_do_not_report_incomplete_cleanup(tmp_path):
+    execute(tmp_path, '''
+import os,shlex,sys
+from pathlib import Path
+from auto_agents.process_supervision import run_supervised_shell_command
+from auto_agents.gate_result_cache import GateResultCache
+from auto_agents.models import CommandResult
+command=shlex.join([sys.executable,'-c',"from pathlib import Path; p=Path('owned'); p.write_text('private'); p.chmod(0o750)"])
+result=run_supervised_shell_command(command,cwd=Path.cwd(),env=dict(os.environ),timeout_seconds=10)
+assert result.returncode==0,result.stderr
+assert not result.cleanup_incomplete,result.process_snapshot
+cache=GateResultCache(Path.cwd(),cache_path=Path.cwd()/'proofs.sqlite3')
+identity=dict(source_fingerprint='retained',cache_scope='source',result_cache_scope='candidate',metadata_signature='owned')
+cache.record(command,CommandResult(command,True,result.returncode,cleanup_incomplete=result.cleanup_incomplete),**identity)
+proof=cache.lookup(command,**identity)
+assert proof is not None and proof.ok
+''')
+
+
+def test_nonleader_exec_preserves_its_narrowed_boundary(tmp_path):
+    child = '''
+import errno,os
+from pathlib import Path
+p=Path('own'); p.write_text('private'); p.chmod(0o750)
+for name in [SHARED,OUTER]:
+    try: os.chmod(name,0o777)
+    except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS)
+    else: raise AssertionError('exec lost the originating thread policy')
+'''
+    program = '''
+import sys,threading
+from pathlib import Path
+from auto_agents.verification_metadata import metadata_exec
+Path('outer').write_text('retained outer object'); Path('inner').mkdir()
+code='SHARED='+repr(SHARED)+'\\nOUTER='+repr(str(Path.cwd()/'outer'))+'\\n'+CHILD
+def replace():
+    metadata_exec([sys.executable,'-c',code],[str(Path.cwd()/'inner')])
+thread=threading.Thread(target=replace); thread.start(); thread.join()
+raise AssertionError('exec returned')
+'''
+    execute(tmp_path, 'CHILD=' + repr(child) + '\n' + program)
+
+
+def stopped(event=0, sig=signal.SIGTRAP):
+    return event << 16 | sig << 8 | 0x7f
+
+
+@pytest.mark.parametrize('creation', [1, 2, 3])
+@pytest.mark.parametrize('child_first', [True, False])
+def test_auto_attached_child_waits_for_its_actual_parent_policy(monkeypatch, creation, child_first):
+    from auto_agents import verification_metadata as metadata
+    parent, child = 10, 11
+    policy = (object(), object())  # Already narrowed parent, not the root policy.
+    tasks, pending, calls = {parent: policy}, {}, []
+    initial = (child, stopped(sig=signal.SIGSTOP))
+    birth = (parent, stopped(creation))
+    events = iter([*( [initial, birth] if child_first else [birth, initial]),
+                   (child, stopped(7)), (child, 0), (parent, 0)])
+    def wait(*args):
+        event = next(events)
+        if child_first and event == birth:
+            assert child not in [pid for op, pid in calls if op == 7]
+            assert child in pending and child not in tasks
+        return event
+    def ptrace(operation, pid, address=0, data=0):
+        calls.append((operation, pid))
+        if operation == 0x4201:
+            ctypes.cast(data, ctypes.POINTER(ctypes.c_ulonglong))[0] = child
+        if operation == 7 and pid == child:
+            assert tasks[child] is policy
+    checked = []
+    monkeypatch.setattr(metadata.os, 'waitpid', wait)
+    monkeypatch.setattr(metadata, '_ptrace', ptrace)
+    monkeypatch.setattr(metadata, '_event', lambda pid, inherited, *_: checked.append((pid, inherited)))
+    assert metadata._trace_loop(parent, tasks, {}, pending) == 0
+    assert checked == [(child, policy)] and not pending
+
+
+def test_unregistered_syscall_never_gets_a_guessed_policy(monkeypatch):
+    from auto_agents import verification_metadata as metadata
+    tasks, pending, calls = {10: (object(),)}, {}, []
+    monkeypatch.setattr(metadata.os, 'waitpid', lambda *_: (11, stopped(7)))
+    monkeypatch.setattr(metadata, '_ptrace', lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(RuntimeError, match='without a registered parent policy'):
+        metadata._trace_loop(10, tasks, {}, pending)
+    assert 11 in pending and 11 not in tasks and not calls
+
+
+def test_exec_keeps_the_origin_threads_narrower_policy(monkeypatch):
+    from auto_agents import verification_metadata as metadata
+    outer, narrowed = (object(),), (object(), object())
+    tasks, pending, observed = {10: outer, 11: outer, 12: narrowed}, {}, []
+    events = iter([(11, stopped(4)), (11, stopped(7)), (12, 0), (11, 0), (10, 0)])
+    def ptrace(operation, pid, address=0, data=0):
+        if operation == 0x4201:
+            ctypes.cast(data, ctypes.POINTER(ctypes.c_ulonglong))[0] = 12
+    monkeypatch.setattr(metadata.os, 'waitpid', lambda *_: next(events))
+    monkeypatch.setattr(metadata, '_ptrace', ptrace)
+    monkeypatch.setattr(metadata, '_event', lambda pid, inherited, *_: observed.append((pid, inherited)))
+    assert metadata._trace_loop(10, tasks, {}, pending) == 0
+    assert observed == [(11, narrowed)]
+
+
+def test_child_killed_during_registration_does_not_leave_parent_stopped(monkeypatch):
+    from auto_agents import verification_metadata as metadata
+    tasks, pending, continued = {10: (object(),)}, {}, []
+    events = iter([(11, stopped(sig=signal.SIGSTOP)), (10, stopped(1)), (11, signal.SIGKILL), (10, 0)])
+    def ptrace(operation, pid, address=0, data=0):
+        if operation == 0x4201:
+            ctypes.cast(data, ctypes.POINTER(ctypes.c_ulonglong))[0] = 11
+        elif operation == 7:
+            continued.append(pid)
+            if pid == 11:
+                raise ProcessLookupError(3, 'killed while stopped')
+    monkeypatch.setattr(metadata.os, 'waitpid', lambda *_: next(events))
+    monkeypatch.setattr(metadata, '_ptrace', ptrace)
+    assert metadata._trace_loop(10, tasks, {}, pending) == 0
+    assert continued == [11, 10] and not pending
