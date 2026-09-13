@@ -285,6 +285,25 @@ with code 3. Only ongoing work needs registration recovery. Environment setup
 failure blocks the job; it does not automatically start another repair generation.
 After resolving the blocker, `repair resume --job JOB` can queue another attempt.
 
+Scope reviews retain their logical round and request identity before provider
+dispatch. A process death, including an out-of-space interruption, does not
+silently start a new diagnosis round. The controller first checks the retained
+request, input and admitted result bindings. Complete static dependencies and
+unchanged execution inputs permit recovery of that result; raw provider output
+does not. Incomplete or external dependencies require a fresh independent
+inspection, with the recovered result supplied only as evidence. Each interrupted
+round permits at most two additional calls, persisted across restarts.
+
+Successful scope decisions and unresolved diagnoses have separate accounting.
+Rechecking a previously completed decision does not spend another unresolved
+diagnosis slot. This does not cache opaque external inputs: those inputs still
+require independent inspection on each revalidation. Historical call totals are
+preserved. Legacy exhausted states with authentic completed scope receipts can
+enter this bounded revalidation path without deleting the experiment, candidates,
+or child session. A recheck returning `unknown` cannot repeatedly use the old
+completed decision to renew its allowance. Exhaustion reports the finding,
+revalidation reason and unresolved dependency locations in its structured result.
+
 ## Publication and evidence
 
 Local and remote commits arriving during repair are integrated in a private delivery

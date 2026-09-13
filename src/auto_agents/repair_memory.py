@@ -229,6 +229,14 @@ def dependency_manifest(root, paths):
     pending = list(paths)
     files, directories = {}, {}
     complete = bool(pending)
+    unresolved = [] if pending else [{'reason': 'no dependency roots'}]
+    unresolved_count = 0
+    def unknown(name, node, reason):
+        nonlocal complete, unresolved_count
+        complete = False
+        unresolved_count += 1
+        if len(unresolved) < 64:
+            unresolved.append({'path': name, 'line': node.lineno, 'reason': reason})
     pending += ['pyproject.toml', 'pytest.ini', 'conftest.py', 'tests/conftest.py']
     try:
         while pending:
@@ -253,13 +261,13 @@ def dependency_manifest(root, paths):
                     if called not in {'len', 'str', 'int', 'bool', 'tuple', 'list', 'dict', 'set',
                                       'sorted', 'range', 'isinstance', 'enumerate', 'zip', 'min',
                                       'max', 'sum', 'abs', 'all', 'any'}:
-                        complete = False
+                        unknown(name, node, 'unproved call: ' + called)
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.decorator_list:
-                    complete = False
+                    unknown(name, node, 'decorated definition')
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
                         node.args.args or node.args.posonlyargs or node.args.kwonlyargs
                         or node.args.vararg or node.args.kwarg):
-                    complete = False  # Caller-supplied objects/fixtures are not a proved static input closure.
+                    unknown(name, node, 'caller-supplied arguments or fixtures')
                 modules = []
                 if isinstance(node, ast.Import):
                     modules = [alias.name for alias in node.names]
@@ -283,14 +291,16 @@ def dependency_manifest(root, paths):
                                 pending.append(candidate)
                                 resolved = True
                     if not resolved:
-                        complete = False
+                        unknown(name, node, 'import outside recorded repository closure: ' + module)
             parent = path.parent
             directories[str(parent.relative_to(root))] = sorted(p.name for p in parent.iterdir()
                 if p.suffix == '.py' or p.is_dir() and p.name.isidentifier() and p.name != '__pycache__')
         return {'complete': complete, 'files': files, 'directories': directories,
-                'source': source_identity(root)}
-    except (OSError, ValueError, SyntaxError):
-        return {'complete': False, 'source': source_identity(root)}
+                'source': source_identity(root), 'unresolved': unresolved,
+                'unresolved_count': unresolved_count}
+    except (OSError, ValueError, SyntaxError) as error:
+        return {'complete': False, 'source': source_identity(root),
+                'unresolved': [{'reason': type(error).__name__, 'path': name}]}
 
 
 def dependencies_match(root, manifest):
