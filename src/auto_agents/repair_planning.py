@@ -134,6 +134,9 @@ def _invoke(runner, workspace, stage, instruction, context):
         # redacted strings alone cannot distinguish different hidden values.
         identity['review_binding'] = {'plan': digest(context.get('proposed_plan')),
             'probes': digest(context.get('probe_results')), 'input': digest(projected)}
+    if stage in {'self_repair_scope_review', 'self_repair_scope_format'}:
+        from .repair_scope_recovery import bind_request
+        bind_request(runner, context, identity, projected)
     atomic_json(directory / 'request.json', identity)
     episode = runner._experiment.repair_episodes.get(context.get('planning_episode'))
     if episode is not None:
@@ -204,6 +207,10 @@ def _invoke(runner, workspace, stage, instruction, context):
         raise PlanFormatError(stage + ' returned invalid JSON', field='response',
                               constraint='JSON object', evidence=str(directory / 'invalid.json')) from error
     atomic_json(directory / 'result.json', sanitize_evidence(payload))
+    if stage in {'self_repair_scope_review', 'self_repair_scope_format'}:
+        from .repair_scope_recovery import admit_result
+        admit_result(identity, payload)
+        atomic_json(directory / 'request.json', identity)
     return payload, request_id
 
 
@@ -286,18 +293,34 @@ def _correct_scope(runner, workspace, context, scope_key, instruction):
         # The caller already rejected reuse (e.g. an unproved external input).
         # A completed draft is not an authorization to skip that fresh review.
         saved.setdefault('prior_requests', []).append(saved.get('request_id'))
-        for key in ('draft', 'request_id', 'format_error', 'format_calls', 'decision'):
+        cleared = ['draft', 'request_id', 'format_error', 'decision']
+        if not saved.get('scope_call') or saved['scope_call'].get('status') == 'validated':
+            cleared.append('format_calls')
+        for key in cleared:
             saved.pop(key, None)
     payload, request_id = saved.get('draft'), saved.get('request_id', '')
+    recovered = None
+    if saved.get('scope_call') and saved['scope_call'].get('status') != 'validated':
+        from .repair_scope_recovery import recover_scope_result
+        recovered = recover_scope_result(runner, workspace, context, scope_key)
+        if recovered:
+            payload, request_id = recovered
+            saved.pop('format_error', None)
+        elif not context.get('scope_dependencies_complete'):
+            # A pending format correction cannot carry an opaque external fact
+            # across a restart. Preserve its consumed format slots, but obtain
+            # a new independent factual decision within the same bounded round.
+            saved.pop('format_error', None)
+            payload = None
+    if (payload is not None and not saved.get('format_error') and saved.get('scope_call')
+            and saved['scope_call'].get('status') != 'validated' and not recovered):
+        # A process may have died after saving the draft but before admitting
+        # its decisions. Apply the same evidence guards as result-file recovery.
+        payload = None
     if payload is None and not saved.get('format_error'):
-        from .repair_probe_recovery import MAX_PROBE_CORRECTIONS
-        extra = min(saved.get('probe_corrections', 0), MAX_PROBE_CORRECTIONS)
-        if experiment.planning_attempts.get(scope_key, 0) >= MAX_PLAN_REVIEWS + extra:
-            raise PlanningBlocked('scope diagnosis exhausted its bounded attempts')
-        experiment.planning_attempts[scope_key] = experiment.planning_attempts.get(scope_key, 0) + 1
-        runner._experiment_store.save(experiment)
+        from .repair_scope_recovery import scope_call
         try:
-            payload, request_id = _invoke(runner, workspace, 'self_repair_scope_review', instruction, context)
+            payload, request_id = scope_call(runner, workspace, context, scope_key, instruction)
         except PlanFormatError as error:
             saved['format_error'] = error.detail
     while True:
@@ -322,6 +345,8 @@ def _correct_scope(runner, workspace, context, scope_key, instruction):
         runner._experiment_store.save(experiment)  # An interrupted call still spends its slot.
         correction = {key: context[key] for key in ('source', 'source_commit', 'workspace',
                       'environment', 'contract_fingerprint', 'findings', 'probe_results')}
+        correction.update({key: context.get(key) for key in ('scope_key', 'engine_base',
+            'runtime_capabilities', 'scope_dependencies_complete', 'scope_unresolved_dependencies')})
         correction.update(previous_scope=payload, feedback=saved['format_error'],
             original_review_ref=str(runner._experiment_store.root / 'planning' / request_id / 'input.json')
                                 if request_id else saved['format_error'].get('evidence', ''),
@@ -339,20 +364,25 @@ def _correct_scope(runner, workspace, context, scope_key, instruction):
             payload = previous
             continue
         # A syntactic correction cannot silently reclassify or weaken a safety finding.
-        match = re.fullmatch(r'decisions\[(\d+)\]\.(\w+)', field)
-        if previous is not None and match:
-            before, after = deepcopy(previous), deepcopy(payload)
-            try:
-                index, key = int(match[1]), match[2]
-                before['decisions'][index].pop(key, None)
-                after['decisions'][index].pop(key, None)
-            except (KeyError, IndexError, TypeError, AttributeError):
-                after = None
-            if before != after:
-                saved['decision'] = 'scope_format_exhausted'
-                runner._experiment_store.save(experiment)
-                raise PlanningBlocked('scope format correction changed unreported decision fields',
-                                      code='scope_semantics_changed', evidence=request_id)
+        if _scope_format_changed(previous, payload, field):
+            saved['decision'] = 'scope_format_exhausted'
+            runner._experiment_store.save(experiment)
+            raise PlanningBlocked('scope format correction changed unreported decision fields',
+                                  code='scope_semantics_changed', evidence=request_id)
+
+
+def _scope_format_changed(previous, payload, field):
+    match = re.fullmatch(r'decisions\[(\d+)\]\.(\w+)', field)
+    if previous is None or not match:
+        return False
+    before, after = deepcopy(previous), deepcopy(payload)
+    try:
+        index, key = int(match[1]), match[2]
+        before['decisions'][index].pop(key, None)
+        after['decisions'][index].pop(key, None)
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return True
+    return before != after
 
 
 def _scope_revalidation_reason(runner, workspace, finding, environment):
@@ -401,6 +431,11 @@ def review_scope(runner, workspace, findings):
     context['scope_revalidation'] = {item['finding_id']: {
         'previous': experiment.scope_decisions.get(item['finding_id']),
         'reason': reasons[item['finding_id']]} for item in pending}
+    manifests = {item['finding_id']: _scope_dependencies(workspace, context, item,
+        experiment.scope_decisions.get(item['finding_id'], {})) for item in pending}
+    context['scope_dependencies_complete'] = all(value.get('complete') for value in manifests.values())
+    context['scope_unresolved_dependencies'] = {key: value.get('unresolved', [])
+        for key, value in manifests.items() if not value.get('complete')}
     deltas = {}
     for row in context['scope_revalidation'].values():
         previous = row.get('previous') or {}
@@ -418,6 +453,7 @@ def review_scope(runner, workspace, findings):
     from .repair_probe_recovery import probe_id
     context['probe_results'] = [{**result, 'probe_id': probe_id(result['specification'])}
                                 for result in context['probe_results']]
+    context['scope_key'] = scope_key
     payload, request_id, decisions = _correct_scope(runner, workspace, context, scope_key,
         'Independently decide whether each observation MUST block this original repair. '
         'Do not equate a valid obligation ID or a changed file with necessity. Use the original user '
@@ -448,19 +484,15 @@ def review_scope(runner, workspace, findings):
             'engine_base': experiment.base_commit, 'source': context['source'],
             'source_commit': context['source_commit'],
             'environment': context['environment'], 'request_id': request_id}
-        from .repair_memory import dependency_manifest, save_record
-        paths = set(finding.get('affected_paths', []))
-        paths.update(context.get('component', {}).get('touched_paths', []))
-        paths.update(node.split('::', 1)[0] for node in pytest_targets(finding.get('required_test', '')))
-        for evidence in [*finding.get('evidence', []), *row.get('evidence', [])]:
-            match = re.match(r'([\w./-]+\.(?:py|json|toml|ini|ya?ml))(?::\d+)?(?:$|\s)', evidence)
-            if match:
-                paths.add(match[1])
+        from .repair_memory import save_record
         fact = save_record(runner, 'scope_fact', {'finding_key': finding_key(finding),
-            'dependencies': dependency_manifest(workspace, sorted(paths)), 'request_id': request_id})
+            'dependencies': _scope_dependencies(workspace, context, finding, row), 'request_id': request_id})
         validated[row['finding_id']]['fact_ref'] = fact
         experiment.review_facts[fact['id']] = fact
     experiment.scope_decisions.update(validated)
+    saved = experiment.planning_receipts[scope_key]
+    if saved.get('scope_call'):
+        saved['scope_call']['status'] = 'validated'
     runner._experiment_store.save(experiment)
     if any(row['verdict'] == 'unknown' for row in validated.values()):
         if payload.get('probes'):
@@ -468,6 +500,18 @@ def review_scope(runner, workspace, findings):
             if queue_probes(runner, scope_key, payload['probes']):
                 return review_scope(runner, workspace, findings)
         raise PlanningBlocked('scope evidence is insufficient; no code change is authorized', evidence=scope_key)
+
+
+def _scope_dependencies(workspace, context, finding, row):
+    from .repair_memory import dependency_manifest
+    paths = set(finding.get('affected_paths', []))
+    paths.update(context.get('component', {}).get('touched_paths', []))
+    paths.update(node.split('::', 1)[0] for node in pytest_targets(finding.get('required_test', '')))
+    for evidence in [*finding.get('evidence', []), *row.get('evidence', [])]:
+        match = re.match(r'([\w./-]+\.(?:py|json|toml|ini|ya?ml))(?::\d+)?(?:$|\s)', evidence)
+        if match:
+            paths.add(match[1])
+    return dependency_manifest(workspace, sorted(paths))
 
 
 def _test_command(command, *, probe=False):
