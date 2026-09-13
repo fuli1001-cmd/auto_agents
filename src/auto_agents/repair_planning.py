@@ -103,7 +103,7 @@ def _context(runner, workspace):
     if getattr(runner, '_real_project_root', None) is not None:
         from .repair_capability_checks import production_capabilities
         capabilities['production_namespace'] = production_capabilities(runner, workspace)
-    return compact_context(runner, sanitize_evidence({
+    result = compact_context(runner, sanitize_evidence({
         'policy': POLICY_VERSION,
         'source': source_identity(workspace), 'source_commit': head_ref(workspace),
         'workspace': str(workspace), 'engine_base': experiment.base_commit,
@@ -117,6 +117,16 @@ def _context(runner, workspace):
         'component': dict(runner._candidate_group),
         'history': experiment.prompt_context(),
     }))
+    if runner._candidate_group.get('completed_by'):
+        from .repair_completion import _memory
+        from .repair_memory import read_record
+        reference = _memory(runner, runner._candidate_group).get('delta_review', {})
+        rejected = read_record(runner, reference)
+        if rejected and rejected.get('decision') == 'REJECT':
+            result['completed_revalidation_failure'] = {
+                'reference': str(runner._experiment_store.root / 'planning' / reference['id'] / 'memory.json'),
+                'reason': rejected.get('reason') or rejected.get('payload', {}).get('reason')}
+    return result
 
 
 def _invoke(runner, workspace, stage, instruction, context):
@@ -187,7 +197,7 @@ def _invoke(runner, workspace, stage, instruction, context):
         atomic_json(directory / 'metrics.json', {'stage': stage, 'seconds': time.monotonic() - started,
             'input_chars': len(json.dumps(context, ensure_ascii=False)),
             'working_input_chars': len(json.dumps(working, ensure_ascii=False)),
-            'prompt_chars': len(request.prompt), 'incremental': bool(context.get('previous_revision')),
+            'prompt_chars': len(request.prompt), 'incremental': bool(context.get('previous_revision') or context.get('completion_ref')),
             'component': context.get('component', {}).get('group_id'),
             'planning_action': context.get('planning_action', ''),
             'scope_revalidation_reasons': {key: row.get('reason') for key, row in
@@ -225,7 +235,9 @@ def _retained_scope(runner, receipt, finding):
             return False
         request, context, result = [json.loads(path.read_text()) for path in paths]
         decisions = [row for row in result.get('decisions', []) if row.get('finding_id') == finding['finding_id']]
-        return (request.get('stage') in {'self_repair_scope_review', 'self_repair_scope_format'} and len(decisions) == 1
+        return (request.get('stage') in {'self_repair_scope_review', 'self_repair_scope_format',
+                                       'self_repair_component_delta_review'} and len(decisions) == 1
+                and (request.get('stage') != 'self_repair_component_delta_review' or result.get('decision') == 'APPROVE')
                 and request.get('request_id') == identity
                 and all(decisions[0].get(key) == receipt.get(key) for key in (
                     'verdict', 'obligation_id', 'trigger', 'consequence', 'support_basis', 'evidence', 'reason', 'disproof'))
@@ -474,7 +486,22 @@ def review_scope(runner, workspace, findings):
         'or python -B -c memory diagnostics. Preserve successful probes. Only an inconclusive probe may be '
         'corrected, at most twice; bind replaces_probe to its probe_id and preserve expected. '
         'The controller executes them in a disposable copy, then asks again.')
-    incoming = {item['finding_id']: item for item in pending}
+    validated = record_scope_decisions(runner, workspace, context, request_id, decisions, persist=False)
+    saved = experiment.planning_receipts[scope_key]
+    if saved.get('scope_call'):
+        saved['scope_call']['status'] = 'validated'
+    runner._experiment_store.save(experiment)
+    if any(row['verdict'] == 'unknown' for row in validated.values()):
+        if payload.get('probes'):
+            from .repair_probe_recovery import queue_probes
+            if queue_probes(runner, scope_key, payload['probes']):
+                return review_scope(runner, workspace, findings)
+        raise PlanningBlocked('scope evidence is insufficient; no code change is authorized', evidence=scope_key)
+
+
+def record_scope_decisions(runner, workspace, context, request_id, decisions, *, persist=True):
+    experiment = runner._experiment
+    incoming = {item['finding_id']: item for item in context['findings']}
     validated = {}
     for row in decisions:
         finding = incoming[row['finding_id']]
@@ -490,16 +517,9 @@ def review_scope(runner, workspace, findings):
         validated[row['finding_id']]['fact_ref'] = fact
         experiment.review_facts[fact['id']] = fact
     experiment.scope_decisions.update(validated)
-    saved = experiment.planning_receipts[scope_key]
-    if saved.get('scope_call'):
-        saved['scope_call']['status'] = 'validated'
-    runner._experiment_store.save(experiment)
-    if any(row['verdict'] == 'unknown' for row in validated.values()):
-        if payload.get('probes'):
-            from .repair_probe_recovery import queue_probes
-            if queue_probes(runner, scope_key, payload['probes']):
-                return review_scope(runner, workspace, findings)
-        raise PlanningBlocked('scope evidence is insufficient; no code change is authorized', evidence=scope_key)
+    if persist:
+        runner._experiment_store.save(experiment)
+    return validated
 
 
 def _scope_dependencies(workspace, context, finding, row):
@@ -783,6 +803,9 @@ def _review_execution_mode(plan, review):
 
 
 def _apply_execution_mode(runner, receipt, source):
+    # Completed-component recovery markers are issued by the controller, never
+    # by a proposed plan or a retained model response.
+    runner._candidate_group.pop('completion_revalidation', None)
     # An unchanged, independently inspected implementation can go directly to
     # verification. New failure evidence still authorizes the original writer.
     if (receipt.get('source') == source and receipt.get('execution_mode') == 'verify_existing'
@@ -822,6 +845,10 @@ def prepare_component(runner, workspace):
     experiment = runner._experiment
     group = deepcopy(next((item for item in experiment.finding_groups
                            if item['group_id'] == runner._candidate_group['group_id']), runner._candidate_group))
+    from .repair_component_revalidation import prepare_completed
+    retained = prepare_completed(runner, workspace, group)
+    if retained is not None:
+        return retained
     findings = [f for f in experiment.findings.values() if f.status in {'confirmed', 'reopened'}
                 and (f.finding_id in group.get('finding_ids', []) or f.repair_group_id == group['group_id'])]
     review_scope(runner, workspace, findings)

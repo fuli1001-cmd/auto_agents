@@ -304,6 +304,27 @@ or child session. A recheck returning `unknown` cannot repeatedly use the old
 completed decision to renew its allowance. Exhaustion reports the finding,
 revalidation reason and unresolved dependency locations in its structured result.
 
+Completed components have a separate revalidation path. An authentic completion
+receipt with unchanged contract and acceptance restores the existing plan in
+`verify_existing` mode. It does not repeat scope diagnosis, planning probes or
+component-plan review. The normal quick/expanded verification pipeline remains;
+one compact, read-only delta review covers changed mechanisms and any historical
+scope conclusions that need fresh inspection. Full receipts and command inventories
+remain referenced artifacts rather than repeated prompt history. A new or reopened
+related defect, changed contract, missing evidence, failed deterministic check or
+rejected delta assessment returns to the ordinary repair path. The recovered plan
+never authorizes a writer by itself, and final integration always retains full review.
+
+Execution evidence is bound separately from review configuration. A reviewer or
+planning-policy change can require a new review while retaining independently
+valid checks; execution-policy/environment changes and unproved input closures
+still require affected commands to run. Existing receipts without the separate
+binding can retain their plan, but do not infer portable execution evidence.
+After source integration, previously failed checks of a completed component run
+before another diagnosis of the old failure. Progress reports distinguish historical
+completion, current acceptance, components awaiting revalidation and reusable versus
+required check commands. Historical completion is never counted as new repair progress.
+
 ## Publication and evidence
 
 Local and remote commits arriving during repair are integrated in a private delivery

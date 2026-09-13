@@ -1769,13 +1769,21 @@ class AutoAgentsSelfRepairRunner:
         if not groups:
             return {}
         completed = sum(group.get("status") == "completed" for group in groups)
-        progress = {"total": len(groups), "completed": completed}
+        historical = sum(bool(group.get('completed_by')) for group in groups)
+        revalidating = sum(bool(group.get('completed_by')) and group.get('status') != 'completed' for group in groups)
+        progress = {"total": len(groups), "completed": completed,
+                    "historical_completed": historical, "needs_revalidation": revalidating}
         active = next((group for group in groups
                        if group.get("group_id") == experiment.active_finding_group_id), None)
         if active and active.get("status") != "completed":
             # Scheduling follows dependencies and regression ownership, not list order.
             progress.update(current=completed + 1, group_id=active["group_id"],
-                            title=redact_incident_text(str(active.get("title") or active["group_id"])))
+                            title=redact_incident_text(str(active.get("title") or active["group_id"])),
+                            revalidating=bool(active.get('completed_by')))
+            current = getattr(self, '_candidate_group', {})
+            if current.get('group_id') == active['group_id'] and isinstance(current.get('completion_revalidation'), dict):
+                marker = current['completion_revalidation']
+                progress.update({key: marker.get(key, 0) for key in ('checks_reused', 'checks_retest')})
         return {"group_progress": progress}
 
     @contextmanager
@@ -3781,6 +3789,9 @@ class AutoAgentsSelfRepairRunner:
                 store.save(experiment)
                 continue
             self._candidate_group = dict(active_group)
+            self._candidate_is_final_group = sum(
+                1 for item in experiment.finding_groups if str(item.get('status', '')) != 'completed'
+            ) == 1
             callback = getattr(self, "_control_phase_callback", None)
             if callback:
                 callback("phase_started", {"phase": "component_selected", **self._group_progress()})
@@ -3790,11 +3801,6 @@ class AutoAgentsSelfRepairRunner:
                 store.save(experiment)
                 return SelfRepairResult(False, "diagnosis_blocked", self._candidate_next_action["cause"],
                     experiment_id=experiment_id, next_action=self._candidate_next_action)
-            self._candidate_is_final_group = sum(
-                1
-                for item in experiment.finding_groups
-                if str(item.get("status", "")) != "completed"
-            ) == 1
             self._migrate_recoverable_candidate_to_pending(experiment)
             pending = self._resume_pending_validation_candidate(
                 experiment_id=experiment_id,
@@ -4627,7 +4633,9 @@ class AutoAgentsSelfRepairRunner:
                 if isinstance(experiment, SelfRepairExperiment):
                     experiment.current_candidate_id = candidate_id
                     self._experiment_store.save(experiment)
-                prompt = self._build_prompt(repair_root, target_snapshot)
+                prompt = ('Revalidate the completed component without generating code.'
+                          if self._candidate_group.get('completion_revalidation') else
+                          self._build_prompt(repair_root, target_snapshot))
                 prompt_path, output_path = self._artifact_paths()
                 write_text(prompt_path, prompt)
                 candidate_timeout = max(
@@ -4685,7 +4693,8 @@ class AutoAgentsSelfRepairRunner:
                     ),
                 )
                 try:
-                    with self._phase_timer("candidate_generation"):
+                    with self._phase_timer('candidate_revalidation' if self._candidate_group.get('mode') == 'verify_existing'
+                                           else 'candidate_generation'):
                         if self._candidate_group.get('planning_receipt') and self._candidate_group.get('mode') == 'verify_existing':
                             self._report_candidate_phase('candidate_revalidation', 'revalidating retained code without a writer')
                             result = AgentResult(True, [], output_path,
@@ -4782,6 +4791,14 @@ class AutoAgentsSelfRepairRunner:
                     repair_root,
                     base_head,
                 )
+                if deterministic_issues and self._candidate_group.get('completion_revalidation'):
+                    from .repair_component_revalidation import reject_prepared
+                    reason = 'completed component failed deterministic revalidation: ' + '; '.join(deterministic_issues)
+                    reject_prepared(self, reason)
+                    return SelfRepairResult(False, 'candidate_verification_failed', category=self.decision.category,
+                        reason=reason, summary=summary, experiment_id=experiment_id, candidate_id=candidate_id,
+                        base_commit=base_head, finding_group_id=self._candidate_group['group_id'],
+                        next_action={'kind': 'repair_code', 'reason': reason})
                 if deterministic_issues:
                     self._report_candidate_phase(
                         "correcting_deterministic_violations",
@@ -6016,6 +6033,10 @@ class AutoAgentsSelfRepairRunner:
         )
         if execution is None or self.diagnosis is None:
             return _VerificationResult(True, "candidate review=legacy-compatible")
+        from .repair_component_revalidation import review_completed
+        revalidated = review_completed(self, repair_root, phase)
+        if revalidated is not None:
+            return revalidated
         review_cache_identity = ''
         if isinstance(getattr(self, '_experiment', None), SelfRepairExperiment):
             from .repair_review_reuse import reuse_review, review_identity
@@ -6304,7 +6325,14 @@ class AutoAgentsSelfRepairRunner:
                 or not isinstance(getattr(self, '_experiment', None), SelfRepairExperiment)):
             return {'mode': 'complete_integration' if phase == 'integration' else 'initial'}
         from .repair_memory import review_context
-        return review_context(self, root, group)
+        context = review_context(self, root, group)
+        reference = (group.get('completion_revalidation') or {}).get('rejected_delta')
+        if reference:
+            from .repair_memory import read_record
+            rejected = read_record(self, reference)
+            if rejected:
+                context['completed_delta_rejection'] = {'reference': reference, 'evidence': rejected.get('payload', rejected)}
+        return context
 
     @_timed_repair_phase("proof_seal")
     def _deterministic_proof_seal(

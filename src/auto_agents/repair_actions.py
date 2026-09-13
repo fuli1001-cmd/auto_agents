@@ -38,6 +38,10 @@ def prepare_action(runner, experiment):
                      key=lambda item: item.created_at)
     record = records[-1] if records else None
     evidence = record.failure_evidence if record else []
+    from .repair_component_revalidation import revalidation_action
+    retained = revalidation_action(runner, record)
+    if retained is not None:
+        return retained
     from .repair_test_refs import review_action
     action = review_action(experiment, next_action(evidence))
     if action['kind'] == 'blocked' and evidence and evidence[-1].get('phase') == 'candidate_admission':
