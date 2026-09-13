@@ -15,6 +15,14 @@ authorize reuse. Both retained `--landlock` and `--writer-landlock` entry protoc
 use this mechanism; generic verification additionally supplies its read-only
 roots, including repository metadata.
 
+Direct verification and gate launchers bind their engine imports to the source
+root containing the launcher, before importing any `auto_agents` module. Managed
+interpreters are cached by dependency metadata and can contain an older installed
+engine, while sandbox preflight intentionally runs in a workspace without `src`.
+The launcher must therefore not rely on that workspace's `PYTHONPATH` or the
+cached installation. This bootstrap is local to the launcher interpreter; the
+executed project command retains its original import environment.
+
 The supervisor pins a requested object, verifies its identity and membership
 under pinned directory descriptors, then performs the operation on that inode.
 It substitutes the syscall result instead of resuming a pathname operation in

@@ -8,9 +8,16 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
-from auto_agents import artifact_temp as tempfile
 import sys
 import ctypes
+
+# The managed interpreter may retain an older installed engine. Direct launches
+# (including the private /tmp preflight) must import helpers from this runtime,
+# before importing any auto_agents module. Do not change the test command's env.
+if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from auto_agents import artifact_temp as tempfile
 
 
 def landlock_abi():

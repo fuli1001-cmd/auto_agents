@@ -5,6 +5,11 @@ import json
 from pathlib import Path
 import sys
 
+# Direct gate launchers use their selected runtime, not the managed environment's
+# possibly older installed package. Ordinary library imports do not change sys.path.
+if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from auto_agents import artifact_temp as tempfile
 
 
