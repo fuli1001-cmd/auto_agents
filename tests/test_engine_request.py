@@ -298,6 +298,8 @@ def test_worker_fetches_then_plans_then_checks_before_candidate_generation(tmp_p
     with patch("auto_agents.repair_worker.engine_environment", return_value=(sys.executable, "env")), \
          patch("auto_agents.repair_worker.execute_selected_worker"), \
          patch("auto_agents.verification_sandbox.check_verification_sandbox"), \
+         patch("auto_agents.verification_input_trace.check_input_tracing", side_effect=lambda *args:
+               events.append("trace_owner") or {"owner": "active", "protocol": 1}), \
          patch("auto_agents.root_cause.RootCauseCoordinator._copy_diagnostic_tree", side_effect=shutil.copytree), \
          patch("auto_agents.repair_contract.prepare_contract", side_effect=plan), \
          patch("auto_agents.repair_worker.import_legacy_experiment"), \
@@ -305,7 +307,7 @@ def test_worker_fetches_then_plans_then_checks_before_candidate_generation(tmp_p
          patch("auto_agents.repair_worker.make_runner", return_value=Oracle()), \
          patch("auto_agents.repair_worker.check_revision", side_effect=checked):
         result = repair({"config": config, "job": {"id": "request", "payload": payload}})
-    assert events == (["plan", "check", "full"] if satisfied else ["plan", "check", "generate"])
+    assert events == (["trace_owner", "plan", "check", "full"] if satisfied else ["trace_owner", "plan", "check", "generate"])
     assert result["ok"] is (satisfied and full_pass)
     if satisfied and full_pass:
         assert result["status"] == "already_repaired"

@@ -36,6 +36,9 @@ def test_real_preflight_uses_selected_runtime_with_reused_interpreter(runtime, t
     driver = ('import sys; from pathlib import Path; sys.path.insert(0,' + repr(str(selected / 'src')) + '); '
               'from auto_agents.verification_sandbox import check_verification_sandbox; '
               'check_verification_sandbox(Path(' + repr(str(selected)) + '),' + repr(str(python)) + ', '
+              'Path(' + repr(str(target)) + ')); '
+              'from auto_agents.verification_input_trace import check_input_tracing; '
+              'check_input_tracing(Path(' + repr(str(selected)) + '),' + repr(str(python)) + ', '
               'Path(' + repr(str(target)) + ')); print("selected-runtime preflight passed")')
     result = subprocess.run([str(python), '-I', '-c', driver], cwd=tmp_path,
                             capture_output=True, text=True, timeout=40)

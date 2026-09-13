@@ -247,13 +247,15 @@ def _change(pid, registers, name, policies):
         os.close(fd)
 
 
-def _event(pid, policies, names, tasks):
+def _event(pid, policies, names, tasks, traces=None):
     registers = Registers()
     _ptrace(12, pid, data=ctypes.byref(registers))  # GETREGS
     name = names.get(registers.orig_rax)
     result = -errno.EPERM if name is None else None
     try:
-        if name == 'prctl' and registers.rdi == POLICY_REQUEST:
+        if name == 'prctl' and registers.rdi == 0x41415452 and traces is not None:
+            result = traces.request(pid, registers, policies)
+        elif name == 'prctl' and registers.rdi == POLICY_REQUEST:
             if registers.rdx == 0:
                 registers.orig_rax = (1 << 64) - 1
                 registers.rax = VERSION
@@ -306,9 +308,11 @@ def _trace_loop(leader, tasks, names, pending):
     waitpid can report the child's initial SIGSTOP before the parent's FORK,
     VFORK or CLONE event. Only the latter establishes the inherited policy.
     """
+    from auto_agents.verification_input_trace import TraceSessions
+    traces = TraceSessions()
     def resume(pid, delivered=0):
         try:
-            _ptrace(7, pid, data=delivered)
+            _ptrace(24 if pid in traces.sessions else 7, pid, data=delivered)
         except OSError as error:
             if error.errno != errno.ESRCH:
                 raise
@@ -316,6 +320,7 @@ def _trace_loop(leader, tasks, names, pending):
     while tasks or pending:
         pid, status = os.waitpid(-1, 0x40000000)  # __WALL includes traced threads.
         if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+            traces.retire(pid, terminated=os.WIFSIGNALED(status))
             known = pid in tasks or pid in retired
             tasks.pop(pid, None)
             retired.discard(pid)
@@ -337,6 +342,7 @@ def _trace_loop(leader, tasks, names, pending):
                 if former.value != pid:
                     tasks[pid] = tasks.pop(former.value)
                     retired.add(former.value)
+                traces.exec(former.value, pid)
                 pending.pop(pid, None)
             if pid not in tasks:
                 pending[pid] = status  # Also retain it for fail-closed cleanup.
@@ -350,12 +356,24 @@ def _trace_loop(leader, tasks, names, pending):
                     raise RuntimeError('metadata child already has an active policy')
                 retired.discard(child.value)
                 tasks[child.value] = tasks[pid]
+                traces.inherit(pid, child.value)
                 if child.value in pending:
                     pending.pop(child.value)
                     resume(child.value)
             elif event == 7:
-                _event(pid, tasks[pid], names, tasks)
-            resume(pid, 0 if event or delivered == signal.SIGSTOP else delivered)
+                _event(pid, tasks[pid], names, tasks, traces)
+            elif delivered == signal.SIGTRAP | 0x80:
+                # GET_SYSCALL_INFO distinguishes entry/exit even after exec,
+                # seccomp stops, signal delivery and child registration.
+                info = ctypes.create_string_buffer(88)
+                _ptrace(0x420e, pid, 88, ctypes.byref(info))
+                registers = Registers()
+                _ptrace(12, pid, data=ctypes.byref(registers))
+                if info.raw[0] == 1:
+                    traces.enter(pid, registers)
+                elif info.raw[0] == 2:
+                    traces.exit(pid, ctypes.c_longlong(registers.rax).value)
+            resume(pid, 0 if event or delivered in (signal.SIGSTOP, signal.SIGTRAP | 0x80) else delivered)
         except OSError as error:
             if error.errno != errno.ESRCH:
                 raise
@@ -403,7 +421,7 @@ def metadata_exec(command, roots, readonly=()):
         if not os.WIFSTOPPED(status):
             return os.waitstatus_to_exitcode(status)
         # All descendants remain traced, and are killed if this supervisor dies.
-        _ptrace(0x4200, leader, data=0x00100000 | 0x80 | 0x02 | 0x04 | 0x08 | 0x10)
+        _ptrace(0x4200, leader, data=0x00100000 | 0x01 | 0x80 | 0x02 | 0x04 | 0x08 | 0x10)
         library = ctypes.CDLL('libseccomp.so.2')
         names = {library.seccomp_syscall_resolve_name(name.encode()): name for name in
                  ('chmod', 'fchmod', 'fchmodat', 'fchmodat2', 'utime', 'utimes', 'utimensat', 'futimesat',

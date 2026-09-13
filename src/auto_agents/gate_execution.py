@@ -13,6 +13,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 from auto_agents import artifact_temp as tempfile
 import threading
 import time
@@ -481,6 +482,11 @@ def _observed_input_manifest(
         text = trace_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {}, False
+    if text.lstrip().startswith('{'):
+        from .verification_input_trace import resolved_trace
+        text = resolved_trace(text)
+        if text is None:
+            return {}, False
     network_observed = "connect(" in text or "sendto(" in text
     denied_inputs = {}
     enriched = bool(re.search(r"(?m)^(?:\[pid\s+)?\d+\]?\s+", text))
@@ -550,7 +556,7 @@ def _observed_input_manifest(
             continue
         if isinstance(raw, str):
             observed_paths.append(raw)
-    for raw in observed_paths:
+    for raw in dict.fromkeys(observed_paths):
         if not isinstance(raw, str) or not raw or raw.startswith(
             ("/dev/", "/proc/", "/sys/")
         ):
@@ -1441,16 +1447,13 @@ class LocalGatePlanExecutor:
             compiled = compile_ini_overrides(command, sandbox,
                 {**os.environ, **self.environment_overrides, **dict(environment_overrides or {})})
             traced_command = isolated_command(compiled)
-            if (
-                result_cache_scope in {"observed_inputs", "auto"}
-                and shutil.which("strace")
-            ):
+            if result_cache_scope in {"observed_inputs", "auto"}:
                 trace_path = runtime_root / "input-trace.log"
-                traced_command = (
-                    "strace -f -qq -y -e trace=%file,%network,%process,fchdir,getdents64,unshare,setns,mount,umount2 -o "
-                    f"{shlex.quote(str(trace_path))} "
-                    f"sh -lc {shlex.quote(traced_command)}"
-                )
+                # Select the backend inside the final boundary, where the live
+                # owner is known. A nested strace cannot attach beneath it.
+                traced_command = shlex.join([sys.executable,
+                    str(Path(__file__).with_name('verification_input_trace.py')),
+                    str(trace_path), 'sh', '-lc', traced_command])
             with (nullcontext() if named_lease is not None or named_lease_held else exclusive_resource_lease(
                 _metadata_list(metadata, "exclusive_resources"),
                 worker_id=self.worker_id,
@@ -1602,6 +1605,13 @@ class LocalGatePlanExecutor:
                 result.observed_inputs = observed_inputs
                 result.input_trace_complete = bool(observed_inputs)
                 result.network_observed = network_observed
+                if not result.input_trace_complete:
+                    result.input_trace_reason = 'input manifest could not be resolved'
+                    try:
+                        last = json.loads(trace_path.read_text().splitlines()[-1])
+                        result.input_trace_reason = ', '.join(last.get('reasons', [])) or last.get('reason') or result.input_trace_reason
+                    except (OSError, ValueError, IndexError):
+                        pass
             if progress is not None:
                 progress("finish", command, result.duration_seconds)
             self.record_timing(command, result)
