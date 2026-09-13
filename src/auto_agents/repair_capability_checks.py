@@ -85,6 +85,7 @@ def _metadata_observation_in_snapshot(runner, workspace):
                 'and any(row.get("path")==str(Path("private").resolve()) for row in rows))\n'
                 'result["input_trace_owner"]=rows[0].get("owner","")\n'
                 'result["input_trace_protocol"]=rows[0].get("version",0)\n'
+                'result["standalone_supervisor_checks"]=json.loads(os.environ.get("AUTO_AGENTS_SUPERVISOR_CHECKS","null"))\n'
                 'print(json.dumps(result))\n')
             launcher = root / 'src/auto_agents/gate_verification.py'
             if not launcher.is_file():
@@ -117,6 +118,14 @@ def _metadata_observation_in_snapshot(runner, workspace):
                         'protocol': observed.get('input_trace_protocol', 0),
                         'route': 'selected worker launches the outer owner before quick and expanded acceptance; nested gates negotiate tracing with that owner',
                         'candidate_runtime_handoff_required': False,
+                    },
+                    'standalone_owner_activation': {
+                        'supported': bool(observed.get('standalone_supervisor_checks')),
+                        'route': 'selected engine verification launcher runs fixed legacy-owner, '
+                                 'startup-denial and owner-death checks before entering the outer '
+                                 'metadata owner; nested acceptance reads source-bound observations '
+                                 'through verification_supervisor_checks.observation',
+                        'acceptance_proof': False,
                     },
                     'mechanism': 'inherited_ptrace_metadata_supervisor' if valid else ''}
     except (OSError, RuntimeError, ValueError) as error:

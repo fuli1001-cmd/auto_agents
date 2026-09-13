@@ -51,27 +51,13 @@ assert owner_identity()['trace'] == 1
 
 
 def test_legacy_owner_executes_once_without_claiming_complete_trace(tmp_path):
-    # Keep the policy implementation frozen, including its original ptrace deny.
-    import subprocess
-    import sys
-    owner = tmp_path / 'old/auto_agents'
-    owner.mkdir(parents=True)
-    (owner / '__init__.py').write_text('')
-    (owner / 'verification_metadata.py').write_bytes(subprocess.check_output([
-        'git', 'show', '8ea6662:src/auto_agents/verification_metadata.py']))
-    source = Path(__file__).parents[1] / 'src/auto_agents'
-    (owner / 'verification_sandbox.py').write_bytes((source / 'verification_sandbox.py').read_bytes())
-    (owner / 'artifact_temp.py').write_text('from tempfile import *\n')
-    helper = Path(__file__).parents[1] / 'src/auto_agents/verification_input_trace.py'
-    private = tmp_path / 'private'; private.mkdir()
-    script = ('from auto_agents.verification_metadata import metadata_exec; '
-              f'raise SystemExit(metadata_exec({[sys.executable, str(helper), str(private / "trace"), "sh", "-c", "echo executed >> count"]!r}, {[str(private)]!r}))')
-    result = subprocess.run([sys.executable, '-I', '-c',
-        f'import sys; sys.path.insert(0,{str(owner.parent)!r}); ' + script],
-        capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0, result.stderr
-    assert (private / 'count').read_text() == 'executed\n'
-    record = json.loads((private / 'trace').read_text())
+    from auto_agents.verification_supervisor_checks import observation, LEGACY_SHA256
+    result = observation('legacy_owner')
+    assert result['returncode'] == 0, result
+    assert result['count'] == 'executed\n'
+    assert result['legacy_sha256'] == LEGACY_SHA256
+    assert result['shared_unchanged'] is True
+    record = result['trace']
     assert record['complete'] is False
     assert record['owner']['metadata'] == 1 and record['owner']['trace'] == 0
 
