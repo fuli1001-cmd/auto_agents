@@ -264,6 +264,8 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
             "candidate_generation": "正在生成修复代码", "candidate_correction": "正在修正候选",
             "repair_design": "正在设计修复方案", "contract_reanalysis": "正在重新分析验收要求",
             "component_plan": "正在细化当前组件方案", "scope_format": "正在纠正范围审核字段",
+            "component_revalidation_prepare": "复用已完成方案，准备差异复核",
+            "component_delta_review": "正在审查已完成组件的变更影响",
             "component_selected": "正在准备当前组修复",
             "scope_review": "正在独立判断问题是否必须修复",
             "plan_format": "正在局部纠正规划格式", "local_correction": "正在分析当前组件的局部修正",
@@ -279,15 +281,22 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
         label = labels.get(phase, "正在审查候选" if phase.startswith("review_") else "正在修复")
         if phase == 'candidate_result' and progress.get('status') == 'candidate_group_completed':
             label = '当前组件已通过验收，继续后续组件与集成验证'
+        group = progress.get("group_progress") or {}
+        if phase == 'component_selected' and group.get('revalidating'):
+            label = '准备复核已完成组件'
         if progress.get("candidate"):
             label = f"第 {progress['candidate']} 轮：" + label
-        group = progress.get("group_progress") or {}
         if group.get("total"):
             if group.get("current"):
                 title = _repair_text(group.get("title") or group.get("group_id"))
                 label = f"{group['current']}/{group['total']}「{title}」；" + label
             else:
                 label = f"已验收 {group.get('completed', 0)}/{group['total']}；" + label
+            if group.get('needs_revalidation'):
+                label += (f"；历史已完成 {group.get('historical_completed', 0)}/{group['total']}，"
+                          f"待复核 {group['needs_revalidation']} 组")
+            if 'checks_retest' in group:
+                label += f"；检查命令：可复用 {group.get('checks_reused', 0)}、需重验 {group['checks_retest']}"
         elif phase == "repair_design":
             label = "正在划分修复组；" + label
         previous = progress.get("last_result") or {}

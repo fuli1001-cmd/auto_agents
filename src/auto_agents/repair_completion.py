@@ -74,6 +74,10 @@ def plan_semantics(record):
 
 
 def context(runner, workspace):
+    return digest(context_parts(runner, workspace))
+
+
+def context_parts(runner, workspace):
     from .planning_capabilities import planning_capabilities
     from .repository_guard import capture_repository_guard
     reviewer = _reviewer_context(runner, workspace)
@@ -83,7 +87,7 @@ def context(runner, workspace):
     if getattr(runner, '_real_project_root', None) is not None:
         from .repair_capability_checks import production_capabilities
         production = production_capabilities(runner, workspace)
-    return digest({'environment': runner._full_suite_environment_fingerprint(), 'reviewer': reviewer,
+    return {'environment': runner._full_suite_environment_fingerprint(), 'reviewer': reviewer,
         'settings': settings, 'capabilities': planning_capabilities(runner),
         'production_capabilities': production,
         'gates': _plain(getattr(runner.target_orchestrator.config, 'gates', None)),
@@ -93,7 +97,25 @@ def context(runner, workspace):
         'project_inputs': capture_repository_guard(
             Path(getattr(runner, '_real_project_root', None) or runner.target_project_root), ignore_run_artifacts=True),
         'sandbox': bool(os.environ.get('AUTO_AGENTS_VERIFICATION_SANDBOX')),
-        'read_roots': list(map(str, getattr(runner, '_verification_read_roots', [])))})
+        'read_roots': list(map(str, getattr(runner, '_verification_read_roots', [])))}
+
+
+def execution_binding(runner, workspace, *, parts=None):
+    """Review/model changes do not change the meaning of an executed check."""
+    from .gate_result_cache import execution_policy_fingerprint
+    parts = parts if parts is not None else context_parts(runner, workspace)
+    root = Path(__file__).parent
+    files = {name: digest((root / name).read_text()) for name in (
+        'self_repair.py', 'models.py', 'config.py', 'repository_guard.py', 'git_ops.py',
+        'process_supervision.py', 'repair_completion.py', 'repair_schedule.py',
+        'repair_verification.py', 'repair_verification_pool.py', 'repair_concurrent_validation.py',
+        'repair_dependencies.py', 'repair_test_refs.py', 'gate_execution.py', 'gate_result_cache.py',
+        'gates.py', 'workers.py', 'verification_sandbox.py', 'verification_metadata.py',
+        'gate_verification.py', 'verification_inputs.py', 'verification_probes.py',
+        'verification_manifest.py', 'verification_pytest.py', 'verification_trace.py')}
+    components = {key: digest(value) for key, value in parts.items() if key != 'reviewer'}
+    return {'policy': digest([execution_policy_fingerprint(), files]), 'files': files,
+            'context': digest(components), 'components': components}
 
 
 def _ledger_state(runner):
@@ -218,6 +240,7 @@ def seal(runner, workspace, review, verification):
                     'inputs': next((row for row in verification.payload.get('completion_inputs', []) if row['command'] == command), {}),
                     'dependencies': dependency_manifest(workspace, _paths([command]))}
                    for command in commands]}
+    proof['execution_binding'] = execution_binding(runner, workspace)
     if snapshot(workspace) != before:
         return None
     reference = save_record(runner, 'component_completion', proof)
@@ -227,22 +250,16 @@ def seal(runner, workspace, review, verification):
     return reference
 
 
-def assess(runner, workspace, group, *, observations=None):
-    """No model/test execution, no progress credit, and no mutable receipt import."""
-    from .repair_planning import finding_key
+def retained_proof(runner, group):
+    """Authenticate the old completion as data, separately from current validity."""
     memory = _memory(runner, group)
     proof = read_record(runner, memory.get('completion', {}))
-    result = {'state': 'needs_revalidation', 'reason': 'completion receipt missing or invalid',
-              'reusable_checks': [], 'affected_checks': []}
     if not proof:
-        return result
-    result['affected_checks'] = proof.get('commands', [])
-    if getattr(runner, '_verification_fresh', False):
-        return {**result, 'reason': 'fresh verification requested'}
+        return None, 'completion receipt missing or invalid'
     if (proof.get('kind') != 'component_completion' or proof.get('version') != VERSION
             or proof.get('contract') != runner._experiment.contract_fingerprint
             or proof.get('definition') != definition(group)):
-        return {**result, 'reason': 'component contract or acceptance changed'}
+        return None, 'component contract or acceptance changed'
     current_revision = _evidence_memory(runner, group).get('latest_revision')
     revision_record = read_record(runner, current_revision or {})
     plan_changed = (proof.get('plan_revision') != current_revision
@@ -250,31 +267,73 @@ def assess(runner, workspace, group, *, observations=None):
                     and (not proof.get('plan_semantics') or proof['plan_semantics'] != plan_semantics(revision_record)))
     if (plan_changed
             or proof.get('acceptance', []) != _evidence_memory(runner, proof.get('plan', group)).get('acceptance_inventory', [])):
-        return {**result, 'reason': 'approved plan or retained acceptance inventory changed'}
+        return None, 'approved plan or retained acceptance inventory changed'
     review, checks = read_record(runner, proof.get('review', {})), read_record(runner, proof.get('verification', {}))
     if (not review or not checks or review.get('result', {}).get('decision') != 'APPROVE'
-            or review.get('result', {}).get('findings') or not checks.get('ok')
+            or review.get('kind') != 'code_review' or checks.get('kind') != 'verification_schedule'
+            or review.get('contract') != proof.get('contract')
+            or review.get('source') != proof.get('source_identity')
+            or review.get('component', {}).get('group_id') != proof.get('component')
+            or review.get('result', {}).get('resolved_finding_ids', []) != proof.get('resolved', [])
+            or checks.get('phase') != 'expanded' or checks.get('candidate_id') != proof.get('candidate_id')
+            or review.get('result', {}).get('findings') or review.get('result', {}).get('deferred_findings')
+            or not checks.get('ok')
             or checks.get('plan', {}).get('commands') != proof.get('commands')):
-        return {**result, 'reason': 'original review or verification evidence is missing'}
+        return None, 'original review or verification evidence is missing'
+    if (not proof.get('commands') or len(proof.get('checks', [])) != len(proof['commands'])
+            or any(row.get('command') != command or row.get('command_digest') != digest(command)
+                   for command, row in zip(proof['commands'], proof['checks']))):
+        return None, 'original executable acceptance evidence is incomplete or redacted'
+    return proof, ''
+
+
+def assess(runner, workspace, group, *, observations=None):
+    """No model/test execution, no progress credit, and no mutable receipt import."""
+    from .repair_planning import finding_key, _retained_scope
+    memory = _memory(runner, group)
+    proof, reason = retained_proof(runner, group)
+    result = {'state': 'needs_revalidation', 'reason': reason,
+              'reusable_checks': [], 'affected_checks': []}
+    if not proof:
+        return result
+    result['affected_checks'] = proof['commands']
+    if getattr(runner, '_verification_fresh', False):
+        return {**result, 'reason': 'fresh verification requested'}
     related_paths = set(proof['plan'].get('touched_paths', [])) | set(proof.get('dependencies', {}).get('files', {}))
+    historical_scope = False
     for finding in runner._experiment.blocking_findings():
         owned = finding.finding_id in group.get('finding_ids', []) or finding.repair_group_id == group['group_id']
         related = bool(set(finding.affected_paths) & related_paths)
         unchanged = proof.get('findings', {}).get(finding.finding_id) == finding_key(finding)
         if owned and (finding.finding_id not in proof.get('resolved', []) or not unchanged or finding.status == 'reopened'):
-            return {**result, 'state': 'pending', 'reason': 'confirmed component defect: ' + finding.finding_id}
+            old_scope = runner._experiment.scope_decisions.get(finding.finding_id, {})
+            if (unchanged and finding.status != 'reopened'
+                    and old_scope.get('verdict') in {'not_applicable', 'follow_up'}
+                    and _retained_scope(runner, old_scope, finding.to_dict())):
+                historical_scope = True  # Reassess the old disproof, not a newly confirmed defect.
+            else:
+                return {**result, 'state': 'pending', 'reason': 'confirmed component defect: ' + finding.finding_id}
         if related and (not unchanged or finding.status == 'reopened'):
             return {**result, 'state': 'pending', 'reason': 'new evidence affects a component dependency: ' + finding.finding_id}
         if (not unchanged or finding.status == 'reopened') and not proof.get('dependencies', {}).get('complete'):
             return {**result, 'reason': 'new evidence has unproved dependency independence: ' + finding.finding_id}
     observations = observations or {'policy': policy(), 'context': context(runner, workspace), 'source': snapshot(workspace)}
-    if proof.get('policy') != observations['policy'] or proof.get('context') != observations['context']:
-        return {**result, 'reason': 'verification policy or runtime context changed'}
+    changed_context = proof.get('policy') != observations['policy'] or proof.get('context') != observations['context']
+    if changed_context:
+        if not proof.get('execution_binding'):
+            return {**result, 'reason': 'verification policy or runtime context changed'}
+        binding = observations.get('execution_binding') or execution_binding(runner, workspace)
+        if proof['execution_binding'] != binding:
+            return {**result, 'reason': 'verification policy or runtime context changed'}
     exact = proof.get('source') == observations['source']
     reusable = [item['command'] for item in proof.get('checks', [])
                 if item.get('command_digest') == digest(item['command'])
                 and _check_matches(runner, workspace, proof, item, exact)]
     result.update(reusable_checks=reusable, affected_checks=[c for c in proof['commands'] if c not in reusable])
+    if historical_scope:
+        return {**result, 'reason': 'historical scope conclusions require delta review'}
+    if changed_context:
+        return {**result, 'reason': 'review context changed; execution evidence checked separately'}
     if not result['affected_checks'] and (exact or dependencies_match(workspace, proof.get('dependencies'))):
         return {**result, 'state': 'completed', 'reason': 'completion evidence remains valid', 'receipt': memory['completion']}
     return {**result, 'reason': ('execution context changed; check dependencies could not be fully validated' if exact
@@ -315,7 +374,9 @@ def refresh(runner, workspace):
     observations = None
     if any(memory.get('completion') for memory in state.component_memory.values()):
         try:
-            observations = {'policy': policy(), 'context': context(runner, workspace), 'source': snapshot(workspace)}
+            parts = context_parts(runner, workspace)
+            observations = {'policy': policy(), 'context': digest(parts), 'source': snapshot(workspace),
+                            'execution_binding': execution_binding(runner, workspace, parts=parts)}
         except (OSError, RuntimeError, ValueError, TypeError):
             observations = {'policy': '', 'context': '', 'source': ''}
     for group in state.finding_groups:

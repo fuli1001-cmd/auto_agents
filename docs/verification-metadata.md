@@ -39,6 +39,18 @@ Unsupported clone3 requests receive ENOSYS so ordinary libc process creation can
 use clone. The tracer uses EXITKILL and reaps remaining descendants at command
 completion. Unsupported supervision blocks before executing the command.
 
+An auto-attached child's initial stop may precede the parent's fork/vfork/clone
+event. The supervisor holds that child until the kernel identifies its parent
+and the exact inherited policy is registered. It never resumes an unknown PID
+with a default policy. Thread-to-leader exec retains the originating thread's
+policy, and shutdown includes children still awaiting registration.
+
+Signal-zero existence checks execute with native kernel semantics; they neither
+deliver a signal nor grant permission to signal an unrelated process. Preserving
+ESRCH for exited process groups prevents false incomplete-cleanup reports.
+Incomplete cleanup still prevents caching a success, and cached proofs bind both
+the metadata supervisor and gate launcher implementation fingerprints.
+
 This implementation currently requires Linux x86_64, ptrace of child processes,
 seccomp TRACE, openat2, and the existing Landlock ABI 3 boundary. It preserves
 inherited kernel restrictions: an ancestor's stronger seccomp denial cannot be
