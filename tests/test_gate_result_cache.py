@@ -21,7 +21,7 @@ def _cache(tmp_path: Path) -> GateResultCache:
     )
 
 
-@pytest.mark.parametrize('helper', ['verification_metadata.py', 'gate_verification.py'])
+@pytest.mark.parametrize('helper', ['verification_metadata.py', 'gate_verification.py', 'verification_input_trace.py'])
 def test_supervision_policy_changes_invalidate_existing_proofs(tmp_path, monkeypatch, helper):
     from auto_agents import gate_result_cache as module
     policy = tmp_path / 'policy'; policy.mkdir()
@@ -35,6 +35,19 @@ def test_supervision_policy_changes_invalidate_existing_proofs(tmp_path, monkeyp
     cache.record('check', CommandResult('check', True, 0), **identity)
     assert cache.lookup('check', **identity) is not None
     source.write_text('changed supervision behavior')
+    assert cache.lookup('check', **identity) is None
+
+
+def test_live_owner_change_invalidates_proof_with_unchanged_candidate_source(tmp_path, monkeypatch):
+    from auto_agents import verification_input_trace
+    owner = {'metadata': 1, 'trace': 1, 'owner': 'first-outer-runtime'}
+    monkeypatch.setattr(verification_input_trace, 'owner_identity', lambda: dict(owner))
+    cache = _cache(tmp_path)
+    identity = dict(source_fingerprint='unchanged', cache_scope='source', result_cache_scope='candidate',
+                    metadata_signature='owned')
+    cache.record('check', CommandResult('check', True, 0), **identity)
+    assert cache.lookup('check', **identity) is not None
+    owner['owner'] = 'second-outer-runtime'
     assert cache.lookup('check', **identity) is None
 
 

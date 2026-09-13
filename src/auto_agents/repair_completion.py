@@ -110,7 +110,7 @@ def execution_binding(runner, workspace, *, parts=None):
         'process_supervision.py', 'repair_completion.py', 'repair_schedule.py',
         'repair_verification.py', 'repair_verification_pool.py', 'repair_concurrent_validation.py',
         'repair_dependencies.py', 'repair_test_refs.py', 'gate_execution.py', 'gate_result_cache.py',
-        'gates.py', 'workers.py', 'verification_sandbox.py', 'verification_metadata.py',
+        'gates.py', 'workers.py', 'verification_sandbox.py', 'verification_metadata.py', 'verification_input_trace.py',
         'gate_verification.py', 'verification_inputs.py', 'verification_probes.py',
         'verification_manifest.py', 'verification_pytest.py', 'verification_trace.py')}
     components = {key: digest(value) for key, value in parts.items() if key != 'reviewer'}

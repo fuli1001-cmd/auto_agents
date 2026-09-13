@@ -216,6 +216,9 @@ def repair(request):
     execute_selected_worker(request, checkout, python)
     from auto_agents.verification_sandbox import check_verification_sandbox
     check_verification_sandbox(checkout, python, Path(payload["project"]))
+    from auto_agents.verification_input_trace import check_input_tracing
+    trace_owner = check_input_tracing(checkout, python, Path(payload['project']))
+    store.event(job['id'], 'verification_input_trace_ready', trace_owner)
     evidence = directory / "evidence"
     if not evidence.exists():
         RootCauseCoordinator._copy_diagnostic_tree(Path(payload["project"]), evidence)

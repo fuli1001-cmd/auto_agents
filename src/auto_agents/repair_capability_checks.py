@@ -65,7 +65,8 @@ def _metadata_observation_in_snapshot(runner, workspace):
             shared = base / 'shared'
             shared.write_bytes(b'protected')
             shared.chmod(0o640)
-            program = ('import ctypes,json,os\nfrom pathlib import Path\n'
+            trace_helper = Path(__file__).with_name('verification_input_trace.py').resolve()
+            program = ('import ctypes,json,os,subprocess\nfrom pathlib import Path\n'
                 'p=Path("private"); p.write_bytes(b"private")\n'
                 'result={"shared_read":Path(' + repr(str(shared)) + ').read_bytes()==b"protected"}\n'
                 'result["metadata_supervisor_version"]=ctypes.CDLL(None).prctl(0x41414D44,0,0,0,0)\n'
@@ -78,6 +79,12 @@ def _metadata_observation_in_snapshot(runner, workspace):
                 '("shared_chmod",lambda:os.chmod(' + repr(str(shared)) + ',0o777))]:\n'
                 ' try: action(); result[name]=True\n'
                 ' except OSError as error: result[name]=False; result[name+"_errno"]=error.errno\n'
+                f'trace=subprocess.run([{runner._verification_python()!r},{str(trace_helper)!r},"input-trace.json","sh","-c","cat private"],capture_output=True,text=True)\n'
+                'rows=[json.loads(line) for line in Path("input-trace.json").read_text().splitlines()]\n'
+                'result["input_trace_supported"]=(trace.returncode==0 and trace.stdout=="private" and rows[-1].get("complete") is True '\
+                'and any(row.get("path")==str(Path("private").resolve()) for row in rows))\n'
+                'result["input_trace_owner"]=rows[0].get("owner","")\n'
+                'result["input_trace_protocol"]=rows[0].get("version",0)\n'
                 'print(json.dumps(result))\n')
             launcher = root / 'src/auto_agents/gate_verification.py'
             if not launcher.is_file():
@@ -104,6 +111,13 @@ def _metadata_observation_in_snapshot(runner, workspace):
                      and observed.get('shared_chmod_errno') in {1, 13, 30} and unchanged)
             return {**result, 'status': 'observed', 'supported': valid, 'checks': observed,
                     'shared_unchanged': unchanged,
+                    'input_trace_activation': {
+                        'supported': valid and observed.get('input_trace_supported') is True,
+                        'owner': observed.get('input_trace_owner', ''),
+                        'protocol': observed.get('input_trace_protocol', 0),
+                        'route': 'selected worker launches the outer owner before quick and expanded acceptance; nested gates negotiate tracing with that owner',
+                        'candidate_runtime_handoff_required': False,
+                    },
                     'mechanism': 'inherited_ptrace_metadata_supervisor' if valid else ''}
     except (OSError, RuntimeError, ValueError) as error:
         return {**result, 'status': 'inconclusive', 'reason': str(error)}

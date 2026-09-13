@@ -214,4 +214,8 @@ def test_real_production_probe_preserves_private_metadata_and_shared_denial(tmp_
     assert observed['checks']['shared_chmod'] is False
     assert observed['checks']['private_chmod'] is True and observed['checks']['private_fchmod'] is True
     assert observed['supported'] is True and observed['acceptance_proof'] is False
+    assert observed['checks']['input_trace_supported'] is True
+    assert observed['input_trace_activation']['supported'] is True
+    assert observed['input_trace_activation']['owner'] == observed['checks']['input_trace_owner']
+    assert observed['input_trace_activation']['candidate_runtime_handoff_required'] is False
     assert (root / 'retained').read_text() == 'original' and not list(target.iterdir())

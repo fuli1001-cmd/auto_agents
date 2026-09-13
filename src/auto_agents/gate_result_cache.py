@@ -25,13 +25,17 @@ def execution_policy_fingerprint() -> str:
     paths = [Path(__file__).with_name(name) for name in (
         "gate_execution.py", "gate_result_cache.py", "gates.py", "workers.py",
         "verification_sandbox.py", "verification_metadata.py", "gate_verification.py",
+        "verification_input_trace.py",
         "verification_inputs.py", "verification_probes.py",
         "verification_manifest.py", "verification_pytest.py", "verification_trace.py")]
     identity = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in paths if path.exists())
     if _POLICY_CACHE[0] != identity:
         _POLICY_CACHE = (identity, _stable_hash([(path.name, hashlib.sha256(path.read_bytes()).hexdigest())
                                                 for path in paths if path.exists()]))
-    return _POLICY_CACHE[1]
+    from .verification_input_trace import owner_identity
+    # Candidate imports do not identify the already-running outer supervisor.
+    # Bind its negotiated implementation as well as the selected source files.
+    return _stable_hash([_POLICY_CACHE[1], owner_identity()])
 
 
 def re_full_digest(value: str) -> bool:

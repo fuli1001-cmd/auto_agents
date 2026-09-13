@@ -39,6 +39,35 @@ Unsupported clone3 requests receive ENOSYS so ordinary libc process creation can
 use clone. The tracer uses EXITKILL and reaps remaining descendants at command
 completion. Unsupported supervision blocks before executing the command.
 
+Input tracing uses that same owner. A gate selects its tracing backend inside
+the final boundary, using a separate `prctl` protocol to query the live owner's
+implementation identity and register a private output descriptor. Registration
+checks the pinned inode against every ancestor policy. The existing tracer then
+uses syscall entry/exit stops for that command and its descendants; `ptrace`
+remains forbidden to tracees. No second tracer, listener or namespace is needed.
+The original metadata policy version remains compatible with retained callers.
+
+The owner resolves cwd and directory-fd inputs per stopped task, records negative
+lookups and network use, and closes the trace only after all registered
+descendants exit. Unsupported calls, ambiguous inputs, concurrent shared input
+state, signal termination and missing footers prevent complete-input credit.
+Anonymous controller output-spool `fstat` calls are runtime plumbing; reading
+those unnameable files is still incomplete. Repeated observed paths are hashed
+once during manifest construction.
+
+With an old metadata owner, the gate runs the original command once without
+claiming complete tracing. An unsupervised command can still use `strace`.
+Certificates bind the selected helper sources and the negotiated live owner,
+so importing candidate code cannot relabel an old owner as a new implementation.
+
+Worker startup checks real input tracing before repair planning, using the
+selected runtime's standalone helper even with a reused installed interpreter.
+Both automatic quick and expanded checks use this worker's outer launcher;
+nested gates negotiate with the owner it has already started. Production
+capability evidence includes the exercised tracing protocol, owner identity and
+activation route. This correction does not require candidate code to activate
+itself, or permit an unverified candidate to replace the trusted outer boundary.
+
 An auto-attached child's initial stop may precede the parent's fork/vfork/clone
 event. The supervisor holds that child until the kernel identifies its parent
 and the exact inherited policy is registered. It never resumes an unknown PID
