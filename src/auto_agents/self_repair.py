@@ -4212,7 +4212,7 @@ class AutoAgentsSelfRepairRunner:
         inputs = [Path(value) for value in [*read_roots, *getattr(self, "_verification_read_roots", [])]
                   if Path(value).resolve() != Path(cwd).resolve()]
         inputs.extend(Path(path) for path in dependency.get("read_roots", []))
-        with verification_argv(argv, cwd, target, read_roots=inputs,
+        with verification_argv(argv, cwd, target, read_roots=inputs, supervisor_checks=True,
                 **{key: dependency.get(key, []) for key in ("path_entries", "python_paths", "node_paths", "library_paths")}) as command:
             yield command
 

@@ -88,7 +88,8 @@ def namespace_exec(payload):
 
 @contextmanager
 def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=(), path_entries=(),
-                      python_paths=(), node_paths=(), library_paths=(), execution_environment=None):
+                      python_paths=(), node_paths=(), library_paths=(), execution_environment=None,
+                      supervisor_checks=False):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     if root == target or root in target.parents or target in root.parents:
         raise RuntimeError("verification workspace overlaps the live target project")
@@ -177,13 +178,18 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
             clean_environment.append("NODE_PATH=" + os.pathsep.join(map(str, node_paths)))
         if library_paths:
             clean_environment.append("LD_LIBRARY_PATH=" + os.pathsep.join(map(str, library_paths)))
+        from auto_agents.verification_supervisor_checks import REPORT_ENV
+        if REPORT_ENV in os.environ:
+            clean_environment.append(REPORT_ENV + '=' + os.environ[REPORT_ENV])
         if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
             launcher = Path(__file__).resolve()
             yield [sys.executable, str(launcher), "--metadata", json.dumps({
-                'roots': writable, 'readonly': metadata_readonly}), *clean_environment, *argv]
+                'roots': writable, 'readonly': metadata_readonly,
+                'supervisor_checks': supervisor_checks}), *clean_environment, *argv]
             return
         metadata = [sys.executable, str(Path(__file__).resolve()), '--metadata',
-                    json.dumps({'roots': [*writable, '/tmp'], 'readonly': metadata_readonly})]
+                    json.dumps({'roots': [*writable, '/tmp'], 'readonly': metadata_readonly,
+                                'supervisor_checks': supervisor_checks})]
         sandbox = [executable, "sandbox", "-c", "features.network_proxy=false",
                    "-c", "permissions.autoagents_verify=" + profile,
                    "-P", "autoagents_verify", "-C", str(root), "--include-managed-config", "--", *clean_environment, *metadata, *argv]
@@ -241,4 +247,17 @@ if __name__ == "__main__":
     policy = json.loads(sys.argv[2])
     if isinstance(policy, list):
         policy = {'roots': policy}
-    raise SystemExit(metadata_exec(sys.argv[3:], policy['roots'], policy.get('readonly', [])))
+    command = sys.argv[3:]
+    if policy.get('supervisor_checks'):
+        from auto_agents.verification_supervisor_checks import prepare, REPORT_ENV
+        prepare()
+        # The nested path installs a clean env after this launcher. Preserve
+        # freshly collected observations across that exact command boundary.
+        if command[:2] == ['env', '-i']:
+            for index in range(2, len(command)):
+                if '=' not in command[index]:
+                    break
+                if command[index].startswith(REPORT_ENV + '='):
+                    command[index] = REPORT_ENV + '=' + os.environ[REPORT_ENV]
+            command.insert(2, REPORT_ENV + '=' + os.environ[REPORT_ENV])
+    raise SystemExit(metadata_exec(command, policy['roots'], policy.get('readonly', [])))

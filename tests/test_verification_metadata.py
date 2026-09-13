@@ -219,49 +219,21 @@ assert result.returncode==0,result.stdout+result.stderr
 
 
 def test_unsupported_supervision_never_executes_the_command(tmp_path):
-    root = tmp_path / 'root'; root.mkdir()
-    marker = root / 'must-not-run'
-    source = str(Path(__file__).resolve().parents[1] / 'src')
-    script = '''
-import sys
-sys.path.insert(0,SOURCE)
-from auto_agents import verification_metadata as metadata
-def denied(*args, **kwargs): raise PermissionError('ptrace unavailable')
-metadata._ptrace=denied
-raise SystemExit(metadata.metadata_exec([sys.executable,'-c',COMMAND],[ROOT]))
-'''
-    prefix = '\n'.join(name + '=' + repr(value) for name, value in {
-        'SOURCE': source, 'ROOT': str(root),
-        'COMMAND': 'from pathlib import Path; Path(' + repr(str(marker)) + ').write_text("unexpected")'}.items())
-    result = subprocess.run([sys.executable, '-I', '-c', prefix + '\n' + script],
-                            capture_output=True, text=True, timeout=10)
-    assert result.returncode == 125 and 'ptrace unavailable' in result.stderr
-    assert not marker.exists()
+    from auto_agents.verification_supervisor_checks import observation
+    result = observation('startup_denied')
+    assert result['returncode'] == 125 and 'ptrace unavailable' in result['stderr'], result
+    assert result['command_executed'] is False
+    assert result['shared_unchanged'] is True
 
 
 def test_supervisor_death_kills_its_tracees(tmp_path):
-    root = tmp_path / 'root'; root.mkdir()
-    ready = root / 'ready'
-    source = str(Path(__file__).resolve().parents[1] / 'src')
-    command = 'from pathlib import Path; import time; Path(' + repr(str(ready)) + ').write_text("ready"); time.sleep(60)'
-    script = ('import sys; sys.path.insert(0,' + repr(source) + '); '
-              'from auto_agents.verification_metadata import metadata_exec; '
-              'raise SystemExit(metadata_exec(' + repr([sys.executable, '-c', command]) + ',' + repr([str(root)]) + '))')
-    process = subprocess.Popen([sys.executable, '-I', '-c', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        deadline = time.monotonic() + 10
-        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert ready.exists(), process.poll()
-        os.kill(process.pid, signal.SIGKILL)
-        # Both pipes stay open in the sleeping tracee. communicate can finish
-        # only when EXITKILL also terminates that descendant.
-        _, errors = process.communicate(timeout=5)
-        assert process.returncode == -signal.SIGKILL, errors
-    finally:
-        if process.poll() is None:
-            process.kill()
-        process.communicate(timeout=5)
+    from auto_agents.verification_supervisor_checks import observation
+    result = observation('owner_death')
+    assert result['tracer_pid'] == result['supervisor_pid']
+    assert result['pid'] != result['supervisor_pid']
+    assert result['returncode'] == -signal.SIGKILL, result
+    assert result['tracee_pipes_closed'] is True
+    assert result['shared_unchanged'] is True
 
 
 def test_concurrent_short_lived_children_keep_metadata_supervision(tmp_path):
