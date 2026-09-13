@@ -65,11 +65,16 @@ def _metadata_observation_in_snapshot(runner, workspace):
             shared = base / 'shared'
             shared.write_bytes(b'protected')
             shared.chmod(0o640)
-            program = ('import json,os\nfrom pathlib import Path\n'
+            program = ('import ctypes,json,os\nfrom pathlib import Path\n'
                 'p=Path("private"); p.write_bytes(b"private")\n'
                 'result={"shared_read":Path(' + repr(str(shared)) + ').read_bytes()==b"protected"}\n'
+                'result["metadata_supervisor_version"]=ctypes.CDLL(None).prctl(0x41414D44,0,0,0,0)\n'
+                'shared_fd=os.open(' + repr(str(shared)) + ',os.O_RDONLY)\n'
                 'for name,action in [("private_chmod",lambda:p.chmod(0o750)), '
                 '("private_fchmod",lambda:os.fchmod(os.open(p,os.O_RDONLY),0o640)), '
+                '("private_utime",lambda:os.utime(p,ns=(1000000000,2000000000))), '
+                '("shared_fchmod",lambda:os.fchmod(shared_fd,0o777)), '
+                '("shared_fd_alias",lambda:os.chmod("/proc/self/fd/"+str(shared_fd),0o777)), '
                 '("shared_chmod",lambda:os.chmod(' + repr(str(shared)) + ',0o777))]:\n'
                 ' try: action(); result[name]=True\n'
                 ' except OSError as error: result[name]=False; result[name+"_errno"]=error.errno\n'
@@ -91,11 +96,15 @@ def _metadata_observation_in_snapshot(runner, workspace):
             if not isinstance(observed, dict):
                 raise ValueError('invalid metadata capability response')
             unchanged = shared.read_bytes() == b'protected' and shared.stat().st_mode & 0o777 == 0o640
-            valid = observed.get('private_chmod') is True and observed.get('private_fchmod') is True
+            valid = (observed.get('private_chmod') is True and observed.get('private_fchmod') is True
+                     and observed.get('private_utime') is True
+                     and observed.get('metadata_supervisor_version') == 1
+                     and observed.get('shared_fchmod') is False and observed.get('shared_fd_alias') is False)
             valid = (valid and observed.get('shared_read') is True and observed.get('shared_chmod') is False
                      and observed.get('shared_chmod_errno') in {1, 13, 30} and unchanged)
             return {**result, 'status': 'observed', 'supported': valid, 'checks': observed,
-                    'shared_unchanged': unchanged}
+                    'shared_unchanged': unchanged,
+                    'mechanism': 'inherited_ptrace_metadata_supervisor' if valid else ''}
     except (OSError, RuntimeError, ValueError) as error:
         return {**result, 'status': 'inconclusive', 'reason': str(error)}
 

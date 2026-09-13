@@ -193,7 +193,7 @@ def test_candidate_entry_probe_cannot_mutate_retained_source(setup):
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux') or not shutil.which('codex'), reason='requires Linux verification wrapper')
-def test_real_production_probe_exposes_private_metadata_denial(tmp_path):
+def test_real_production_probe_preserves_private_metadata_and_shared_denial(tmp_path):
     from auto_agents.managed_verification import engine_runner
     from auto_agents.repair_capability_checks import metadata_observation
     from auto_agents.verification_sandbox import landlock_abi
@@ -212,6 +212,6 @@ def test_real_production_probe_exposes_private_metadata_denial(tmp_path):
     assert observed['status'] == 'observed', observed
     assert observed['checks']['shared_read'] and observed['shared_unchanged']
     assert observed['checks']['shared_chmod'] is False
-    assert observed['checks']['private_chmod'] is False and observed['checks']['private_fchmod'] is False
-    assert observed['supported'] is False and observed['acceptance_proof'] is False
+    assert observed['checks']['private_chmod'] is True and observed['checks']['private_fchmod'] is True
+    assert observed['supported'] is True and observed['acceptance_proof'] is False
     assert (root / 'retained').read_text() == 'original' and not list(target.iterdir())
