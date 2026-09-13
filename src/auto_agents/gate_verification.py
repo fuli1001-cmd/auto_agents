@@ -1,13 +1,11 @@
-"""Nested project verification launcher with inherited content/metadata limits."""
+"""Nested project verification through inherited metadata supervision."""
 import ctypes
 from contextlib import contextmanager
 import json
-import os
 from pathlib import Path
 import sys
 
 from auto_agents import artifact_temp as tempfile
-from auto_agents.verification_sandbox import restrict_nested_writes
 
 
 @contextmanager
@@ -21,12 +19,10 @@ def confined_session_executor(executor):
 
 
 def restrict_gate_metadata():
-    """Close Landlock's metadata gap when nesting inside an existing sandbox.
+    """Legacy fail-closed filter for callers without supervised dispatch.
 
-    Landlock covers content, links, renames and deletion, but not chmod/chown
-    or timestamps/xattrs. A nested verification conservatively cannot alter these
-    metadata fields, even on private files; creation modes remain supported.
-    The filter is inherited across exec and by every tool descendant.
+    New launchers use metadata_exec instead. This compatibility helper cannot
+    authorize private metadata writes or undo an ancestor's syscall denials.
     """
     import errno
     library = ctypes.CDLL('libseccomp.so.2', use_errno=True)
@@ -58,7 +54,5 @@ if __name__ == '__main__':
     if len(sys.argv) < 5 or sys.argv[1] != '--landlock':
         raise SystemExit('internal gate launcher requires --landlock ROOTS COMMAND')
     roots = json.loads(sys.argv[2])
-    restrict_nested_writes(roots)
-    restrict_gate_metadata()
-    os.chdir(roots[0])
-    os.execvp(sys.argv[3], sys.argv[3:])
+    from auto_agents.verification_metadata import metadata_exec
+    raise SystemExit(metadata_exec(sys.argv[3:], roots))

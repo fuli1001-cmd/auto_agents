@@ -104,6 +104,7 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
                    str(root): "write", str(scratch): "write", str(target): "read"}
         preserve = [str(root), str(scratch), str(target), str(Path(__file__).resolve().parents[2])]
         writable = [str(root), str(scratch)]
+        metadata_readonly = [str(target), *map(str, read_roots)]
         for value in write_roots:
             extra = Path(value).resolve()
             if extra == target or extra in target.parents or target in extra.parents or extra == Path("/"):
@@ -122,11 +123,16 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
             # Environment values stay in env, never in command-line audit records.
             for key in ('PATH', 'PYTHONPATH', 'NODE_PATH', 'LD_LIBRARY_PATH', 'CONDA_PREFIX'):
                 for value in execution_environment.get(key, '').split(os.pathsep):
-                    if value and Path(value).is_dir():
-                        extra = Path(value).resolve()
-                        preserve.append(str(extra))
-                        if str(extra).startswith('/tmp/') and str(extra) not in entries:
-                            entries[str(extra)] = 'read'
+                    try:
+                        if value and Path(value).is_dir():
+                            extra = Path(value).resolve()
+                            preserve.append(str(extra))
+                            if str(extra).startswith('/tmp/') and str(extra) not in entries:
+                                entries[str(extra)] = 'read'
+                    except OSError:
+                        # An inherited PATH may name directories already hidden
+                        # by an ancestor. Preserve the environment, not access.
+                        continue
         for name in (() if execution_environment is not None else (".ssh", ".gnupg", ".codex")):
             sensitive = Path.home() / name
             if sensitive.exists():
@@ -143,6 +149,7 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         for name in (".git", ".agents", ".codex"):
             if (root / name).exists():
                 entries[str(root / name)] = "read"
+                metadata_readonly.append(str(root / name))
         filesystem = ",".join(json.dumps(key) + "=" + json.dumps(value) for key, value in entries.items())
         profile = '{filesystem={' + filesystem + '},network={enabled=true}}'
         executable_path = os.pathsep.join([*(str(Path(value).resolve()) for value in path_entries),
@@ -165,13 +172,14 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
             clean_environment.append("LD_LIBRARY_PATH=" + os.pathsep.join(map(str, library_paths)))
         if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
             launcher = Path(__file__).resolve()
-            if execution_environment is not None:
-                launcher = launcher.with_name('gate_verification.py')
-            yield [sys.executable, str(launcher), "--landlock", json.dumps(writable), *clean_environment, *argv]
+            yield [sys.executable, str(launcher), "--metadata", json.dumps({
+                'roots': writable, 'readonly': metadata_readonly}), *clean_environment, *argv]
             return
+        metadata = [sys.executable, str(Path(__file__).resolve()), '--metadata',
+                    json.dumps({'roots': [*writable, '/tmp'], 'readonly': metadata_readonly})]
         sandbox = [executable, "sandbox", "-c", "features.network_proxy=false",
                    "-c", "permissions.autoagents_verify=" + profile,
-                   "-P", "autoagents_verify", "-C", str(root), "--include-managed-config", "--", *clean_environment, *argv]
+                   "-P", "autoagents_verify", "-C", str(root), "--include-managed-config", "--", *clean_environment, *metadata, *argv]
         if not os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
             unshare, ip, mount = shutil.which("unshare"), shutil.which("ip"), shutil.which("mount")
             required = [("unshare", unshare), ("mount", mount)]
@@ -220,9 +228,10 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--namespace":
         namespace_exec(json.loads(sys.argv[2]))
         raise SystemExit(3)
-    if len(sys.argv) < 5 or sys.argv[1] != "--landlock":
+    if len(sys.argv) < 5 or sys.argv[1] not in {"--landlock", "--writer-landlock", "--metadata"}:
         raise SystemExit("internal verification launcher requires --landlock ROOTS COMMAND")
-    roots = json.loads(sys.argv[2])
-    restrict_nested_writes(roots)
-    os.chdir(roots[0])
-    os.execvp(sys.argv[3], sys.argv[3:])
+    from auto_agents.verification_metadata import metadata_exec
+    policy = json.loads(sys.argv[2])
+    if isinstance(policy, list):
+        policy = {'roots': policy}
+    raise SystemExit(metadata_exec(sys.argv[3:], policy['roots'], policy.get('readonly', [])))
