@@ -2878,7 +2878,7 @@ def test_candidate_receipt_excludes_intervening_foreign_content_index_and_modes(
     import stat
     import auto_agents.session as session_module
     from auto_agents.session_candidate import GateSnapshotManager
-    from test_engine_child_recovery import parent_workflow, resume_to_observation
+    from test_engine_child_recovery import parent_workflow, resume_to_observation, configure_local_writer
 
     root, child = project(tmp_path, missing=failure)
     owned_test = root / 'tests/test_owned.py'
@@ -2891,6 +2891,15 @@ def test_candidate_receipt_excludes_intervening_foreign_content_index_and_modes(
     git(root, 'commit', '-m', 'retain file kind and mode contract')
     child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
     save_session_state(root, child)
+    configure_local_writer(root, child, '''
+assert Path('value.py').read_text() == 'VALUE = 0\\n'
+Path('value.py').write_text('VALUE = 1\\n')
+Path('value.py').chmod(0o640)
+subprocess.run(['git','add','value.py'],check=True)
+Path('value.py').chmod(0o750)
+Path('writer-link').symlink_to('value.py')
+Path('obsolete.txt').unlink()
+''')
     store, _, handoff = parent_workflow(root, child)
     shared_head = head_ref(root)
     shared_refs = git(root, 'show-ref')
@@ -2923,14 +2932,8 @@ def test_candidate_receipt_excludes_intervening_foreign_content_index_and_modes(
         assert candidate_root != root
         assert (candidate_root / '.git').is_dir()
         assert (candidate_root / 'value.py').read_text() == 'VALUE = 0\n'
-        (candidate_root / 'value.py').write_text('VALUE = 1\n')
-        (candidate_root / 'value.py').chmod(0o640)
-        git(candidate_root, 'add', 'value.py')
-        (candidate_root / 'value.py').chmod(0o750)
-        (candidate_root / 'writer-link').symlink_to('value.py')
-        (candidate_root / 'obsolete.txt').unlink()
         return 'Fixed\nCOMMIT_MESSAGE: Repair owned value'
-    resume_to_observation(root, monkeypatch, writer)
+    resume_to_observation(root, monkeypatch, writer, real_dispatch=True)
     saved = load_session_state(root, child.session_id)
     assert (saved.status == 'completed') == (not failure), saved.to_dict()
     assert len(observations) == 1
@@ -2967,7 +2970,9 @@ def test_candidate_publication_preserves_foreign_edit_after_final_snapshot(tmp_p
 
 
 def test_verification_snapshot_contains_only_owned_candidate_changes(tmp_path, monkeypatch):
+    from test_engine_child_recovery import configure_local_writer, REAL_PROVIDER_CALL
     root, child = project(tmp_path)
+    configure_local_writer(root, child, "Path('value.py').write_text('VALUE = 1\\n')")
     (root / 'foreign.py').write_text('VALUE = 88\n')
     git(root, 'add', 'foreign.py')
     (root / 'foreign.py').write_text('VALUE = 99\n')
@@ -2982,12 +2987,9 @@ def test_verification_snapshot_contains_only_owned_candidate_changes(tmp_path, m
         writer_roots.append(request.cwd)
         assert (request.cwd / '.git').is_dir()
         assert (request.cwd / 'foreign.py').read_text() == 'VALUE = 7\n'
-        (request.cwd / 'value.py').write_text('VALUE = 1\n')
         (root / 'foreign-note.txt').write_bytes(b'concurrent foreign bytes')
-        reply = 'Fixed value.\nCOMMIT_MESSAGE: Repair owned value'
-        request.output_path.write_text(reply)
-        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
-                           summary=reply, stdout=reply, returncode=0)
+        assert request.writer_boundary is not None
+        return REAL_PROVIDER_CALL(self, request)
     monkeypatch.setattr(Orchestrator, '_call_with_failover', writer)
     result = Session(Orchestrator(root), mode='fix', auto_approve=True).resume(child.session_id)
     assert result.status == 'completed', result.to_dict()
@@ -3157,7 +3159,9 @@ def test_overlapping_or_unknown_ownership_blocks_without_overwriting_foreign_wor
 
 def test_parent_consumes_delivered_child_revision_without_shared_copyback(tmp_path, monkeypatch):
     from test_engine_child_recovery import parent_workflow, ObservationBoundary
+    from test_engine_child_recovery import configure_local_writer, REAL_PROVIDER_CALL
     root, child = project(tmp_path)
+    configure_local_writer(root, child, "Path('value.py').write_text('VALUE = 1\\n')")
     store, _, handoff = parent_workflow(root, child)
     before = head_ref(root)
     index = (root / '.git/index').read_bytes()
@@ -3176,11 +3180,8 @@ def test_parent_consumes_delivered_child_revision_without_shared_copyback(tmp_pa
             assert (root / 'value.py').read_text() == 'VALUE = 0\n'
             assert (root / '.git/index').read_bytes() == index
             raise ObservationBoundary()
-        (request.cwd / 'value.py').write_text('VALUE = 1\n')
-        reply = 'Fixed\nCOMMIT_MESSAGE: Repair owned value'
-        request.output_path.write_text(reply)
-        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
-                           summary=reply, stdout=reply, returncode=0)
+        assert request.writer_boundary is not None
+        return REAL_PROVIDER_CALL(self, request)
     monkeypatch.setattr(Orchestrator, '_call_with_failover', agent)
     for _ in range(2):
         with pytest.raises(ObservationBoundary):
@@ -3435,7 +3436,7 @@ def test_completed_parent_resume_preserves_shared_work_after_private_delivery(tm
 def test_public_child_receipt_materializes_directory_to_file_replacement(tmp_path, monkeypatch, staged):
     import base64
     import shutil
-    from test_engine_child_recovery import parent_workflow, resume_to_observation
+    from test_engine_child_recovery import parent_workflow, resume_to_observation, configure_local_writer
 
     root, child = project(tmp_path)
     (root / 'assets').mkdir()
@@ -3449,6 +3450,13 @@ def test_public_child_receipt_materializes_directory_to_file_replacement(tmp_pat
     git(root, 'commit', '-m', 'retain directory replacement contract')
     child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
     save_session_state(root, child)
+    configure_local_writer(root, child, '''
+assert Path('assets/old.json').read_bytes() == b'{"retained": true}\\n'
+shutil.rmtree('assets')
+Path('assets').write_bytes(b'replacement\\x00bytes')
+Path('value.py').write_text('VALUE = 1\\n')
+if STAGED: subprocess.run(['git','add','-A','--','assets'],check=True)
+'''.replace('STAGED', repr(staged)))
     store, _, handoff = parent_workflow(root, child)
     (root / 'assets/old.json').write_bytes(b'foreign staged')
     git(root, 'add', 'assets/old.json')
@@ -3458,11 +3466,6 @@ def test_public_child_receipt_materializes_directory_to_file_replacement(tmp_pat
     observed = []
     def writer(state, prompt, candidate_root):
         assert (candidate_root / 'assets/old.json').read_bytes() == b'{"retained": true}\n'
-        shutil.rmtree(candidate_root / 'assets')
-        (candidate_root / 'assets').write_bytes(b'replacement\x00bytes')
-        (candidate_root / 'value.py').write_text('VALUE = 1\n')
-        if staged:
-            git(candidate_root, 'add', '-A', '--', 'assets')
         return 'Replaced the directory.\nCOMMIT_MESSAGE: Replace owned assets'
     def observe(request):
         observed.append(request.cwd)
@@ -3470,7 +3473,7 @@ def test_public_child_receipt_materializes_directory_to_file_replacement(tmp_pat
         assert (request.cwd / 'assets').is_file()
         assert (request.cwd / 'assets').read_bytes() == b'replacement\x00bytes'
         assert not (request.cwd / 'assets/old.json').exists()
-    resume_to_observation(root, monkeypatch, writer, observe=observe)
+    resume_to_observation(root, monkeypatch, writer, observe=observe, real_dispatch=True)
     saved = load_session_state(root, child.session_id)
     assert saved.status == 'completed', saved.to_dict()
     assert len(observed) == 1
@@ -3501,7 +3504,7 @@ def test_directory_symlink_receipt_never_claims_or_chmods_foreign_descendants(
     import stat
     import auto_agents.session_candidate as custody
     import auto_agents.gate_execution as gates
-    from test_engine_child_recovery import parent_workflow, resume_to_observation
+    from test_engine_child_recovery import parent_workflow, resume_to_observation, configure_local_writer
 
     root, child = project(tmp_path)
     (root / 'assets/nested').mkdir(parents=True)
@@ -3514,6 +3517,13 @@ def test_directory_symlink_receipt_never_claims_or_chmods_foreign_descendants(
     git(root, 'commit', '-m', 'retain directory to symlink contract')
     child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
     save_session_state(root, child)
+    configure_local_writer(root, child, '''
+assert Path('assets/nested/old.json').read_bytes() == b'retained private entry'
+shutil.rmtree('assets')
+Path('assets').symlink_to(SHARED_ASSETS,target_is_directory=True)
+Path('value.py').write_text('VALUE = 1\\n')
+if STAGED: subprocess.run(['git','add','-A','--','assets'],check=True)
+'''.replace('STAGED', repr(staged)).replace('SHARED_ASSETS', repr(str(root / 'assets'))))
     store, _, handoff = parent_workflow(root, child)
     old.write_bytes(b'foreign staged')
     git(root, 'add', 'assets/nested/old.json')
@@ -3569,11 +3579,6 @@ def test_directory_symlink_receipt_never_claims_or_chmods_foreign_descendants(
 
     def writer(state, prompt, candidate_root):
         assert (candidate_root / 'assets/nested/old.json').read_bytes() == b'retained private entry'
-        shutil.rmtree(candidate_root / 'assets')
-        (candidate_root / 'assets').symlink_to(root / 'assets', target_is_directory=True)
-        (candidate_root / 'value.py').write_text('VALUE = 1\n')
-        if staged:
-            git(candidate_root, 'add', '-A', '--', 'assets')
         return 'Replaced owned directory.\nCOMMIT_MESSAGE: Replace owned assets'
     observed = []
     def observe(request):
@@ -3583,7 +3588,7 @@ def test_directory_symlink_receipt_never_claims_or_chmods_foreign_descendants(
         assert os.readlink(request.cwd / 'assets') == str(root / 'assets')
         assert old.read_bytes() == b'late foreign worktree'
         assert stat.S_IMODE(old.stat().st_mode) == 0o711
-    resume_to_observation(root, monkeypatch, writer, observe=observe)
+    resume_to_observation(root, monkeypatch, writer, observe=observe, real_dispatch=True)
     saved = load_session_state(root, child.session_id)
     assert saved.status == 'completed', saved.to_dict()
     assert len(observed) == len(injections) == 1

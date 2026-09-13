@@ -23,6 +23,86 @@ from auto_agents import artifact_temp as tempfile
 
 _active_writer_boundary = ContextVar('auto_agents_writer_boundary', default=None)
 
+
+def metadata_probe_command(python, scratch, protected, *, loopback=False):
+    """Build a model-free probe without entering verification_argv recursively."""
+    code = '''
+import ctypes, errno, json, os, socket, tempfile
+from pathlib import Path
+report = {'phase': 'metadata_preflight', 'launcher_protocol': 'inherited_metadata',
+          'supervisor_version': ctypes.CDLL(None).prctl(0x41414D44, 0, 0, 0, 0), 'errno': None}
+try:
+    with tempfile.NamedTemporaryFile(dir=SCRATCH) as private:
+        p = Path(private.name)
+        p.chmod(0o750)
+        assert p.stat().st_mode & 0o7777 == 0o750
+        os.fchmod(private.fileno(), 0o640)
+        assert p.stat().st_mode & 0o7777 == 0o640
+        os.utime(p, ns=(123000000000, 456000000000))
+        assert p.stat().st_mtime_ns == 456000000000
+    with tempfile.TemporaryFile(dir=SCRATCH) as private:
+        private.write(b'private')
+    p = Path(PROTECTED)
+    before, mode = p.read_bytes(), p.stat().st_mode
+    assert before == b'retained'
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        for operation in (lambda: p.write_bytes(b'bad'), lambda: p.chmod(0o777),
+                          lambda: os.fchmod(fd, 0o777),
+                          lambda: os.chmod('/proc/self/fd/' + str(fd), 0o777)):
+            try: operation()
+            except OSError as error:
+                report['errno'] = error.errno
+                assert error.errno in (errno.EPERM, errno.EACCES, errno.EROFS)
+            else: raise RuntimeError('boundary allowed a shared mutation')
+        assert p.read_bytes() == before and p.stat().st_mode == mode
+    finally:
+        os.close(fd)
+    if LOOPBACK:
+        with socket.socket() as sock: sock.bind(('127.0.0.1', 0))
+    report['ok'] = True
+except BaseException as error:
+    report.update(error=str(error), errno=getattr(error, 'errno', report['errno']))
+    print(json.dumps(report), flush=True)
+    raise
+print(json.dumps(report), flush=True)
+'''
+    values = dict(SCRATCH=str(scratch), PROTECTED=str(protected), LOOPBACK=loopback)
+    return [python, '-I', '-c', '\n'.join(k + '=' + repr(v) for k, v in values.items()) + '\n' + code]
+
+
+class ConfinementPreflightError(RuntimeError):
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic
+        super().__init__('confinement is unavailable: ' + json.dumps(diagnostic, sort_keys=True))
+
+
+def _check_metadata_launch(launch, python, scratch, protected, *, cwd, env=None, loopback=False,
+                           phase='verification_preflight', protocol='--metadata'):
+    from .process_supervision import run_supervised_shell_command
+    command = metadata_probe_command(python, scratch, protected, loopback=loopback)
+    diagnostic = dict(phase=phase, launcher_protocol=protocol, supervisor_version=None, errno=None)
+    confirmed = False
+    try:
+        # Reserve the remaining ten seconds for the existing owned-process
+        # TERM/KILL cleanup. Never signal the inherited metadata supervisor.
+        result = run_supervised_shell_command(shlex.join(launch(command)), cwd=cwd, env=env,
+            timeout_seconds=20, kind='confinement_preflight')
+        for line in result.stdout.splitlines():
+            try:
+                report = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(report, dict) and report.get('phase') == 'metadata_preflight':
+                diagnostic.update(supervisor_version=report.get('supervisor_version'), errno=report.get('errno'))
+                confirmed = report.get('ok') is True
+        if result.returncode or result.cleanup_incomplete or not confirmed:
+            raise RuntimeError(result.stdout[-2000:] + result.stderr[-2000:])
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        diagnostic.update(detail=str(error), errno=getattr(error, 'errno', diagnostic['errno']))
+        raise ConfinementPreflightError(diagnostic) from error
+
+
 def provider_probe_command(argv):
     # Capability probes execute the same provider binary as a writer. Keep
     # them within the active boundary even when no AgentRequest is accepted.
@@ -145,8 +225,12 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         raise VerificationDependencyError(MissingDependency("executable", "codex"),
             "engine verification needs a local Codex sandbox executable; no model calls are made by this command")
     temporary_parent = os.environ.get("TMPDIR", "/tmp") if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX") else "/tmp"
-    with tempfile.TemporaryDirectory(prefix="aav-", dir=temporary_parent) as temporary:
+    with tempfile.TemporaryDirectory(prefix="aav-", dir=temporary_parent) as temporary, \
+            tempfile.TemporaryDirectory(prefix="aav-readonly-", dir=temporary_parent) as outside:
         scratch = Path(temporary)
+        protected = Path(outside) / 'input'
+        protected.write_bytes(b'retained')
+        read_roots = [*read_roots, Path(outside)]
         if target == scratch or target in scratch.parents:
             raise RuntimeError("verification scratch directory overlaps the live project")
         home = scratch / "home"
@@ -226,8 +310,12 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
             clean_environment.append("LD_LIBRARY_PATH=" + os.pathsep.join(map(str, library_paths)))
         if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
             launcher = Path(__file__).resolve()
-            yield [sys.executable, str(launcher), "--metadata", json.dumps({
-                'roots': writable, 'readonly': metadata_readonly}), *clean_environment, *argv]
+            prefix = [sys.executable, str(launcher), "--metadata", json.dumps({
+                'roots': writable, 'readonly': metadata_readonly}), *clean_environment]
+            _check_metadata_launch(lambda command: [*prefix, *command], sys.executable,
+                                   scratch, protected, cwd=root, env=execution_environment,
+                                   loopback=execution_environment is None)
+            yield [*prefix, *argv]
             return
         metadata = [sys.executable, str(Path(__file__).resolve()), '--metadata',
                     json.dumps({'roots': [*writable, '/tmp'], 'readonly': metadata_readonly})]
@@ -247,6 +335,11 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
             payload = {"cwd": str(root), "preserve": preserve, "command": sandbox, "ip": ip if execution_environment is None else None, "mount": mount}
             sandbox = [unshare, "--user", "--map-root-user", "--mount", *(["--net"] if execution_environment is None else []), "--pid", "--fork", "--mount-proc",
                        sys.executable, str(Path(__file__).resolve()), "--namespace", json.dumps(payload)]
+        def launch(command):
+            probe_payload = dict(payload, command=[*payload['command'][:-len(argv)], *command])
+            return ['env', 'TMPDIR=' + temporary, *sandbox[:-1], json.dumps(probe_payload)]
+        _check_metadata_launch(launch, sys.executable, scratch, protected, cwd=root,
+                               env=execution_environment, loopback=execution_environment is None)
         yield ["env", "TMPDIR=" + temporary, *sandbox]
 
 
@@ -340,20 +433,13 @@ class CandidateWriterBoundary:
         protected.write_text('retained')
         self.read_roots.append(outside)
         try:
-            code = ("from pathlib import Path; import tempfile; "
-                    "f=tempfile.TemporaryFile(dir='.'); f.write(b'private'); f.close(); "
-                    f"p=Path({str(protected)!r}); assert p.read_text() == 'retained'\n"
-                    "for operation in (lambda: p.write_text('bad'), lambda: p.chmod(0o777)):\n"
-                    " try: operation()\n"
-                    " except OSError: pass\n"
-                    " else: raise RuntimeError('writer boundary allowed a shared write')\n")
             env = self._environment(os.environ)
-            result = subprocess.run(self._command([sys.executable, '-I', '-c', code], env),
-                                    cwd=self.root, env=env, capture_output=True, text=True, timeout=30)
-            if result.returncode:
-                raise RuntimeError(result.stderr[-2000:])
+            _check_metadata_launch(lambda command: self._command(command, env), sys.executable,
+                                   self.scratch, protected, cwd=self.root, env=env,
+                                   phase='writer_preflight', protocol='--writer-landlock' if self.nested else '--namespace')
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            raise ownership_error(self.state, 'writer confinement is unavailable', detail=str(error)) from error
+            details = getattr(error, 'diagnostic', {'detail': str(error)})
+            raise ownership_error(self.state, 'writer confinement is unavailable', **details) from error
         finally:
             self.read_roots.remove(outside)
             shutil.rmtree(outside)
@@ -406,27 +492,11 @@ def check_verification_sandbox(root: Path, python: str, real_project: Path):
     if landlock_abi() < 3:
         raise RuntimeError("verification host needs Landlock ABI 3 or newer")
     with tempfile.TemporaryDirectory(prefix="sandbox-probe-", dir=root) as probe:
-        workspace, readonly = Path(probe) / "candidate", Path(probe) / "readonly"
-        workspace.mkdir()
-        readonly.mkdir()
-        outside = readonly / "outside"
-        code = (
-            "from pathlib import Path; import socket; "
-            "Path('inside').write_text('ok'); "
-            "s=socket.socket(); s.bind(('127.0.0.1',0)); s.close(); "
-            f"p=Path({str(outside)!r}); "
-            "\ntry: p.write_text('not-allowed'); blocked=False\n"
-            "except OSError: blocked=True\n"
-            "assert blocked, 'sandbox allowed an out-of-workspace write'"
-        )
-        try:
-            with verification_argv([python, "-c", code], workspace, readonly) as command:
-                result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-            if result.returncode:
-                raise RuntimeError("verification sandbox is unavailable: " + result.stderr[-1000:])
-        finally:
-            # This is a uniquely named probe file, never a project input.
-            outside.unlink(missing_ok=True)
+        workspace = Path(probe)
+        # Preparation itself runs the named-file, descriptor, shared-sentinel,
+        # temporary-file and loopback controls through the selected launcher.
+        with verification_argv([python, '-c', 'pass'], workspace, real_project):
+            pass
 
 
 if __name__ == "__main__":

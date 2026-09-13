@@ -12,13 +12,13 @@ import pytest
 from auto_agents.config import (load_session_state, save_session_state,
                                 load_project_config, save_project_config)
 from auto_agents.gate_execution import LocalGatePlanExecutor
-from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.session import Session
 import auto_agents.session as session_module
 import auto_agents.session_candidate as candidate
 from test_session_verification_ownership import project, git
-from test_engine_child_recovery import parent_workflow, ObservationBoundary
+from test_engine_child_recovery import (parent_workflow, ObservationBoundary,
+    configure_local_writer, REAL_PROVIDER_CALL)
 
 
 BINARY = b"candidate\x00\xff\r\n"
@@ -26,6 +26,15 @@ BINARY = b"candidate\x00\xff\r\n"
 
 def fixture(tmp_path, monkeypatch, *, parent=False, gitlink=False):
     root, child = project(tmp_path)
+    configure_local_writer(root, child, """
+Path('value.py').write_text('VALUE = 2\\n')
+subprocess.run(['git','add','value.py'],check=True)
+Path('value.py').write_text('VALUE = 1\\n')
+Path('value.py').chmod(0o750)
+Path('binary.dat').write_bytes(BINARY)
+Path('writer-link').symlink_to('value.py')
+Path('obsolete.bin').unlink()
+""".replace('BINARY', repr(BINARY)))
     config = load_project_config(root)
     # These scenarios require cache reuse, not probabilistic audit execution.
     # Retain real lookup, source admission and evidence from executed tests.
@@ -83,17 +92,8 @@ def fixture(tmp_path, monkeypatch, *, parent=False, gitlink=False):
             assert (request.cwd / 'value.py').stat().st_mode & 0o7777 == 0o750
             raise ObservationBoundary()
         assert request.cwd != root and not request.cwd.is_relative_to(root)
-        (request.cwd / 'value.py').write_text('VALUE = 2\n')
-        git(request.cwd, 'add', 'value.py')
-        (request.cwd / 'value.py').write_text('VALUE = 1\n')
-        (request.cwd / 'value.py').chmod(0o750)
-        (request.cwd / 'binary.dat').write_bytes(BINARY)
-        (request.cwd / 'writer-link').symlink_to('value.py')
-        (request.cwd / 'obsolete.bin').unlink()
-        reply = 'Fixed\nCOMMIT_MESSAGE: Repair owned value'
-        request.output_path.write_text(reply)
-        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
-                           summary=reply, stdout=reply, returncode=0)
+        assert request.writer_boundary is not None
+        return REAL_PROVIDER_CALL(self, request)
     monkeypatch.setattr(Orchestrator, '_call_with_failover', agent)
     context = Session._session_gate_executor_context
     @contextmanager

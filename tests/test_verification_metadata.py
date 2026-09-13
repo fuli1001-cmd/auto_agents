@@ -67,9 +67,13 @@ os.close(fd); os.close(directory)
 
 
 def test_two_nested_launches_narrow_one_supervisor_and_preserve_ancestor_policy(tmp_path):
-    inner = '''
+    selected_source = str(Path(__file__).resolve().parents[1] / 'src')
+    binding = 'SELECTED_SOURCE = ' + repr(selected_source) + '\n'
+    inner = binding + '''
 import ctypes, errno, json, os
 from pathlib import Path
+import auto_agents.verification_metadata as metadata
+assert Path(metadata.__file__).resolve().is_relative_to(Path(SELECTED_SOURCE))
 from auto_agents.verification_metadata import POLICY_REQUEST, VERSION
 libc=ctypes.CDLL(None, use_errno=True)
 assert libc.prctl(POLICY_REQUEST, 0, 0, 0, 0) == VERSION
@@ -84,25 +88,31 @@ for name in [SHARED, OUTER]:
     except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS)
     else: raise AssertionError('ancestor boundary widened')
 '''
-    middle = '''
+    middle = binding + '''
 import os, subprocess, sys
 from pathlib import Path
+import auto_agents.verification_sandbox as sandbox
+assert Path(sandbox.__file__).resolve().is_relative_to(Path(SELECTED_SOURCE))
 from auto_agents.verification_sandbox import verification_argv
 parent=Path.cwd(); Path('parent-owned').write_text('parent')
+Path('parent-owned').chmod(0o640)
+assert Path('parent-owned').stat().st_mode & 0o777 == 0o640
 Path('child').mkdir()
 program = 'OUTER = ' + repr(str(parent/'parent-owned')) + '\\n' + INNER
-with verification_argv([sys.executable,'-c',program],parent/'child',Path(SHARED).parent) as argv:
+with verification_argv([sys.executable,'-c',program],parent/'child',Path(SHARED).parent, python_paths=[SELECTED_SOURCE]) as argv:
     result=subprocess.run(argv,capture_output=True,text=True,timeout=15)
 assert result.returncode==0, result.stdout+result.stderr
 assert Path('child/owned').stat().st_mode & 0o777 == 0o750
 '''
-    outer = '''
+    outer = binding + '''
 import subprocess, sys
 from pathlib import Path
+import auto_agents.verification_sandbox as sandbox
+assert Path(sandbox.__file__).resolve().is_relative_to(Path(SELECTED_SOURCE))
 from auto_agents.verification_sandbox import verification_argv
 Path('first').mkdir()
 program='SHARED = '+repr(SHARED)+'\\nINNER = '+repr('SHARED = '+repr(SHARED)+'\\n'+INNER)+'\\n'+MIDDLE
-with verification_argv([sys.executable,'-c',program],Path.cwd()/'first',Path(SHARED).parent) as argv:
+with verification_argv([sys.executable,'-c',program],Path.cwd()/'first',Path(SHARED).parent, python_paths=[SELECTED_SOURCE]) as argv:
     result=subprocess.run(argv,capture_output=True,text=True,timeout=20)
 assert result.returncode==0, result.stdout+result.stderr
 '''
@@ -218,25 +228,44 @@ assert result.returncode==0,result.stdout+result.stderr
     execute(tmp_path, 'import json\nPROTOCOL=' + repr(protocol) + '\n' + program)
 
 
-def test_unsupported_supervision_never_executes_the_command(tmp_path):
+@pytest.mark.parametrize('failure', ['registration', 'landlock'])
+def test_unsupported_supervision_never_executes_the_command(tmp_path, failure):
     root = tmp_path / 'root'; root.mkdir()
     marker = root / 'must-not-run'
     source = str(Path(__file__).resolve().parents[1] / 'src')
-    script = '''
-import sys
+    script = """
+import ctypes, errno, sys
 sys.path.insert(0,SOURCE)
-from auto_agents import verification_metadata as metadata
-def denied(*args, **kwargs): raise PermissionError('ptrace unavailable')
-metadata._ptrace=denied
-raise SystemExit(metadata.metadata_exec([sys.executable,'-c',COMMAND],[ROOT]))
-'''
+from auto_agents import verification_metadata as metadata, verification_sandbox as sandbox
+native = metadata._libc
+class RefuseRegistration:
+    def prctl(self, operation, *args):
+        assert operation == metadata.POLICY_REQUEST
+        ctypes.set_errno(errno.EPERM)
+        return -1
+    def __getattr__(self, name): return getattr(native, name)
+def denied(*args, **kwargs): raise PermissionError(errno.EPERM, 'Landlock setup refused')
+if FAILURE == 'registration': metadata._libc = RefuseRegistration()
+else:
+    assert native.prctl(metadata.POLICY_REQUEST, 0, 0, 0, 0) == metadata.VERSION
+    sandbox.restrict_nested_writes = denied
+try:
+    metadata.metadata_exec([sys.executable,'-c',COMMAND],[ROOT])
+except (RuntimeError, OSError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(125)
+raise AssertionError('refused setup executed command')
+"""
     prefix = '\n'.join(name + '=' + repr(value) for name, value in {
-        'SOURCE': source, 'ROOT': str(root),
+        'SOURCE': source, 'ROOT': str(root), 'FAILURE': failure,
         'COMMAND': 'from pathlib import Path; Path(' + repr(str(marker)) + ').write_text("unexpected")'}.items())
     result = subprocess.run([sys.executable, '-I', '-c', prefix + '\n' + script],
                             capture_output=True, text=True, timeout=10)
-    assert result.returncode == 125 and 'ptrace unavailable' in result.stderr
+    assert result.returncode == 125, result.stdout + result.stderr
+    assert ('refused the boundary' if failure == 'registration' else 'Landlock setup refused') in result.stderr
     assert not marker.exists()
+    # A failed descendant cannot replace or terminate the inherited owner.
+    execute(tmp_path, "from pathlib import Path; p=Path('fresh'); p.write_text('ok'); p.chmod(0o750)")
 
 
 def test_supervisor_death_kills_its_tracees(tmp_path):

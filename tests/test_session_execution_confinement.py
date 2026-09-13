@@ -23,6 +23,23 @@ def shared_environment(tmp_path):
     test = root / 'tests/test_owned.py'
     test.write_text('''from pathlib import Path
 import errno, os, socket, tempfile
+def metadata_controls():
+    with tempfile.NamedTemporaryFile() as private:
+        p=Path(private.name); p.chmod(0o750)
+        assert p.stat().st_mode & 0o777 == 0o750
+        os.fchmod(private.fileno(),0o640)
+        assert p.stat().st_mode & 0o777 == 0o640
+    for name in ['.conda/etc/conda/activate.d/context.sh', HOOK]:
+        p=Path(name); before,mode=p.read_bytes(),p.stat().st_mode
+        fd=os.open(p,os.O_RDONLY)
+        try:
+            for action in (lambda: os.fchmod(fd,0o777),lambda: os.chmod('/proc/self/fd/'+str(fd),0o777)):
+                try: action()
+                except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS)
+                else: raise AssertionError('shared descriptor was writable')
+        finally: os.close(fd)
+        assert p.read_bytes()==before and p.stat().st_mode==mode
+metadata_controls()
 # This executes during collection, before any test body or writer.
 for p in [Path('.conda/etc/conda/activate.d/context.sh'), Path(HOOK)]:
     assert p.read_text() == 'original environment'
@@ -41,6 +58,7 @@ with socket.socket() as sock:
 with socket.create_connection(('127.0.0.1', int(os.environ['CONFINEMENT_TEST_PORT'])), timeout=5) as sock:
     assert sock.recv(20) == b'retained service'
 def test_owned(tmp_path):
+    metadata_controls()
     (tmp_path / 'result').write_text('owned temporary fixture')
     assert 'VALUE = 1' in Path('value.py').read_text()
 '''.replace('HOOK', repr(str(hook))))
@@ -87,8 +105,25 @@ def test_public_resume_blocks_validation_if_confinement_unavailable(tmp_path, mo
     original = verification_sandbox.shutil.which
     monkeypatch.setattr(verification_sandbox.shutil, 'which',
                         lambda name, *a, **kw: None if name == 'codex' else original(name, *a, **kw))
+    from auto_agents import gate_execution
+    launched = []
+    def forbidden(*args, **kwargs):
+        launched.append(True)
+        raise AssertionError('collection or execution started without confinement')
+    monkeypatch.setattr(gate_execution, 'run_supervised_shell_command', forbidden)
     result, calls, _ = run_session(root, monkeypatch)
     assert result.status != 'completed' and calls in ([], ['fix'])
     assert hook.read_text() == 'original environment'
     diagnostic = json.dumps(result.to_dict()).lower()
     assert 'sandbox' in diagnostic or 'confinement' in diagnostic
+    assert not launched
+    custody, attempt = result.candidate_custody, result.current_attempt
+    for _ in range(2):
+        repeated, calls, _ = run_session(root, monkeypatch)
+        assert repeated.status != 'completed' and calls == []
+        assert repeated.candidate_custody == custody and repeated.current_attempt == attempt
+        assert not repeated.candidate_custody.get('delivered_revision')
+        assert not any(e.get('verification', {}).get('ok') for e in repeated.execution_log
+                       if e.get('action') == 'receipt_verification')
+    assert not launched
+    assert hook.read_text() == 'original environment' and hook.stat().st_mode & 0o777 == 0o640

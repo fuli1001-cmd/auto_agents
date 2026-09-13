@@ -1,5 +1,7 @@
 """Recovery through the public session entrypoint and real workflow handoffs."""
 import json
+from pathlib import Path
+import sys
 
 import pytest
 
@@ -16,6 +18,49 @@ from test_session_verification_ownership import project, git
 
 class ObservationBoundary(BaseException):
     pass
+
+
+REAL_PROVIDER_CALL = Orchestrator._call_with_failover
+
+
+def configure_local_writer(root, child, program):
+    """Freeze deterministic transport before the retained baseline is captured."""
+    from auto_agents.config import load_project_config, save_project_config
+    from auto_agents.models import ProviderConfig
+    binary = root / 'receipt-provider'
+    controls = '''
+import ctypes, errno, os, tempfile
+with tempfile.NamedTemporaryFile(dir=os.environ['TMPDIR']) as private:
+    p = Path(private.name); p.chmod(0o750)
+    assert p.stat().st_mode & 0o777 == 0o750
+    os.fchmod(private.fileno(), 0o640)
+    assert p.stat().st_mode & 0o777 == 0o640
+for name in SHARED:
+    p=Path(name); before,mode=p.read_bytes(),p.stat().st_mode
+    fd=os.open(p,os.O_RDONLY)
+    try:
+        for action in (lambda: p.write_bytes(b'bad'), lambda: p.chmod(0o777),
+                       lambda: os.fchmod(fd,0o777), lambda: os.chmod('/proc/self/fd/'+str(fd),0o777)):
+            try: action()
+            except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS)
+            else: raise AssertionError('shared input was writable')
+        assert p.read_bytes()==before and p.stat().st_mode==mode
+    finally: os.close(fd)
+'''
+    binary.write_text('#!' + sys.executable + '\nimport json,sys,subprocess,shutil\nfrom pathlib import Path\n'
+        "if '--help' in sys.argv or '--version' in sys.argv:\n    print('local Claude fixture --output-format --permission-mode --dangerously-skip-permissions'); sys.exit(0)\n"
+        'sys.stdin.read()\nSHARED=' + repr([str(root / 'foreign.py'), str(root / '.git/index')]) + '\n'
+        + controls + '\n' + program + '\n'
+        "print(json.dumps({'type':'result','subtype':'success','result':'Fixed\\nCOMMIT_MESSAGE: Repair owned value'}))\n")
+    binary.chmod(0o755)
+    config = load_project_config(root)
+    config.active_provider = 'claude-code'
+    config.providers = {'claude-code': ProviderConfig(kind='claude-code', binary=str(binary), profile_map={})}
+    save_project_config(root, config)
+    git(root, 'add', '-A')
+    git(root, 'commit', '-m', 'retain deterministic provider transport')
+    child.baseline_git_ref = child.baseline_head_ref = head_ref(root)
+    save_session_state(root, child)
 
 
 def parent_workflow(root, child, *, engine=False):
@@ -47,7 +92,7 @@ def parent_workflow(root, child, *, engine=False):
     return store, snapshot, handoff
 
 
-def resume_to_observation(root, monkeypatch, action, *, observe=None):
+def resume_to_observation(root, monkeypatch, action, *, observe=None, real_dispatch=False):
     def agent(self, request):
         if request.purpose.startswith('collab'):
             if observe is not None:
@@ -55,6 +100,9 @@ def resume_to_observation(root, monkeypatch, action, *, observe=None):
             raise ObservationBoundary()
         state = load_session_state(root, 'owned-child')
         reply = action(state, request.prompt, request.cwd)
+        if real_dispatch:
+            assert request.writer_boundary is not None
+            return REAL_PROVIDER_CALL(self, request)
         request.output_path.write_text(reply)
         return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
                            summary=reply, stdout=reply, returncode=0)

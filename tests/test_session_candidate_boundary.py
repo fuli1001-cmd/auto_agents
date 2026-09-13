@@ -31,7 +31,15 @@ def _writer_project(tmp_path, monkeypatch, *, fallback=False):
     attacks = [str(root / 'foreign.py'), 'checkout-link',
                str(dependency / 'library'), 'node_modules/library', str(root / '.git/index')]
     attack_code = f'''from pathlib import Path
-import errno, os, json
+import ctypes, errno, os, json, tempfile
+with tempfile.NamedTemporaryFile(dir=os.environ["TMPDIR"]) as private:
+    p=Path(private.name); p.chmod(0o750)
+    assert p.stat().st_mode & 0o777 == 0o750
+    os.fchmod(private.fileno(),0o640)
+    assert p.stat().st_mode & 0o777 == 0o640
+libc=ctypes.CDLL(None,use_errno=True)
+for number,args in [(272,(0x10000000,)), (308,(-1,0))]:
+    assert libc.syscall(number,*args)==-1 and ctypes.get_errno()==errno.EPERM
 paths = {attacks!r}
 results = []
 for name in paths:
@@ -47,6 +55,13 @@ for name in paths:
             results.append([name, action, os.getcwd()])
         else:
             raise AssertionError('unconfined writer: ' + name + ':' + action)
+    fd=os.open(p,os.O_RDONLY)
+    try:
+        for action in (lambda: os.fchmod(fd,0o777), lambda: os.chmod('/proc/self/fd/'+str(fd),0o777)):
+            try: action()
+            except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS)
+            else: raise AssertionError('unconfined descriptor metadata')
+    finally: os.close(fd)
     assert p.read_bytes() == before and p.stat().st_mode == mode
 Path(os.environ['BOUNDARY_REPORT']).write_text(json.dumps(results))
 '''
@@ -190,12 +205,29 @@ def test_claude_fallback_keeps_candidate_write_boundary(tmp_path, monkeypatch, l
     assert _shared_image(root, dependency) == before
 
 
-def test_unavailable_writer_confinement_blocks_before_dispatch(tmp_path, monkeypatch):
+@pytest.mark.parametrize('failure', ['unavailable', 'private_chmod', 'private_fchmod'])
+def test_unavailable_writer_confinement_blocks_before_dispatch(tmp_path, monkeypatch, failure):
     import auto_agents.verification_sandbox as sandbox
     root, dependency, before = _writer_project(tmp_path, monkeypatch, fallback=True)
-    monkeypatch.setattr(sandbox, 'landlock_abi', lambda: -1)
-    which = sandbox.shutil.which
-    monkeypatch.setattr(sandbox.shutil, 'which', lambda name, *a, **k: None if name == 'unshare' else which(name, *a, **k))
+    if failure == 'unavailable':
+        monkeypatch.setattr(sandbox, 'landlock_abi', lambda: -1)
+        which = sandbox.shutil.which
+        monkeypatch.setattr(sandbox.shutil, 'which', lambda name, *a, **k: None if name == 'unshare' else which(name, *a, **k))
+    else:
+        command = sandbox.CandidateWriterBoundary._command
+        def deny_private_metadata(boundary, argv, env):
+            # Reproduce an inherited filter denying private metadata in the
+            # actual preflight process. The former creation-only probe passes
+            # this setup and wrongly reaches the forbidden provider below.
+            argv = list(argv)
+            if '-c' in argv:
+                i = argv.index('-c') + 1
+                operation = failure.removeprefix('private_')
+                argv[i] = ("import os,errno\n"
+                    "def denied(*a,**k): raise PermissionError(errno.EPERM,'private metadata denied')\n"
+                    "os." + operation + "=denied\n" + argv[i])
+            return command(boundary, argv, env)
+        monkeypatch.setattr(sandbox.CandidateWriterBoundary, '_command', deny_private_metadata)
     calls = []
     def forbidden(*args, **kwargs):
         calls.append(True)
@@ -207,6 +239,20 @@ def test_unavailable_writer_confinement_blocks_before_dispatch(tmp_path, monkeyp
     diagnostic = result.execution_log[-1]['diagnostic']
     assert diagnostic['retry_fix'] is False and diagnostic['session_id'] == 'owned-child'
     assert diagnostic['contract_fingerprint']
+    if failure != 'unavailable':
+        assert diagnostic['phase'] == 'writer_preflight'
+        assert diagnostic['launcher_protocol'] == '--writer-landlock'
+        assert diagnostic['supervisor_version'] == 1
+        assert diagnostic['errno'] == 1
     assert 'writer confinement is unavailable' in result.execution_log[-1]['result']
     assert not calls
     assert _shared_image(root, dependency) == before
+    custody = result.candidate_custody
+    for _ in range(2):
+        repeated = _resume(root)
+        assert repeated.status != 'completed'
+        assert repeated.candidate_custody == custody
+        assert repeated.current_attempt == result.current_attempt
+        assert not repeated.candidate_custody.get('delivered_revision')
+        assert any(entry.get('diagnostic') == diagnostic for entry in repeated.execution_log)
+    assert not calls and _shared_image(root, dependency) == before
