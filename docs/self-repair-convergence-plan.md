@@ -11,7 +11,7 @@ budget. A step without meaningful progress can still be diagnosed and stopped.
 
 ## Incremental planning and independent review
 
-Experiment schema 7 retains immutable plan revisions, stable step/scenario IDs,
+Experiment schema 8 retains stable controller-owned work items, immutable plan revisions, stable step/scenario IDs,
 parent revisions, independent review results, bounded repair episodes and
 verification schedules. The latest draft survives rejection, malformed replies,
 interruption and restart. Complete historical inputs remain in protected artifacts;
@@ -178,7 +178,10 @@ changed observations require another review of the retained draft. Exhaustion
 reports the current scenario and reason first, retaining complete feedback in the
 structured blocker, including after restart. The three-review limit remains.
 
-Scope decisions remain independent of code review. `required`, `follow_up`,
+Scope and code correctness remain distinct decisions. An independent code review
+may supply a complete, grounded `required` decision bound to its original input;
+the controller need not ask another model to restate it. Exclusions and unknown
+scope still use the separate independent scope gate. `required`, `follow_up`,
 `not_applicable` and `unknown` preserve their previous meaning. A safety violation
 or introduced regression requires explicit disproof to become nonblocking.
 Current facts retain their original request/result artifacts and a controller-built
@@ -202,7 +205,7 @@ checks. A scenario may name an exact parameter case in `quick_check`; its origin
 commands exceeding targets are reported. Commands with different target cohorts,
 flags or shell effects are never treated as interchangeable proof.
 
-Schema 6 migration backs up the old state and preserves candidates, histories,
+Schema 6/7 migration backs up the old state and preserves candidates, histories,
 proof schema 4 and old counters. Matching original request/input/result artifacts
 can recover a legacy draft and an interrupted review slot; an old approval flag
 never manufactures a new approval. New memory artifacts use the existing
