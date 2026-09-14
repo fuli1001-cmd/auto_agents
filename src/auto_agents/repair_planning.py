@@ -25,6 +25,7 @@ from .repair_feedback import sanitize_evidence
 from .verification_ledger import source_identity
 from .repair_test_refs import pytest_targets
 from .repair_planning_input import plan_delta, source_delta, working_input
+from .repair_capability_checks import capability_fingerprint
 
 POLICY_VERSION = 2
 MAX_PLAN_REVIEWS = 3
@@ -690,6 +691,8 @@ def _review_reuse_failure(runner, receipt, group):
                 and context.get('source_commit') == receipt.get('source_commit')
                 and ('runtime_capabilities' not in receipt
                      or receipt['runtime_capabilities'] == digest(context.get('runtime_capabilities')))
+                and ('runtime_capability_semantics' not in receipt
+                     or receipt['runtime_capability_semantics'] == capability_fingerprint(context.get('runtime_capabilities')))
                 and result.get('decision') == 'APPROVE' and result.get('issues') == []
                 and receipt.get('execution_mode', receipt['plan'].get('mode', 'implement')) == _review_execution_mode(receipt['plan'], result)
                 and set(result.get('scenario_ids', [])) == {row['scenario_id'] for row in receipt['plan']['scenarios']}
@@ -865,7 +868,7 @@ def prepare_component(runner, workspace):
                            'unless a concrete current defect requires code changes. Do not rewrite completed mechanisms.'}
     signature = _component_signature(group)
     strategy = digest([POLICY_VERSION, experiment.base_commit, experiment.contract_fingerprint,
-                       signature, context['environment'], digest(context['runtime_capabilities']),
+                       signature, context['environment'], capability_fingerprint(context['runtime_capabilities']),
                        [finding_key(f) for f in context['findings']]])
     reuse_failures, invalid_approvals = [], set()
     for receipt in experiment.planning_receipts.values():
@@ -873,7 +876,8 @@ def prepare_component(runner, workspace):
         if receipt.get('decision') != 'APPROVE':
             continue
         failure = _review_reuse_failure(runner, receipt, original_group)
-        if receipt.get('runtime_capabilities') != digest(context['runtime_capabilities']):
+        if (not receipt.get('runtime_capabilities')
+                or receipt.get('runtime_capability_semantics', receipt.get('runtime_capabilities')) != capability_fingerprint(context['runtime_capabilities'])):
             failure = failure or 'planning runtime capabilities changed or were not recorded'
         if receipt.get('component_signature') == signature:
             if (failure and receipt.get('engine_base') == experiment.base_commit
@@ -1148,6 +1152,7 @@ def prepare_component(runner, workspace):
                 'contract': experiment.contract_fingerprint, 'engine_base': experiment.base_commit,
                 'plan': plan, 'planner_request': planner_id, 'request_id': reviewer_id,
                 'runtime_capabilities': digest(context['runtime_capabilities']),
+                'runtime_capability_semantics': capability_fingerprint(context['runtime_capabilities']),
                 'decision': 'APPROVE' if approved else 'REVISE', 'revision': context['revision'],
                 'probe_results': probes, 'feedback': [review], 'execution_mode': _review_execution_mode(plan, review)}
             experiment.planning_receipts[key] = receipt

@@ -86,7 +86,7 @@ def test_source_conflict_is_retained_without_changing_installation_and_can_resum
         repository.select_source(local)
     assert git(engine, 'rev-parse', 'HEAD') == local
     assert not git(engine, 'status', '--porcelain')
-    merge = next((repository.root / 'runtimes').glob('source-merge-*'))
+    merge = next(path for path in (repository.root / 'runtimes').glob('source-merge-*') if path.is_dir())
     assert git(merge, 'diff', '--name-only', '--diff-filter=U') == 'bug.py'
     from auto_agents.artifact_references import protection
     assert protection({'path': str(merge), 'kind': 'worktree',

@@ -19,6 +19,9 @@ if __name__ == '__main__':
 
 from auto_agents import artifact_temp as tempfile
 
+RUNTIME_ROOT_ENV = 'AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT'
+SHM_ENV = 'AUTO_AGENTS_VERIFICATION_PRIVATE_SHM'
+
 
 def landlock_abi():
     libc = ctypes.CDLL(None, use_errno=True)
@@ -71,11 +74,14 @@ def namespace_exec(payload):
     try:
         for value in sorted(set(payload["preserve"]), key=lambda item: len(Path(item).parts)):
             path = Path(value).resolve()
-            if str(path).startswith("/tmp/") and path.is_dir():
+            if (str(path).startswith('/tmp/') or payload.get('private_shm') and str(path).startswith('/dev/shm/')) and path.is_dir():
                 kept.append((str(path), os.open(path, os.O_PATH | os.O_CLOEXEC)))
         if payload.get("ip"):
             subprocess.run([payload["ip"], "link", "set", "lo", "up"], check=True)
         subprocess.run([payload["mount"], "-t", "tmpfs", "-o", "mode=1777", "tmpfs", "/tmp"], check=True)
+        if payload.get('private_shm'):
+            subprocess.run([payload['mount'], '-t', 'tmpfs', '-o', 'mode=1777,nosuid,nodev',
+                            'tmpfs', '/dev/shm'], check=True)
         for path, fd in kept:
             Path(path).mkdir(parents=True, exist_ok=True)
             subprocess.run([payload["mount"], "--no-canonicalize", "--rbind", f"/proc/self/fd/{fd}", path], pass_fds=(fd,), check=True)
@@ -91,6 +97,11 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
                       python_paths=(), node_paths=(), library_paths=(), execution_environment=None,
                       supervisor_checks=False):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
+    from auto_agents.verification_input_trace import owner_identity
+    owner = owner_identity()
+    nested = bool(owner['metadata'] or os.environ.get('AUTO_AGENTS_VERIFICATION_SANDBOX'))
+    private_shm = not nested and execution_environment is None
+    inherited_shm = bool(owner['metadata'] and os.environ.get(SHM_ENV) == '1')
     if root == target or root in target.parents or target in root.parents:
         raise RuntimeError("verification workspace overlaps the live target project")
     executable = shutil.which("codex")
@@ -98,7 +109,7 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         from auto_agents.verification_dependencies import MissingDependency, VerificationDependencyError
         raise VerificationDependencyError(MissingDependency("executable", "codex"),
             "engine verification needs a local Codex sandbox executable; no model calls are made by this command")
-    temporary_parent = os.environ.get("TMPDIR", "/tmp") if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX") else "/tmp"
+    temporary_parent = os.environ.get("TMPDIR", "/tmp") if nested else "/tmp"
     with tempfile.TemporaryDirectory(prefix="aav-", dir=temporary_parent) as temporary:
         scratch = Path(temporary)
         if target == scratch or target in scratch.parents:
@@ -113,7 +124,17 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         preserve = [str(root), str(scratch), str(target), str(Path(__file__).resolve().parents[2])]
         writable = [str(root), str(scratch)]
         metadata_readonly = [str(target), *map(str, read_roots)]
-        for value in write_roots:
+        if private_shm or inherited_shm:
+            entries['/dev/shm'] = 'write'
+            writable.append('/dev/shm')
+        retained_runtime = os.environ.get(RUNTIME_ROOT_ENV) if owner['metadata'] else None
+        runtime_parent = Path(retained_runtime) if retained_runtime else scratch / 'g'
+        if (not runtime_parent.is_absolute() or runtime_parent.is_symlink()
+                or runtime_parent.resolve() != runtime_parent):
+            raise RuntimeError('verification runtime reservation must be an absolute private directory')
+        if not retained_runtime:
+            runtime_parent.mkdir(mode=0o700)
+        for value in [runtime_parent, *write_roots]:
             extra = Path(value).resolve()
             if extra == target or extra in target.parents or target in extra.parents or extra == Path("/"):
                 raise RuntimeError("verification write root overlaps the live project")
@@ -165,23 +186,28 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         clean_environment = ["env", "-i", "PATH=" + executable_path,
                              "HOME=" + str(home), "CODEX_HOME=" + str(codex_home),
                              "TMPDIR=" + temporary, "LANG=C.UTF-8",
-                             "PYTHONPATH=" + os.pathsep.join([str(root / "src"), *map(str, python_paths)]),
+                             "PYTHONPATH=" + os.pathsep.join([str(root / "src"), *map(str, python_paths),
+                                 str(Path(__file__).resolve().parents[1])]),
                              "PYTHONDONTWRITEBYTECODE=1",
                              "AUTO_AGENTS_TEST=True", "TESTING=True", "AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1",
                              "AUTO_AGENTS_VERIFICATION_SANDBOX=1"]
+        clean_environment.append(RUNTIME_ROOT_ENV + '=' + str(runtime_parent))
         if execution_environment is not None:
             # Project verification retains operator inputs, activation and networking.
             # Only sandbox bookkeeping goes to a fresh private home.
             clean_environment = ['env', 'CODEX_HOME=' + str(codex_home),
-                                 'AUTO_AGENTS_VERIFICATION_SANDBOX=1']
+                                 'AUTO_AGENTS_VERIFICATION_SANDBOX=1',
+                                 RUNTIME_ROOT_ENV + '=' + str(runtime_parent)]
         if node_paths:
             clean_environment.append("NODE_PATH=" + os.pathsep.join(map(str, node_paths)))
         if library_paths:
             clean_environment.append("LD_LIBRARY_PATH=" + os.pathsep.join(map(str, library_paths)))
+        if private_shm or inherited_shm:
+            clean_environment.append(SHM_ENV + '=1')
         from auto_agents.verification_supervisor_checks import REPORT_ENV
         if REPORT_ENV in os.environ:
             clean_environment.append(REPORT_ENV + '=' + os.environ[REPORT_ENV])
-        if os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
+        if nested:
             launcher = Path(__file__).resolve()
             yield [sys.executable, str(launcher), "--metadata", json.dumps({
                 'roots': writable, 'readonly': metadata_readonly,
@@ -193,7 +219,7 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         sandbox = [executable, "sandbox", "-c", "features.network_proxy=false",
                    "-c", "permissions.autoagents_verify=" + profile,
                    "-P", "autoagents_verify", "-C", str(root), "--include-managed-config", "--", *clean_environment, *metadata, *argv]
-        if not os.environ.get("AUTO_AGENTS_VERIFICATION_SANDBOX"):
+        if not nested:
             unshare, ip, mount = shutil.which("unshare"), shutil.which("ip"), shutil.which("mount")
             required = [("unshare", unshare), ("mount", mount)]
             if execution_environment is None:
@@ -203,8 +229,10 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
                 missing = next(name for name, value in required if not value)
                 raise VerificationDependencyError(MissingDependency("executable", missing),
                     "verification requires " + ', '.join(name for name, _ in required) + " for private test namespaces")
-            payload = {"cwd": str(root), "preserve": preserve, "command": sandbox, "ip": ip if execution_environment is None else None, "mount": mount}
-            sandbox = [unshare, "--user", "--map-root-user", "--mount", *(["--net"] if execution_environment is None else []), "--pid", "--fork", "--mount-proc",
+            payload = {"cwd": str(root), "preserve": preserve, "command": sandbox, "ip": ip if execution_environment is None else None, "mount": mount,
+                       'private_shm': private_shm}
+            sandbox = [unshare, "--user", "--map-root-user", "--mount", *(["--net"] if execution_environment is None else []),
+                       *(['--ipc'] if private_shm else []), "--pid", "--fork", "--mount-proc",
                        sys.executable, str(Path(__file__).resolve()), "--namespace", json.dumps(payload)]
         yield ["env", "TMPDIR=" + temporary, *sandbox]
 

@@ -75,10 +75,12 @@ def acceptance_planning(root):
         }]}))
 
     orchestrator = SimpleNamespace(config=SimpleNamespace(efforts={}), _call_with_failover=plan)
+    directory = root / 'jobs' / 'probe'
+    directory.mkdir(parents=True)
     with patch("auto_agents.orchestrator.Orchestrator", return_value=orchestrator):
         payload = {"invocation": {"engine_route": route}}
-        first = prepare_contract(payload, "probe", root, root, root)
-        second = prepare_contract(payload, "probe", root, root, root)
+        first = prepare_contract(payload, "probe", root, root, directory)
+        second = prepare_contract(payload, "probe", root, root, directory)
     assert len(calls) == 1 and first.to_dict() == second.to_dict(), "planning cache is not preserved"
     assert first.checks[0]["nodeids"] == ["tests/test_runtime.py::test_progress", "tests/test_runtime.py::test_planned_progress"]
     assert first.checks[1]["nodeids"] == ["tests/test_runtime.py::test_planned_coverage"]

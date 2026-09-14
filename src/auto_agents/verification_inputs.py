@@ -24,6 +24,7 @@ class InputObserver:
         self.runtime = [path for path in self.runtime if path != self.root and path not in self.root.parents]
         self.helpers = {str(Path(__file__).resolve()), str(Path(__file__).with_name("verification_pytest.py").resolve())}
         self.probes = []
+        self.supports = []
 
     def _probe(self, operation, original):
         def observed(*args, **kwargs):
@@ -178,6 +179,11 @@ class InputObserver:
             wrapper = self._probe(name, original)
             self.probes.append((owner, name, original, wrapper, name in vars(owner)))
             setattr(owner, name, wrapper)
+            for capability in ('supports_fd', 'supports_dir_fd', 'supports_follow_symlinks', 'supports_effective_ids'):
+                supported = getattr(os, capability, set())
+                if original in supported:
+                    supported.add(wrapper)
+                    self.supports.append((supported, wrapper))
         sys.addaudithook(self.audit)
         sys.setprofile(self.profile)
 
@@ -195,5 +201,7 @@ class InputObserver:
                     delattr(owner, name)
             else:
                 self.reasons.add('filesystem_observer_replaced')
+        for supported, wrapper in self.supports:
+            supported.discard(wrapper)
         return {"manifest": self.inputs, "complete": bool(self.inputs) and not self.reasons,
                 "reasons": sorted(self.reasons)}

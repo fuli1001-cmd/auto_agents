@@ -71,6 +71,8 @@ def test_two_nested_launches_narrow_one_supervisor_and_preserve_ancestor_policy(
 import ctypes, errno, json, os
 from pathlib import Path
 from auto_agents.verification_metadata import POLICY_REQUEST, VERSION
+import auto_agents.verification_metadata as selected_metadata
+assert str(Path(selected_metadata.__file__).resolve()) == EXPECTED_HELPER
 libc=ctypes.CDLL(None, use_errno=True)
 assert libc.prctl(POLICY_REQUEST, 0, 0, 0, 0) == VERSION
 # A forged request for the entire filesystem only adds another intersection.
@@ -84,6 +86,7 @@ for name in [SHARED, OUTER]:
     except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS)
     else: raise AssertionError('ancestor boundary widened')
 '''
+    inner = 'EXPECTED_HELPER=' + repr(str(Path(__file__).resolve().parents[1] / 'src/auto_agents/verification_metadata.py')) + '\n' + inner
     middle = '''
 import os, subprocess, sys
 from pathlib import Path
@@ -109,6 +112,46 @@ assert result.returncode==0, result.stdout+result.stderr
     # Keep package import paths available after each private cwd change.
     outer = 'INNER = ' + repr(inner) + '\nMIDDLE = ' + repr(middle) + '\n' + outer
     execute(tmp_path, outer)
+
+
+@pytest.mark.parametrize('kind', ['socket', 'fifo'])
+def test_private_ipc_metadata_preserves_nested_shared_and_hardlink_denial(tmp_path, kind):
+    create = ("s=socket.socket(socket.AF_UNIX); s.bind(str(path)); s.close()"
+              if kind == 'socket' else "os.mkfifo(path)")
+    program = '''
+import os,socket,subprocess,sys
+from pathlib import Path
+from auto_agents.verification_sandbox import verification_argv
+root=Path.cwd(); Path('inner').mkdir()
+for name in ['outside','linked']:
+    path=root/name
+    exec(CREATE)
+    path.chmod(0o600)
+os.link('linked','inner/alias')
+Path('inner/escape').symlink_to(root/'outside')
+script="""
+import errno,os,socket
+from pathlib import Path
+path=Path('private')
+exec(CREATE)
+path.chmod(0o640)
+os.utime(path,ns=(1000000000,2000000000))
+assert path.stat().st_mode & 0o777 == 0o640
+assert path.stat().st_mtime_ns == 2000000000
+for path in [OUTSIDE,'alias','escape']:
+    for operation in [lambda:os.chmod(path,0o777),lambda:os.utime(path,ns=(1,1))]:
+        try:operation()
+        except OSError as error:assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS)
+        else:raise AssertionError('shared IPC metadata changed')
+"""
+script='CREATE='+repr(CREATE)+'\\nOUTSIDE='+repr(str(root/'outside'))+'\\n'+script
+with verification_argv([sys.executable,'-c',script],root/'inner',Path(SHARED).parent) as argv:
+    result=subprocess.run(argv,capture_output=True,text=True,timeout=10)
+assert result.returncode==0,result.stdout+result.stderr
+assert Path('outside').stat().st_mode & 0o777 == 0o600
+assert Path('linked').stat().st_mode & 0o777 == 0o600
+'''
+    execute(tmp_path, 'CREATE=' + repr(create) + '\n' + program)
 
 
 def test_nested_launch_preserves_environment_with_inaccessible_path_entries(tmp_path):

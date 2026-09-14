@@ -162,15 +162,23 @@ private temporary files, bounded subprocesses, and explicit process cleanup.
 No candidate command runs before the metadata boundary.
 
 Nested tests consume these observations through
-`verification_supervisor_checks.observation`. They require matching source
-hashes and the live tracer PID; absent observations or a different implementation
-fail closed. The packaged legacy fixture is byte-for-byte revision `8ea6662`,
+`verification_supervisor_checks.observation`. They require the live tracer PID
+and hashes matching the runtime identified by that tracer's `/proc/<pid>/cmdline`.
+The production launcher uses an absolute `verification_sandbox.py --metadata`
+path. Report-supplied paths and candidate import paths do not select the source
+used for validation. Absent observations, unreadable launcher identity, or
+mismatched producing source fail closed. This also consumes existing version 1
+reports when the selected launcher predates the candidate. The packaged legacy
+fixture is byte-for-byte revision `8ea6662`,
 including its original ptrace restriction, so installed or shallow runtimes do
 not require Git history. The death check first proves that the tracee's
 `TracerPid` is the separate supervisor that it kills, then requires pipe EOF.
 
 The planning capability observation describes this activation route. It does
 not require a nested user/mount namespace or grant repair acceptance by itself.
+Returned observations expose `source_root`, `sources`, and `launcher_pid` so their
+provenance remains explicit. The runtime capability route tells planning that
+these are selected-runtime diagnostics, not proof of candidate supervisor changes.
 Quick and expanded acceptance still execute their tests and assertions. Ordinary
 nested gates retain their inherited owner and narrowing policy. If a candidate
 changes the supervisor implementation, observations from another selected

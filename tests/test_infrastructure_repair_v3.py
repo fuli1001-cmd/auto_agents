@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import shutil
 
 from auto_agents.execution_recovery import (
@@ -183,7 +184,7 @@ def test_gate_environment_uses_a_short_isolated_socket_runtime(
         assert env["AUTO_AGENTS_GATE_RUNTIME_PROFILE"] == SHORT_RUNTIME_PROFILE
         assert len(str(Path(env["TMPDIR"]) / ("s" * 64)).encode()) <= 100
         assert Path(env["XDG_RUNTIME_DIR"]).stat().st_mode & 0o777 == 0o700
-        assert runtime_root.parent == Path("/tmp")
+        assert runtime_root.parent == Path(os.environ.get('AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT', '/tmp'))
     finally:
         shutil.rmtree(runtime_root, ignore_errors=True)
 
