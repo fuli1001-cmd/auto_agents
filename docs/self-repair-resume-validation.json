@@ -1,0 +1,58 @@
+{
+  "incident_job": "55b5e9bc4270493fb66d797a",
+  "incident_engine": "97a4c50e05f25f4f43e93c6153ec3b94ed6ed60a",
+  "runtime_code_commit": "a4359562e056c42c6c290413d50624bdc2813ad7",
+  "full_suite": {
+    "source_commit": "739ea4713ea1ae91c2d4d08cd394f066eb670818",
+    "ok": true,
+    "cases": 3247,
+    "shards": 168,
+    "seconds": 1678.3981540079985,
+    "report": "/tmp/self-repair-resume-fix-m35tw483/full-suite/result.json"
+  },
+  "followup_regressions": {
+    "source_commit": "a4359562e056c42c6c290413d50624bdc2813ad7",
+    "ok": true,
+    "cases": 552,
+    "coverage": "all tests/test_repair_*.py",
+    "seconds": 210.29670366899518,
+    "report": "/tmp/self-repair-resume-fix-m35tw483/probe-review-regressions/result.json"
+  },
+  "archived_probe_rehearsal": {
+    "controller_commit": "b7f9ec79659f820af629fc60bdc46be2b6d38f5f",
+    "candidate_commit": "607f2483c82b12938ff33c97ad9da2d1f164b853",
+    "seconds_before_model": 67.70359360499424,
+    "model_calls": 0,
+    "scenarios": 13,
+    "pending_scope_decisions": 2,
+    "checks_unchanged": true,
+    "probe_outcomes": [
+      {
+        "outcome": "pass",
+        "matches": false
+      },
+      {
+        "outcome": "pass",
+        "matches": true
+      },
+      {
+        "outcome": "pass",
+        "matches": true
+      }
+    ],
+    "original_source_unchanged": true,
+    "original_state_modified": false,
+    "report": "/tmp/self-repair-resume-fix-m35tw483/archive-probes-clean/report.json"
+  },
+  "native_archived_review": {
+    "status": "awaiting_explicit_authorization",
+    "executed": false,
+    "reason": "automatic approval review rejected sending archived private repair context to the configured external Codex provider"
+  },
+  "original_project_resumed": false,
+  "repair_candidate_accepted": false,
+  "limitations": [
+    "Final runtime code has the full baseline suite plus the complete affected repair regression suite, not a second full-suite run.",
+    "The archived rehearsal stops before any model verdict; it measures neither model latency nor completed repair throughput."
+  ]
+}
