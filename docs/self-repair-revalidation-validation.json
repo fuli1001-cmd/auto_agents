@@ -1,0 +1,76 @@
+{
+  "validated_at": "2026-09-15T00:44:48.424299+08:00",
+  "code_revision": "706c25a7801f60f543104a389e98137bebcf1740",
+  "regressions": {
+    "tests": 683,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "seconds": 153.039,
+    "junit": "/tmp/auto-agents-revalidation-regressions-final.xml"
+  },
+  "legacy_negative_control": {
+    "baseline": "682bfae prepare_completed, current test harness",
+    "pytest_exit_code": 1,
+    "expected_failure": true,
+    "tests": 2
+  },
+  "archive_replay": {
+    "mode": "offline protocol replay; not fresh acceptance",
+    "provider_calls": 0,
+    "project_resumed": false,
+    "repair_accepted": false,
+    "delta_review": {
+      "request": "b4e677fc11b14c22a774dd215ad2aa2b",
+      "legacy_error": "scope review must classify every observation exactly once",
+      "decision": "APPROVE",
+      "requested_rows": 2,
+      "original_rows": 6,
+      "validated_rows": 2,
+      "requested_decisions_unchanged": true,
+      "seconds": 0.00041185898589901626
+    },
+    "unchanged_review": {
+      "request": "01acd9626dac4e1eb74420b618d102ba",
+      "matches_reselection_regression": true,
+      "reusable_checks": 36,
+      "source_commit": "9f3731d4313a6a45f330534cd438afcf6f77a13f"
+    },
+    "original_payload_unchanged": true,
+    "archive_unchanged": true,
+    "input_digests": {
+      "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/b490c9e371b8430a8ed160a3/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/experiment.json": "bdb01cb5b59b01d00c2f360aac12d34c2c69c17031497714143d550fe5abc514",
+      "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/b490c9e371b8430a8ed160a3/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/planning/b4e677fc11b14c22a774dd215ad2aa2b/input.json": "094602ef93c8da749c51a1e58558d0527309e240f68038bcb0d8dc7bd932b04f",
+      "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/b490c9e371b8430a8ed160a3/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/planning/0ee7ef21aa574adaa608bed13088d459/memory.json": "bf1d85b9bd9ab04267347900f4d9da7d2a245c2cd94f200af4695b1ad57442db",
+      "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/b490c9e371b8430a8ed160a3/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/planning/b4e677fc11b14c22a774dd215ad2aa2b/result.json": "d94ededfcf5b10ac53106534a09d598c9b563ce62ee0f06590c97906246b42a6",
+      "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/b490c9e371b8430a8ed160a3/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/planning/01acd9626dac4e1eb74420b618d102ba/input.json": "81b9db3b8801840ed980979b86c5a3511d1cc5c2774e0a3d51357410720ba003",
+      "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/b490c9e371b8430a8ed160a3/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/planning/728c16e729ba43e7b5fc0050813dbea8/memory.json": "50ec25339fcebc7f7b0c4a66fff47aa24e863c7355c3d58f76dec9b30d343372"
+    }
+  },
+  "candidate_continuation": {
+    "code_revision": "706c25a7801f60f543104a389e98137bebcf1740",
+    "original_candidate": "9f3731d4313a6a45f330534cd438afcf6f77a13f",
+    "combined_candidate": "06b235efd665fe4d0547b762d1e46a19318f029d",
+    "merge_conflicts": false,
+    "provider_calls": 0,
+    "uses_production_carry_function": true,
+    "retains_candidate": true,
+    "retains_fix": true,
+    "checkout": "/tmp/auto-agents-revalidation-continuation-20260915/repair"
+  },
+  "candidate_regressions": {
+    "tests": 114,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "seconds": 35.363,
+    "junit": "/tmp/auto-agents-revalidation-continuation-tests.xml",
+    "python": "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/environments/8518272c2c1eafbfc0bf1fdc/bin/python"
+  },
+  "provider_calls": 0,
+  "project_resumed": false,
+  "full_repair_elapsed_time_measured": false,
+  "archive_inputs_still_unchanged": true,
+  "original_job_state": "cancelled",
+  "original_candidate_head": "9f3731d4313a6a45f330534cd438afcf6f77a13f"
+}
