@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import time
 from types import SimpleNamespace
@@ -170,12 +171,18 @@ def run(output, configuration_project, provider, proposal=None):
         from auto_agents.repair_control import digest
         from auto_agents.verification_ledger import source_identity
         draft = json.loads(proposal.read_text())
-        origin = save_record(runner, 'retained_model_proposal', {'path': str(proposal), 'draft': draft,
-                            'acceptance_proof': False})
+        request_file = proposal.with_name('request.json')
+        request = json.loads(request_file.read_text())
+        if request.get('stage') not in {'self_repair_component_plan', 'self_repair_plan_format'} or request.get('request_id') != proposal.parent.name:
+            raise ValueError('retained proposal requires its original planner request artifacts')
+        origin = runner._experiment_store.root / 'planning' / request['request_id']
+        origin.mkdir(parents=True, exist_ok=False)
+        for name in ('request.json', 'input.json', 'result.json'):
+            shutil.copyfile(proposal.with_name(name), origin / name)
         remember_revision(runner, group, {'draft': draft, 'component': group, 'status': 'recovered_draft',
             'source': source_identity(engine), 'source_commit': state.base_commit,
             'environment': digest(runner._full_suite_environment_fingerprint()),
-            'planner_request': origin['id'], 'requires_independent_review': True})
+            'planner_request': request['request_id'], 'requires_independent_review': True})
     results, phase_calls = [], []
     seen = set()
     start = time.monotonic()
@@ -217,7 +224,7 @@ def run(output, configuration_project, provider, proposal=None):
             raise RuntimeError('pilot did not complete its retained component acceptance')
         phase_calls.append({'phase': phase, 'stages': [row['stage'] for row in calls[before_calls:]]})
     workspace = runner._continuous_workspace / 'repair'
-    assert (workspace / 'tests/test_alias_reuse.py').read_text() == TESTS, 'original acceptance was modified'
+    assert (workspace / 'tests/test_alias_reuse.py').read_text().startswith(TESTS), 'original acceptance was modified'
     assert (target / 'sentinel.txt').read_text() == 'preserve original target\n'
     final = runner._run_verification_commands([full], workspace)
     report = {'ok': final.ok, 'scope': 'two real-provider component repair cycles and complete fixture acceptance',
@@ -236,6 +243,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True, help='new disposable directory; must not exist')
     parser.add_argument('--configuration-project', type=Path, required=True, help='read provider and effort settings only')
     parser.add_argument('--provider', required=True)
-    parser.add_argument('--proposal', type=Path, help='optional retained model plan as untrusted data; requires fresh probes and independent review')
+    parser.add_argument('--proposal', type=Path, help='original model result.json with adjacent request/input artifacts; requires fresh probes and independent review')
     args = parser.parse_args()
     raise SystemExit(run(args.output.resolve(), args.configuration_project.resolve(), args.provider, args.proposal))

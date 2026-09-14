@@ -227,3 +227,14 @@ def test_corrupt_work_budgets_cannot_be_reset_during_reload(approved, bad):
     work['diagnoses']['case'] = {'calls': bad}
     with pytest.raises(ValueError, match='diagnosis counters'):
         SelfRepairExperiment.from_dict(raw)
+
+
+def test_only_completed_reviewed_additions_can_extend_the_plan_reuse_baseline(completed):
+    from auto_agents.repair_planning import _completed_source_covers_delta
+    runner, state, group, _, _ = completed
+    plan = {'touched_paths': ['source.py']}
+    (runner.repo_root / 'source.py').write_text('value = 2\n')
+    assert _completed_source_covers_delta(runner, runner.repo_root, group, plan, ['tests/test_a.py'])
+    assert not _completed_source_covers_delta(runner, runner.repo_root, group, plan, ['unreviewed.py'])
+    (runner.repo_root / 'tests/test_a.py').write_text('def test_a(): assert 2 == 2\n')
+    assert not _completed_source_covers_delta(runner, runner.repo_root, group, plan, ['tests/test_a.py'])

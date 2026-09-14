@@ -908,6 +908,31 @@ def _preserve_scenarios(previous, plan):
         raise PlanningBlocked('plan revision deletes retained acceptance scenarios', code='acceptance_removed')
 
 
+def _completed_source_covers_delta(runner, workspace, group, plan, outside):
+    """Retain test changes already independently reviewed and fully tested.
+
+    This preserves a plan, not execution proof, and never expands its write
+    paths. Current code review and complete acceptance still run after repair.
+    """
+    from .repair_completion import retained_proof
+    from .repair_memory import read_record
+    tests = {node.split('::', 1)[0] for command in group.get('focused_tests', [])
+             for node in pytest_targets(command, prose=False)}
+    if not outside or not set(outside).issubset(tests):
+        return False
+    proof, _ = retained_proof(runner, group)
+    if not proof:
+        return False
+    review = read_record(runner, proof.get('review', {}))
+    commit = (review or {}).get('source_commit')
+    if not commit or subprocess.run(['git', 'merge-base', '--is-ancestor', commit, 'HEAD'],
+                                   cwd=workspace, capture_output=True).returncode:
+        return False
+    changed = subprocess.check_output(['git', 'diff', '--name-only', commit, '--'], cwd=workspace, text=True).splitlines()
+    untracked = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=workspace, text=True).splitlines()
+    return all(path in plan['touched_paths'] for path in changed + untracked)
+
+
 def prepare_component(runner, workspace):
     from .repair_memory import component_key, latest_revision, remember_revision, read_record
     from .repair_work import memory as work_memory, link_definition
@@ -978,6 +1003,9 @@ def prepare_component(runner, workspace):
             changes = subprocess.check_output(['git', 'diff', '--name-only', receipt['source_commit'], '--'], cwd=workspace).decode().splitlines()
             untracked = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=workspace).decode().splitlines()
             same = all(path in receipt['plan']['touched_paths'] for path in changes + untracked)
+            if not same:
+                outside = [path for path in changes + untracked if path not in receipt['plan']['touched_paths']]
+                same = _completed_source_covers_delta(runner, workspace, group, receipt['plan'], outside)
         if same:
             runner._candidate_group = {**group, **receipt['plan'], 'planning_receipt': receipt['request_id'],
                                        'finding_scenario_bindings': bindings,
