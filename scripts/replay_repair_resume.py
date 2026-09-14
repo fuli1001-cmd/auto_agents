@@ -2,7 +2,8 @@
 """Exercise full planning admission on a private copy of an archived repair.
 
 Default: capture the next required independent request, without calling a model
-or executing probes. --native runs the real bounded probes and one independent
+or executing probes. --probes executes the real probes without sending a model
+request. --native runs the real bounded probes and one independent
 Codex review. Neither mode generates code, publishes an engine or resumes the
 original project. Reports distinguish observations from repair acceptance.
 """
@@ -47,6 +48,8 @@ def run(args):
         os.environ[name] = str(output / name.lower())
     os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
     archive = args.experiment.resolve()
+    archive_before = archive.read_bytes()
+    original_source_before = source_identity(args.source.resolve())
     incoming = json.loads((archive.parent / 'planning' / args.request / 'input.json').read_text())
     state = SelfRepairExperiment.from_dict(json.loads(archive.read_text()))
     engine, target = output / 'engine', output / 'target'
@@ -73,7 +76,14 @@ def run(args):
         working = (request.output_path.parent / 'working_input.json').read_text()
         record = {'stage': request.stage, 'request': request.output_path.parent.name,
                   'working_input_chars': len(working), 'scope_findings': [f['finding_id'] for f in context.get('scope_findings', [])],
-                  'scenario_ids': [s['scenario_id'] for s in context.get('proposed_plan', {}).get('scenarios', [])]}
+                  'scenario_ids': [s['scenario_id'] for s in context.get('proposed_plan', {}).get('scenarios', [])],
+                  'probe_outcomes': [{key: p.get(key) for key in ('outcome', 'matches')}
+                                     for p in context.get('probe_results', [])]}
+        old_plan, current_plan = incoming.get('proposed_plan', {}), context.get('proposed_plan', {})
+        record['retained_checks_unchanged'] = (
+            old_plan.get('quick_checks') == current_plan.get('quick_checks')
+            and [(s['scenario_id'], s.get('check'), s.get('quick_check')) for s in old_plan.get('scenarios', [])]
+            == [(s['scenario_id'], s.get('check'), s.get('quick_check')) for s in current_plan.get('scenarios', [])])
         calls.append(record)
         (output / 'calls.json').write_text(json.dumps(calls, indent=2))
         if not args.native:
@@ -117,11 +127,11 @@ def run(args):
     runner._experiment_store.save(state)
     before = source_identity(engine)
     started = time.monotonic()
-    report = {'native': args.native, 'original_state_modified': False, 'code_generated': False,
+    report = {'native': args.native, 'real_probes': args.native or args.probes, 'code_generated': False,
               'engine_published': False, 'original_project_resumed': False, 'repair_accepted': False,
               'source_commit': head_ref(engine), 'planning_approved': False}
     try:
-        if args.native:
+        if args.native or args.probes:
             receipt = prepare_component(runner, engine)
             report['planning_approved'] = receipt['decision'] == 'APPROVE'
         else:
@@ -135,6 +145,8 @@ def run(args):
     finally:
         report.update(seconds=time.monotonic() - started, calls=calls,
                       source_unchanged=source_identity(engine) == before,
+                      original_state_modified=archive.read_bytes() != archive_before,
+                      original_source_unchanged=source_identity(args.source.resolve()) == original_source_before,
                       experiment=str(runner._experiment_store.root / 'experiment.json'))
         (output / 'report.json').write_text(json.dumps(report, indent=2))
         print(json.dumps(report, indent=2), flush=True)
@@ -151,4 +163,5 @@ if __name__ == '__main__':
     parser.add_argument('--python', type=Path, required=True, help='prepared verification interpreter')
     parser.add_argument('--output', type=Path, required=True, help='new private directory')
     parser.add_argument('--native', action='store_true')
+    parser.add_argument('--probes', action='store_true', help='real local probes; capture review without a provider call')
     raise SystemExit(run(parser.parse_args()))
