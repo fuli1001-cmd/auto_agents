@@ -49,6 +49,47 @@ def capability_fingerprint(observation):
     return digest(capability_semantics(observation))
 
 
+def planning_capabilities(observation):
+    """Separate an observation's custody annotation from the observed capability.
+
+    The v1 controller annotation describes who recorded the observations. It
+    adds no OS feature or candidate acceptance claim. Keep every actual owner
+    digest, feature, failure and unknown field; only this known annotation is
+    redundant for a plan's assumptions. Original receipts still bind it exactly.
+    """
+    result = capability_semantics(observation)
+    if not isinstance(result, dict):
+        return result
+    production = result.get('production_namespace', {})
+    annotation = production.get('validation_protocol') if isinstance(production, dict) else None
+    if (isinstance(annotation, dict) and annotation.get('version') == 1
+            and annotation.get('acceptance_proof') is False
+            and annotation.get('activation') == 'immutable selected controller; candidate changes require independently verified version handoff'
+            and set(annotation) == {'version', 'runtime', 'runtime_commit', 'observer',
+                                    'environment', 'generation', 'acceptance_proof', 'activation'}):
+        production.pop('validation_protocol')
+    return result
+
+
+def planning_capability_fingerprint(observation):
+    from .repair_control import digest
+    return digest(planning_capabilities(observation))
+
+
+def retained_capabilities_match(runner, receipt, current):
+    """Compare authenticated original observations, including pre-v1 archives."""
+    if not receipt.get('runtime_capabilities'):
+        return False
+    try:
+        path = runner._experiment_store.root / 'planning' / receipt['request_id'] / 'input.json'
+        previous = json.loads(path.read_text())['runtime_capabilities']
+        from .repair_control import digest
+        return (digest(previous) == receipt['runtime_capabilities']
+                and planning_capability_fingerprint(previous) == planning_capability_fingerprint(current))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def _probe_environment():
     # The outer wrapper imports the controller before its clean child env is
     # installed. Support an interpreter without an editable engine installation.

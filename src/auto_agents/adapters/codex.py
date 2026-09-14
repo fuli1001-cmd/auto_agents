@@ -25,7 +25,7 @@ from ..supervision import ProgressDecoder
 
 
 _CODEX_RECONNECTING_ERROR = re.compile(
-    r"\breconnecting\.\.\.\s*\d+\s*/\s*\d+\b",
+    r"^\s*reconnecting\.\.\.\s*(?:\d+\s*/\s*\d+\b|waiting for network\b)",
     re.IGNORECASE,
 )
 

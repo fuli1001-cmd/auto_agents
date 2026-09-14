@@ -2159,6 +2159,16 @@ class ProviderCleanupIncompleteError(RuntimeError):
     """Automatic execution must stop until the preceding process is cleaned up."""
 
 
+class ProvidersExhaustedError(RuntimeError):
+    """Preserve the typed failure without making callers parse provider output."""
+
+    def __init__(self, message, *, providers, result, category):
+        super().__init__(message)
+        self.providers = list(providers)
+        self.result = result
+        self.category = category
+
+
 @dataclass
 class AgentRequest:
     stage: str

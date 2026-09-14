@@ -548,7 +548,8 @@ _FAILOVER_EXPLICIT_QUOTA_PATTERN = re.compile(
 )
 _FAILOVER_CONNECTION_PATTERN = re.compile(
     r"websocket.*failed.to.connect|connection.error|connect.error|failed.to.conne"
-    r"|stream.disconnected|tls.*(?:unexpected.eof|close.notify)|peer.closed.connection",
+    r"|stream.disconnected|tls.*(?:handshake.eof|unexpected.eof|close.notify)|peer.closed.connection"
+    r"|connection.failed|error.sending.request|waiting.for.network",
     re.IGNORECASE,
 )
 _FAILOVER_AVAILABILITY_PATTERN = re.compile(
@@ -43803,8 +43804,11 @@ class Orchestrator:
                 reporter.emit("provider.recovering")
             last_error = result.stderr or result.summary or "unknown error"
 
-        raise RuntimeError(
-            f"All providers exhausted. Tried: {tried}. Last error: {last_error}"
+        from .models import ProvidersExhaustedError
+        raise ProvidersExhaustedError(
+            f"All providers exhausted. Tried: {tried}. Last error: {last_error}",
+            providers=tried, result=last_result,
+            category=self._failover_error_category(last_result) if last_result else 'unavailable',
         )
 
     def _provider_failover_handoff(self, request: AgentRequest, provider: str, result: AgentResult) -> str:
@@ -44014,10 +44018,16 @@ class Orchestrator:
                 else None
             )
             resumable = reason in {"tool_stalled", "semantic_stall", "loop_detected"}
+            connection_recovery = (not result.ok and provider_request.sandbox_mode == 'read-only'
+                                   and self._failover_error_category(result) == 'connection')
+            resumable = resumable or connection_recovery
             resume_limit = self.config.execution.smart_timeout.same_provider_resume_limit
             if resumable and resume_count < resume_limit:
                 resume_count += 1
-                handoff = self._smart_timeout_handoff(result, reason)
+                handoff = ("AUTO-AGENTS CONNECTION RECOVERY\nThe transport disconnected. Continue this read-only "
+                           "review from the retained observations and finish its required output. "
+                           "The interruption is not new counterevidence or a request to redesign the plan."
+                           if connection_recovery else self._smart_timeout_handoff(result, reason))
                 session_id = result.provider_session_id
                 provider_request = self._provider_request_for_attempt(
                     self._prompt_handoff(provider_request, handoff, session_id),

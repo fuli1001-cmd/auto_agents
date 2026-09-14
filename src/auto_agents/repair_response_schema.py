@@ -40,7 +40,7 @@ def schema_for(stage):
         issue = obj({key: TEXT for key in ('scenario_id', 'reason', 'counterexample', 'requested_change')})
         return obj({'decision': {'type': 'string', 'enum': ['APPROVE', 'REVISE']}, 'reason': TEXT,
                     'scenario_ids': TEXTS, 'issues': array(issue), 'implementation_required': {'type': 'boolean'},
-                    'remaining_changes': TEXTS})
+                    'remaining_changes': TEXTS, 'decisions': {'type': ['array', 'null'], 'items': SCOPE}})
     if stage == 'self_repair_candidate_review':
         finding = obj({**{key: TEXT for key in ('finding_id', 'causal_obligation_id', 'reason', 'counterexample',
                                                'required_test', 'defer_until', 'repair_group_id')},
