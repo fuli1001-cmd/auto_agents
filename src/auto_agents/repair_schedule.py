@@ -43,12 +43,17 @@ def quick_verification_plan(experiment, active):
     scenarios = active.get('scenarios', [])
     required = set(active.get('finding_ids', []))
     bindings = active.get('finding_scenario_bindings', {})
-    from .repair_memory import component_key
-    timings = getattr(experiment, 'component_memory', {}).get(component_key(active), {}).get('check_timings', {})
+    from .repair_work import stored_memory
+    timings = stored_memory(experiment, active).get('check_timings', {})
     def cost(row):
         old = timings.get(row.get('quick_check') or row['check'], {})
         return (not bool(old), old.get('seconds', 0), old.get('collected_cases') or 0)
     selected, reasons = [], []
+    from .repair_review_protocol import controls_for
+    for pair in controls_for(experiment, active):
+        selected.extend(pair['controls'][kind]['command'] for kind in ('negative', 'positive'))
+    if selected:
+        reasons.append('independent review counterexamples and compatible controls run first')
     # Recheck the actual failed acceptance cohort before paying for another
     # semantic review. Do not split its fixture lifetime or invent new commands
     # from failure prose, and keep future-component checks deferred.
@@ -178,6 +183,9 @@ def pytest_parts(command):
 def verification_plan(experiment, active):
     migrate_review_commands(experiment)
     focused = list(active.get('focused_tests', []))
+    from .repair_review_protocol import controls_for
+    for pair in controls_for(experiment, active):
+        focused.extend(pair['controls'][kind]['command'] for kind in ('negative', 'positive'))
     focused.extend(active.get('quick_checks', []))
     focused.extend(active.get('retained_acceptance', []))
     focused.extend(row['check'] for row in active.get('scenarios', []) if row.get('check'))
@@ -236,8 +244,8 @@ def verification_plan(experiment, active):
     if any(not pytest_parts(command) for command in focused + regressions):
         failures = []  # A prior failure cannot move ahead of its preparation.
     commands, requests = canonical_commands([*failures, *focused, *regressions])
-    from .repair_memory import component_key
-    timings = getattr(experiment, 'component_memory', {}).get(component_key(active), {}).get('check_timings', {})
+    from .repair_work import stored_memory
+    timings = stored_memory(experiment, active).get('check_timings', {})
     original_indexes = defaultdict(deque)
     for index, command in enumerate(commands):
         original_indexes[command].append(index)

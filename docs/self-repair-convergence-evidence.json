@@ -1,0 +1,84 @@
+{
+  "captured_at": "2026-09-14T13:29:28.652976+08:00",
+  "job": "738de054c3634ab9b7cddccb",
+  "session": "6a0cedd6674d",
+  "engine_base": "7e5ff7b23a39ee32af46ffb56a419ea71844dfa0",
+  "experiment": "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/738de054c3634ab9b7cddccb/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/experiment.json",
+  "method": "Read-only comparison of the baseline and corrected implementation-binding resolver against archived controller records. No provider, writer, verification, or store.save call.",
+  "limitations": "This tests evidence routing only. It neither certifies candidate correctness nor measures end-to-end latency; all other plan/candidate/final gates remain required.",
+  "cases": [
+    {
+      "finding_id": "gate-trace-evidence-exclusion-drops-real-dependencies",
+      "planning_receipt": "8f48fdf24c2a4a5c87d39fc8a170303f",
+      "review_reference": {
+        "digest": "b646bbc0614576657562a9265ee04b4851c3ea0fe06d5b3433335a13e2aed053",
+        "id": "6a24cd9afcbd4437ba6c2e5495f0a72e"
+      },
+      "reviewed_commit": "5dad47414512b99082736f8dd35dd6055f3cfc8b",
+      "canonical_key": "65116a259e4a842f4da3819f98a4a9626c700add4be678ff4bdb9a0b064ba1d1",
+      "execution_key": "af0dc6223c29037891f13a08fcb24c1e6c9c29e5a00d8624fc53341f37b53697",
+      "before_bindings": null,
+      "after_bindings": {
+        "gate-trace-evidence-exclusion-drops-real-dependencies": [
+          "g02_trace_custody_preserves_valid_reuse"
+        ]
+      },
+      "outside_approved_paths": []
+    },
+    {
+      "finding_id": "gate-trace-custody-overrides-clean-execution-mode",
+      "planning_receipt": "8f48fdf24c2a4a5c87d39fc8a170303f",
+      "review_reference": {
+        "digest": "b646bbc0614576657562a9265ee04b4851c3ea0fe06d5b3433335a13e2aed053",
+        "id": "6a24cd9afcbd4437ba6c2e5495f0a72e"
+      },
+      "reviewed_commit": "5dad47414512b99082736f8dd35dd6055f3cfc8b",
+      "canonical_key": "65116a259e4a842f4da3819f98a4a9626c700add4be678ff4bdb9a0b064ba1d1",
+      "execution_key": "af0dc6223c29037891f13a08fcb24c1e6c9c29e5a00d8624fc53341f37b53697",
+      "before_bindings": null,
+      "after_bindings": {
+        "gate-trace-custody-overrides-clean-execution-mode": [
+          "g02_trace_custody_preserves_valid_reuse",
+          "g02_launcher_discovery_execution_agree"
+        ]
+      },
+      "outside_approved_paths": []
+    },
+    {
+      "finding_id": "live-launcher-source-binding-rejects-isolated-interpreter",
+      "planning_receipt": "8f48fdf24c2a4a5c87d39fc8a170303f",
+      "review_reference": {
+        "digest": "b646bbc0614576657562a9265ee04b4851c3ea0fe06d5b3433335a13e2aed053",
+        "id": "6a24cd9afcbd4437ba6c2e5495f0a72e"
+      },
+      "reviewed_commit": "5dad47414512b99082736f8dd35dd6055f3cfc8b",
+      "canonical_key": "65116a259e4a842f4da3819f98a4a9626c700add4be678ff4bdb9a0b064ba1d1",
+      "execution_key": "af0dc6223c29037891f13a08fcb24c1e6c9c29e5a00d8624fc53341f37b53697",
+      "before_bindings": null,
+      "after_bindings": null,
+      "outside_approved_paths": [
+        "src/auto_agents/verification_supervisor_checks.py",
+        "tests/test_verification_supervisor_checks.py"
+      ]
+    },
+    {
+      "finding_id": "gate-trace-registered-dependency-links-disable-valid-reuse",
+      "planning_receipt": "65f812e249da4d138a39a1e5d5f95f3f",
+      "review_reference": {
+        "digest": "56bd7e1bc3a0e0e144ab984c3349c4c4d5e75153a1bb4c08b881809d60eed98a",
+        "id": "e6d4ece55c6641b0bed73f90daf79c33"
+      },
+      "reviewed_commit": "2ce54f945c0d116e44adba2a5a347c397344fcdd",
+      "canonical_key": "65116a259e4a842f4da3819f98a4a9626c700add4be678ff4bdb9a0b064ba1d1",
+      "execution_key": "7ffd608a3ce4a083463ed9f7d92d53f35955e17af3b1f7bbe34631b29c22d3ea",
+      "before_bindings": null,
+      "after_bindings": {
+        "gate-trace-registered-dependency-links-disable-valid-reuse": [
+          "g02_trace_custody_preserves_valid_reuse",
+          "g02_launcher_discovery_execution_agree"
+        ]
+      },
+      "outside_approved_paths": []
+    }
+  ]
+}

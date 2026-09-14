@@ -1,0 +1,157 @@
+{
+  "source_commit": "0b35f66ae3fca9a1291c013ed11779a76fa424b1",
+  "native_pilot": {
+    "ok": true,
+    "scope": "two real-provider component repair cycles and complete fixture acceptance",
+    "original_project_resumed": false,
+    "engine_published": false,
+    "final_engine_handoff_exercised": false,
+    "seconds": 557.158466895009,
+    "phase_calls": [
+      {
+        "phase": "retained_plan",
+        "stages": [
+          "self_repair_plan_review",
+          "self_repair",
+          "self_repair_candidate_review"
+        ]
+      },
+      {
+        "phase": "injected_regression",
+        "stages": [
+          "self_repair",
+          "self_repair_candidate_review"
+        ]
+      }
+    ],
+    "acceptance_sha256": "45f9c9ec30cab2d382ff45fe6294f8802432e2aff09fda3bff5550e1937809dc"
+  },
+  "native_calls": [
+    {
+      "stage": "self_repair_plan_review",
+      "seconds": 250.56485764899116,
+      "prompt_chars": 22587,
+      "native_schema": true,
+      "usage": {
+        "input_tokens": 355580,
+        "cached_input_tokens": 291072,
+        "output_tokens": 5341
+      }
+    },
+    {
+      "stage": "self_repair",
+      "seconds": 69.17475776199717,
+      "prompt_chars": 14401,
+      "native_schema": false,
+      "usage": {
+        "input_tokens": 125747,
+        "cached_input_tokens": 106880,
+        "output_tokens": 1233
+      }
+    },
+    {
+      "stage": "self_repair_candidate_review",
+      "seconds": 72.20193304900022,
+      "prompt_chars": 12731,
+      "native_schema": true,
+      "usage": {
+        "input_tokens": 64681,
+        "cached_input_tokens": 40064,
+        "output_tokens": 1775
+      }
+    },
+    {
+      "stage": "self_repair",
+      "seconds": 66.17955502099358,
+      "prompt_chars": 14698,
+      "native_schema": false,
+      "usage": {
+        "input_tokens": 145418,
+        "cached_input_tokens": 134016,
+        "output_tokens": 1062
+      }
+    },
+    {
+      "stage": "self_repair_candidate_review",
+      "seconds": 69.16129536800145,
+      "prompt_chars": 11781,
+      "native_schema": true,
+      "usage": {
+        "input_tokens": 92978,
+        "cached_input_tokens": 65920,
+        "output_tokens": 1521
+      }
+    }
+  ],
+  "fixture_tests": [
+    "tests/test_alias_reuse.py::test_registered_alias_reuses",
+    "tests/test_alias_reuse.py::test_unregistered_alias_denied",
+    "tests/test_alias_reuse.py::test_changed_real_input_invalidates",
+    "tests/test_alias_reuse.py::test_retargeted_alias_denied_and_recovery",
+    "tests/test_alias_reuse.py::test_registration_is_specific_to_alias"
+  ],
+  "historical_replay": {
+    "experiment": "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/738de054c3634ab9b7cddccb/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/experiment.json",
+    "scope": "read-only historical evidence routing",
+    "models_called": 0,
+    "candidate_commands_executed": 0,
+    "original_state_modified": false,
+    "limitations": "Routing is not candidate correctness, plan approval or an end-to-end latency measurement.",
+    "results": [
+      {
+        "candidate": "c93-5f3fd875",
+        "source_commit": "5dad47414512b99082736f8dd35dd6055f3cfc8b",
+        "review": {
+          "digest": "b646bbc0614576657562a9265ee04b4851c3ea0fe06d5b3433335a13e2aed053",
+          "id": "6a24cd9afcbd4437ba6c2e5495f0a72e"
+        },
+        "findings": [
+          "gate-trace-evidence-exclusion-drops-real-dependencies",
+          "gate-trace-custody-overrides-clean-execution-mode",
+          "live-launcher-source-binding-rejects-isolated-interpreter"
+        ],
+        "recorded_action": "implement",
+        "routed_action": "amend_plan",
+        "cause": "independent review identifies a changed mechanism, scope or unproved scenario mapping",
+        "context_sizes": null,
+        "repair_approved": false
+      },
+      {
+        "candidate": "c94-6b9b44e7",
+        "source_commit": "2ce54f945c0d116e44adba2a5a347c397344fcdd",
+        "review": {
+          "digest": "56bd7e1bc3a0e0e144ab984c3349c4c4d5e75153a1bb4c08b881809d60eed98a",
+          "id": "e6d4ece55c6641b0bed73f90daf79c33"
+        },
+        "findings": [
+          "gate-trace-registered-dependency-links-disable-valid-reuse"
+        ],
+        "recorded_action": "implement",
+        "routed_action": "repair_code",
+        "cause": "independent review identifies a covered correction",
+        "context_sizes": {
+          "original_payload_chars": 258451,
+          "working_payload_chars": 29768,
+          "scope": "working JSON payload only; referenced evidence remains available"
+        },
+        "repair_approved": false
+      }
+    ]
+  },
+  "full_engine_suite": {
+    "status": "passed",
+    "fresh": true,
+    "source_commit": "0b35f66ae3fca9a1291c013ed11779a76fa424b1",
+    "shards": 166,
+    "collected_cases": 3231,
+    "passed_cases": 3231,
+    "failed_shards": 0,
+    "wall_seconds": 1703.6078966539935,
+    "report_artifact": "/tmp/self-repair-full-optimization-6bc1pj6h/full-suite-release/result.json",
+    "environment": "prepared verification interpreter with its pinned Vitest toolchain"
+  },
+  "limitations": [
+    "The pilot exercises component repair and regression correction, not resuming or publishing the original project.",
+    "Working-payload reduction is not an end-to-end speedup measurement."
+  ]
+}

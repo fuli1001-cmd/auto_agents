@@ -53,7 +53,8 @@ def run_component_checks(runner, commands, workspace, *, parallel=True):
         return runner._run_verification_commands(commands, workspace)
     environment = runner._full_suite_environment_fingerprint()
     group = runner._candidate_group
-    timings = runner._experiment.component_memory.get(component_key(group), {}).get('check_timings', {})
+    from .repair_work import memory as work_memory
+    timings = work_memory(runner, group).get('check_timings', {})
     from .repair_verification_pool import prepare_pool, run_in_pool
     retained_pool = prepare_pool(runner, workspace, commands, timings, environment)
     pending = []

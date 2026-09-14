@@ -166,7 +166,7 @@ def test_namespace_probe_uses_production_wrapper_and_distinguishes_unknown(setup
         assert namespace_observation(runner, runner.repo_root)['supported'] is None
 
 
-def test_capability_observation_is_cached_only_for_same_source_and_environment(setup):
+def test_capability_observation_binds_controller_environment_instead_of_candidate_edits(setup):
     runner, _, _, _ = setup
     with patch('auto_agents.repair_capability_checks.namespace_observation', return_value={'supported': False}) as probe, \
          patch('auto_agents.repair_capability_checks.metadata_observation', return_value={'supported': False}):
@@ -174,6 +174,9 @@ def test_capability_observation_is_cached_only_for_same_source_and_environment(s
         production_capabilities(runner, runner.repo_root)
         assert probe.call_count == 1
         (runner.repo_root / 'source.py').write_text('changed = True\n')
+        production_capabilities(runner, runner.repo_root)
+        assert probe.call_count == 1
+        runner._full_suite_environment_fingerprint = lambda: ('changed-environment',)
         production_capabilities(runner, runner.repo_root)
         assert probe.call_count == 2
 

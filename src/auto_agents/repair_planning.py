@@ -179,7 +179,9 @@ def _invoke(runner, workspace, stage, instruction, context):
             'required_action': 'Read the working input, previous revision and relevant delta. '
                                'Retrieve referenced background only when relevant or missing; '
                                'unchanged history need not be reconstructed.'}, ensure_ascii=False)
+    from .repair_response_schema import schema_for
     request = AgentRequest(stage=stage, purpose='self_repair_review', effort=runner._review_effort(),
+        response_schema=schema_for(stage),
         cwd=workspace, output_path=directory / 'output.json', sandbox_mode='read-only',
         record_execution_incidents=False,
         progress_lease_seconds=getattr(runner._autonomy_config(), 'candidate_review_timeout_seconds', 600),
@@ -217,6 +219,8 @@ def _invoke(runner, workspace, stage, instruction, context):
         atomic_json(directory / 'invalid.json', {'error': str(error), 'output': sanitize_evidence(raw)})
         raise PlanFormatError(stage + ' returned invalid JSON', field='response',
                               constraint='JSON object', evidence=str(directory / 'invalid.json')) from error
+    from .repair_response_schema import normalize_reply
+    payload = normalize_reply(stage, payload)
     atomic_json(directory / 'result.json', sanitize_evidence(payload))
     if stage in {'self_repair_scope_review', 'self_repair_scope_format'}:
         from .repair_scope_recovery import admit_result
@@ -226,6 +230,9 @@ def _invoke(runner, workspace, stage, instruction, context):
 
 
 def _retained_scope(runner, receipt, finding):
+    if receipt.get('code_review_scope'):
+        from .repair_review_protocol import retained_scope
+        return retained_scope(runner, receipt, finding)
     identity = receipt.get('request_id', '')
     if not isinstance(identity, str) or not re.fullmatch('[a-f0-9]{32}', identity):
         return False
@@ -562,6 +569,8 @@ def validate_probes(probes):
 
 
 def validate_plan(plan, group, contract_ids):
+    from .repair_schedule import canonical_commands, pytest_parts
+    retained_commands = set(canonical_commands(group.get('focused_tests', []))[0])
     if not isinstance(plan, dict):
         raise PlanFormatError('component plan must be an object', field='plan', constraint='JSON object')
     for key in ('implementation_steps', 'touched_paths', 'quick_checks', 'scenarios'):
@@ -591,7 +600,9 @@ def validate_plan(plan, group, contract_ids):
         if not _texts(row.get('obligation_ids')) or not set(row['obligation_ids']).issubset(contract_ids):
             raise PlanningBlocked('scenario expands the frozen contract')
         covered.update(row['obligation_ids'])
-        if not _texts(row.get('finding_ids', []), empty=True) or not _test_command(row['check']):
+        retained_check = (bool(pytest_parts(row['check']))
+                          and canonical_commands([row['check']])[0][0] in retained_commands)
+        if not _texts(row.get('finding_ids', []), empty=True) or not (_test_command(row['check']) or retained_check):
             raise PlanningBlocked('scenario requires explicit acceptance nodes and finding mappings')
         if row.get('quick_check') is not None:
             if not _test_command(row['quick_check']):
@@ -723,25 +734,58 @@ def _component_signature(group):
 
 def _implementation_bindings(runner, receipt, findings):
     """Only an actual independent code review can classify a covered correction."""
-    from .repair_memory import component_key, read_record
-    memory = runner._experiment.component_memory.get(component_key(receipt.get('component', {})), {})
-    review = read_record(runner, memory.get('code_review', {}))
-    if not review or review.get('contract') != runner._experiment.contract_fingerprint:
+    from .repair_memory import read_record
+    from .repair_work import memory as work_memory, work_id
+    canonical = receipt.get('component', {})
+    review = read_record(runner, work_memory(runner, canonical).get('code_review', {}))
+    if (not review or review.get('kind') != 'code_review'
+            or review.get('contract') != runner._experiment.contract_fingerprint
+            or review.get('environment') != receipt.get('environment')
+            or not isinstance(review.get('component'), dict)
+            or not all(_texts(review['component'].get(key, []), empty=True)
+                       for key in ('touched_paths', 'contract_obligation_ids', 'focused_tests'))
+            or work_id(runner._experiment, review['component']) != work_id(runner._experiment, canonical)
+            or review['component'].get('planning_receipt', receipt['request_id']) != receipt['request_id']):
         return None
-    reviewed = {f['finding_id']: f for f in review['result'].get('findings', [])}
+    if not review or not isinstance(review.get('result'), dict):
+        return None
+    rows = review['result'].get('findings', [])
+    if not isinstance(rows, list) or not all(isinstance(f, dict) and _text(f.get('finding_id')) for f in rows):
+        return None
+    reviewed = {f['finding_id']: f for f in rows}
+    if len(reviewed) != len(rows):
+        return None
     scenarios = {s['scenario_id']: s for s in receipt['plan']['scenarios']}
     bindings = {}
     for finding in findings:
         item = reviewed.get(finding['finding_id'], {})
         ids = item.get('scenario_ids', [])
         if (finding_key(item) != finding_key(finding) or item.get('repair_kind') != 'implementation'
-                or not ids or not set(ids).issubset(scenarios)
+                or not _texts(ids) or not set(ids).issubset(scenarios)
                 or not all(finding.get('causal_obligation_id') in scenarios[key]['obligation_ids'] for key in ids)
                 or not finding.get('affected_paths') or not all(
                     path in receipt['plan']['touched_paths'] for path in finding['affected_paths'])):
             return None
+        if item.get('controls'):
+            from .repair_review_protocol import normalized_controls
+            controls = normalized_controls(item, {**canonical, **receipt['plan']})
+            if not controls or any(target.split('::', 1)[0] not in receipt['plan']['touched_paths']
+                                   for row in controls.values() for target in pytest_targets(row['command'], prose=False)):
+                return None
         bindings[finding['finding_id']] = ids
     return bindings
+
+
+def _revision_finding_delta(runner, previous, findings):
+    """Evidence changes need semantic work, not repair of scenario references."""
+    known = previous.get('finding_keys')
+    if not isinstance(known, dict):
+        receipt = next((row for row in runner._experiment.planning_receipts.values()
+                        if row.get('request_id') == previous.get('reviewer_request')), {})
+        known = {f['finding_id']: finding_key(f) for f in receipt.get('findings', [])}
+    # Missing historical evidence cannot establish that an active defect was
+    # already addressed. An empty current finding set still allows revalidation.
+    return [f['finding_id'] for f in findings if known.get(f['finding_id']) != finding_key(f)]
 
 
 def _format_semantics_changed(original, corrected):
@@ -802,6 +846,8 @@ def normalize_plan_references(runner, workspace, plan, group):
 def _review_execution_mode(plan, review):
     if review.get('implementation_required') is False and review.get('remaining_changes') == []:
         return 'verify_existing'
+    if review.get('implementation_required') is True or review.get('remaining_changes'):
+        return 'implement'
     return plan.get('mode', 'implement')
 
 
@@ -809,6 +855,13 @@ def _apply_execution_mode(runner, receipt, source):
     # Completed-component recovery markers are issued by the controller, never
     # by a proposed plan or a retained model response.
     runner._candidate_group.pop('completion_revalidation', None)
+    if (runner._candidate_group.get('finding_scenario_bindings')
+            or getattr(runner, '_candidate_next_action', {}).get('kind') in {'repair_code', 'repair_verification'}):
+        # A bound independent code review supersedes an earlier observation
+        # that no writing was necessary, even when no command failed.
+        runner._candidate_group['mode'] = 'implement'
+        return
+    runner._candidate_group['mode'] = receipt.get('execution_mode', receipt['plan'].get('mode', 'implement'))
     # An unchanged, independently inspected implementation can go directly to
     # verification. New failure evidence still authorizes the original writer.
     if (receipt.get('source') == source and receipt.get('execution_mode') == 'verify_existing'
@@ -818,6 +871,7 @@ def _apply_execution_mode(runner, receipt, source):
 
 def _materialize_draft(payload, previous):
     if not isinstance(payload, dict) or 'amendment' not in payload:
+        _preserve_scenarios(previous, payload)
         return payload
     amendment = payload['amendment']
     if (not previous or not isinstance(previous.get('draft'), dict) or not isinstance(amendment, dict)
@@ -836,15 +890,52 @@ def _materialize_draft(payload, previous):
             raise PlanFormatError('step replacements need existing stable IDs and nonempty text', field='amendment.replace_steps')
         plan['implementation_steps'] = [replacements.get(identity, text)
             for identity, text in zip(previous['step_ids'], previous['draft']['implementation_steps'])]
-    original = {s['scenario_id'] for s in previous['draft'].get('scenarios', []) if isinstance(s, dict) and s.get('scenario_id')}
-    updated = {s.get('scenario_id') for s in plan.get('scenarios', []) if isinstance(s, dict)}
-    if not original.issubset(updated):
-        raise PlanningBlocked('amendment deletes retained acceptance scenarios', code='acceptance_removed')
+    _preserve_scenarios(previous, plan)
     return plan
+
+
+def _preserve_scenarios(previous, plan):
+    # Complete JSON replies must obey the same retention rule as amendments.
+    # Malformed fields still go through the normal format validator.
+    old = (previous or {}).get('draft')
+    if not isinstance(old, dict) or not isinstance(plan, dict):
+        return
+    if not isinstance(old.get('scenarios'), list) or not isinstance(plan.get('scenarios'), list):
+        return
+    original = {s['scenario_id'] for s in old['scenarios'] if isinstance(s, dict) and _text(s.get('scenario_id'))}
+    updated = {s['scenario_id'] for s in plan['scenarios'] if isinstance(s, dict) and _text(s.get('scenario_id'))}
+    if not original.issubset(updated):
+        raise PlanningBlocked('plan revision deletes retained acceptance scenarios', code='acceptance_removed')
+
+
+def _completed_source_covers_delta(runner, workspace, group, plan, outside):
+    """Retain test changes already independently reviewed and fully tested.
+
+    This preserves a plan, not execution proof, and never expands its write
+    paths. Current code review and complete acceptance still run after repair.
+    """
+    from .repair_completion import retained_proof
+    from .repair_memory import read_record
+    tests = {node.split('::', 1)[0] for command in group.get('focused_tests', [])
+             for node in pytest_targets(command, prose=False)}
+    if not outside or not set(outside).issubset(tests):
+        return False
+    proof, _ = retained_proof(runner, group)
+    if not proof:
+        return False
+    review = read_record(runner, proof.get('review', {}))
+    commit = (review or {}).get('source_commit')
+    if not commit or subprocess.run(['git', 'merge-base', '--is-ancestor', commit, 'HEAD'],
+                                   cwd=workspace, capture_output=True).returncode:
+        return False
+    changed = subprocess.check_output(['git', 'diff', '--name-only', commit, '--'], cwd=workspace, text=True).splitlines()
+    untracked = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=workspace, text=True).splitlines()
+    return all(path in plan['touched_paths'] for path in changed + untracked)
 
 
 def prepare_component(runner, workspace):
     from .repair_memory import component_key, latest_revision, remember_revision, read_record
+    from .repair_work import memory as work_memory, link_definition
     experiment = runner._experiment
     group = deepcopy(next((item for item in experiment.finding_groups
                            if item['group_id'] == runner._candidate_group['group_id']), runner._candidate_group))
@@ -859,6 +950,7 @@ def prepare_component(runner, workspace):
     context['findings'] = [f.to_dict() for f in findings if not nonblocking_scope(experiment, f)]
     group['finding_ids'] = [f['finding_id'] for f in context['findings']]
     context['component'] = group
+    context['work'] = link_definition(runner, group)
     from .repair_completion import _memory as completion_memory
     completed = completion_memory(runner, group)
     if completed.get('completion') or group.get('status') == 'needs_revalidation':
@@ -911,10 +1003,13 @@ def prepare_component(runner, workspace):
             changes = subprocess.check_output(['git', 'diff', '--name-only', receipt['source_commit'], '--'], cwd=workspace).decode().splitlines()
             untracked = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], cwd=workspace).decode().splitlines()
             same = all(path in receipt['plan']['touched_paths'] for path in changes + untracked)
+            if not same:
+                outside = [path for path in changes + untracked if path not in receipt['plan']['touched_paths']]
+                same = _completed_source_covers_delta(runner, workspace, group, receipt['plan'], outside)
         if same:
             runner._candidate_group = {**group, **receipt['plan'], 'planning_receipt': receipt['request_id'],
                                        'finding_scenario_bindings': bindings,
-                                       'retained_acceptance': experiment.component_memory.get(component_key(group), {}).get('acceptance_inventory', [])}
+                                       'retained_acceptance': work_memory(runner, group).get('acceptance_inventory', [])}
             _apply_execution_mode(runner, receipt, context['source'])
             runner._experiment_store.record_health(experiment, status='plan_reused', detail=receipt['request_id'])
             return receipt
@@ -935,6 +1030,21 @@ def prepare_component(runner, workspace):
         context['component_delta'] = {key: value for key, value in group.items()
                                       if key not in {'status', 'completed_at', 'completed_by', 'title', 'group_id'}
                                       and previous.get('component', {}).get(key) != value}
+    changed_findings = (_revision_finding_delta(runner, previous, context['findings'])
+                        if previous and previous.get('status') == 'APPROVE' else [])
+    needs_amendment = bool(changed_findings)
+    reviewable_draft = False
+    if previous and previous.get('status') in {'draft', 'recovered_draft', 'legacy_draft'}:
+        try:
+            validate_plan(previous.get('draft'), group, set(experiment.contract_obligation_ids))
+            reviewable_draft = True
+        except PlanningBlocked:
+            pass
+    if needs_amendment:
+        context['finding_delta'] = {'added_or_changed': changed_findings, 'prior_revision': previous['id'],
+            'instruction': 'The retained approval could not cover this current evidence. Amend the affected '
+                           'mechanisms and scenarios before independent review; changing finding references '
+                           'alone cannot resolve a semantic defect. Preserve all retained acceptance.'}
     # A new commit or label does not buy another window for the same unresolved design.
     key = 'episode:' + strategy
     if key not in experiment.repair_episodes and previous is None:
@@ -946,10 +1056,18 @@ def prepare_component(runner, workspace):
     episode = experiment.repair_episodes.setdefault(key, {
         'semantic_attempts': 0, 'format_corrections': 0, 'status': 'active', 'feedback': [],
         'source': context['source'], 'strategy': strategy,
-        'resume_phase': 'review' if (previous and previous.get('status') == 'APPROVE'
+        'resume_phase': 'review' if reviewable_draft or (previous and previous.get('status') == 'APPROVE'
+                                    and not needs_amendment
                                     and _component_signature(previous.get('component', {})) == signature) else 'draft'})
+    if needs_amendment:
+        # Migrate queued retained-plan reviews without renewing attempts or
+        # format-call budgets. Interrupted independent calls still cost a slot.
+        episode['resume_phase'] = 'draft'
+        if episode.get('phase') == 'review':
+            episode['phase'] = 'draft'
+        episode['pending_format'] = 0
     approved_draft = bool(previous and previous.get('status') == 'APPROVE' and previous.get('draft'))
-    recovering_receipt = (approved_draft and episode['semantic_attempts'] >= MAX_PLAN_REVIEWS
+    recovering_receipt = (approved_draft and not needs_amendment and episode['semantic_attempts'] >= MAX_PLAN_REVIEWS
                           and previous.get('reviewer_request') in invalid_approvals
                           and not episode.get('approval_recovery_used'))
     if recovering_receipt:
@@ -1019,16 +1137,18 @@ def prepare_component(runner, workspace):
         'Quick selection targets 3 commands, 12 collected cases, 180 estimated seconds; mandatory coverage may '
         'exceed these scheduling targets without invalidating the plan. Preserve each original command cohort. '
         'For parameterized acceptance, quick_check should name the exact relevant parameter case; check retains '
-        'full acceptance. Never substitute an arbitrary parameter unrelated to the scenario trigger. '
+        'full acceptance. A scenario check may retain an EXACT original pytest cohort, including a whole '
+        'test file; quick_check must select explicit nodes inside that cohort. Never substitute an '
+        'arbitrary parameter unrelated to the scenario trigger. '
         'Use 1 to 3 probes, each explicit pytest nodes (at most 8 targets) or python -B -c memory diagnostics. '
         'Include concrete negative, inverse positive, recovery and interaction mechanisms; no broad suite probes.')
     if episode.get('phase') == 'reviewing':
         # An interrupted independent request consumed its slot, not its draft.
-        episode.update(pending_round=False, resume_phase='review')
+        episode.update(pending_round=False, resume_phase='draft' if needs_amendment else 'review')
     elif episode.get('status') == 'approved' and previous and previous.get('draft'):
         # Lost/invalid review artifacts require another independent review, not
         # rewriting a still available draft from scratch.
-        episode.update(pending_round=False, resume_phase='review')
+        episode.update(pending_round=False, resume_phase='draft' if needs_amendment else 'review')
     while episode['semantic_attempts'] < MAX_PLAN_REVIEWS or episode.get('pending_round'):
         if not episode.get('pending_round'):
             episode['semantic_attempts'] += 1
@@ -1090,7 +1210,8 @@ def prepare_component(runner, workspace):
                 reference = remember_revision(runner, group, {'parent_revision': previous.get('id') if previous else None,
                     'draft': payload, 'source': context['source'], 'source_commit': context['source_commit'],
                     'environment': context['environment'], 'planner_request': planner_id,
-                    'component': group, 'feedback': feedback, 'status': 'draft'})
+                    'component': group, 'finding_keys': {f['finding_id']: finding_key(f) for f in context['findings']},
+                    'feedback': feedback, 'status': 'draft'})
                 episode['latest_revision'] = reference
                 previous = {**read_record(runner, reference), 'draft': deepcopy(payload)}
                 plan = validate_plan(payload, group, set(experiment.contract_obligation_ids))
@@ -1159,6 +1280,7 @@ def prepare_component(runner, workspace):
             reference = remember_revision(runner, group, {'parent_revision': previous['id'],
                 'draft': plan, 'source': context['source'], 'source_commit': context['source_commit'],
                 'environment': context['environment'], 'planner_request': planner_id, 'component': group,
+                'finding_keys': {f['finding_id']: finding_key(f) for f in context['findings']},
                 'review': review, 'reviewer_request': reviewer_id, 'probe_results': probes,
                 'status': receipt['decision']})
             previous = {**read_record(runner, reference), 'draft': deepcopy(plan)}
@@ -1170,7 +1292,7 @@ def prepare_component(runner, workspace):
             if approved:
                 episode.update(status='approved', pending_round=False, phase='complete',
                                feedback=[], latest_decision='APPROVE')
-                memory = experiment.component_memory.setdefault(component_key(group), {})
+                memory = work_memory(runner, group)
                 memory['acceptance_inventory'] = list(dict.fromkeys([*memory.get('acceptance_inventory', []),
                     *group.get('focused_tests', []), *plan['quick_checks'], *(s['check'] for s in plan['scenarios'])]))
                 runner._experiment_store.save(experiment)
@@ -1206,7 +1328,9 @@ def history_report(experiment):
                 'historical_resolved' if finding.status == 'resolved' else 'needs_scope_review'),
             'reason': decision.get('reason', '') if current else 'No current independent necessity receipt',
             'counterexample': finding.counterexample, 'evidence': finding.evidence})
+    from .repair_convergence import summary
     return {'experiment_id': experiment.experiment_id, 'current_candidate_id': experiment.current_candidate_id,
+        'convergence': summary(experiment),
         'policy': POLICY_VERSION, 'historical_progress_count': len(experiment.progress_credits),
         'candidate_attempt_count': experiment.attempt_count,
         'non_improvement_count': experiment.consecutive_non_improvements,
