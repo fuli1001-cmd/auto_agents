@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from auto_agents.repair_completion import assess, refresh, seal, _memory
+from auto_agents.repair_work import memory as work_memory
 from auto_agents.repair_memory import component_key, read_record, remember_review, remember_check_timings, remember_revision
 from auto_agents.self_repair import _VerificationResult
 from auto_agents.self_repair_search import SelfRepairFinding
@@ -103,7 +104,7 @@ def test_bound_inputs_invalidate_completion(completed, change):
     elif change == 'acceptance':
         group['focused_tests'] = [*commands, 'python -m pytest -q tests/test_contract.py::test_contract']
     elif change == 'plan':
-        state.component_memory[component_key(group)]['latest_revision'] = {'id': 'new-plan'}
+        work_memory(runner, group)['latest_revision'] = {'id': 'new-plan'}
     elif change == 'target':
         (runner.target_project_root / 'source.py').write_text('changed project inputs')
     elif change == 'fresh':
@@ -326,7 +327,7 @@ def test_partial_reuse_keeps_shell_preparation_barriers(completed):
 def test_revalidated_unchanged_plan_keeps_independent_quick_check(completed):
     from auto_agents.repair_completion import execute_checks
     runner, state, group, commands, _ = completed
-    previous = read_record(runner, state.component_memory[component_key(group)]['latest_revision'])
+    previous = read_record(runner, work_memory(runner, group)['latest_revision'])
     remember_revision(runner, group, {'component': deepcopy(group), 'parent_revision': previous['id'],
         'draft': {**previous['draft'], 'mode': 'verify_existing'}, 'status': 'APPROVE'})
     (runner.repo_root / 'tests/test_a.py').write_text('def test_a():\n    assert 2 == 2\n')

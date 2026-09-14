@@ -2194,6 +2194,7 @@ class AgentRequest:
     stream_transport: bool = False
     logical_call_id: str = ""
     usage_context: Dict[str, str] = field(default_factory=dict)
+    response_schema: Optional[Dict[str, object]] = None
 
     def __post_init__(self) -> None:
         from .prompting import PromptBlock

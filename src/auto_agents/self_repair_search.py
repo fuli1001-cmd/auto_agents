@@ -16,7 +16,7 @@ from .execution_recovery import redact_incident_text
 from .io_utils import read_json
 
 
-SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 7
+SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 8
 # Adding progress metadata does not change what existing proof establishes.
 SELF_REPAIR_PROOF_SCHEMA_VERSION = 4
 
@@ -265,6 +265,7 @@ class SelfRepairExperiment:
     planning_attempts: Dict[str, int] = field(default_factory=dict)
     plan_revisions: Dict[str, Dict[str, object]] = field(default_factory=dict)
     component_memory: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    work_items: Dict[str, Dict[str, object]] = field(default_factory=dict)
     repair_episodes: Dict[str, Dict[str, object]] = field(default_factory=dict)
     review_facts: Dict[str, Dict[str, object]] = field(default_factory=dict)
     historical_completed_groups: Dict[str, Dict[str, object]] = field(default_factory=dict)
@@ -419,13 +420,35 @@ class SelfRepairExperiment:
             if isinstance(value, Mapping)
         }
         for name in ('scope_decisions', 'planning_receipts', 'planning_attempts', 'historical_completed_groups',
-                     'plan_revisions', 'component_memory', 'repair_episodes', 'review_facts'):
+                     'plan_revisions', 'component_memory', 'work_items', 'repair_episodes', 'review_facts'):
             if not isinstance(payload.get(name, {}), Mapping):
                 raise ValueError(f'self-repair experiment {name} must be an object')
             if name != 'planning_attempts' and any(not isinstance(value, Mapping) for value in payload.get(name, {}).values()):
                 raise ValueError(f'self-repair experiment {name} entries must be objects')
         if any(type(value) is not int or value < 0 for value in payload.get('planning_attempts', {}).values()):
             raise ValueError('planning attempt counters must be nonnegative integers')
+        for identity, item in payload.get('work_items', {}).items():
+            if (not isinstance(identity, str) or not identity.startswith('work:')
+                    or item.get('work_id') != identity or item.get('version') != 1
+                    or not isinstance(item.get('group_id'), str) or not item['group_id']):
+                raise ValueError('invalid repair work identity')
+            for name in ('memory', 'definitions', 'families', 'transitions', 'diagnoses'):
+                if not isinstance(item.get(name), Mapping):
+                    raise ValueError('repair work ' + name + ' must be an object')
+            if not isinstance(item.get('aliases', []), list) or any(not isinstance(alias, str) for alias in item.get('aliases', [])):
+                raise ValueError('repair work aliases must be a list of group identities')
+            for family in item['families'].values():
+                if not isinstance(family, Mapping) or not isinstance(family.get('cases'), Mapping) or not isinstance(family.get('review_sources'), Mapping):
+                    raise ValueError('invalid repair counterexample family')
+                for case in family['cases'].values():
+                    if not isinstance(case, Mapping) or not isinstance(case.get('observations'), Mapping) or not isinstance(case.get('finding_ids'), list):
+                        raise ValueError('invalid repair counterexample history')
+            for diagnosis in item['diagnoses'].values():
+                if not isinstance(diagnosis, Mapping):
+                    raise ValueError('invalid repair diagnosis history')
+                for name in ('calls', 'hypotheses', 'recoveries', 'observed_count'):
+                    if type(diagnosis.get(name, 0)) is not int or diagnosis.get(name, 0) < 0:
+                        raise ValueError('repair diagnosis counters must be nonnegative integers')
         for episode in payload.get('repair_episodes', {}).values():
             for name in ('semantic_attempts', 'format_corrections', 'pending_format', 'round_format_calls'):
                 if type(episode.get(name, 0)) is not int or episode.get(name, 0) < 0:
@@ -507,6 +530,7 @@ class SelfRepairExperiment:
             planning_attempts=dict(payload.get('planning_attempts', {})),
             plan_revisions=dict(payload.get('plan_revisions', {})),
             component_memory=dict(payload.get('component_memory', {})),
+            work_items=dict(payload.get('work_items', {})),
             repair_episodes=dict(payload.get('repair_episodes', {})),
             review_facts=dict(payload.get('review_facts', {})),
             historical_completed_groups=dict(payload.get('historical_completed_groups', {})),

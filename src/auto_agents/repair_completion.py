@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from .repair_control import digest
 from .repair_memory import component_key, read_record as _read_record, save_record, dependency_manifest, dependencies_match
+from .repair_work import memory as work_memory
 
 VERSION = 1
 
@@ -156,14 +157,13 @@ def epoch(runner, workspace):
 def _memory(runner, group):
     # Component-key memory can be shared by overlapping groups. Completion is
     # owned by one group; another group's review cannot overwrite its status.
-    key = 'completion:' + digest([component_key(group), group['group_id']])
     state = runner._experiment
-    memory = state.component_memory.setdefault(key, {})
+    memory = work_memory(runner, group)
     if not memory.get('completion') and not memory.get('completion_history') and not memory.get('completion_assessment'):
         live = {g['group_id'] for g in state.finding_groups}
         matching = [g for g in state.finding_groups if definition(g) == definition(group)]
         if len(matching) == 1:
-            for previous in list(state.component_memory.values()):
+            for previous in _memories(state):
                 proof = read_record(runner, previous.get('completion', {}))
                 if proof and proof.get('component') not in live and proof.get('definition') == definition(group):
                     memory['completion'] = previous['completion']  # A rename, not cross-group approval.
@@ -172,7 +172,12 @@ def _memory(runner, group):
 
 
 def _evidence_memory(runner, group):
-    return runner._experiment.component_memory.setdefault(component_key(group), {})
+    return work_memory(runner, group)
+
+
+def _memories(state):
+    return [*state.component_memory.values(),
+            *(row['memory'] for row in getattr(state, 'work_items', {}).values())]
 
 
 def _paths(commands):
@@ -369,13 +374,13 @@ def _check_matches(runner, workspace, proof, check, exact):
 def refresh(runner, workspace):
     """Refresh statuses against the selected retained source before scheduling."""
     state = runner._experiment
-    if not state.planning_receipts and not any(m.get('completion') for m in state.component_memory.values()):
+    if not state.planning_receipts and not any(m.get('completion') for m in _memories(state)):
         return  # Legacy direct calls have no component planning gate.
     changed = False
     previous = {g['group_id']: (g.get('status'), deepcopy(_memory(runner, g).get('completion_assessment')))
                 for g in state.finding_groups}
     observations = None
-    if any(memory.get('completion') for memory in state.component_memory.values()):
+    if any(memory.get('completion') for memory in _memories(state)):
         try:
             parts = context_parts(runner, workspace)
             observations = {'policy': policy(), 'context': digest(parts), 'source': snapshot(workspace),

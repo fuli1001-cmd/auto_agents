@@ -179,7 +179,9 @@ def _invoke(runner, workspace, stage, instruction, context):
             'required_action': 'Read the working input, previous revision and relevant delta. '
                                'Retrieve referenced background only when relevant or missing; '
                                'unchanged history need not be reconstructed.'}, ensure_ascii=False)
+    from .repair_response_schema import schema_for
     request = AgentRequest(stage=stage, purpose='self_repair_review', effort=runner._review_effort(),
+        response_schema=schema_for(stage),
         cwd=workspace, output_path=directory / 'output.json', sandbox_mode='read-only',
         record_execution_incidents=False,
         progress_lease_seconds=getattr(runner._autonomy_config(), 'candidate_review_timeout_seconds', 600),
@@ -217,6 +219,8 @@ def _invoke(runner, workspace, stage, instruction, context):
         atomic_json(directory / 'invalid.json', {'error': str(error), 'output': sanitize_evidence(raw)})
         raise PlanFormatError(stage + ' returned invalid JSON', field='response',
                               constraint='JSON object', evidence=str(directory / 'invalid.json')) from error
+    from .repair_response_schema import normalize_reply
+    payload = normalize_reply(stage, payload)
     atomic_json(directory / 'result.json', sanitize_evidence(payload))
     if stage in {'self_repair_scope_review', 'self_repair_scope_format'}:
         from .repair_scope_recovery import admit_result
@@ -226,6 +230,9 @@ def _invoke(runner, workspace, stage, instruction, context):
 
 
 def _retained_scope(runner, receipt, finding):
+    if receipt.get('code_review_scope'):
+        from .repair_review_protocol import retained_scope
+        return retained_scope(runner, receipt, finding)
     identity = receipt.get('request_id', '')
     if not isinstance(identity, str) or not re.fullmatch('[a-f0-9]{32}', identity):
         return False
@@ -723,31 +730,19 @@ def _component_signature(group):
 
 def _implementation_bindings(runner, receipt, findings):
     """Only an actual independent code review can classify a covered correction."""
-    from .repair_memory import component_key, read_record
+    from .repair_memory import read_record
+    from .repair_work import memory as work_memory, work_id
     canonical = receipt.get('component', {})
-    # The writer/reviewer receives the approved execution scope, which can be
-    # narrower or wider than the original grouping. Prefer that exact record;
-    # canonical-only records remain readable for older callers.
-    review = None
-    for group in ({**canonical, **receipt['plan']}, canonical):
-        memory = runner._experiment.component_memory.get(component_key(group), {})
-        if not isinstance(memory, dict):
-            return None
-        reference = memory.get('code_review')
-        if not reference:
-            continue
-        review = read_record(runner, reference)
-        if (not review or review.get('kind') != 'code_review'
-                or review.get('contract') != runner._experiment.contract_fingerprint
-                or review.get('environment') != receipt.get('environment')
-                or not isinstance(review.get('component'), dict)
-                or not all(_texts(review['component'].get(key, []), empty=True)
-                           for key in ('touched_paths', 'contract_obligation_ids', 'focused_tests'))
-                or component_key(review['component']) != component_key(group)
-                or review['component'].get('group_id') != canonical.get('group_id')
-                or review['component'].get('planning_receipt', receipt['request_id']) != receipt['request_id']):
-            return None  # A corrupt/current record cannot fall back to stale evidence.
-        break
+    review = read_record(runner, work_memory(runner, canonical).get('code_review', {}))
+    if (not review or review.get('kind') != 'code_review'
+            or review.get('contract') != runner._experiment.contract_fingerprint
+            or review.get('environment') != receipt.get('environment')
+            or not isinstance(review.get('component'), dict)
+            or not all(_texts(review['component'].get(key, []), empty=True)
+                       for key in ('touched_paths', 'contract_obligation_ids', 'focused_tests'))
+            or work_id(runner._experiment, review['component']) != work_id(runner._experiment, canonical)
+            or review['component'].get('planning_receipt', receipt['request_id']) != receipt['request_id']):
+        return None
     if not review or not isinstance(review.get('result'), dict):
         return None
     rows = review['result'].get('findings', [])
@@ -767,6 +762,12 @@ def _implementation_bindings(runner, receipt, findings):
                 or not finding.get('affected_paths') or not all(
                     path in receipt['plan']['touched_paths'] for path in finding['affected_paths'])):
             return None
+        if item.get('controls'):
+            from .repair_review_protocol import normalized_controls
+            controls = normalized_controls(item, {**canonical, **receipt['plan']})
+            if not controls or any(target.split('::', 1)[0] not in receipt['plan']['touched_paths']
+                                   for row in controls.values() for target in pytest_targets(row['command'], prose=False)):
+                return None
         bindings[finding['finding_id']] = ids
     return bindings
 
@@ -841,6 +842,8 @@ def normalize_plan_references(runner, workspace, plan, group):
 def _review_execution_mode(plan, review):
     if review.get('implementation_required') is False and review.get('remaining_changes') == []:
         return 'verify_existing'
+    if review.get('implementation_required') is True or review.get('remaining_changes'):
+        return 'implement'
     return plan.get('mode', 'implement')
 
 
@@ -848,11 +851,13 @@ def _apply_execution_mode(runner, receipt, source):
     # Completed-component recovery markers are issued by the controller, never
     # by a proposed plan or a retained model response.
     runner._candidate_group.pop('completion_revalidation', None)
-    if runner._candidate_group.get('finding_scenario_bindings'):
+    if (runner._candidate_group.get('finding_scenario_bindings')
+            or getattr(runner, '_candidate_next_action', {}).get('kind') in {'repair_code', 'repair_verification'}):
         # A bound independent code review supersedes an earlier observation
         # that no writing was necessary, even when no command failed.
         runner._candidate_group['mode'] = 'implement'
         return
+    runner._candidate_group['mode'] = receipt.get('execution_mode', receipt['plan'].get('mode', 'implement'))
     # An unchanged, independently inspected implementation can go directly to
     # verification. New failure evidence still authorizes the original writer.
     if (receipt.get('source') == source and receipt.get('execution_mode') == 'verify_existing'
@@ -901,6 +906,7 @@ def _preserve_scenarios(previous, plan):
 
 def prepare_component(runner, workspace):
     from .repair_memory import component_key, latest_revision, remember_revision, read_record
+    from .repair_work import memory as work_memory, link_definition
     experiment = runner._experiment
     group = deepcopy(next((item for item in experiment.finding_groups
                            if item['group_id'] == runner._candidate_group['group_id']), runner._candidate_group))
@@ -915,6 +921,7 @@ def prepare_component(runner, workspace):
     context['findings'] = [f.to_dict() for f in findings if not nonblocking_scope(experiment, f)]
     group['finding_ids'] = [f['finding_id'] for f in context['findings']]
     context['component'] = group
+    context['work'] = link_definition(runner, group)
     from .repair_completion import _memory as completion_memory
     completed = completion_memory(runner, group)
     if completed.get('completion') or group.get('status') == 'needs_revalidation':
@@ -970,7 +977,7 @@ def prepare_component(runner, workspace):
         if same:
             runner._candidate_group = {**group, **receipt['plan'], 'planning_receipt': receipt['request_id'],
                                        'finding_scenario_bindings': bindings,
-                                       'retained_acceptance': experiment.component_memory.get(component_key(group), {}).get('acceptance_inventory', [])}
+                                       'retained_acceptance': work_memory(runner, group).get('acceptance_inventory', [])}
             _apply_execution_mode(runner, receipt, context['source'])
             runner._experiment_store.record_health(experiment, status='plan_reused', detail=receipt['request_id'])
             return receipt
@@ -1244,7 +1251,7 @@ def prepare_component(runner, workspace):
             if approved:
                 episode.update(status='approved', pending_round=False, phase='complete',
                                feedback=[], latest_decision='APPROVE')
-                memory = experiment.component_memory.setdefault(component_key(group), {})
+                memory = work_memory(runner, group)
                 memory['acceptance_inventory'] = list(dict.fromkeys([*memory.get('acceptance_inventory', []),
                     *group.get('focused_tests', []), *plan['quick_checks'], *(s['check'] for s in plan['scenarios'])]))
                 runner._experiment_store.save(experiment)
@@ -1280,7 +1287,9 @@ def history_report(experiment):
                 'historical_resolved' if finding.status == 'resolved' else 'needs_scope_review'),
             'reason': decision.get('reason', '') if current else 'No current independent necessity receipt',
             'counterexample': finding.counterexample, 'evidence': finding.evidence})
+    from .repair_convergence import summary
     return {'experiment_id': experiment.experiment_id, 'current_candidate_id': experiment.current_candidate_id,
+        'convergence': summary(experiment),
         'policy': POLICY_VERSION, 'historical_progress_count': len(experiment.progress_credits),
         'candidate_attempt_count': experiment.attempt_count,
         'non_improvement_count': experiment.consecutive_non_improvements,

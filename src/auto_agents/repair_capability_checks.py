@@ -206,13 +206,18 @@ def namespace_observation(runner, workspace):
 
 
 def production_capabilities(runner, workspace):
-    from .verification_ledger import source_identity
-    key = (source_identity(workspace), runner._full_suite_environment_fingerprint())
+    from .repair_validation_protocol import binding, controller_runtime, retain
+    from .repair_control import digest
+    identity = binding(runner)
+    key = digest(identity)
     cached = getattr(runner, '_production_capability_cache', None)
     if cached and cached[0] == key:
         return cached[1]
-    result = namespace_observation(runner, workspace)
-    result['nested_gate_metadata'] = metadata_observation(runner, workspace)
+    runtime = controller_runtime()
+    result = namespace_observation(runner, runtime)
+    result['nested_gate_metadata'] = metadata_observation(runner, runtime)
+    result['validation_protocol'] = identity
     if _cancel_event() is None or not _cancel_event().is_set():
         runner._production_capability_cache = (key, result)
+        retain(runner, result, identity)
     return result

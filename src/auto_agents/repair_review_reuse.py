@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from .repair_control import digest
 from .repair_memory import component_key, read_record, save_record
 from .verification_ledger import source_identity
+from .repair_work import memory as work_memory
 
 
 def reviewer_policy(runner, root):
@@ -51,7 +52,7 @@ def reuse_review(runner, root, group, phase, identity=None):
     identity = review_identity(runner, root, group, phase) if identity is None else identity
     if not identity:
         return None
-    memory = runner._experiment.component_memory.get(component_key(group), {})
+    memory = work_memory(runner, group)
     record = read_record(runner, memory.get('approved_review', {}))
     if not record or record.get('identity') != identity:
         return None
@@ -75,7 +76,7 @@ def remember_approval(runner, root, group, phase, payload, *, reviewed_identity)
     if not identity or identity != reviewed_identity:
         return
     reference = save_record(runner, 'approved_component_review', {'identity': identity, 'payload': payload})
-    runner._experiment.component_memory.setdefault(component_key(group), {})['approved_review'] = reference
+    work_memory(runner, group)['approved_review'] = reference
     runner._experiment_store.save(runner._experiment)
 
 
@@ -84,13 +85,19 @@ def related_reviews(runner, root, group):
     current = source_identity(root)
     environment = digest(runner._full_suite_environment_fingerprint())
     result = []
-    for memory in runner._experiment.component_memory.values():
+    memories = [*runner._experiment.component_memory.values(),
+                *(row['memory'] for row in getattr(runner._experiment, 'work_items', {}).values())]
+    seen = set()
+    for memory in memories:
         record = read_record(runner, memory.get('code_review', {}))
+        if record and record['id'] in seen:
+            continue
         if (not record or record.get('source') != current or record.get('environment') != environment
                 or record.get('contract') != runner._experiment.contract_fingerprint
                 or record.get('result', {}).get('decision') != 'APPROVE'
                 or record.get('result', {}).get('findings') or record.get('result', {}).get('deferred_findings')):
             continue
+        seen.add(record['id'])
         previous = record.get('component', {})
         if previous.get('group_id') == group.get('group_id'):
             continue

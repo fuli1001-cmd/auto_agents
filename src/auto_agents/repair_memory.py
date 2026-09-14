@@ -10,6 +10,7 @@ import uuid
 from .repair_control import atomic_json, digest
 from .verification_ledger import source_identity
 from .repair_feedback import sanitize_evidence
+from .repair_work import memory as work_memory
 
 
 def component_key(group):
@@ -69,13 +70,13 @@ def remember_revision(runner, group, payload):
     reference = save_record(runner, 'plan_revision', payload)
     state = runner._experiment
     state.plan_revisions[reference['id']] = reference
-    state.component_memory.setdefault(component_key(group), {})['latest_revision'] = reference
+    work_memory(runner, group)['latest_revision'] = reference
     runner._experiment_store.save(state)
     return reference
 
 
 def latest_revision(runner, group):
-    memory = runner._experiment.component_memory.get(component_key(group), {})
+    memory = work_memory(runner, group)
     return read_record(runner, memory.get('latest_revision', {}))
 
 
@@ -183,7 +184,7 @@ def compact_context(runner, context):
     group = context.get('component', {})
     state = runner._experiment
     background_key = digest(history)
-    memory = state.component_memory.setdefault(component_key(group), {})
+    memory = work_memory(runner, group)
     background = memory.get('background', {})
     if background.get('content') != background_key or not read_record(runner, background):
         background = {**save_record(runner, 'background', {'history': history}), 'content': background_key}
@@ -324,7 +325,7 @@ def dependencies_match(root, manifest):
 def remember_check_timings(runner, workspace, group, plan, result, *, phase):
     """Keep actual execution costs separate from certificate lookup latency."""
     from .git_ops import head_ref
-    memory = runner._experiment.component_memory.setdefault(component_key(group), {})
+    memory = work_memory(runner, group)
     timings = result.payload.get('command_timings', [])
     known = memory.setdefault('check_timings', {})
     for row in timings:
@@ -348,7 +349,7 @@ def remember_check_timings(runner, workspace, group, plan, result, *, phase):
 
 
 def review_context(runner, root, group):
-    memory = runner._experiment.component_memory.get(component_key(group), {})
+    memory = work_memory(runner, group)
     previous = read_record(runner, memory.get('code_review', {}))
     if not previous:
         from .repair_review_reuse import related_reviews
@@ -369,6 +370,7 @@ def review_context(runner, root, group):
     return {'mode': 'incremental', 'previous_review': {key: previous.get(key) for key in ('id', 'source_commit', 'contract', 'result')},
             'complete_previous_review': str(runner._experiment_store.root / 'planning' / memory['code_review']['id'] / 'memory.json'),
             'delta_ref': str(runner._experiment_store.root / 'planning' / reference['id'] / 'memory.json'),
+            'delta_excerpt': diff[:10000], 'omitted_diff_chars': max(0, len(diff) - 10000),
             'instruction': 'Review every changed behavior and its dependencies; retain unchanged conclusions. '
                            'The cumulative diff and frozen contract remain available. Missing evidence requires inspection.'}
 
@@ -379,6 +381,11 @@ def remember_review(runner, root, group, payload):
         'source': source_identity(root), 'contract': runner._experiment.contract_fingerprint,
         'environment': digest(runner._full_suite_environment_fingerprint()),
         'component': deepcopy(group), 'result': deepcopy(payload)})
-    runner._experiment.component_memory.setdefault(component_key(group), {})['code_review'] = reference
+    work_memory(runner, group)['code_review'] = reference
     runner._experiment.review_facts[reference['id']] = reference
+    from .repair_review_protocol import remember_controls
+    remember_controls(runner, group, payload, reference)
     runner._experiment_store.save(runner._experiment)
+    from .repair_convergence import observe_review
+    observe_review(runner, group, reference)
+    return reference

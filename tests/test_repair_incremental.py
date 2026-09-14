@@ -8,6 +8,7 @@ import pytest
 
 from auto_agents.models import AgentResult
 from auto_agents.repair_control import atomic_json
+from auto_agents.repair_work import memory as work_memory
 from auto_agents.repair_memory import (
     compact_context, component_key, dependencies_match, dependency_manifest,
     latest_revision, read_record, remember_review,
@@ -235,7 +236,7 @@ def test_schema_seven_records_and_original_six_backup_survive_store_reload(setup
         prepare_component(runner, runner.repo_root)
     assert json.loads(runner._experiment_store.path.with_name('experiment.v6.json').read_text()) == raw
     restored = runner._experiment_store.load()
-    assert restored.to_dict()['schema_version'] == 7
+    assert restored.to_dict()['schema_version'] == 8
     assert restored.plan_revisions == state.plan_revisions and restored.repair_episodes == state.repair_episodes
     assert all(read_record(runner, ref) for ref in restored.plan_revisions.values())
 
@@ -508,7 +509,7 @@ def test_expanded_costs_survive_fast_certificate_hits(setup):
     remember_check_timings(runner, runner.repo_root, group, {},
         _VerificationResult(True, 'reused', payload={'command_timings': [{**slow, 'seconds': .01, 'cache_hit': True}],
                                                   'certificate_hits': 1}), phase='quick')
-    memory = state.component_memory[component_key(group)]
+    memory = work_memory(runner, group)
     assert memory['check_timings'][command]['seconds'] == 250
     assert len(memory['verification_history']) == 2
     expanded = read_record(runner, memory['verification_history'][0])

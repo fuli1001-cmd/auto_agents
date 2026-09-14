@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from auto_agents.repair_work import memory as work_memory
 from auto_agents.repair_memory import (
     component_key, latest_revision, read_record, remember_review, remember_revision, save_record,
 )
@@ -183,9 +184,11 @@ def test_invalid_review_cannot_authorize_reuse_or_borrow_a_legacy_review(setup, 
         elif invalid == 'environment':
             runner._full_suite_environment_fingerprint = lambda: ('foreign-review-environment',)
         review(runner, execution, item, **changes)
+        if invalid == 'other_group':
+            work_memory(runner, state.finding_groups[0])['code_review'] = work_memory(runner, execution)['code_review']
         runner._full_suite_environment_fingerprint = lambda: ('provisioned',)
         if invalid in {'malformed_scope', 'wrong_record_kind'}:
-            memory = state.component_memory[component_key(execution)]
+            memory = work_memory(runner, execution)
             record = read_record(runner, memory['code_review'])
             if invalid == 'malformed_scope':
                 record['component']['touched_paths'] = None
@@ -193,7 +196,7 @@ def test_invalid_review_cannot_authorize_reuse_or_borrow_a_legacy_review(setup, 
                 record['kind'] = 'unreviewed_draft'
             memory['code_review'] = save_record(runner, record['kind'], record)
         if invalid == 'tampered':
-            reference = state.component_memory[component_key(execution)]['code_review']
+            reference = work_memory(runner, execution)['code_review']
             artifact = runner._experiment_store.root / 'planning' / reference['id'] / 'memory.json'
             artifact.write_text(artifact.read_text().replace('REJECT', 'APPROVE'))
             assert read_record(runner, reference) is None

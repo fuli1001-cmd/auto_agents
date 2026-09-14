@@ -5,7 +5,9 @@ import json
 import os
 import re
 import shutil
+from contextlib import nullcontext
 from dataclasses import replace
+from pathlib import Path
 from typing import Callable, List, Optional
 
 from ..io_utils import read_text, write_text
@@ -174,14 +176,23 @@ class CodexAdapter(AgentAdapter):
                 stream_output=self._make_json_stream_filter(request.stream_output),
             )
 
-        process_result = run_subprocess_with_optional_streaming(
-            command,
-            filtered_request,
-            env,
-            smart_timeout=self.smart_timeout,
-            progress_decoder=CodexProgressDecoder(),
-            provider="codex",
-        )
+        from .. import artifact_temp as tempfile
+        # The schema is an output-format constraint, never an approval or a
+        # substitute for the controller's semantic/evidence validators.
+        constrained = request.response_schema is not None and not any(arg.startswith('--output-schema') for arg in command)
+        with (tempfile.TemporaryDirectory(prefix='auto-agents-response-schema-') if constrained else nullcontext()) as directory:
+            if constrained:
+                schema = Path(directory) / 'response.json'
+                schema.write_text(json.dumps(request.response_schema, ensure_ascii=False))
+                command.extend(['--output-schema', str(schema)])
+            process_result = run_subprocess_with_optional_streaming(
+                command,
+                filtered_request,
+                env,
+                smart_timeout=self.smart_timeout,
+                progress_decoder=CodexProgressDecoder(),
+                provider="codex",
+            )
         stdout_raw, stderr, returncode, streamed_stdout, streamed_stderr = process_result
 
         visible_stdout, usage, error_messages = self._parse_json_stdout(stdout_raw)

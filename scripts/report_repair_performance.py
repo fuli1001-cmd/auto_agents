@@ -30,7 +30,9 @@ def legacy_runner_commands(root, job, events):
             if commit:
                 commits[commit].append(candidate)
         seen = set()
-        for memory in experiment.get('component_memory', {}).values():
+        memories = [*experiment.get('component_memory', {}).values(),
+                    *(row.get('memory', {}) for row in experiment.get('work_items', {}).values())]
+        for memory in memories:
             for ref in memory.get('verification_history', []):
                 identity = ref.get('id', '')
                 if identity in seen or len(identity) != 32 or any(c not in '0123456789abcdef' for c in identity):
@@ -107,6 +109,9 @@ def report(control_root, job):
                                            for c in commands if not c.get('cache_hit') and not c.get('input_trace_complete'))),
         'command_origins': dict(Counter(c['origin'] for c in commands)),
         'review_reuses': sum(k == 'review_reused' for k, _, _ in events),
+        'repair_transitions': [payload for kind, payload, _ in events if kind == 'repair_transition'],
+        'routing_actions': dict(Counter(payload.get('action', payload.get('event', 'unknown'))
+                                        for kind, payload, _ in events if kind == 'repair_transition')),
         'probe_corrections': sum(k == 'scope_probe_correction' for k, _, _ in events),
         'deterministic_plan_migrations': sum(k == 'plan_references_normalized' for k, _, _ in events),
         'component_completion_checks': [payload for kind, payload, _ in events

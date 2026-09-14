@@ -18,6 +18,27 @@ def control_protocol(root):
     assert VERSION == 1, "unsupported repair control protocol"
 
 
+def verification_protocol(root):
+    from auto_agents.repair_validation_protocol import VERSION, controller_runtime
+    from auto_agents.repair_capability_checks import production_capabilities
+    assert VERSION == 1
+    calls = []
+    runner = SimpleNamespace(_full_suite_environment_fingerprint=lambda: ('fixed',))
+    observed = {'supported': True, 'acceptance_proof': False}
+    identity = {'version': 1, 'runtime': str(controller_runtime()), 'observer': 'fixed', 'acceptance_proof': False}
+    def probe(_runner, workspace):
+        assert workspace == controller_runtime(), 'candidate was used to advertise outer verifier capabilities'
+        calls.append(workspace)
+        return dict(observed)
+    with patch('auto_agents.repair_validation_protocol.binding', return_value=identity), \
+         patch('auto_agents.repair_capability_checks.namespace_observation', side_effect=probe), \
+         patch('auto_agents.repair_capability_checks.metadata_observation', side_effect=probe):
+        first = production_capabilities(runner, root / 'candidate-one')
+        second = production_capabilities(runner, root / 'candidate-two')
+    assert first == second and len(calls) == 2, 'candidate edits re-bootstrap the running verifier'
+    assert first['validation_protocol']['acceptance_proof'] is False
+
+
 def progress_supervision(root):
     from auto_agents.adapters import base
     from auto_agents.models import AgentRequest, SmartTimeoutConfig
@@ -135,7 +156,7 @@ def main():
                      "AUTO_AGENTS_WORKER_ROOT", "AUTO_AGENTS_CLUSTER_HOME"):
             os.environ[name] = str(root / name.lower())
         os.environ.update(AUTO_AGENTS_REPAIR_CONTROL_DISABLED="1", AUTO_AGENTS_STORAGE_MAINTENANCE="off")
-        for check in (control_protocol, progress_supervision, acceptance_planning, terminal_repair_status):
+        for check in (control_protocol, progress_supervision, acceptance_planning, terminal_repair_status, verification_protocol):
             try:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     check(root)
