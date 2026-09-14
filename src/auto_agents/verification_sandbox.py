@@ -264,7 +264,7 @@ def namespace_exec(payload):
 @contextmanager
 def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=(), path_entries=(),
                       python_paths=(), node_paths=(), library_paths=(), execution_environment=None,
-                      supervisor_checks=False, trace_custody=None):
+                      supervisor_checks=False, trace_custody=None, gate_environment_overrides=None):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     from auto_agents.verification_input_trace import owner_identity
     owner = owner_identity()
@@ -356,41 +356,52 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         profile = '{filesystem={' + filesystem + '},network={enabled=true}}'
         executable_path = os.pathsep.join([*(str(Path(value).resolve()) for value in path_entries),
                                            os.environ.get("PATH", os.defpath)])
-        clean_environment = ["env", "-i", "PATH=" + executable_path,
-                             "HOME=" + str(home), "CODEX_HOME=" + str(codex_home),
-                             "TMPDIR=" + temporary, "LANG=C.UTF-8",
-                             "PYTHONPATH=" + os.pathsep.join([str(root / "src"), *map(str, python_paths),
-                                 str(Path(__file__).resolve().parents[1])]),
-                             "PYTHONDONTWRITEBYTECODE=1",
-                             "AUTO_AGENTS_TEST=True", "TESTING=True", "AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1",
-                             "AUTO_AGENTS_VERIFICATION_SANDBOX=1"]
+        # Select the command environment once. An empty retained mapping is
+        # intentional; it must never select ambient variables by truthiness.
+        effective_environment = {
+            'PATH': executable_path, 'HOME': str(home), 'CODEX_HOME': str(codex_home),
+            'TMPDIR': temporary, 'LANG': 'C.UTF-8',
+            'PYTHONPATH': os.pathsep.join([str(root / 'src'), *map(str, python_paths),
+                                          str(Path(__file__).resolve().parents[1])]),
+            'PYTHONDONTWRITEBYTECODE': '1', 'AUTO_AGENTS_TEST': 'True', 'TESTING': 'True',
+            'AUTO_AGENTS_REPAIR_CONTROL_DISABLED': '1',
+        } if execution_environment is None else dict(execution_environment)
         from auto_agents.verification_input_trace import file_identity
         runtime_identity = json.dumps(file_identity(runtime_parent.lstat()))
-        clean_environment.append(RUNTIME_ROOT_ENV + '=' + str(runtime_parent))
-        clean_environment.append(RUNTIME_ID_ENV + '=' + runtime_identity)
-        if execution_environment is not None:
-            # Project verification retains operator inputs, activation and networking.
-            # Only sandbox bookkeeping goes to a fresh private home.
-            clean_environment = ['env', 'CODEX_HOME=' + str(codex_home),
-                                 'AUTO_AGENTS_VERIFICATION_SANDBOX=1',
-                                 RUNTIME_ROOT_ENV + '=' + str(runtime_parent),
-                                 RUNTIME_ID_ENV + '=' + runtime_identity]
+        bookkeeping_environment = {
+            'CODEX_HOME': str(codex_home), 'AUTO_AGENTS_VERIFICATION_SANDBOX': '1',
+            RUNTIME_ROOT_ENV: str(runtime_parent), RUNTIME_ID_ENV: runtime_identity,
+        }
+        if execution_environment is not None and path_entries:
+            bookkeeping_environment['PATH'] = os.pathsep.join([
+                *map(str, path_entries), effective_environment.get('PATH', os.defpath)])
         if node_paths:
-            clean_environment.append("NODE_PATH=" + os.pathsep.join(map(str, node_paths)))
+            bookkeeping_environment['NODE_PATH'] = os.pathsep.join(map(str, node_paths))
         if library_paths:
-            clean_environment.append("LD_LIBRARY_PATH=" + os.pathsep.join(map(str, library_paths)))
+            bookkeeping_environment['LD_LIBRARY_PATH'] = os.pathsep.join(map(str, library_paths))
         if private_shm or inherited_shm:
-            clean_environment.append(SHM_ENV + '=1')
+            bookkeeping_environment[SHM_ENV] = '1'
         from auto_agents.verification_supervisor_checks import REPORT_ENV
         if REPORT_ENV in os.environ:
-            clean_environment.append(REPORT_ENV + '=' + os.environ[REPORT_ENV])
+            bookkeeping_environment[REPORT_ENV] = os.environ[REPORT_ENV]
+        effective_environment.update(bookkeeping_environment)
+        effective_environment.update(gate_environment_overrides or {})
+        # Retained non-custody callers already pass their mapping as the process
+        # environment. Keep operator values out of launcher argument records.
+        clean_environment = (['env', '-i', *[key + '=' + value for key, value in effective_environment.items()]]
+                             if execution_environment is None else
+                             ['env', *[key + '=' + value for key, value in bookkeeping_environment.items()],
+                              *[key + '=' + value for key, value in (gate_environment_overrides or {}).items()]])
         if trace_custody is not None:
             # The common reservation and evidence directory are provisional
             # bootstrap authority only. Gate descendants receive the job leaf.
             trace_custody.payload['roots'] = [str(root), str(scratch), *map(str, write_roots)]
             trace_custody.payload['readonly'] = metadata_readonly
             writable.append(str(trace_custody.directory))
-            argv = trace_custody.command(argv, execution_environment or dict(os.environ))
+            argv = trace_custody.command(argv, effective_environment)
+            # The parent injects the digest-bound transport into a minimal
+            # bootstrap environment. env -i here would erase that transport.
+            clean_environment = []
         if nested:
             launcher = Path(__file__).resolve()
             prefix = [sys.executable, "-I", str(launcher), "--metadata", json.dumps({

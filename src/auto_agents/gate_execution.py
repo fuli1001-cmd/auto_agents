@@ -12,6 +12,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 from auto_agents import artifact_temp as tempfile
@@ -469,12 +470,61 @@ def _path_observation_digest(path: Path) -> str:
     return "file:" + _sha256(path)
 
 
+
+def _resolve_observed_path(path: Path, sandbox: Path):
+    """Walk the actual lookup before excluding private bookkeeping.
+
+    A missing or non-directory component cannot be cancelled by a later '..'.
+    External symlinks remain dependencies, including when their destination is
+    a runtime object. Project symlink traversal retains the conservative guard.
+    """
+    current = Path(path.anchor)
+    pending = list(path.parts[1:])
+    links = {}
+    followed = 0
+    while pending:
+        part = pending.pop(0)
+        if part == '..':
+            current = current.parent
+            continue
+        candidate = current / part
+        try:
+            value = candidate.lstat()
+        except FileNotFoundError:
+            if '..' in pending:
+                raise ValueError('unresolved traversal before parent component')
+            return candidate.joinpath(*pending), links, candidate
+        except PermissionError:
+            if pending:
+                raise ValueError('unresolved traversal through denied directory')
+            return candidate, links, None
+        if stat.S_ISLNK(value.st_mode):
+            if candidate.is_relative_to(sandbox):
+                raise ValueError('project symlink observation cannot certify inputs')
+            target = os.readlink(candidate)
+            links[candidate] = 'link:' + target
+            followed += 1
+            if followed > 40:
+                raise ValueError('unresolved symlink loop')
+            target_path = Path(target)
+            if target_path.is_absolute():
+                current = Path(target_path.anchor)
+                pending = list(target_path.parts[1:]) + pending
+            else:
+                pending = list(target_path.parts) + pending
+        else:
+            if pending and not stat.S_ISDIR(value.st_mode):
+                raise ValueError('unresolved traversal through non-directory')
+            current = candidate
+    return current, links, None
+
+
 def _observed_input_manifest(
     trace_path: Path,
     sandbox: Path,
     dependency_links: Mapping[str, Path],
     runtime_roots: Sequence[Path] = (),
-    *, trace_text: Optional[str] = None,
+    *, trace_text: Optional[str] = None, bookkeeping: Optional[Mapping[str, Sequence[int]]] = None,
 ) -> tuple[dict[str, str], bool]:
     sandbox = sandbox.resolve()
     try:
@@ -488,6 +538,31 @@ def _observed_input_manifest(
             return {}, False
     network_observed = "connect(" in text or "sendto(" in text
     denied_inputs = {}
+    link_inputs = {}
+    classification_failed = False
+    runtime_roots = [Path(root).resolve(strict=True) for root in runtime_roots]
+
+    def name_of(path):
+        try:
+            return path.relative_to(sandbox).as_posix()
+        except ValueError:
+            return '@' + str(path)
+
+    def classify(raw):
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = sandbox / candidate
+        resolved, links, missing = _resolve_observed_path(candidate, sandbox)
+        for path, identity in links.items():
+            link_inputs[name_of(path)] = identity
+        expected = (bookkeeping or {}).get(str(resolved))
+        if expected is not None:
+            from .verification_input_trace import file_identity
+            if file_identity(resolved.lstat()) != list(expected):
+                raise ValueError('bookkeeping identity changed during input admission')
+            return resolved, missing, True
+        return resolved, missing, any(resolved.is_relative_to(root) for root in runtime_roots)
+
     enriched = bool(re.search(r"(?m)^(?:\[pid\s+)?\d+\]?\s+", text))
     if enriched:
         from .verification_trace import resolve_file_trace
@@ -497,17 +572,18 @@ def _observed_input_manifest(
         text = resolved
         network_observed = network_observed or "connect(" in text
         def denied(match):
-            path = Path(json.loads(match.group(1)))
-            if any(path == root or root in path.parents for root in runtime_roots):
-                return ""
+            nonlocal classification_failed
             try:
-                name = path.relative_to(sandbox).as_posix()
-            except ValueError:
-                name = "@" + str(path)
-            # Record only the failed lookup, never read/hash denied content.
-            denied_inputs["?" + name] = "13" if match.group(2) == "EACCES" else "1"
-            return ""
+                path, _missing, excluded = classify(json.loads(match.group(1)))
+                if not excluded:
+                    # Do not read content from an EACCES/EPERM observation.
+                    denied_inputs['?' + name_of(path)] = '13' if match.group(2) == 'EACCES' else '1'
+            except (OSError, ValueError):
+                classification_failed = True
+            return ''
         text = re.sub(r'stat\(("(?:[^"\\]|\\.)*")\) = -1 (EACCES|EPERM)[^\n]*', denied, text)
+        if classification_failed:
+            return {}, network_observed
     descriptor_paths: list[str] = []
 
     def resolved_descriptor_stat(match: re.Match[str]) -> str:
@@ -548,7 +624,7 @@ def _observed_input_manifest(
         ".auto-agents-gate-cache",
         *dependency_links.keys(),
     }
-    manifest: dict[str, str] = dict(denied_inputs)
+    manifest: dict[str, str] = {**denied_inputs, **link_inputs}
     observed_paths = list(descriptor_paths)
     for match in re.finditer(r'"(?:[^"\\]|\\.)*"', text):
         try:
@@ -562,42 +638,16 @@ def _observed_input_manifest(
             ("/dev/", "/proc/", "/sys/")
         ):
             continue
-        candidate = Path(raw)
-        if not candidate.is_absolute():
-            candidate = sandbox / candidate
-        if any(candidate == root or root in candidate.parents for root in runtime_roots):
-            continue
         try:
-            lexical_relative = candidate.relative_to(sandbox)
-        except ValueError:
-            lexical_relative = None
-        if lexical_relative is not None:
-            relative = lexical_relative.as_posix()
-            if any(
-                relative == prefix or relative.startswith(prefix.rstrip("/") + "/")
-                for prefix in ignored
-            ):
-                continue
-            component = sandbox
-            for part in lexical_relative.parts:
-                component = component / part
-                if component.is_symlink():
-                    # Resolving only the final target loses symlink dependencies,
-                    # including intermediate links that can later be retargeted.
-                    return {}, network_observed
-        try:
-            resolved = candidate.resolve()
-            relative = resolved.relative_to(sandbox).as_posix()
+            resolved, missing, excluded = classify(raw)
         except (OSError, ValueError):
-            if not enriched:
-                continue
-            component = Path(candidate.anchor)
-            for part in candidate.parts[1:]:
-                component = component / part
-                if component.is_symlink():
-                    manifest["@" + str(component)] = "link:" + os.readlink(component)
-            resolved = candidate.resolve()
-            relative = "@" + str(resolved)
+            return {}, network_observed
+        manifest.update(link_inputs)
+        if excluded:
+            continue
+        if not enriched and not resolved.is_relative_to(sandbox):
+            continue
+        relative = name_of(resolved)
         if any(
             relative == prefix or relative.startswith(prefix.rstrip("/") + "/")
             for prefix in ignored
@@ -607,7 +657,9 @@ def _observed_input_manifest(
             # Negative lookups are inputs too: a later source change that
             # creates the probed path must invalidate this certificate.
             manifest[f"!{relative}"] = "missing"
-            parent = resolved.parent
+            if missing is not None:
+                manifest["!" + name_of(missing)] = "missing"
+            parent = (missing or resolved).parent
             try:
                 parent_relative = parent.relative_to(sandbox.resolve()).as_posix()
             except ValueError:
@@ -1535,20 +1587,14 @@ class LocalGatePlanExecutor:
                         capture.protect(tuple(merged_overrides.values()))
                         if getattr(self, "sandbox_target", None) is not None:
                             from .verification_sandbox import verification_argv
-                            if trace_custody is not None:
-                                kernel_context = verification_argv(['sh', '-lc', traced_command], sandbox,
-                                    self.sandbox_target, read_roots=[*self.dependency_links.values(), *retained_sources],
-                                    write_roots=[runtime_root], execution_environment=env,
-                                    trace_custody=trace_custody)
-                            else:
-                                from functools import partial
-                                if getattr(self, 'retain_execution_environment', False):
-                                    verification_argv = partial(verification_argv, execution_environment=env)
-                                safe = {key: value for key, value in env.items() if key.startswith("AUTO_AGENTS_GATE_")
-                                        or key in {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "npm_config_cache"}}
-                                argv = ["env", *[key + "=" + value for key, value in safe.items()], "sh", "-c", traced_command]
-                                kernel_context = verification_argv(argv, sandbox, self.sandbox_target,
-                                    read_roots=[*self.dependency_links.values(), *retained_sources], write_roots=[runtime_root])
+                            safe = {key: value for key, value in env.items() if key.startswith("AUTO_AGENTS_GATE_")
+                                    or key in {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "XDG_STATE_HOME", "npm_config_cache"}}
+                            retained_environment = env if getattr(self, 'retain_execution_environment', False) else None
+                            shell_argv = ['sh', '-lc' if trace_custody is not None else '-c', traced_command]
+                            kernel_context = verification_argv(shell_argv, sandbox,
+                                self.sandbox_target, read_roots=[*self.dependency_links.values(), *retained_sources],
+                                write_roots=[runtime_root], execution_environment=retained_environment,
+                                trace_custody=trace_custody, gate_environment_overrides=safe)
                             traced_command = shlex.join(kernel_context.__enter__())
                         elif trace_custody is not None:
                             traced_command = shlex.join(trace_custody.command(['sh', '-lc', traced_command], env))
@@ -1643,7 +1689,10 @@ class LocalGatePlanExecutor:
                 if trace_text is not None:
                     observed_inputs, network_observed = _observed_input_manifest(
                         Path(trace_custody.payload['trace']['path']), sandbox, self.dependency_links,
-                        runtime_roots=[runtime_root, trace_custody.directory], trace_text=trace_text)
+                        runtime_roots=[runtime_root], trace_text=trace_text,
+                        bookkeeping={str(trace_custody.directory): trace_custody.directory_identity,
+                            **{trace_custody.payload[name]["path"]: trace_custody.payload[name]["identity"]
+                               for name in ("trace", "receipt")}})
                     result.observed_inputs = observed_inputs
                     result.input_trace_complete = bool(observed_inputs)
                     result.network_observed = network_observed

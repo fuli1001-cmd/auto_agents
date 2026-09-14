@@ -18,6 +18,7 @@ def test_all_fresh_owner_checks_through_two_production_boundaries(tmp_path, monk
     from auto_agents.verification_supervisor_checks import observation, source_identity
     expected_sources = (observation('owner_death')['sources'] if owner_identity()['metadata']
                         else source_identity())
+    _assert_supported_launcher_layouts(monkeypatch)
     root, shared = tmp_path / 'candidate', tmp_path / 'shared'
     root.mkdir(); shared.mkdir()
     (shared / 'input').write_text('retained')
@@ -46,6 +47,10 @@ from auto_agents.verification_supervisor_checks import observation, source_ident
 import json
 assert owner_identity()['trace']==1
 observed=observation('owner_death')
+tracer_pid=int(next(line.split()[1] for line in Path('/proc/self/status').read_text().splitlines() if line.startswith('TracerPid:')))
+producer_argv=[os.fsdecode(value) for value in Path('/proc/'+str(tracer_pid)+'/cmdline').read_bytes().split(b'\\0') if value]
+print(json.dumps(dict(sources=observed['sources'],source_root=observed['source_root'],
+                      launcher_pid=observed['launcher_pid'],tracer_pid=tracer_pid,producer_argv=producer_argv)),flush=True)
 assert observed['sources']=={expected_sources!r}
 if {different_candidate!r}:
     assert observed['sources']!=source_identity()
@@ -67,10 +72,34 @@ for phase in ['quick','expanded']:
     assert result.returncode==0,result.stdout+result.stderr
     assert '4 passed' in result.stdout,result.stdout
 '''
-    with verification_argv([sys.executable, '-c', program], root, shared,
-                           supervisor_checks=True) as command:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=40)
-    assert result.returncode == 0, result.stdout + result.stderr
+    # Exercise both generated interpreter layouts. With no owner, this is the
+    # supported initial-owner route; beneath one, these are policy intersections
+    # and consume its authenticated observations without starting a ptracer.
+    inherited = bool(owner_identity()['metadata'])
+    for isolated in (False, True):
+        lane = root / ('isolated' if isolated else 'unisolated'); lane.mkdir()
+        (lane / 'src').symlink_to(root / 'src', target_is_directory=True)
+        with verification_argv([sys.executable, '-c', program], lane, shared,
+                               python_paths=[str(root / 'src')], supervisor_checks=True) as command:
+            command = list(command)
+            assert command[1] == '-I' and Path(command[2]).name == 'verification_sandbox.py'
+            if not isolated:
+                del command[1]
+            assert owner_identity()['metadata'] == (1 if inherited else 0)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=40)
+        assert result.returncode == 0, result.stdout + result.stderr
+        reports = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
+        assert len(reports) == 1, result.stdout
+        report = reports[0]
+        assert report['sources'] == expected_sources
+        assert report['launcher_pid'] == report['tracer_pid'] and report['launcher_pid'] > 0
+        if not inherited:
+            offset = 2 if isolated else 1
+            assert report['producer_argv'][offset + 1] == '--metadata'
+            assert Path(report['producer_argv'][offset]).resolve() == Path(command[offset]).resolve()
+        # A live producer binds its own source, including under differing test
+        # imports; expose the observation for pre-owner diagnostic collection.
+        print(json.dumps(dict(report, initial_owner=not inherited, isolated=isolated)), flush=True)
     assert (shared / 'input').read_text() == 'retained'
 
 
@@ -109,3 +138,23 @@ def test_death_check_detects_missing_exitkill_and_cleans_up():
     assert result['pid'] != result['supervisor_pid']
     assert result['returncode'] == -9
     assert result['tracee_pipes_closed'] is False
+
+
+def _assert_supported_launcher_layouts(monkeypatch):
+    import auto_agents.verification_supervisor_checks as checks
+    source = Path(checks.__file__).with_name('verification_sandbox.py').resolve()
+    for flags in ([], ['-I'], ['-c'], ['-m'], ['-I', '-I'], ['-s'], ['-I', '-c']):
+        args = [sys.executable, *flags, str(source), '--metadata', '{}']
+        data = b'\0'.join(os.fsencode(arg) for arg in args) + b'\0'
+        def path(value):
+            if str(value) == '/proc/123/cmdline':
+                from types import SimpleNamespace
+                return SimpleNamespace(read_bytes=lambda: data)
+            return Path(value)
+        with monkeypatch.context() as patch:
+            patch.setattr(checks, 'Path', path)
+            if flags in ([], ['-I']):
+                assert checks._launcher_source_root(123) == source.parent
+            else:
+                with pytest.raises(ValueError, match='launcher mismatch'):
+                    checks._launcher_source_root(123)

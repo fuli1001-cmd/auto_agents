@@ -19,37 +19,82 @@ raise SystemExit(pytest.main(['-q', '-p', 'no:cacheprovider',
 @pytest.mark.parametrize('scope', ['observed_inputs', 'auto'])
 def test_nested_gate_tracing_keeps_private_and_shared_boundaries(tmp_path, scope):
     execute(tmp_path, f'''
-import json, os, subprocess, sys
+import sys
 from pathlib import Path
-from auto_agents.verification_input_trace import owner_identity
-from auto_agents.gate_execution import LocalGatePlanExecutor
-from auto_agents.gates import GateCommandMetadata
 sys.path.insert(0, {str(Path(__file__).parent)!r})
-from test_gate_execution import _project, _config, _git
-root=Path.cwd(); project=_project(root)
-(project/'input.txt').write_text('one')
-_git(project,'add','-A'); _git(project,'commit','-m','input')
-script="""import os, errno
-from pathlib import Path
+from test_verification_input_trace import _nested_environment_probe
+_nested_environment_probe({scope!r}, Path(SHARED))
+''')
+
+
+def _nested_environment_probe(scope, shared):
+    import os
+    import shlex
+    import sys
+    from pytest import MonkeyPatch
+    from auto_agents.verification_input_trace import owner_identity
+    from auto_agents.gate_execution import LocalGatePlanExecutor
+    from auto_agents.gates import GateCommandMetadata
+    from test_gate_execution import _project, _config, _git
+    root = Path.cwd(); project = _project(root)
+    (project / 'input.txt').write_text('one')
+    (project / 'src').mkdir()
+    (project / 'src/environment_choice.py').write_text("SOURCE = 'candidate'\n")
+    ambient = root / 'ambient-source'; ambient.mkdir()
+    (ambient / 'environment_choice.py').write_text("SOURCE = 'ambient'\n")
+    _git(project, 'add', '-A'); _git(project, 'commit', '-m', 'input and selected module')
+    before = shared.read_bytes(), shared.stat().st_mode
+    for retain in (False, True):
+        script = _environment_assertions(retain, ambient) + '''
+import errno
 assert Path('input.txt').read_text() == 'one'
 Path('private').write_text('own'); Path('private').chmod(0o750)
 fd=os.open('private',os.O_RDONLY); os.fchmod(fd,0o640); os.utime(fd,ns=(1,1)); os.close(fd)
-try: os.chmod({{SHARED!r}},0o777)
-except OSError as e: assert e.errno in (1,13,30)
-else: raise AssertionError('shared changed')
-""".replace('{{SHARED!r}}',repr(SHARED))
-import shlex
-command=shlex.join([sys.executable,'-c',script])
-config=_config(root); config.verification_policy_version=3
-with LocalGatePlanExecutor(project,config,{{command:GateCommandMetadata(cache_scope='source',result_cache_scope={scope!r})}}) as executor:
-    executor.sandbox_target=Path(SHARED).parent
-    result=executor.run(command,timeout_seconds=30,adaptive_timeout_enabled=False,idle_timeout_seconds=30)
-assert result.ok, result.stderr
-assert result.input_trace_complete, result
-assert owner_identity()['trace'] == 1
-from test_verification_input_trace import _runtime_socket_probe
-_runtime_socket_probe(root, project, Path(SHARED).parent)
-''')
+assert Path('private').stat().st_mode & 0o777 == 0o640
+assert Path('private').stat().st_mtime_ns == 1
+'''
+        script += 'shared = Path(' + repr(str(shared)) + ')\n' + '''
+before = shared.read_bytes(), shared.stat().st_mode
+fd = os.open(shared, os.O_RDONLY)
+try:
+    for action in (lambda: shared.write_bytes(b'bad'), lambda: shared.chmod(0o777),
+                   lambda: os.fchmod(fd,0o777), lambda: os.chmod('/proc/self/fd/'+str(fd),0o777)):
+        try: action()
+        except OSError as error: assert error.errno in (1,13,30), error
+        else: raise AssertionError('shared changed')
+finally: os.close(fd)
+assert (shared.read_bytes(), shared.stat().st_mode) == before
+'''
+        command = shlex.join([sys.executable, '-c', script])
+        config = _config(root); config.verification_policy_version = 3
+        with MonkeyPatch.context() as patch:
+            patch.setenv('GATE_AMBIENT_SENTINEL', 'retained-value')
+            patch.setenv('PYTHONPATH', str(ambient))
+            with LocalGatePlanExecutor(project, config, {command: GateCommandMetadata(
+                    cache_scope='source', result_cache_scope=scope)}) as executor:
+                executor.sandbox_target = shared.parent
+                executor.retain_execution_environment = retain
+                result = executor.run(command, timeout_seconds=30, adaptive_timeout_enabled=False, idle_timeout_seconds=30)
+            assert result.ok, result.stderr
+            assert result.input_trace_complete, result
+            assert owner_identity()['trace'] == 1
+            _runtime_socket_probe(root, project, shared.parent, retain=retain, ambient=ambient)
+        assert (shared.read_bytes(), shared.stat().st_mode) == before
+
+
+def _environment_assertions(retain, ambient):
+    # The final interpreter intentionally honors PYTHONPATH. -I belongs to the
+    # trusted bootstrap, not this test of which source is actually executed.
+    return '''import os
+from pathlib import Path
+import environment_choice
+assert environment_choice.SOURCE == EXPECTED_SOURCE
+assert os.environ.get('GATE_AMBIENT_SENTINEL') == EXPECTED_SENTINEL
+assert Path(environment_choice.__file__).resolve() == EXPECTED_FILE
+'''.replace('EXPECTED_SOURCE', repr('ambient' if retain else 'candidate')).replace(
+        'EXPECTED_SENTINEL', repr('retained-value' if retain else None)).replace(
+        'EXPECTED_FILE', ('Path(' + repr(str(ambient / 'environment_choice.py')) + ')' if retain else
+         "Path(os.environ['AUTO_AGENTS_GATE_SANDBOX_ROOT']) / 'src/environment_choice.py'"))
 
 
 def test_legacy_owner_executes_once_without_claiming_complete_trace(tmp_path):
@@ -192,6 +237,7 @@ def _custody_cache_probe(scope, attack=None, confined=True, recovery=False):
     root = Path.cwd()
     project = _project(root)
     (project / 'input.txt').write_text('one')
+    (project / 'stat-only.txt').write_text('one')
     (project / 'pyproject.toml').write_text('[build-system]\nrequires=[]\n')
     (project / 'fault').write_text('signal' if recovery else 'healthy')
     (project / 'unrelated').write_text('first')
@@ -199,6 +245,15 @@ def _custody_cache_probe(scope, attack=None, confined=True, recovery=False):
     program = '''import os, signal
 from pathlib import Path
 value = Path('input.txt').read_text()
+lookup = Path(os.environ['PROBE_LOOKUP_ROOT'])
+assert '..' in lookup.parts
+assert (lookup / 'stat-only.txt').stat().st_size == 3, 'stat-only dependency changed'
+try:
+    (lookup / 'missing.txt').stat()
+except FileNotFoundError:
+    pass
+else:
+    raise AssertionError('negative dependency changed')
 p = Path(os.environ['TMPDIR']) / 'private'; p.write_text('own'); p.chmod(0o750)
 fd = os.open(p, os.O_RDONLY); os.fchmod(fd,0o640); os.utime(fd,ns=(1,1)); os.close(fd)
 if Path('fault').read_text() == 'signal':
@@ -254,11 +309,15 @@ for fd in os.environ.get('PROBE_HANDLES','').split(','):
             # runtime trace is the original behavioral counterexample.
             env = dict(kwargs['env'])
             env.update(PROBE_TRACE=str(Path(env['AUTO_AGENTS_GATE_RUNTIME_ROOT']) / 'input-trace.log'),
-                       PROBE_OWNER=trace_module.owner_identity()['owner'])
+                       PROBE_OWNER=trace_module.owner_identity()['owner'],
+                       PROBE_LOOKUP_ROOT=str(Path(env['AUTO_AGENTS_GATE_SANDBOX_ROOT']) / '..' /
+                                             Path(env['AUTO_AGENTS_GATE_SANDBOX_ROOT']).name))
             kwargs['env'] = env
         return original_dispatch(*args, **kwargs)
     def launch(self, argv, env):
         return original_command(self, argv, dict(env, PROBE_TRACE=self.payload['trace']['path'],
+                                               PROBE_LOOKUP_ROOT=str(self.directory / '..' / os.path.relpath(
+                                                   self.payload['roots'][0], self.directory.parent)),
                                                PROBE_OWNER=self.payload['owner']['owner'],
                                                PROBE_PARENT=str(os.getpid()),
                                                PROBE_HANDLES=','.join(map(str,self.handles.values()))))
@@ -288,6 +347,14 @@ for fd in os.environ.get('PROBE_HANDLES','').split(','):
             assert len(dispatches) == 2
         elif not attack:
             assert first.input_trace_complete, first
+        if not attack:
+            baseline = healthy if recovery else first
+            assert 'stat-only.txt' in baseline.observed_inputs, baseline.observed_inputs
+            assert baseline.observed_inputs.get('!missing.txt') == 'missing', baseline.observed_inputs
+            payload = consumed[-1][0]
+            assert not any(key.lstrip('!@?') == payload['trace']['path']
+                           or key.lstrip('!@?') == payload['receipt']['path']
+                           for key in baseline.observed_inputs)
         count = len(dispatches)
         (project / 'unrelated').write_text('second')
         second = run()
@@ -300,6 +367,21 @@ for fd in os.environ.get('PROBE_HANDLES','').split(','):
             assert stream and not reason
             assert json.loads(stream.splitlines()[0])['owner'] == payload['owner']['owner']
             assert json.loads(stream.splitlines()[-1])['complete'] is True
+        if not attack:
+            for path, data, message in [('stat-only.txt', 'longer', 'stat-only dependency changed'),
+                                        ('missing.txt', 'present', 'negative dependency changed')]:
+                # Independently restore the healthy baseline for each inverse.
+                baseline = run()
+                assert baseline.ok, baseline
+                (project / path).write_text(data)
+                count = len(dispatches)
+                failed = run()
+                assert not failed.ok and not failed.cached and message in failed.stderr, failed
+                assert len(dispatches) == count + 1
+                if path == 'stat-only.txt':
+                    (project / path).write_text('one')
+                else:
+                    (project / path).unlink()
         (project / 'input.txt').write_text('two')
         count = len(dispatches)
         third = run()
@@ -498,7 +580,7 @@ assert (sibling/'retained').read_bytes()==before
 ''')
 
 
-def _runtime_socket_probe(root, project, shared):
+def _runtime_socket_probe(root, project, shared, *, retain=False, ambient=None):
     import shlex
     import sys
     from pytest import MonkeyPatch
@@ -516,7 +598,9 @@ with socket.socket(socket.AF_UNIX) as sock:
     sock.bind(str(path))
 path.unlink()
 """
-    command=shlex.join([sys.executable,'-I','-c',program])
+    if ambient is not None:
+        program = _environment_assertions(retain, ambient) + program
+    command=shlex.join([sys.executable,'-c',program])
     allocated=[]
     original_allocate,original_env=gates.short_job_runtime_root,gates.gate_environment
     def allocate(job, **kwargs):
@@ -532,6 +616,7 @@ path.unlink()
         with gates.LocalGatePlanExecutor(project,_config(root),
             {command:GateCommandMetadata(result_cache_scope='off')}) as executor:
             executor.sandbox_target=shared
+            executor.retain_execution_environment=retain
             result=executor.run(command,timeout_seconds=20,adaptive_timeout_enabled=False,idle_timeout_seconds=20)
         assert result.ok and len(allocated)==1, result
         assert not allocated[0].exists()
@@ -568,4 +653,34 @@ assert 'runtime_allocation' in result.stderr and 'socket_byte_budget' in result.
 assert (foreign/'retained').read_bytes()==b'foreign'
 assert (leaves[0]/'retained').read_bytes()==b'foreign'
 assert leaves[0].is_symlink()=={symlink!r}
+''')
+
+
+def test_custody_explicit_empty_environment_does_not_adopt_ambient(tmp_path):
+    execute(tmp_path, '''
+import json, os, subprocess, sys
+from pathlib import Path
+from pytest import MonkeyPatch
+from auto_agents.verification_input_trace import TraceCustody, RETAINED_ENV
+from auto_agents.verification_sandbox import verification_argv
+root=Path.cwd(); private=root/'empty-environment'; private.mkdir()
+program="""import os
+assert 'GATE_AMBIENT_SENTINEL' not in os.environ
+assert 'PYTHONPATH' not in os.environ
+assert 'HOME' not in os.environ
+assert os.environ['AUTO_AGENTS_VERIFICATION_SANDBOX']=='1'
+"""
+with MonkeyPatch.context() as patch:
+    patch.setenv('GATE_AMBIENT_SENTINEL','must-not-inherit')
+    patch.setenv('PYTHONPATH',str(root/'ambient-source'))
+    custody=TraceCustody(Path(os.environ['TMPDIR']),'empty-environment',[private])
+    try:
+        with verification_argv([sys.executable,'-c',program],private,Path(SHARED).parent,
+                               execution_environment={},trace_custody=custody) as argv:
+            # Transport is supplied to the bootstrap, never env -i or argv.
+            assert custody.environment not in ' '.join(argv)
+            process=subprocess.run(argv,cwd=private,env={RETAINED_ENV:custody.environment},
+                                   capture_output=True,text=True,timeout=20)
+            assert process.returncode==0,process.stdout+process.stderr
+    finally: custody.close()
 ''')

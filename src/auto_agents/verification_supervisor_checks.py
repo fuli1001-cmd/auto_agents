@@ -47,9 +47,10 @@ def _launcher_source_root(pid):
     # Resolve the producer through the live owner, never through a report path
     # or candidate imports. Production launchers always use an absolute path.
     command = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
-    if len(command) < 4 or command[2] != b'--metadata':
+    script_index = 2 if len(command) > 1 and command[1] == b'-I' else 1
+    if len(command) < script_index + 3 or command[script_index + 1] != b'--metadata':
         raise ValueError('standalone supervisor check launcher mismatch')
-    launcher = Path(os.fsdecode(command[1]))
+    launcher = Path(os.fsdecode(command[script_index]))
     if not launcher.is_absolute() or launcher.name != 'verification_sandbox.py':
         raise ValueError('standalone supervisor check launcher mismatch')
     return launcher.resolve(strict=True).parent

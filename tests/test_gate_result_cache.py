@@ -335,3 +335,52 @@ with MonkeyPatch.context() as patch:
 assert result.ok and not result.input_trace_complete and not result.observed_inputs, result
 assert result.input_trace_reason
 ''')
+
+
+@pytest.mark.parametrize('lookup', ['parent', 'denied', 'external_symlink', 'missing_component', 'file_component'])
+def test_bookkeeping_exclusion_preserves_traversal_dependencies(tmp_path, monkeypatch, lookup):
+    import json
+    import auto_agents.gate_execution as gates
+    from auto_agents.verification_input_trace import file_identity
+    project = tmp_path / 'project'; project.mkdir()
+    runtime = tmp_path / 'runtime'; runtime.mkdir()
+    evidence = tmp_path / 'evidence'; evidence.mkdir()
+    (project / 'control').write_text('control')
+    source = project / 'input'; source.write_text('real input')
+    missing = evidence / '..' / 'project' / 'missing'
+    path = evidence / '..' / 'project' / 'input'
+    code = '0'
+    if lookup == 'external_symlink':
+        (project / 'sub').mkdir()
+        (runtime / 'alias').symlink_to(project / 'sub', target_is_directory=True)
+        path = runtime / 'alias' / '..' / 'input'
+    elif lookup == 'missing_component':
+        path = evidence / 'absent' / '..' / '..' / 'project' / 'input'
+        code = '-1 ENOENT'
+    elif lookup == 'file_component':
+        (evidence / 'file').write_text('not a directory')
+        path = evidence / 'file' / '..' / '..' / 'project' / 'input'
+        code = '-1 ENOTDIR'
+    elif lookup == 'denied':
+        code = '-1 EACCES'
+        sha = gates._sha256
+        def protect(path):
+            assert path != source, 'denied file contents must not be read'
+            return sha(path)
+        monkeypatch.setattr(gates, '_sha256', protect)
+    trace = tmp_path / 'trace.log'
+    trace.write_text(''.join('0 stat(' + json.dumps(str(name)) + ') = ' + result + '\n'
+                            for name, result in [(project / 'control', '0'), (path, code),
+                                                 (missing, '-1 ENOENT'), (evidence, '0')]))
+    manifest, network = _observed_input_manifest(trace, project, {}, runtime_roots=[runtime],
+        bookkeeping={str(evidence): file_identity(evidence.stat())})
+    assert not network
+    if lookup in {'missing_component', 'file_component'}:
+        assert not manifest
+    else:
+        assert 'control' in manifest
+        assert ('?input' if lookup == 'denied' else 'input') in manifest
+        assert manifest.get('!missing') == 'missing'
+        assert '@' + str(evidence) not in manifest
+        if lookup == 'external_symlink':
+            assert manifest['@' + str(runtime / 'alias')] == 'link:' + str(project / 'sub')
