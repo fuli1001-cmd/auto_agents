@@ -287,3 +287,51 @@ def test_descriptor_stat_does_not_certify_symlink_dependencies(tmp_path):
         encoding="utf-8",
     )
     assert _observed_input_manifest(trace, tmp_path, {}) == ({}, False)
+
+
+@pytest.mark.parametrize('scope', ['observed_inputs', 'auto'])
+@pytest.mark.parametrize('fault', ['replacement', 'overwrite', 'missing_footer', 'owner_mismatch', 'replayed_job'])
+def test_gate_trace_evidence_requires_custody(tmp_path, scope, fault):
+    from auto_agents.verification_input_trace import TraceCustody
+    from test_verification_metadata import execute
+    execute(tmp_path, f'''
+import json, os, subprocess, sys
+from pathlib import Path
+from auto_agents.verification_input_trace import TraceCustody
+from auto_agents.gate_execution import LocalGatePlanExecutor
+from auto_agents.gates import GateCommandMetadata
+sys.path.insert(0, {str(Path(__file__).parent)!r})
+from test_gate_execution import _project, _config
+from pytest import MonkeyPatch
+root=Path.cwd(); project=_project(root)
+config=_config(root); config.verification_policy_version=3
+command='cat tracked.txt'
+original=TraceCustody.consume
+fault={fault!r}
+def consume(self, **kwargs):
+    path=Path(self.payload['trace']['path'])
+    if fault=='replacement':
+        data=path.read_bytes(); path.unlink(); path.write_bytes(data)
+    elif fault=='overwrite':
+        path.write_text('{{"complete":true}}\\n')
+    elif fault=='missing_footer':
+        path.write_text('\\n'.join(path.read_text().splitlines()[:-1])+'\\n')
+    elif fault=='owner_mismatch':
+        receipt=Path(self.payload['receipt']['path'])
+        data=json.loads(receipt.read_text()); data['owner']['owner']='foreign'
+        receipt.write_text(json.dumps(data))
+    else:
+        receipt=Path(self.payload['receipt']['path'])
+        data=json.loads(receipt.read_text()); data['job']='previous-job'
+        receipt.write_text(json.dumps(data))
+    result=original(self, **kwargs)
+    assert result[0] is None and result[1], result
+    assert original(self, **kwargs)[0] is None
+    return result
+with MonkeyPatch.context() as patch:
+    patch.setattr(TraceCustody,'consume',consume)
+    with LocalGatePlanExecutor(project,config,{{command:GateCommandMetadata(cache_scope='source',result_cache_scope={scope!r})}}) as executor:
+        result=executor.run(command,timeout_seconds=20,adaptive_timeout_enabled=False,idle_timeout_seconds=20)
+assert result.ok and not result.input_trace_complete and not result.observed_inputs, result
+assert result.input_trace_reason
+''')

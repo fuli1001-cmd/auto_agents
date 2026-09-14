@@ -43,43 +43,38 @@ GATE_SNAPSHOT_RUNTIME_PATHS = (
 
 
 def short_job_runtime_root(job_id: str, *, create: bool = True) -> Path:
-    """Return a short, user-owned per-job root suitable for Unix sockets."""
+    """Exclusively allocate one job leaf beneath the inherited reservation."""
+    from .verification_sandbox import runtime_reservation, ConfinementPreflightError
+    from .verification_input_trace import owner_identity, file_identity
     normalized = str(job_id).strip()
     if not normalized:
         raise ValueError("gate job id is required for a short runtime")
-    if os.name != "posix":
-        root = Path(tempfile.gettempdir()) / (
-            "auto-agents-gate-" + hashlib.sha256(normalized.encode()).hexdigest()[:12]
-        )
-    else:
-        reserved = os.environ.get('AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT')
-        base = Path(reserved) if reserved else Path("/tmp")
-        if not reserved and (not base.is_dir() or not os.access(base, os.W_OK | os.X_OK)):
-            base = Path(tempfile.gettempdir())
-        if reserved and (not base.is_absolute() or base.resolve() != base or not base.is_dir()):
-            raise RuntimeError('short_runtime_root_unavailable: invalid verification runtime reservation')
-        uid = os.getuid() if hasattr(os, "getuid") else 0
-        prefix = '' if reserved else f"aag-{uid}-"
-        root = base / (prefix + hashlib.sha256(normalized.encode()).hexdigest()[:12])
-        worst_socket = root / "t" / ("s" * 64)
-        if len(os.fsencode(str(worst_socket))) > _SHORT_RUNTIME_SOCKET_BUDGET:
-            raise RuntimeError(
-                "short_runtime_root_unavailable: no writable temporary root "
-                "satisfies the Unix socket path budget"
-            )
-    if create:
-        if root.is_symlink():
-            raise RuntimeError("short runtime root must not be a symbolic link")
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if os.name == "posix":
-            root.chmod(0o700)
-        (root / ".auto-agents-runtime.json").write_text(
-            json.dumps({"job_id": normalized}, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+    base = runtime_reservation() or Path('/tmp')
+    prefix = '' if os.environ.get('AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT') else f'aag-{os.getuid()}-'
+    root = base / (prefix + hashlib.sha256(normalized.encode()).hexdigest()[:12])
+    diagnostic = dict(phase='runtime_allocation', attempted_location=str(root), errno=None,
+                      socket_byte_budget=_SHORT_RUNTIME_SOCKET_BUDGET, owner=owner_identity(),
+                      launcher_protocol='inherited_metadata', supervisor_version=owner_identity()['metadata'])
+    try:
+        if len(os.fsencode(str(root / 't' / ('s' * 64)))) > _SHORT_RUNTIME_SOCKET_BUDGET:
+            raise OSError(36, 'Unix socket path budget exceeded')
+        if not create:
+            return root
+        # One exclusive attempt is sufficient for a fresh random job identity.
+        # A collision is ambiguity, never authorization to adopt an old leaf.
+        root.mkdir(mode=0o700)
+        value = root.lstat()
+        if root.is_symlink() or value.st_uid != os.getuid():
+            raise OSError(1, 'invalid runtime ownership')
+        marker = root / '.auto-agents-runtime.json'
+        with marker.open('x') as stream:
+            json.dump({'job_id': normalized, 'identity': file_identity(value)}, stream)
         from .artifact_runtime import track
-        track(root, "scratch")
-    return root
+        track(root, 'scratch')
+        return root
+    except OSError as error:
+        diagnostic.update(errno=error.errno, detail=str(error))
+        raise ConfinementPreflightError(diagnostic) from error
 
 
 def _run_git(
@@ -479,10 +474,11 @@ def _observed_input_manifest(
     sandbox: Path,
     dependency_links: Mapping[str, Path],
     runtime_roots: Sequence[Path] = (),
+    *, trace_text: Optional[str] = None,
 ) -> tuple[dict[str, str], bool]:
     sandbox = sandbox.resolve()
     try:
-        text = trace_path.read_text(encoding="utf-8", errors="replace")
+        text = trace_text if trace_text is not None else trace_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {}, False
     if text.lstrip().startswith('{'):
@@ -502,6 +498,8 @@ def _observed_input_manifest(
         network_observed = network_observed or "connect(" in text
         def denied(match):
             path = Path(json.loads(match.group(1)))
+            if any(path == root or root in path.parents for root in runtime_roots):
+                return ""
             try:
                 name = path.relative_to(sandbox).as_posix()
             except ValueError:
@@ -1409,6 +1407,8 @@ class LocalGatePlanExecutor:
         sandbox: Optional[Path] = None
         runtime_root: Optional[Path] = None
         kernel_context = None
+        trace_custody = None
+        runtime_identity = None
         cleanup = not bool(lane)
         try:
             metadata = self.metadata.get(command)
@@ -1459,9 +1459,12 @@ class LocalGatePlanExecutor:
                 if requested_profile == SHORT_RUNTIME_PROFILE
                 else self.worktree_root / self.plan_id / ".runtime" / job_id
             )
+            if requested_profile != SHORT_RUNTIME_PROFILE:
+                runtime_root.mkdir(mode=0o700, parents=True)
+            from .verification_input_trace import file_identity
+            runtime_identity = file_identity(runtime_root.lstat())
             if progress is not None:
                 progress("start", command, 0.0)
-            trace_path: Optional[Path] = None
             from .pytest_invocation import compile_ini_overrides
             compiled = compile_ini_overrides(command, sandbox,
                 {**os.environ, **self.environment_overrides, **dict(environment_overrides or {})})
@@ -1470,13 +1473,16 @@ class LocalGatePlanExecutor:
             if prepare_retained is not None:
                 compiled, retained_sources = prepare_retained(compiled, sandbox, runtime_root)
             traced_command = isolated_command(compiled)
-            if result_cache_scope in {"observed_inputs", "auto"}:
-                trace_path = runtime_root / "input-trace.log"
-                # Select the backend inside the final boundary, where the live
-                # owner is known. A nested strace cannot attach beneath it.
-                traced_command = shlex.join([sys.executable,
-                    str(Path(__file__).with_name('verification_input_trace.py')),
-                    str(trace_path), 'sh', '-lc', traced_command])
+            from .verification_input_trace import TraceCustody, owner_identity
+            trace_requested = result_cache_scope in {"observed_inputs", "auto"}
+            # Reusable tracing requires an existing negotiated owner. Plain
+            # legacy/strace execution can still populate candidate-key results.
+            if owner_identity()["metadata"]:
+                # The reservation's parent is ancestor-permitted but is never
+                # included in the final gate write boundary.
+                evidence_parent = Path(os.environ.get('TMPDIR', '/tmp'))
+                trace_custody = TraceCustody(evidence_parent, job_id, [sandbox, runtime_root],
+                    [*self.dependency_links.values(), *retained_sources], tracing=trace_requested)
             with (nullcontext() if named_lease is not None or named_lease_held else exclusive_resource_lease(
                 _metadata_list(metadata, "exclusive_resources"),
                 worker_id=self.worker_id,
@@ -1529,21 +1535,34 @@ class LocalGatePlanExecutor:
                         capture.protect(tuple(merged_overrides.values()))
                         if getattr(self, "sandbox_target", None) is not None:
                             from .verification_sandbox import verification_argv
-                            if getattr(self, 'retain_execution_environment', False):
+                            if trace_custody is not None:
+                                kernel_context = verification_argv(['sh', '-lc', traced_command], sandbox,
+                                    self.sandbox_target, read_roots=[*self.dependency_links.values(), *retained_sources],
+                                    write_roots=[runtime_root], execution_environment=env,
+                                    trace_custody=trace_custody)
+                            else:
                                 from functools import partial
-                                verification_argv = partial(verification_argv, execution_environment=env)
-                            # Runtime variables describe disposable directories
-                            # and private loopback ports, never operator secrets.
-                            safe = {key: value for key, value in env.items() if key.startswith("AUTO_AGENTS_GATE_")
-                                    or key in {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "npm_config_cache"}}
-                            argv = ["env", *[key + "=" + value for key, value in safe.items()], "sh", "-c", traced_command]
-                            kernel_context = verification_argv(argv, sandbox, self.sandbox_target,
-                                read_roots=[*self.dependency_links.values(), *retained_sources], write_roots=[runtime_root])
+                                if getattr(self, 'retain_execution_environment', False):
+                                    verification_argv = partial(verification_argv, execution_environment=env)
+                                safe = {key: value for key, value in env.items() if key.startswith("AUTO_AGENTS_GATE_")
+                                        or key in {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "npm_config_cache"}}
+                                argv = ["env", *[key + "=" + value for key, value in safe.items()], "sh", "-c", traced_command]
+                                kernel_context = verification_argv(argv, sandbox, self.sandbox_target,
+                                    read_roots=[*self.dependency_links.values(), *retained_sources], write_roots=[runtime_root])
                             traced_command = shlex.join(kernel_context.__enter__())
+                        elif trace_custody is not None:
+                            traced_command = shlex.join(trace_custody.command(['sh', '-lc', traced_command], env))
+                        dispatch_env = env
+                        if trace_custody is not None:
+                            dispatch_env = {key: value for key, value in os.environ.items() if key in {
+                                'PATH', 'LANG', 'AUTO_AGENTS_VERIFICATION_SANDBOX',
+                                'AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT', 'AUTO_AGENTS_VERIFICATION_RUNTIME_ID'}}
+                            from .verification_input_trace import RETAINED_ENV
+                            dispatch_env[RETAINED_ENV] = trace_custody.environment
                         process = run_supervised_shell_command(
                             traced_command,
                             cwd=sandbox,
-                            env=env,
+                            env=dispatch_env,
                             timeout_seconds=timeout_seconds,
                             adaptive_timeout_enabled=adaptive_timeout_enabled,
                             idle_timeout_seconds=idle_timeout_seconds,
@@ -1618,23 +1637,18 @@ class LocalGatePlanExecutor:
             )
             from .gates import reject_empty_vitest_selection
             reject_empty_vitest_selection(result, sandbox)
-            if trace_path is not None and result.ok:
-                observed_inputs, network_observed = _observed_input_manifest(
-                    trace_path,
-                    sandbox,
-                    self.dependency_links,
-                    runtime_roots=[runtime_root],
-                )
-                result.observed_inputs = observed_inputs
-                result.input_trace_complete = bool(observed_inputs)
-                result.network_observed = network_observed
+            if trace_custody is not None and trace_requested and result.ok:
+                trace_text, reason = trace_custody.consume(dispatched=True,
+                    cleanup_complete=not process.cleanup_incomplete and not process.termination_reason)
+                if trace_text is not None:
+                    observed_inputs, network_observed = _observed_input_manifest(
+                        Path(trace_custody.payload['trace']['path']), sandbox, self.dependency_links,
+                        runtime_roots=[runtime_root, trace_custody.directory], trace_text=trace_text)
+                    result.observed_inputs = observed_inputs
+                    result.input_trace_complete = bool(observed_inputs)
+                    result.network_observed = network_observed
                 if not result.input_trace_complete:
-                    result.input_trace_reason = 'input manifest could not be resolved'
-                    try:
-                        last = json.loads(trace_path.read_text().splitlines()[-1])
-                        result.input_trace_reason = ', '.join(last.get('reasons', [])) or last.get('reason') or result.input_trace_reason
-                    except (OSError, ValueError, IndexError):
-                        pass
+                    result.input_trace_reason = reason or 'input manifest could not be resolved'
             if progress is not None:
                 progress("finish", command, result.duration_seconds)
             self.record_timing(command, result)
@@ -1658,6 +1672,10 @@ class LocalGatePlanExecutor:
             self.record_timing(command, result)
             return result
         finally:
+            if trace_custody is not None:
+                closed = trace_custody.close()
+                if not closed and result is not None:
+                    result.cleanup_incomplete = True
             if kernel_context is not None:
                 kernel_context.__exit__(None, None, None)
             if resource_lease is not None:
@@ -1665,7 +1683,15 @@ class LocalGatePlanExecutor:
             if named_lease is not None:
                 named_lease.__exit__(None, None, None)
             if runtime_root is not None and not (result and result.cleanup_incomplete):
-                shutil.rmtree(runtime_root, ignore_errors=True)
+                from .verification_input_trace import file_identity
+                try:
+                    if file_identity(runtime_root.lstat()) == runtime_identity:
+                        shutil.rmtree(runtime_root)
+                    elif result is not None:
+                        result.cleanup_incomplete = True
+                except OSError:
+                    if result is not None:
+                        result.cleanup_incomplete = True
             if cleanup and sandbox is not None and not (result and result.cleanup_incomplete):
                 try:
                     _run_git(

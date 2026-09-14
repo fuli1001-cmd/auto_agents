@@ -47,6 +47,8 @@ with LocalGatePlanExecutor(project,config,{{command:GateCommandMetadata(cache_sc
 assert result.ok, result.stderr
 assert result.input_trace_complete, result
 assert owner_identity()['trace'] == 1
+from test_verification_input_trace import _runtime_socket_probe
+_runtime_socket_probe(root, project, Path(SHARED).parent)
 ''')
 
 
@@ -173,4 +175,397 @@ assert calls and len(calls)==1, calls
 assert any(row[:3]==('source',{scope!r},True) for row in observed),observed
 assert (root/'.auto-agents/state/task_plan.json').read_bytes()==before
 assert load_session_state(root,state.session_id).verification_binding['session_id']==state.session_id
+''')
+
+
+def _custody_cache_probe(scope, attack=None, confined=True, recovery=False):
+    import os
+    import shlex
+    import sys
+    from pytest import MonkeyPatch
+    from auto_agents.gate_execution import LocalGatePlanExecutor
+    import auto_agents.gate_execution as gates
+    import auto_agents.verification_input_trace as trace_module
+    TraceCustody = getattr(trace_module, "TraceCustody", None)
+    from auto_agents.gates import GateCommandMetadata
+    from test_gate_execution import _project, _config, _git
+    root = Path.cwd()
+    project = _project(root)
+    (project / 'input.txt').write_text('one')
+    (project / 'pyproject.toml').write_text('[build-system]\nrequires=[]\n')
+    (project / 'fault').write_text('signal' if recovery else 'healthy')
+    (project / 'unrelated').write_text('first')
+    _git(project, 'add', '-A'); _git(project, 'commit', '-m', 'trace custody inputs')
+    program = '''import os, signal
+from pathlib import Path
+value = Path('input.txt').read_text()
+p = Path(os.environ['TMPDIR']) / 'private'; p.write_text('own'); p.chmod(0o750)
+fd = os.open(p, os.O_RDONLY); os.fchmod(fd,0o640); os.utime(fd,ns=(1,1)); os.close(fd)
+if Path('fault').read_text() == 'signal':
+    pid = os.fork()
+    if pid == 0: os.kill(os.getpid(), signal.SIGKILL)
+    os.waitpid(pid, 0)
+'''
+    if attack:
+        program += '''
+import json
+trace = Path(os.environ['PROBE_TRACE'])
+fake = '\\n'.join(json.dumps(row) for row in [
+    {'format':'auto-agents-input-trace','version':1,'owner':os.environ['PROBE_OWNER']},
+    {'path':str(Path('pyproject.toml').resolve()),'result':0}, {'complete':True}])+'\\n'
+def denied(action):
+    try: action()
+    except OSError as error: assert error.errno in (1,2,9,13,30), error
+    else: raise AssertionError('writable trace evidence reached command')
+'''
+        if attack == 'replace':
+            program += "denied(trace.unlink)\ndenied(lambda: trace.write_text(fake))\n"
+        elif attack == 'overwrite':
+            program += "denied(lambda: trace.open('w'))\ndenied(lambda: os.open(trace,os.O_WRONLY|os.O_TRUNC))\n"
+            program += "denied(lambda: os.write(os.open(trace,os.O_WRONLY),fake.encode()))\n"
+        else:
+            program += '''
+for number in list(Path('/proc/self/fd').iterdir()):
+    try:
+        if number.resolve() == trace:
+            denied(lambda: os.write(int(number.name), fake.encode()))
+            denied(lambda: number.open('w'))
+    except FileNotFoundError: pass
+# No inherited writable handle or newly opened proc alias can name the trace.
+denied(lambda: Path('/proc/self/root'+str(trace)).open('w'))
+for fd in os.environ.get('PROBE_HANDLES','').split(','):
+    if fd:
+        denied(lambda: Path('/proc/'+os.environ['PROBE_PARENT']+'/fd/'+fd).open('w'))
+'''
+        program += "Path(os.environ['AUTO_AGENTS_GATE_RUNTIME_ROOT'],'input-trace.log').write_text(fake)\n"
+    program += "assert value == 'one', value\n"
+    command = shlex.join([sys.executable, '-I', '-c', program])
+    config = _config(root); config.verification_policy_version = 3
+    metadata = {command: GateCommandMetadata(cache_scope='source', result_cache_scope=scope)}
+    dispatches = []
+    consumed = []
+    original_dispatch = gates.run_supervised_shell_command
+    if TraceCustody is not None:
+        original_command, original_consume = TraceCustody.command, TraceCustody.consume
+    def dispatch(*args, **kwargs):
+        dispatches.append(args[0])
+        if TraceCustody is None:
+            # Keep the same attack executable on the base engine. Its writable
+            # runtime trace is the original behavioral counterexample.
+            env = dict(kwargs['env'])
+            env.update(PROBE_TRACE=str(Path(env['AUTO_AGENTS_GATE_RUNTIME_ROOT']) / 'input-trace.log'),
+                       PROBE_OWNER=trace_module.owner_identity()['owner'])
+            kwargs['env'] = env
+        return original_dispatch(*args, **kwargs)
+    def launch(self, argv, env):
+        return original_command(self, argv, dict(env, PROBE_TRACE=self.payload['trace']['path'],
+                                               PROBE_OWNER=self.payload['owner']['owner'],
+                                               PROBE_PARENT=str(os.getpid()),
+                                               PROBE_HANDLES=','.join(map(str,self.handles.values()))))
+    def consume(self, **kwargs):
+        result = original_consume(self, **kwargs)
+        consumed.append((self.payload.copy(), result))
+        return result
+    def run():
+        with LocalGatePlanExecutor(project, config, metadata) as executor:
+            if confined:
+                shared = root / 'shared-target'; shared.mkdir(exist_ok=True)
+                executor.sandbox_target = shared
+            return executor.run(command, timeout_seconds=20, adaptive_timeout_enabled=False, idle_timeout_seconds=20)
+    with MonkeyPatch.context() as patch:
+        patch.setattr(gates, 'run_supervised_shell_command', dispatch)
+        if TraceCustody is not None:
+            patch.setattr(TraceCustody, 'command', launch)
+            patch.setattr(TraceCustody, 'consume', consume)
+        first = run()
+        assert first.ok, first.stderr
+        assert len(dispatches) == 1
+        if recovery:
+            assert not first.input_trace_complete and 'signal' in first.input_trace_reason, first
+            (project / 'fault').write_text('healthy')
+            healthy = run()
+            assert healthy.ok and not healthy.cached and healthy.input_trace_complete, healthy
+            assert len(dispatches) == 2
+        elif not attack:
+            assert first.input_trace_complete, first
+        count = len(dispatches)
+        (project / 'unrelated').write_text('second')
+        second = run()
+        if not attack:
+            from auto_agents.verification_manifest import manifest_matches
+            mismatches = [key for key, value in first.observed_inputs.items() if not manifest_matches(project, {key: value})]
+            assert second.ok and second.cached and second.backend == 'result-cache-observed-inputs', (second.cache_miss_reason, mismatches)
+            assert len(dispatches) == count
+            payload, (stream, reason) = consumed[-1]
+            assert stream and not reason
+            assert json.loads(stream.splitlines()[0])['owner'] == payload['owner']['owner']
+            assert json.loads(stream.splitlines()[-1])['complete'] is True
+        (project / 'input.txt').write_text('two')
+        count = len(dispatches)
+        third = run()
+        assert not third.ok and not third.cached, third
+        assert len(dispatches) == count + 1
+
+
+@pytest.mark.parametrize('scope', ['observed_inputs', 'auto'])
+@pytest.mark.parametrize('attack', ['replace', 'overwrite', 'fd_alias'])
+@pytest.mark.parametrize('boundary', ['executor', 'confined'])
+def test_gate_trace_tampering_cannot_authorize_reuse(tmp_path, scope, attack, boundary):
+    execute(tmp_path, f'''
+import sys
+sys.path.insert(0, {str(Path(__file__).parent)!r})
+from test_verification_input_trace import _custody_cache_probe
+_custody_cache_probe({scope!r}, {attack!r}, {boundary == 'confined'!r})
+''')
+
+
+@pytest.mark.parametrize('scope', ['observed_inputs', 'auto'])
+def test_gate_trace_custody_preserves_valid_reuse(tmp_path, scope):
+    execute(tmp_path, f'''
+import sys
+sys.path.insert(0, {str(Path(__file__).parent)!r})
+from test_verification_input_trace import _custody_cache_probe
+_custody_cache_probe({scope!r})
+''')
+
+
+@pytest.mark.parametrize('scope', ['observed_inputs', 'auto'])
+def test_gate_trace_custody_recovers_after_incomplete_run(tmp_path, scope):
+    execute(tmp_path, f'''
+import sys
+sys.path.insert(0, {str(Path(__file__).parent)!r})
+from test_verification_input_trace import _custody_cache_probe
+_custody_cache_probe({scope!r}, recovery=True)
+''')
+
+
+def _public_custody_probe(scope, attack, switch):
+    import sys
+    from auto_agents.config import load_project_config, save_project_config, save_task_plan, save_session_state
+    from auto_agents.git_ops import head_ref
+    from auto_agents.models import AgentResult, VerificationStep
+    from auto_agents.orchestrator import Orchestrator
+    from auto_agents.session import Session
+    from auto_agents.verification_input_trace import TraceCustody
+    from auto_agents.gate_execution import LocalGatePlanExecutor
+    from test_session_verification_ownership import project, git
+    from pytest import MonkeyPatch
+    root, state = project(Path.cwd())
+    test = root / 'tests/test_owned.py'
+    test.write_text('''import os
+from pathlib import Path
+def test_owned():
+    value = Path('value.py').read_text()
+    path = Path(os.environ['PROBE_TRACE'])
+    try:
+        OPERATION
+    except OSError as error:
+        assert error.errno in (1, 13, 30)
+    else:
+        raise AssertionError('trace evidence is writable')
+    assert value == 'VALUE = 1\\n'
+'''.replace('OPERATION', 'path.unlink()' if attack == 'replace' else "path.write_text('{\"complete\":true}')"))
+    config = load_project_config(root)
+    config.gates.steps[0].cache_scope = 'source'
+    config.gates.steps[0].result_cache_scope = scope
+    save_project_config(root, config)
+    save_task_plan(root, {'tasks': [{'task_id': 'task-owned', 'title': 'Owned contract',
+        'requirement_ids': ['REQ-owned'], 'verification_refs': config.gates.steps[0].targets}],
+        'verification_steps': [config.gates.steps[0].to_dict()], 'verification_policy_version': 4})
+    git(root, 'add', '-A'); git(root, 'commit', '-m', 'retained tampering probe')
+    state.baseline_head_ref = state.baseline_git_ref = head_ref(root)
+    save_session_state(root, state)
+    if switch:
+        foreign = VerificationStep(runner='pytest', targets=['tests/test_future.py::test_future'],
+                                   proof_id='foreign.future', levels=['affected', 'release'])
+        config.gates.steps = [foreign]; save_project_config(root, config)
+        save_task_plan(root, {'tasks': [{'task_id': 'foreign', 'title': 'Pending', 'status': 'pending'}],
+                             'verification_steps': [foreign.to_dict()], 'verification_policy_version': 4})
+    (root / 'foreign.py').write_text('VALUE = 8\n'); git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 9\n'); (root / 'foreign.py').chmod(0o640)
+    (root / 'foreign-note.txt').write_bytes(b'foreign\x00untracked')
+    before = ((root / 'foreign.py').read_bytes(), (root / 'foreign.py').stat().st_mode,
+              git(root, 'show', ':foreign.py'), (root / '.auto-agents/state/task_plan.json').read_bytes(),
+              (root / 'foreign-note.txt').read_bytes())
+    writes, verifications, results = [], [], []
+    orch = Orchestrator(root, user_input_fn=lambda *a, **kw: 'y')
+    def writer(request):
+        writes.append(request.cwd)
+        (request.cwd / 'value.py').write_text('VALUE = ' + str(len(writes)) + '\n')
+        reply = 'Candidate\nCOMMIT_MESSAGE: Repair owned value'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    original_verify, original_run = Session._run_verify, LocalGatePlanExecutor.run
+    original_command = TraceCustody.command
+    def launch(self, command, environment):
+        return original_command(self, command, dict(environment, PROBE_TRACE=self.payload['trace']['path']))
+    def run(self, command, **kwargs):
+        result = original_run(self, command, **kwargs)
+        results.append(result)
+        return result
+    def verify(self, *args, **kwargs):
+        outcome = original_verify(self, *args, **kwargs)
+        verifications.append(outcome)
+        if len(verifications) == 1:
+            assert outcome['ok'], outcome
+            # A separate downstream rejection requests a second real writer
+            # candidate. Gate/cache evidence from the first remains authentic.
+            return dict(outcome, ok=False, reason='downstream fixture requests next candidate')
+        return dict(outcome, retry_fix=False)
+    with MonkeyPatch.context() as patch:
+        patch.setattr(orch, '_call_with_failover', writer)
+        patch.setattr(Session, '_run_verify', verify)
+        patch.setattr(LocalGatePlanExecutor, 'run', run)
+        patch.setattr(TraceCustody, 'command', launch)
+        result = Session(orch, mode='fix', auto_approve=True).resume(state.session_id)
+    assert len(writes) == 2 and len(verifications) == 2, (writes, verifications, result.to_dict())
+    assert verifications[0]['ok'] and not verifications[1]['ok']
+    assert result.status != 'completed'
+    assert any(not entry.ok and not entry.cached and 'VALUE = 2' in (entry.stdout + entry.stderr) for entry in results)
+    assert result.verification_binding['session_id'] == state.session_id
+    assert result.verification_binding['contract_fingerprint']
+    after = ((root / 'foreign.py').read_bytes(), (root / 'foreign.py').stat().st_mode,
+             git(root, 'show', ':foreign.py'), (root / '.auto-agents/state/task_plan.json').read_bytes(),
+             (root / 'foreign-note.txt').read_bytes())
+    assert after == before
+
+
+@pytest.mark.parametrize('scope', ['observed_inputs', 'auto'])
+@pytest.mark.parametrize('attack', ['replace', 'overwrite'])
+@pytest.mark.parametrize('state', ['retained', 'global_plan_switch'])
+def test_public_resume_trace_tampering_keeps_owned_authority(tmp_path, scope, attack, state):
+    execute(tmp_path, f'''
+import sys
+sys.path.insert(0, {str(Path(__file__).parent)!r})
+from test_verification_input_trace import _public_custody_probe
+_public_custody_probe({scope!r}, {attack!r}, {state == 'global_plan_switch'!r})
+''')
+
+
+@pytest.mark.parametrize('fault', ['denied_reservation', 'invalid_reservation', 'final_boundary'])
+def test_gate_custody_refusal_preserves_siblings_and_recovers(tmp_path, fault):
+    execute(tmp_path, f'''
+import ctypes, json, os, shlex, sys
+from pathlib import Path
+from pytest import MonkeyPatch
+from auto_agents.gate_execution import LocalGatePlanExecutor
+from auto_agents.verification_input_trace import TraceCustody
+from auto_agents.verification_sandbox import RUNTIME_ROOT_ENV, RUNTIME_ID_ENV
+from auto_agents.gates import GateCommandMetadata
+sys.path.insert(0,{str(Path(__file__).parent)!r})
+from test_gate_execution import _project,_config
+root=Path.cwd(); project=_project(root); config=_config(root); config.verification_policy_version=3
+import secrets
+pool=Path(os.environ[RUNTIME_ROOT_ENV]); sibling=pool/('sibling-'+secrets.token_hex(4)); sibling.mkdir()
+(sibling/'retained').write_text('foreign'); before=(sibling/'retained').read_bytes()
+command='printf actual-command-dispatched; test "$(cat tracked.txt)" = committed'
+metadata={{command:GateCommandMetadata(cache_scope='source',result_cache_scope='observed_inputs')}}
+original=TraceCustody.command
+# Deny only the final Landlock restriction in a real child. No project body is
+# allowed to execute if that kernel call fails; the inherited owner stays live.
+def denied_boundary(self, argv, environment):
+    original_argv=original(self,argv,environment)
+    code="""import ctypes,os,sys
+lib=ctypes.CDLL('libseccomp.so.2'); lib.seccomp_init.restype=ctypes.c_void_p
+lib.seccomp_rule_add.argtypes=[ctypes.c_void_p,ctypes.c_uint32,ctypes.c_int,ctypes.c_uint]
+lib.seccomp_load.argtypes=[ctypes.c_void_p]
+context=lib.seccomp_init(0x7fff0000)
+assert context and lib.seccomp_rule_add(context,0x50001,446,0)==0
+assert lib.seccomp_load(context)==0
+os.execv(sys.argv[1],sys.argv[1:])
+"""
+    return [sys.executable,'-I','-c',code,*original_argv]
+def run():
+    with LocalGatePlanExecutor(project,config,metadata) as executor:
+        return executor.run(command,timeout_seconds=20,adaptive_timeout_enabled=False,idle_timeout_seconds=20)
+with MonkeyPatch.context() as patch:
+    if {fault!r}=='denied_reservation':
+        patch.setenv(RUNTIME_ROOT_ENV,str(Path(SHARED).parent)); patch.delenv(RUNTIME_ID_ENV,raising=False)
+    elif {fault!r}=='invalid_reservation':
+        patch.setenv(RUNTIME_ID_ENV,'[0,0,0,0]')
+    else: patch.setattr(TraceCustody,'command',denied_boundary)
+    refused=run()
+assert not refused.ok and 'actual-command-dispatched' not in refused.stdout, refused
+if {fault!r}!='final_boundary':
+    assert 'runtime_allocation' in refused.stderr and 'socket_byte_budget' in refused.stderr, refused
+else: assert 'verification write boundary' in refused.stderr, refused
+assert (sibling/'retained').read_bytes()==before
+healthy=run(); assert healthy.ok and not healthy.cached and healthy.input_trace_complete, healthy
+(project/'unrelated').write_text('new')
+reused=run(); assert reused.ok and reused.cached, reused
+assert (sibling/'retained').read_bytes()==before
+''')
+
+
+def _runtime_socket_probe(root, project, shared):
+    import shlex
+    import sys
+    from pytest import MonkeyPatch
+    import auto_agents.gate_execution as gates
+    from auto_agents.gates import GateCommandMetadata
+    from test_gate_execution import _config
+    program = """import os,socket
+from pathlib import Path
+root=Path(os.environ['AUTO_AGENTS_GATE_RUNTIME_ROOT'])
+assert Path(os.environ['TMPDIR'])==root/'t'
+assert os.environ['TMP']==os.environ['TEMP']==os.environ['TMPDIR']
+path=root/'t'/('s'*64)
+assert len(os.fsencode(path))<=100
+with socket.socket(socket.AF_UNIX) as sock:
+    sock.bind(str(path))
+path.unlink()
+"""
+    command=shlex.join([sys.executable,'-I','-c',program])
+    allocated=[]
+    original_allocate,original_env=gates.short_job_runtime_root,gates.gate_environment
+    def allocate(job, **kwargs):
+        path=original_allocate(job,**kwargs); allocated.append(path); return path
+    def environment(*args, **kwargs):
+        assert kwargs['runtime_root']==allocated[-1]
+        result=original_env(*args, **kwargs)
+        assert result['AUTO_AGENTS_GATE_RUNTIME_ROOT']==str(allocated[-1])
+        return result
+    with MonkeyPatch.context() as patch:
+        patch.setattr(gates,'short_job_runtime_root',allocate)
+        patch.setattr(gates,'gate_environment',environment)
+        with gates.LocalGatePlanExecutor(project,_config(root),
+            {command:GateCommandMetadata(result_cache_scope='off')}) as executor:
+            executor.sandbox_target=shared
+            result=executor.run(command,timeout_seconds=20,adaptive_timeout_enabled=False,idle_timeout_seconds=20)
+        assert result.ok and len(allocated)==1, result
+        assert not allocated[0].exists()
+
+
+@pytest.mark.parametrize('symlink', [False, True])
+def test_runtime_allocation_rejects_foreign_job_leaves(tmp_path, symlink):
+    execute(tmp_path, f'''
+import os
+from pathlib import Path
+from pytest import MonkeyPatch
+import auto_agents.gate_execution as gates
+from auto_agents.gates import GateCommandMetadata
+import sys
+sys.path.insert(0,{str(Path(__file__).parent)!r})
+from test_gate_execution import _project,_config
+root=Path.cwd(); project=_project(root)
+foreign=root/'foreign-runtime'; foreign.mkdir(); (foreign/'retained').write_bytes(b'foreign')
+original=gates.short_job_runtime_root
+leaves=[]
+def conflict(job, **kwargs):
+    leaf=original(job,create=False); leaves.append(leaf)
+    if {symlink!r}: leaf.symlink_to(foreign,target_is_directory=True)
+    else:
+        leaf.mkdir(mode=0o700); (leaf/'retained').write_bytes(b'foreign')
+    return original(job,**kwargs)
+command='printf must-not-execute'
+with MonkeyPatch.context() as patch:
+    patch.setattr(gates,'short_job_runtime_root',conflict)
+    with gates.LocalGatePlanExecutor(project,_config(root),{{command:GateCommandMetadata(result_cache_scope='auto')}}) as executor:
+        result=executor.run(command,timeout_seconds=20,adaptive_timeout_enabled=False,idle_timeout_seconds=20)
+assert not result.ok and not result.stdout, result
+assert 'runtime_allocation' in result.stderr and 'socket_byte_budget' in result.stderr
+assert (foreign/'retained').read_bytes()==b'foreign'
+assert (leaves[0]/'retained').read_bytes()==b'foreign'
+assert leaves[0].is_symlink()=={symlink!r}
 ''')

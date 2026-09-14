@@ -23,6 +23,48 @@ from auto_agents import artifact_temp as tempfile
 RUNTIME_ROOT_ENV = 'AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT'
 SHM_ENV = 'AUTO_AGENTS_VERIFICATION_PRIVATE_SHM'
 
+RUNTIME_ID_ENV = 'AUTO_AGENTS_VERIFICATION_RUNTIME_ID'
+
+
+def runtime_reservation():
+    """Validate inherited allocation authority against its actual directory."""
+    import stat
+    from auto_agents.verification_input_trace import file_identity, owner_identity
+    raw = os.environ.get(RUNTIME_ROOT_ENV)
+    if not raw:
+        return None
+    diagnostic = dict(phase='runtime_allocation', attempted_location=raw, errno=None,
+                      socket_byte_budget=100, owner=owner_identity(), launcher_protocol='inherited_metadata',
+                      supervisor_version=owner_identity()['metadata'])
+    try:
+        path = Path(raw)
+        value = path.lstat()
+        if (not path.is_absolute() or path.resolve() != path or not stat.S_ISDIR(value.st_mode)
+                or value.st_uid != os.getuid() or value.st_mode & 0o077):
+            raise OSError(1, 'invalid verification runtime reservation')
+        expected = json.loads(os.environ.get(RUNTIME_ID_ENV, 'null'))
+        if expected is None and owner_identity()['metadata']:
+            # Older selected launchers propagate a reservation without an inode
+            # token. Prove allocation through the inherited boundary before
+            # sealing that identity for subsequent orchestration boundaries.
+            import secrets
+            probe = path / ('.reserve-' + secrets.token_hex(8))
+            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+            os.close(fd)
+            probe.unlink()
+            expected = file_identity(value)
+            if file_identity(path.lstat()) != expected:
+                raise OSError(1, 'runtime reservation changed during admission')
+        if (not path.is_absolute() or path.resolve() != path or not stat.S_ISDIR(value.st_mode)
+                or value.st_uid != os.getuid() or value.st_mode & 0o077
+                or expected != file_identity(value)):
+            raise OSError(1, 'invalid verification runtime reservation identity')
+        return path
+    except (OSError, ValueError) as error:
+        diagnostic.update(errno=getattr(error, 'errno', None), detail=str(error))
+        raise ConfinementPreflightError(diagnostic) from error
+
+
 
 _active_writer_boundary = ContextVar('auto_agents_writer_boundary', default=None)
 
@@ -222,7 +264,7 @@ def namespace_exec(payload):
 @contextmanager
 def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=(), path_entries=(),
                       python_paths=(), node_paths=(), library_paths=(), execution_environment=None,
-                      supervisor_checks=False):
+                      supervisor_checks=False, trace_custody=None):
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     from auto_agents.verification_input_trace import owner_identity
     owner = owner_identity()
@@ -258,8 +300,8 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         if private_shm or inherited_shm:
             entries['/dev/shm'] = 'write'
             writable.append('/dev/shm')
-        retained_runtime = os.environ.get(RUNTIME_ROOT_ENV) if owner['metadata'] else None
-        runtime_parent = Path(retained_runtime) if retained_runtime else scratch / 'g'
+        retained_runtime = runtime_reservation() if owner['metadata'] else None
+        runtime_parent = retained_runtime if retained_runtime else scratch / 'g'
         if (not runtime_parent.is_absolute() or runtime_parent.is_symlink()
                 or runtime_parent.resolve() != runtime_parent):
             raise RuntimeError('verification runtime reservation must be an absolute private directory')
@@ -322,13 +364,17 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
                              "PYTHONDONTWRITEBYTECODE=1",
                              "AUTO_AGENTS_TEST=True", "TESTING=True", "AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1",
                              "AUTO_AGENTS_VERIFICATION_SANDBOX=1"]
+        from auto_agents.verification_input_trace import file_identity
+        runtime_identity = json.dumps(file_identity(runtime_parent.lstat()))
         clean_environment.append(RUNTIME_ROOT_ENV + '=' + str(runtime_parent))
+        clean_environment.append(RUNTIME_ID_ENV + '=' + runtime_identity)
         if execution_environment is not None:
             # Project verification retains operator inputs, activation and networking.
             # Only sandbox bookkeeping goes to a fresh private home.
             clean_environment = ['env', 'CODEX_HOME=' + str(codex_home),
                                  'AUTO_AGENTS_VERIFICATION_SANDBOX=1',
-                                 RUNTIME_ROOT_ENV + '=' + str(runtime_parent)]
+                                 RUNTIME_ROOT_ENV + '=' + str(runtime_parent),
+                                 RUNTIME_ID_ENV + '=' + runtime_identity]
         if node_paths:
             clean_environment.append("NODE_PATH=" + os.pathsep.join(map(str, node_paths)))
         if library_paths:
@@ -338,13 +384,22 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
         from auto_agents.verification_supervisor_checks import REPORT_ENV
         if REPORT_ENV in os.environ:
             clean_environment.append(REPORT_ENV + '=' + os.environ[REPORT_ENV])
+        if trace_custody is not None:
+            # The common reservation and evidence directory are provisional
+            # bootstrap authority only. Gate descendants receive the job leaf.
+            trace_custody.payload['roots'] = [str(root), str(scratch), *map(str, write_roots)]
+            trace_custody.payload['readonly'] = metadata_readonly
+            writable.append(str(trace_custody.directory))
+            argv = trace_custody.command(argv, execution_environment or dict(os.environ))
         if nested:
             launcher = Path(__file__).resolve()
-            prefix = [sys.executable, str(launcher), "--metadata", json.dumps({
+            prefix = [sys.executable, "-I", str(launcher), "--metadata", json.dumps({
                 'roots': writable, 'readonly': metadata_readonly,
                 'supervisor_checks': supervisor_checks}), *clean_environment]
             _check_metadata_launch(lambda command: [*prefix, *command], sys.executable,
-                                   scratch, protected, cwd=root, env=execution_environment,
+                                   scratch, protected, cwd=root,
+                                   env=({key: os.environ[key] for key in ('PATH', 'LANG') if key in os.environ}
+                                        if trace_custody is not None else execution_environment),
                                    loopback=execution_environment is None)
             yield [*prefix, *argv]
             return

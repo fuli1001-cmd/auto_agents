@@ -17,6 +17,7 @@ import sys
 
 TRACE_REQUEST = 0x41415452
 TRACE_PROTOCOL = 1
+RETAINED_ENV = 'AUTO_AGENTS_GATE_RETAINED_ENV'
 
 
 def owner_identity():
@@ -223,10 +224,19 @@ class TraceSessions:
                 row.emit({'path': path, 'result': result})
 
 
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate evidence field')
+        result[key] = value
+    return result
+
+
 def resolved_trace(text):
     """Adapt a complete owner stream to the existing conservative manifest parser."""
     try:
-        rows = [json.loads(line) for line in text.splitlines()]
+        rows = [json.loads(line, object_pairs_hook=_unique_object) for line in text.splitlines()]
         if (len(rows) < 2 or rows[0].get('format') != 'auto-agents-input-trace'
                 or rows[0].get('version') != TRACE_PROTOCOL or not rows[0].get('owner')
                 or rows[-1].get('complete') is not True):
@@ -244,6 +254,151 @@ def resolved_trace(text):
         return '\n'.join(result)
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+
+def file_identity(value):
+    return [value.st_dev, value.st_ino, value.st_uid, stat.S_IFMT(value.st_mode)]
+
+
+class TraceCustody:
+    """Parent-owned evidence; no writable descriptor is inherited by a gate."""
+    def __init__(self, parent, job, roots, readonly=(), *, tracing=True):
+        from auto_agents import artifact_temp as tempfile
+        parent = Path(parent).absolute()
+        if parent.resolve(strict=True) != parent:
+            raise ValueError('trace evidence parent must not contain symlinks')
+        self.directory = Path(tempfile.mkdtemp(prefix='e-', dir=parent))
+        self.directory_identity = file_identity(self.directory.lstat())
+        self.handles = {}
+        self.consumed = False
+        self.payload = {'job': job, 'owner': owner_identity(), 'tracing': tracing,
+                        'roots': list(map(str, roots)), 'readonly': list(map(str, readonly))}
+        try:
+            for name in ('trace', 'receipt'):
+                path = self.directory / name
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC, 0o600)
+                os.close(fd)
+                handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                self.handles[name] = handle
+                self.payload[name] = {'path': str(path), 'identity': file_identity(os.fstat(handle))}
+            if any(self.directory.is_relative_to(Path(root)) for root in roots):
+                raise ValueError('trace evidence overlaps final write roots')
+        except BaseException:
+            self.close()
+            raise
+
+    def command(self, command, environment):
+        if any(self.directory.is_relative_to(Path(root).resolve()) for root in self.payload['roots']):
+            raise ValueError('trace evidence overlaps final write roots')
+        self.payload['root_identities'] = {root: file_identity(Path(root).lstat())
+                                           for root in self.payload['roots']}
+        self.environment = json.dumps(environment, sort_keys=True)
+        self.payload['environment_digest'] = hashlib.sha256(self.environment.encode()).hexdigest()
+        payload = dict(self.payload, command=command)
+        return [sys.executable, '-I', str(Path(__file__).resolve()), '--custody', json.dumps(payload)]
+
+    def consume(self, *, dispatched, cleanup_complete):
+        if self.consumed:
+            return None, 'trace evidence already consumed'
+        self.consumed = True
+        try:
+            if not dispatched or not cleanup_complete:
+                raise ValueError('trace dispatch or cleanup incomplete')
+            if file_identity(self.directory.lstat()) != self.directory_identity:
+                raise ValueError('trace directory identity changed')
+            streams = {}
+            for name, fd in self.handles.items():
+                expected = self.payload[name]
+                current = os.fstat(fd)
+                if (file_identity(current) != expected['identity'] or current.st_nlink != 1
+                        or file_identity(Path(expected['path']).lstat()) != expected['identity']):
+                    raise ValueError('trace evidence identity changed')
+                with os.fdopen(os.dup(fd), 'r', encoding='utf-8') as stream:
+                    streams[name] = stream.read()
+            receipt = json.loads(streams['receipt'], object_pairs_hook=_unique_object)
+            if receipt != dict(self.payload, boundary=True, registered=True):
+                raise ValueError('trace bootstrap receipt mismatch')
+            if owner_identity() != self.payload['owner']:
+                raise ValueError('trace owner changed')
+            rows = [json.loads(line) for line in streams['trace'].splitlines()]
+            if not rows or rows[0].get('owner') != self.payload['owner']['owner']:
+                raise ValueError('trace owner mismatch')
+            if resolved_trace(streams['trace']) is None:
+                raise ValueError(', '.join(rows[-1].get('reasons', [])) or 'incomplete trace')
+            return streams['trace'], ''
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            return None, str(error)
+
+    def close(self):
+        for fd in self.handles.values():
+            os.close(fd)
+        self.handles.clear()
+        try:
+            if file_identity(self.directory.lstat()) != self.directory_identity:
+                return False
+            shutil.rmtree(self.directory)
+            return True
+        except OSError:
+            return False
+
+
+def custody_exec(payload):
+    """Trusted bootstrap: Landlock, registration, metadata narrowing, then exec."""
+    from auto_agents.verification_sandbox import restrict_nested_writes, ConfinementPreflightError
+    from auto_agents.verification_metadata import POLICY_REQUEST
+    encoded_environment = os.environ.get(RETAINED_ENV, '')
+    if hashlib.sha256(encoded_environment.encode()).hexdigest() != payload['environment_digest']:
+        raise RuntimeError('retained command environment mismatch')
+    environment = json.loads(encoded_environment)
+    owner = owner_identity()
+    if owner != payload['owner']:
+        raise RuntimeError('trace bootstrap owner mismatch')
+    handles = {}
+    phase = 'final_root_identity'
+    try:
+        for root, expected in payload['root_identities'].items():
+            value = Path(root).lstat()
+            if (file_identity(value) != expected or not stat.S_ISDIR(value.st_mode)
+                    or Path(root).resolve() != Path(root)):
+                raise RuntimeError('final write root identity mismatch')
+        for name in ('trace', 'receipt'):
+            expected = payload[name]
+            fd = os.open(expected['path'], os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            handles[name] = fd
+            value = os.fstat(fd)
+            if (file_identity(value) != expected['identity'] or not stat.S_ISREG(value.st_mode)
+                    or value.st_nlink != 1 or value.st_size):
+                raise RuntimeError('trace bootstrap evidence identity mismatch')
+        # All Landlock syscalls precede trace registration. The existing owner
+        # intentionally classifies unrecognized syscalls as incomplete evidence.
+        phase = 'final_boundary'
+        restrict_nested_writes(payload['roots'])
+        libc = ctypes.CDLL(None, use_errno=True)
+        phase = 'trace_registration'
+        if owner['trace'] and payload['tracing']:
+            if libc.prctl(TRACE_REQUEST, handles['trace'], TRACE_PROTOCOL, 0, 0):
+                raise OSError(ctypes.get_errno(), 'input trace registration failed')
+        os.close(handles.pop('trace'))
+        phase = 'final_metadata'
+        if owner['metadata']:
+            policy = json.dumps({key: payload[key] for key in ('roots', 'readonly')}).encode()
+            if libc.prctl(POLICY_REQUEST, ctypes.c_char_p(policy), len(policy), 0, 0):
+                raise OSError(ctypes.get_errno(), 'final metadata boundary refused')
+        phase = 'trace_receipt'
+        receipt = {key: value for key, value in payload.items() if key != 'command'}
+        receipt.update(boundary=True, registered=bool(owner['trace'] and payload['tracing']))
+        with os.fdopen(handles.pop('receipt'), 'w') as stream:
+            stream.write(json.dumps(receipt))
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ConfinementPreflightError(dict(phase=phase, job=payload['job'],
+            launcher_protocol='inherited_metadata', supervisor_version=owner['metadata'],
+            owner=owner, errno=getattr(error, 'errno', None), detail=str(error))) from error
+    finally:
+        for fd in handles.values():
+            os.close(fd)
+    # No project import, retained environment or shell startup precedes custody.
+    os.execvpe(payload['command'][0], payload['command'], environment)
 
 
 def check_input_tracing(root, python, real_project):
@@ -271,6 +426,13 @@ def check_input_tracing(root, python, real_project):
 
 
 def main():
+    if sys.argv[1] == '--custody':
+        try:
+            custody_exec(json.loads(sys.argv[2]))
+        except (OSError, RuntimeError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            raise SystemExit(125)
+        return
     destination, command = Path(sys.argv[1]), sys.argv[2:]
     destination.parent.mkdir(parents=True, exist_ok=True)
     owner = owner_identity()
