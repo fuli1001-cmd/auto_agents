@@ -129,6 +129,7 @@ def test_new_work_and_missing_evidence_keep_the_full_repair_path(completed, chan
 
 def test_source_change_after_preparation_cannot_reuse_the_delta_approval(completed):
     runner, state, group, _, _ = completed
+    runner._full_suite_environment_fingerprint = lambda: ('changed execution context',)
     prepare_component(runner, runner.repo_root)
     (runner.repo_root / 'tests/test_a.py').write_text('def test_a(): assert False\n')
     with patch.object(runner.target_orchestrator, '_call_with_failover', side_effect=AssertionError('stale context reviewed')):
@@ -199,6 +200,7 @@ def test_diagnosed_current_failure_does_not_get_an_old_no_writer_plan(completed)
 
 def test_delta_rejection_reaches_full_review_with_its_evidence(completed):
     runner, state, _, _, _ = completed
+    runner._full_suite_environment_fingerprint = lambda: ('changed execution context',)
     stages = []
     def provider(request):
         stages.append(request.stage)
@@ -219,6 +221,7 @@ def test_delta_rejection_reaches_full_review_with_its_evidence(completed):
 
 def test_completed_review_does_not_rebuild_large_unchanged_history(completed, monkeypatch):
     runner, state, _, _, _ = completed
+    runner._full_suite_environment_fingerprint = lambda: ('changed execution context',)
     state.repair_design['historical_detail'] = 'historical unrelated details ' * 50000
     monkeypatch.setattr(state, 'prompt_context', lambda: (_ for _ in ()).throw(AssertionError('history rebuilt')))
     calls = []
@@ -244,6 +247,7 @@ def test_a_proposed_plan_cannot_inject_completed_revalidation_authority(setup):
 
 def test_deterministic_revalidation_failure_never_dispatches_a_writer(completed, tmp_path, monkeypatch):
     runner, state, group, _, _ = completed
+    runner._full_suite_environment_fingerprint = lambda: ('changed execution context',)
     runner._continuous_workspace = tmp_path / 'continued'
     state.best_search_ref = git(runner.repo_root, 'rev-parse', 'HEAD')
     monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')

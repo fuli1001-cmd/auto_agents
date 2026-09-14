@@ -182,7 +182,7 @@ def _invoke(runner, workspace, stage, instruction, context):
                                'unchanged history need not be reconstructed.'}, ensure_ascii=False)
     from .repair_response_schema import schema_for
     request = AgentRequest(stage=stage, purpose='self_repair_review', effort=runner._review_effort(),
-        response_schema=schema_for(stage),
+        response_schema=schema_for(stage, context),
         cwd=workspace, output_path=directory / 'output.json', sandbox_mode='read-only',
         record_execution_incidents=False,
         progress_lease_seconds=getattr(runner._autonomy_config(), 'candidate_review_timeout_seconds', 600),
@@ -260,11 +260,13 @@ def _retained_scope(runner, receipt, finding):
         request, context, result = [json.loads(path.read_text()) for path in paths]
         decisions = [row for row in result.get('decisions', []) if row.get('finding_id') == finding['finding_id']]
         return (request.get('stage') in {'self_repair_scope_review', 'self_repair_scope_format',
-                                       'self_repair_component_delta_review', 'self_repair_plan_review'} and len(decisions) == 1
+                                       'self_repair_component_delta_review', 'self_repair_component_delta_format',
+                                       'self_repair_plan_review'} and len(decisions) == 1
                 and (request.get('stage') != 'self_repair_plan_review'
                      or (request.get('review_binding', {}).get('input') == digest(context)
                          and request.get('scope_result_digest') == digest(result)))
-                and (request.get('stage') != 'self_repair_component_delta_review' or result.get('decision') == 'APPROVE')
+                and (request.get('stage') not in {'self_repair_component_delta_review', 'self_repair_component_delta_format'}
+                     or result.get('decision') == 'APPROVE')
                 and request.get('request_id') == identity
                 and all(decisions[0].get(key) == receipt.get(key) for key in (
                     'verdict', 'obligation_id', 'trigger', 'consequence', 'support_basis', 'evidence', 'reason', 'disproof'))

@@ -79,6 +79,27 @@ def context(runner, workspace):
     return digest(context_parts(runner, workspace))
 
 
+def observe(runner, workspace):
+    """Use one context observation for the receipt and its execution binding."""
+    parts = context_parts(runner, workspace)
+    return {'policy': policy(), 'context': digest(parts), 'source': snapshot(workspace),
+            'context_components': {key: digest(value) for key, value in parts.items()},
+            'execution_binding': execution_binding(runner, workspace, parts=parts)}
+
+
+def binding_changes(proof, observed):
+    before, after = proof.get('execution_binding', {}), observed.get('execution_binding', {})
+    return {'policy': proof.get('policy') != observed.get('policy'),
+            'context': proof.get('context') != observed.get('context'),
+            'execution_policy': before.get('policy') != after.get('policy'),
+            **{key: sorted(name for name in set(before.get(key, {})) | set(after.get(key, {}))
+                           if before.get(key, {}).get(name) != after.get(key, {}).get(name))
+               for key in ('files', 'components')},
+            'reviewer': (proof.get('context_components', {}).get('reviewer') !=
+                         observed.get('context_components', {}).get('reviewer'))
+                        if proof.get('context_components') else None}
+
+
 def context_parts(runner, workspace):
     from .planning_capabilities import planning_capabilities
     from .repository_guard import capture_repository_guard
@@ -233,8 +254,10 @@ def seal(runner, workspace, review, verification):
         targets = pytest_targets(command, prose=False)
         return [node for node in verification.payload.get('executed_tests', [])
                 if any(node == target or node.startswith(target + '[') or node.startswith(target + '::') for target in targets)]
+    observed_context = observe(runner, workspace)
     proof = {'version': VERSION, 'component': group['group_id'], 'definition': definition(canonical),
-        'contract': runner._experiment.contract_fingerprint, 'context': context(runner, workspace), 'policy': policy(),
+        'contract': runner._experiment.contract_fingerprint,
+        **{key: observed_context[key] for key in ('context', 'context_components', 'policy', 'execution_binding')},
         'source': before, 'candidate_id': runner._candidate_id, 'plan': deepcopy(group),
         'epoch': epoch(runner, workspace), 'source_identity': source,
         'plan_revision': _evidence_memory(runner, canonical).get('latest_revision'),
@@ -248,7 +271,6 @@ def seal(runner, workspace, review, verification):
                     'inputs': next((row for row in verification.payload.get('completion_inputs', []) if row['command'] == command), {}),
                     'dependencies': dependency_manifest(workspace, _paths([command]))}
                    for command in commands]}
-    proof['execution_binding'] = execution_binding(runner, workspace)
     if snapshot(workspace) != before:
         return None
     reference = save_record(runner, 'component_completion', proof)
@@ -325,9 +347,13 @@ def assess(runner, workspace, group, *, observations=None):
             return {**result, 'state': 'pending', 'reason': 'new evidence affects a component dependency: ' + finding.finding_id}
         if (not unchanged or finding.status == 'reopened') and not proof.get('dependencies', {}).get('complete'):
             return {**result, 'reason': 'new evidence has unproved dependency independence: ' + finding.finding_id}
-    observations = observations or {'policy': policy(), 'context': context(runner, workspace), 'source': snapshot(workspace)}
+    observations = observations or observe(runner, workspace)
+    if observations.get('error'):
+        return {**result, 'reason': 'completion context could not be observed',
+                'observation_error': observations['error']}
     changed_context = proof.get('policy') != observations['policy'] or proof.get('context') != observations['context']
     if changed_context:
+        result['binding_changes'] = binding_changes(proof, observations)
         if not proof.get('execution_binding'):
             return {**result, 'reason': 'verification policy or runtime context changed'}
         binding = observations.get('execution_binding') or execution_binding(runner, workspace)
@@ -382,11 +408,9 @@ def refresh(runner, workspace):
     observations = None
     if any(memory.get('completion') for memory in _memories(state)):
         try:
-            parts = context_parts(runner, workspace)
-            observations = {'policy': policy(), 'context': digest(parts), 'source': snapshot(workspace),
-                            'execution_binding': execution_binding(runner, workspace, parts=parts)}
-        except (OSError, RuntimeError, ValueError, TypeError):
-            observations = {'policy': '', 'context': '', 'source': ''}
+            observations = observe(runner, workspace)
+        except (OSError, RuntimeError, ValueError, TypeError) as error:
+            observations = {'source': '', 'error': type(error).__name__ + ': ' + str(error)[:400]}
     for group in state.finding_groups:
         memory = _memory(runner, group)
         if not memory.get('completion') and group.get('status') != 'needs_revalidation':
