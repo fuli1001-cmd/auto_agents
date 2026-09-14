@@ -52,11 +52,14 @@ def short_job_runtime_root(job_id: str, *, create: bool = True) -> Path:
             "auto-agents-gate-" + hashlib.sha256(normalized.encode()).hexdigest()[:12]
         )
     else:
-        base = Path("/tmp")
-        if not base.is_dir() or not os.access(base, os.W_OK | os.X_OK):
+        reserved = os.environ.get('AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT')
+        base = Path(reserved) if reserved else Path("/tmp")
+        if not reserved and (not base.is_dir() or not os.access(base, os.W_OK | os.X_OK)):
             base = Path(tempfile.gettempdir())
+        if reserved and (not base.is_absolute() or base.resolve() != base or not base.is_dir()):
+            raise RuntimeError('short_runtime_root_unavailable: invalid verification runtime reservation')
         uid = os.getuid() if hasattr(os, "getuid") else 0
-        prefix = f"aag-{uid}-"
+        prefix = '' if reserved else f"aag-{uid}-"
         root = base / (prefix + hashlib.sha256(normalized.encode()).hexdigest()[:12])
         worst_socket = root / "t" / ("s" * 64)
         if len(os.fsencode(str(worst_socket))) > _SHORT_RUNTIME_SOCKET_BUDGET:
@@ -853,7 +856,7 @@ def gate_environment(
     if runtime_profile not in {SHORT_RUNTIME_PROFILE, LEGACY_RUNTIME_PROFILE}:
         raise ValueError(f"unsupported gate runtime profile: {runtime_profile}")
     if runtime_profile == SHORT_RUNTIME_PROFILE:
-        runtime_root = short_job_runtime_root(job_id)
+        runtime_root = runtime_root or short_job_runtime_root(job_id)
     else:
         runtime_root = runtime_root or (sandbox / ".auto-agents-gate-runtime")
     temp_root = runtime_root / "t"

@@ -11,9 +11,11 @@ MAX_INTERRUPTION_RECOVERIES = 2
 
 def _binding(context):
     from .repair_planning import finding_key
+    from .repair_capability_checks import capability_semantics
     return digest({**{key: context.get(key) for key in (
         'source', 'source_commit', 'environment', 'engine_base', 'contract_fingerprint',
-        'runtime_capabilities', 'probe_results')},
+        'probe_results')},
+        'runtime_capabilities': capability_semantics(context.get('runtime_capabilities')),
         'findings': [finding_key(f) for f in context['findings']]})
 
 

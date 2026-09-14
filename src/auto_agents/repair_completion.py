@@ -4,6 +4,7 @@ Only the controller seals a successful reviewed component. Opaque checks require
 their original execution context; unknown closures never imply independence.
 """
 from copy import deepcopy
+from collections import Counter
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 import os
@@ -85,8 +86,8 @@ def context_parts(runner, workspace):
     settings = _plain(execution) if execution else {}
     production = None
     if getattr(runner, '_real_project_root', None) is not None:
-        from .repair_capability_checks import production_capabilities
-        production = production_capabilities(runner, workspace)
+        from .repair_capability_checks import production_capabilities, capability_semantics
+        production = capability_semantics(production_capabilities(runner, workspace))
     return {'environment': runner._full_suite_environment_fingerprint(), 'reviewer': reviewer,
         'settings': settings, 'capabilities': planning_capabilities(runner),
         'production_capabilities': production,
@@ -217,7 +218,9 @@ def seal(runner, workspace, review, verification):
         return None  # A boolean/model statement alone is not a completion receipt.
     commands = schedule.get('plan', {}).get('commands', [])
     observed = verification.payload.get('source_commands', [])
-    if (not commands or set(commands) != set(observed) or len(observed) != len(verification.returncodes)
+    from .repair_schedule import pytest_parts
+    if (not commands or Counter(commands) != Counter(observed) or len(observed) != len(verification.returncodes)
+            or any(not pytest_parts(command) for command in commands) and commands != observed
             or any(verification.returncodes) or any(verification.termination_reasons)):
         return None
     from .repair_test_refs import pytest_targets

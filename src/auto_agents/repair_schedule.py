@@ -1,6 +1,7 @@
 """Prerequisite-aware verification selection without deleting obligations."""
 import shlex
 import math
+from collections import defaultdict, deque
 
 from .repair_test_refs import migrate_review_commands, pytest_targets
 
@@ -43,7 +44,7 @@ def quick_verification_plan(experiment, active):
     required = set(active.get('finding_ids', []))
     bindings = active.get('finding_scenario_bindings', {})
     from .repair_memory import component_key
-    timings = experiment.component_memory.get(component_key(active), {}).get('check_timings', {})
+    timings = getattr(experiment, 'component_memory', {}).get(component_key(active), {}).get('check_timings', {})
     def cost(row):
         old = timings.get(row.get('quick_check') or row['check'], {})
         return (not bool(old), old.get('seconds', 0), old.get('collected_cases') or 0)
@@ -90,6 +91,11 @@ def quick_verification_plan(experiment, active):
             selected.append(row.get('quick_check') or row['check'])
     if not selected:
         selected = list(active.get('quick_checks', []))
+    if any(not pytest_parts(command) for command in allowed):
+        # Selection must not detach a test from its shell preparation, including
+        # a second execution of the same test after another preparation step.
+        selected = allowed
+        reasons.append('ordered shell preparation requires the complete acceptance sequence')
     commands, requests = canonical_commands(selected)
     inventory = allowed
     targets = sum(len((pytest_parts(command) or ([], []))[1]) for command in commands)
@@ -132,11 +138,18 @@ def canonical_commands(commands):
     """
     selected, requests, seen = [], [], {}
     for original in commands:
-        command = shlex.join(shlex.split(original)) if pytest_parts(original) else original
-        if command not in seen:
-            seen[command] = len(selected)
+        supported = pytest_parts(original)
+        command = shlex.join(shlex.split(original)) if supported else original
+        if not supported:
+            seen.clear()
+            index = len(selected)
             selected.append(command)
-        requests.append({'original_command': original, 'execution_index': seen[command],
+        else:
+            if command not in seen:
+                seen[command] = len(selected)
+                selected.append(command)
+            index = seen[command]
+        requests.append({'original_command': original, 'execution_index': index,
                          'command': command})
     return selected, requests
 
@@ -220,13 +233,18 @@ def verification_plan(experiment, active):
                 elif command in focused + regressions:
                     failures.append(command)
             break
+    if any(not pytest_parts(command) for command in focused + regressions):
+        failures = []  # A prior failure cannot move ahead of its preparation.
     commands, requests = canonical_commands([*failures, *focused, *regressions])
     from .repair_memory import component_key
-    timings = experiment.component_memory.get(component_key(active), {}).get('check_timings', {})
+    timings = getattr(experiment, 'component_memory', {}).get(component_key(active), {}).get('check_timings', {})
+    original_indexes = defaultdict(deque)
+    for index, command in enumerate(commands):
+        original_indexes[command].append(index)
     commands = order_verification_commands(commands, timings, first=failures)
-    indexes = {command: index for index, command in enumerate(commands)}
+    indexes = {original_indexes[command].popleft(): index for index, command in enumerate(commands)}
     for request in requests:
-        request['execution_index'] = indexes[request['command']]
+        request['execution_index'] = indexes[request['execution_index']]
     return {'commands': commands, 'deferred': deferred, 'requests': requests,
             'ordering': 'previous failures, then short checks before expensive matrices; shell barriers retained',
             'deduplicated_commands': len(requests) - len(commands)}

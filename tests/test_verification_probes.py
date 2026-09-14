@@ -45,6 +45,24 @@ print(json.dumps(receipt))
     return json.loads(result.stdout)
 
 
+def test_observer_preserves_symlink_copy_and_native_capability_sets(tmp_path):
+    (tmp_path / 'data').write_text('retained')
+    (tmp_path / 'link').symlink_to('data')
+    receipt = observe(tmp_path, '''
+import shutil
+from auto_agents.verification_probes import OPERATIONS
+for capability in ('supports_fd','supports_dir_fd','supports_follow_symlinks','supports_effective_ids'):
+    supported=getattr(os,capability,set())
+    for name,native in OPERATIONS.items():
+        if native in supported:
+            assert getattr(os,name) in supported,(capability,name)
+shutil.copy2(Path(root,'link'),Path(root,'copied'),follow_symlinks=False)
+assert Path(root,'copied').is_symlink()
+assert Path(root,'copied').readlink()==Path('data')
+''')
+    assert (tmp_path / 'copied').readlink() == Path('data')
+
+
 @pytest.mark.parametrize('change', ['unrelated', 'content', 'mode', 'missing', 'symlink'])
 def test_recorded_metadata_supports_safe_reuse_and_invalidates_changed_inputs(tmp_path, change):
     source = tmp_path / 'source'

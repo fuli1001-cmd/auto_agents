@@ -5,6 +5,48 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+from copy import deepcopy
+
+
+def capability_semantics(observation):
+    """Bind behavior and producer source without binding disposable process names.
+
+    Keep the original observations in planning artifacts. Only known disposable
+    PIDs are renamed, preserving equality and invalid/absent values. Trace-owner
+    identities are source hashes and must remain bound. Unknown fields, failures,
+    protocol versions and source hashes remain
+    part of the binding, so a changed capability still requires revalidation.
+    """
+    result = deepcopy(observation)
+    if not isinstance(result, dict):
+        return result
+    production = result.get('production_namespace', result)
+    if not isinstance(production, dict):
+        return result
+    metadata = production.get('nested_gate_metadata')
+    if not isinstance(metadata, dict):
+        return result
+    pids = {}
+    checks = metadata.get('checks')
+    if isinstance(checks, dict):
+        def processes(value):
+            if isinstance(value, dict):
+                for key in sorted(value):
+                    item = value[key]
+                    if key in {'pid', 'launcher_pid', 'supervisor_pid', 'tracer_pid'} and type(item) is int and item > 0:
+                        value[key] = pids.setdefault(item, '<process:' + str(len(pids)) + '>')
+                    else:
+                        processes(item)
+            elif isinstance(value, list):
+                for item in value:
+                    processes(item)
+        processes(checks.get('standalone_supervisor_checks'))
+    return result
+
+
+def capability_fingerprint(observation):
+    from .repair_control import digest
+    return digest(capability_semantics(observation))
 
 
 def _probe_environment():
@@ -124,7 +166,9 @@ def _metadata_observation_in_snapshot(runner, workspace):
                         'route': 'selected engine verification launcher runs fixed legacy-owner, '
                                  'startup-denial and owner-death checks before entering the outer '
                                  'metadata owner; nested acceptance reads source-bound observations '
-                                 'through verification_supervisor_checks.observation',
+                                 'through verification_supervisor_checks.observation, bound to the '
+                                 'live tracer launcher source rather than candidate imports; these '
+                                 'diagnostics do not certify candidate supervisor changes',
                         'acceptance_proof': False,
                     },
                     'mechanism': 'inherited_ptrace_metadata_supervisor' if valid else ''}

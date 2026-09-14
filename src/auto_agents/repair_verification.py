@@ -8,6 +8,24 @@ from .repair_memory import component_key
 from .repair_schedule import pytest_parts
 
 
+def merge_verification_payloads(*results):
+    """Retain execution evidence and fatal process state through aggregation."""
+    payload = {}
+    for result in results:
+        for key, value in result.payload.items():
+            if isinstance(value, list):
+                payload.setdefault(key, []).extend(value)
+            elif key in {'cleanup_incomplete', 'cancelled', 'infrastructure_failure'}:
+                payload[key] = bool(payload.get(key)) or bool(value)
+            elif key == 'certificate_hits':
+                payload[key] = payload.get(key, 0) + value
+            elif key == 'outcome' and payload.get(key) == 'invalid':
+                continue
+            else:
+                payload[key] = value
+    return payload
+
+
 def run_component_checks(runner, commands, workspace, *, parallel=True):
     """Keep every command's cohort/options and stop dispatch after a failure.
 
@@ -110,14 +128,16 @@ def run_component_checks(runner, commands, workspace, *, parallel=True):
     payload = {key: [] for key in ('source_commands', 'command_timings', 'completion_inputs', 'failure_evidence',
                                   'proof_refs', 'executed_tests', 'nonfatal_source_commands')}
     payload.update(parallel_workers=workers, planned_commands=len(commands),
-                   completed_commands=len(ordered), certificate_hits=0, cancelled=cancelled())
+                   completed_commands=len(ordered), certificate_hits=0, cancelled=cancelled(),
+                   cleanup_incomplete=bool(getattr(runner, '_verification_cleanup_incomplete', False))
+                       or any(result.payload.get('cleanup_incomplete') for _, result in ordered))
     for index, result in ordered:
         payload['source_commands'].append(commands[index])
         for key in ('command_timings', 'completion_inputs', 'failure_evidence', 'proof_refs', 'executed_tests', 'nonfatal_source_commands'):
             payload[key].extend(result.payload.get(key, []))
         payload['certificate_hits'] += result.payload.get('certificate_hits', 0)
     return _VerificationResult(
-        not stopped and not cancelled() and len(ordered) == len(commands),
+        not stopped and not cancelled() and not payload['cleanup_incomplete'] and len(ordered) == len(commands),
         '\n\n'.join(result.summary for _, result in ordered),
         commands=tuple(command for _, result in ordered for command in result.commands),
         returncodes=tuple(code for _, result in ordered for code in result.returncodes),

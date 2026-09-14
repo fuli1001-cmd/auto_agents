@@ -59,3 +59,34 @@ finally: os.close(fd)
     assert result.returncode == 0, result.stderr
     assert live.read_text() == "original" and live.stat().st_mode == mode
     assert (candidate / "result.txt").read_text() == "allowed"
+
+
+def test_private_shared_memory_supports_multiprocessing_across_nested_boundaries(tmp_path):
+    import os
+    from uuid import uuid4
+    from auto_agents.verification_input_trace import owner_identity
+    from auto_agents.verification_sandbox import SHM_ENV
+    inherited = owner_identity()['metadata'] and os.environ.get(SHM_ENV) == '1'
+    marker = Path('/dev/shm') / ('auto-agents-test-' + uuid4().hex)
+    candidate, shared = tmp_path / 'candidate', tmp_path / 'shared'
+    candidate.mkdir(); shared.mkdir()
+    inner = "import multiprocessing; sem=multiprocessing.Semaphore(1); assert sem.acquire(timeout=1); sem.release()"
+    program = f'''
+import multiprocessing,subprocess,sys
+from pathlib import Path
+from auto_agents.verification_sandbox import verification_argv
+Path({str(marker)!r}).write_text('private')
+sem=multiprocessing.Semaphore(1); assert sem.acquire(timeout=1); sem.release()
+Path('inner').mkdir()
+with verification_argv([sys.executable,'-c',{inner!r}],Path.cwd()/'inner',Path({str(shared)!r})) as argv:
+    result=subprocess.run(argv,capture_output=True,text=True,timeout=10)
+assert result.returncode==0,result.stderr
+'''
+    try:
+        with verification_argv([sys.executable, '-c', program], candidate, shared) as argv:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert marker.exists() is bool(inherited)
+    finally:
+        if inherited:
+            marker.unlink(missing_ok=True)

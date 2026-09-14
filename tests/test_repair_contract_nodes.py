@@ -100,3 +100,24 @@ def test_new_engine_revision_reuses_frozen_checks_without_replanning(tmp_path):
     assert contract.revision == 'new-revision'
     assert contract.checks == data['checks']
     assert not contract.to_dict()['repair_approved']
+
+
+@pytest.mark.parametrize('unavailable', ['removed', 'symlink'])
+def test_contract_history_discovery_tolerates_cleanup_and_ignores_foreign_links(tmp_path, monkeypatch, unavailable):
+    import os
+    from auto_agents.repair_contract import _previous_contracts
+    retained, sibling = tmp_path / 'retained', tmp_path / 'vanishing'
+    retained.mkdir()
+    receipt = retained / ('request-contract-' + 'a' * 24 + '.json')
+    receipt.write_text('{}')
+    if unavailable == 'removed':
+        sibling.mkdir()
+        scandir = os.scandir
+        def concurrent_cleanup(path):
+            if str(path) == str(sibling):
+                raise FileNotFoundError(str(sibling))
+            return scandir(path)
+        monkeypatch.setattr('auto_agents.repair_contract.os.scandir', concurrent_cleanup)
+    else:
+        sibling.symlink_to(retained, target_is_directory=True)
+    assert _previous_contracts(tmp_path) == [receipt]

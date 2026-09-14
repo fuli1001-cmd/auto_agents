@@ -25,8 +25,8 @@ CASES = ('legacy_owner', 'startup_denied', 'owner_death', 'missing_exitkill')
 LEGACY_SHA256 = '571b87579a36bb884a21e5dae723f67af0f3cc20d88b5d0a362aed8cc880f02f'
 
 
-def source_identity():
-    root = Path(__file__).parent
+def source_identity(root=None):
+    root = Path(root) if root is not None else Path(__file__).parent
     names = ('verification_metadata.py', 'verification_input_trace.py',
              'verification_sandbox.py', 'verification_supervisor_checks.py',
              'verification_fixtures/metadata_v1.py')
@@ -43,23 +43,42 @@ def _tracer_pid():
                     if line.startswith('TracerPid:')))
 
 
+def _launcher_source_root(pid):
+    # Resolve the producer through the live owner, never through a report path
+    # or candidate imports. Production launchers always use an absolute path.
+    command = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+    if len(command) < 4 or command[2] != b'--metadata':
+        raise ValueError('standalone supervisor check launcher mismatch')
+    launcher = Path(os.fsdecode(command[1]))
+    if not launcher.is_absolute() or launcher.name != 'verification_sandbox.py':
+        raise ValueError('standalone supervisor check launcher mismatch')
+    return launcher.resolve(strict=True).parent
+
+
 def observation(case):
-    """Read a source-bound launch observation, or run locally without an owner."""
+    """Observe the live launcher's implementation, or run locally without an owner.
+
+    Candidate imports may differ from the selected runtime. These diagnostics
+    describe that runtime; they do not certify changes to candidate supervision.
+    """
     if case not in CASES:
         raise ValueError('unknown standalone supervisor check')
     if not _owner()['metadata']:
         return _run_case(case)
     try:
         report = json.loads(os.environ[REPORT_ENV])
-        if report['version'] != 1 or report['sources'] != source_identity():
-            raise ValueError('standalone supervisor check source mismatch')
-        if report['launcher_pid'] != _tracer_pid():
+        pid = _tracer_pid()
+        if pid <= 0 or report['launcher_pid'] != pid:
             raise ValueError('standalone supervisor check owner mismatch')
+        root = _launcher_source_root(pid)
+        if report['version'] != 1 or report['sources'] != source_identity(root):
+            raise ValueError('standalone supervisor check source mismatch')
         result = report['checks'][case]
         if result['case'] != case or result['inherited_owner']['metadata'] != 0:
             raise ValueError('standalone supervisor check inherited an owner')
-        return result
-    except (KeyError, TypeError, ValueError) as error:
+        return {**result, 'source_root': str(root), 'sources': report['sources'],
+                'launcher_pid': pid}
+    except (KeyError, TypeError, ValueError, OSError) as error:
         raise RuntimeError('fresh supervisor checks require the selected engine verification '
                            'launcher before entering its metadata owner: ' + str(error)) from error
 

@@ -222,7 +222,9 @@ def _change(pid, registers, name, policies):
         actual = os.readlink(f'/proc/self/fd/{fd}')
         if nofollow and stat.S_ISLNK(value.st_mode) and not timestamps:
             return -errno.EOPNOTSUPP
-        if (not (stat.S_ISREG(value.st_mode) or stat.S_ISDIR(value.st_mode) or nofollow and stat.S_ISLNK(value.st_mode))
+        if (not (stat.S_ISREG(value.st_mode) or stat.S_ISDIR(value.st_mode)
+                 or stat.S_ISSOCK(value.st_mode) or stat.S_ISFIFO(value.st_mode)
+                 or nofollow and stat.S_ISLNK(value.st_mode))
                 or not stat.S_ISDIR(value.st_mode) and value.st_nlink != 1
                 or not all(policy.allows(actual, value) for policy in policies)):
             return -errno.EPERM

@@ -11,6 +11,7 @@ import hashlib
 from pathlib import Path
 import re
 import shlex
+import os
 
 from .repair_control import atomic_json, digest
 from .root_cause import RootCauseReport
@@ -117,6 +118,27 @@ class EngineRequestContract:
         return cls(route, str(data.get("revision", "")), normalized)
 
 
+def _previous_contracts(parent):
+    """Optional sibling receipts may disappear during concurrent job cleanup."""
+    found = []
+    try:
+        with os.scandir(parent) as siblings:
+            for sibling in siblings:
+                try:
+                    if not sibling.is_dir(follow_symlinks=False):
+                        continue
+                    with os.scandir(sibling.path) as files:
+                        for entry in files:
+                            if (re.fullmatch(r'request-contract-[a-f0-9]{24}\.json', entry.name)
+                                    and entry.is_file(follow_symlinks=False)):
+                                found.append((entry.stat(follow_symlinks=False).st_mtime_ns, Path(entry.path)))
+                except OSError:
+                    continue  # Missing history never grants acceptance or blocks a fresh plan.
+    except OSError:
+        pass
+    return [path for _, path in sorted(found, key=lambda item: (item[0], str(item[1])), reverse=True)]
+
+
 def prepare_contract(payload, revision, checkout, evidence, directory):
     """Read-only planning under progress supervision, cached by route + SHA."""
     from .models import AgentRequest
@@ -130,8 +152,7 @@ def prepare_contract(payload, revision, checkout, evidence, directory):
         return EngineRequestContract.from_dict(json.loads(receipt.read_text()), route)
     # The authorized checks do not change merely because the engine changed.
     # A filename binds the previous revision to the SAME retained input digest.
-    for previous in sorted(directory.parent.glob("*/request-contract-*.json"),
-                           key=lambda path: path.stat().st_mtime, reverse=True):
+    for previous in _previous_contracts(directory.parent):
         if previous.is_symlink() or previous.name.endswith(".output.json"):
             continue
         try:

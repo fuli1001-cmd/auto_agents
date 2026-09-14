@@ -15,7 +15,7 @@ import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
@@ -4200,7 +4200,7 @@ class AutoAgentsSelfRepairRunner:
         return bool(root and (Path(root) / "fallback.json").exists())
 
     @contextmanager
-    def _verification_argv(self, argv, cwd, *, read_roots=(), dependency_state=None):
+    def _verification_argv(self, argv, cwd, *, read_roots=(), dependency_state=None, supervisor_checks=True):
         target = getattr(self, "_real_project_root", None)
         if target is None:
             yield argv
@@ -4212,7 +4212,7 @@ class AutoAgentsSelfRepairRunner:
         inputs = [Path(value) for value in [*read_roots, *getattr(self, "_verification_read_roots", [])]
                   if Path(value).resolve() != Path(cwd).resolve()]
         inputs.extend(Path(path) for path in dependency.get("read_roots", []))
-        with verification_argv(argv, cwd, target, read_roots=inputs, supervisor_checks=True,
+        with verification_argv(argv, cwd, target, read_roots=inputs, supervisor_checks=supervisor_checks,
                 **{key: dependency.get(key, []) for key in ("path_entries", "python_paths", "node_paths", "library_paths")}) as command:
             yield command
 
@@ -5621,6 +5621,8 @@ class AutoAgentsSelfRepairRunner:
                         self._report_candidate_phase("checkpoint_failed", f"Candidate worktree retained at {repair_root}; checkpoint could not be saved")
                 raise
             finally:
+                if getattr(self, '_verification_cleanup_incomplete', False):
+                    self._candidate_keep_workspace = True
                 if created and not self._candidate_keep_workspace and not self._continuous_mode():
                     try:
                         remove_worktree(self.repo_root, repair_root, force=True)
@@ -6709,10 +6711,15 @@ class AutoAgentsSelfRepairRunner:
         verification_root: Path,
         *,
         suite_kind: str = "candidate",
+        _environment_retry: bool = False,
     ) -> "_VerificationResult":
+        from .repair_concurrent_validation import cancelled, cancellation_result
+        if cancelled():
+            return cancellation_result()
         shards = self._collect_full_suite_shards(verification_root)
         if not shards:
             return _VerificationResult(True, "full-suite shards=not-applicable")
+        environment = self._full_suite_environment_fingerprint()
         suite_key = self._full_suite_checkpoint_key(
             verification_root,
             [target for shard in shards for target in shard.targets],
@@ -6729,6 +6736,7 @@ class AutoAgentsSelfRepairRunner:
         completed = (
             dict(checkpoint.get("completed", {}))
             if isinstance(checkpoint, Mapping)
+            and not getattr(self, '_verification_fresh', False)
             and checkpoint.get("schema_version")
             == SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION
             and checkpoint.get("suite_key") == suite_key
@@ -6740,8 +6748,11 @@ class AutoAgentsSelfRepairRunner:
         for shard in shards:
             cached = completed.get(shard.shard_id)
             if isinstance(cached, Mapping):
-                shard_result = _VerificationResult.from_dict(cached)
-                if shard_result.ok and not shard_result.recoverable and not shard_result.timed_out:
+                try:
+                    shard_result = _VerificationResult.from_dict(cached)
+                except (ValueError, TypeError):
+                    shard_result = None
+                if shard_result is not None and shard_result.passed_cleanly:
                     results.append((shard.shard_id, shard_result, True))
                     continue
             proof = self._full_suite_proof_cache_lookup(
@@ -6767,15 +6778,19 @@ class AutoAgentsSelfRepairRunner:
             shard: _FullSuiteShard,
             shard_result: _VerificationResult,
         ) -> bool:
-            interrupted = shard_result.timed_out or any(
-                reason == "stalled"
+            interrupted = shard_result.timed_out or shard_result.payload.get('cleanup_incomplete') or any(
+                reason in {"stalled", "cancelled"}
                 for reason in shard_result.termination_reasons
             )
             with checkpoint_lock:
                 results.append((shard.shard_id, shard_result, False))
                 if interrupted:
                     return False
-                if shard_result.ok:
+                if self._full_suite_environment_fingerprint() != environment:
+                    # This result cannot populate the original environment's
+                    # checkpoint or a proof key computed from the new one.
+                    return True
+                if shard_result.passed_cleanly:
                     completed[shard.shard_id] = shard_result.to_dict()
                 else:
                     completed.pop(shard.shard_id, None)
@@ -6791,7 +6806,7 @@ class AutoAgentsSelfRepairRunner:
                             "updated_at": _utc_now_iso(),
                         },
                     )
-                if shard_result.ok:
+                if shard_result.passed_cleanly:
                     self._full_suite_proof_cache_store(
                         verification_root,
                         shard,
@@ -6821,6 +6836,17 @@ class AutoAgentsSelfRepairRunner:
             finally:
                 slots.release(resources)
 
+        def finish(recoverable):
+            result = self._aggregate_full_suite_shards(results, recoverable=recoverable, total_shards=len(shards))
+            if not cancelled() and not result.payload.get('cleanup_incomplete') and self._full_suite_environment_fingerprint() != environment:
+                if not _environment_retry:
+                    return self._run_full_suite_shards(verification_root, suite_kind=suite_kind, _environment_retry=True)
+                result.ok = False
+                result.recoverable = True
+                result.payload['outcome'] = 'invalid'
+                result.summary += '\nverification environment changed again; retained source requires revalidation'
+            return result
+
         for priority in sorted({shard.priority for shard in pending}):
             phase = [shard for shard in pending if shard.priority == priority]
             workers = min(slots.capacity, len(phase))
@@ -6828,6 +6854,9 @@ class AutoAgentsSelfRepairRunner:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {}
                 while phase or futures:
+                    interrupted = interrupted or cancelled()
+                    if interrupted:
+                        phase.clear()
                     for shard in list(phase):
                         if len(futures) >= workers:
                             break
@@ -6835,13 +6864,15 @@ class AutoAgentsSelfRepairRunner:
                         if resources is None:
                             continue
                         try:
-                            future = pool.submit(execute, shard, resources)
+                            future = pool.submit(copy_context().run, execute, shard, resources)
                         except BaseException:
                             slots.release(resources)
                             raise
                         futures[future] = shard
                         phase.remove(shard)
                     if not futures:
+                        if not phase:
+                            break
                         slots.wait_for_change()
                         continue
                     completed_futures, _ = wait(
@@ -6853,16 +6884,8 @@ class AutoAgentsSelfRepairRunner:
                         if not record(shard, shard_result):
                             interrupted = True
             if interrupted:
-                return self._aggregate_full_suite_shards(
-                    results,
-                    recoverable=True,
-                    total_shards=len(shards),
-                )
-        return self._aggregate_full_suite_shards(
-            results,
-            recoverable=False,
-            total_shards=len(shards),
-        )
+                return finish(True)
+        return finish(False)
 
     def _execute_full_suite_shard(
         self,
@@ -6872,33 +6895,30 @@ class AutoAgentsSelfRepairRunner:
         if shard.isolated:
             commit = head_ref(verification_root)
             if commit:
-                with tempfile.TemporaryDirectory(
-                    prefix="auto-agents-full-suite-shard-"
-                ) as tmp:
-                    isolated_root = Path(tmp) / "verification"
-                    created = False
-                    try:
-                        with self._shard_worktree_lock:
-                            add_worktree(
-                                verification_root,
-                                isolated_root,
-                                ref=commit,
-                            )
-                        created = True
-                        return self._execute_full_suite_shard_command(
-                            isolated_root, shard
-                        )
-                    finally:
+                tmp = tempfile.mkdtemp(prefix="auto-agents-full-suite-shard-")
+                isolated_root = Path(tmp) / "verification"
+                created = False
+                preserve = False
+                try:
+                    with self._shard_worktree_lock:
+                        add_worktree(verification_root, isolated_root, ref=commit)
+                    created = True
+                    result = self._execute_full_suite_shard_command(isolated_root, shard)
+                    preserve = bool(result.payload.get('cleanup_incomplete'))
+                    if preserve:
+                        self._verification_cleanup_incomplete = True
+                        result.ok = False
+                        result.payload['retained_workspace'] = str(isolated_root)
+                    return result
+                finally:
+                    if not preserve and not getattr(self, '_verification_cleanup_incomplete', False):
                         if created:
                             with self._shard_worktree_lock:
                                 try:
-                                    remove_worktree(
-                                        verification_root,
-                                        isolated_root,
-                                        force=True,
-                                    )
+                                    remove_worktree(verification_root, isolated_root, force=True)
                                 except RuntimeError:
                                     pass
+                        shutil.rmtree(tmp, ignore_errors=True)
         return self._execute_full_suite_shard_command(verification_root, shard)
 
     def _execute_full_suite_shard_command(
@@ -7361,6 +7381,8 @@ class AutoAgentsSelfRepairRunner:
         verification_root: Path,
         shard: _FullSuiteShard,
     ) -> Optional["_VerificationResult"]:
+        if getattr(self, '_verification_fresh', False):
+            return None
         if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
             return None  # Managed runs use the process-shared ledger.
         proof_key = self._full_suite_proof_key(verification_root, shard)
@@ -7379,8 +7401,11 @@ class AutoAgentsSelfRepairRunner:
             or not isinstance(payload.get("result"), Mapping)
         ):
             return None
-        result = _VerificationResult.from_dict(payload["result"])
-        return result if result.ok and not result.recoverable else None
+        try:
+            result = _VerificationResult.from_dict(payload["result"])
+        except (ValueError, TypeError):
+            return None
+        return result if result.passed_cleanly else None
 
     def _full_suite_proof_cache_store(
         self,
@@ -7390,7 +7415,7 @@ class AutoAgentsSelfRepairRunner:
     ) -> None:
         if getattr(self, "_real_project_root", None) is not None and self._acceleration_enabled():
             return
-        if not result.ok or result.recoverable:
+        if not result.passed_cleanly:
             return
         proof_key = self._full_suite_proof_key(verification_root, shard)
         path = self._full_suite_proof_cache_path(proof_key)
@@ -7717,7 +7742,7 @@ class AutoAgentsSelfRepairRunner:
         termination_reasons: list[str] = []
         nonfatal_source_commands: list[str] = []
         source_commands: list[str] = []
-        ok = not recoverable
+        ok = not recoverable and len({shard for shard, _, _ in results}) == len(results) == total_shards and total_shards > 0
         for shard, result, cached in sorted(results, key=lambda item: item[0]):
             summaries.append(
                 f"=== full-suite shard {shard} cached={str(cached).lower()} ===\n"
@@ -7751,14 +7776,17 @@ class AutoAgentsSelfRepairRunner:
             f"completed={completed_shards}/{total_shards} "
             f"recoverable={str(recoverable).lower()}"
         )
+        from .repair_verification import merge_verification_payloads
+        payload = merge_verification_payloads(*(result for _, result, _ in sorted(results, key=lambda item: item[0])))
         return _VerificationResult(
-            ok,
+            ok and not payload.get('cleanup_incomplete', False),
             "\n\n".join(summaries),
             commands=tuple(commands),
             returncodes=tuple(returncodes),
             termination_reasons=tuple(termination_reasons),
             recoverable=recoverable,
-            payload={
+            duration_seconds=sum(result.duration_seconds for _, result, _ in results),
+            payload={**payload,
                 "source_commands": source_commands,
                 "nonfatal_source_commands": nonfatal_source_commands,
             },
@@ -8889,30 +8917,12 @@ class AutoAgentsSelfRepairRunner:
                 else:
                     supplemental.append(normalized)
         if not supplemental:
-            summary = "\n\n".join(
+            required.summary = "\n\n".join(
                 part
                 for part in (required.summary, *skipped)
                 if part
             )
-            return _VerificationResult(
-                required.ok,
-                summary,
-                commands=required.commands,
-                returncodes=required.returncodes,
-                termination_reasons=required.termination_reasons,
-                recoverable=required.recoverable,
-                payload={
-                    "source_commands": list(
-                        required.payload.get("source_commands", []) or []
-                    ),
-                    "nonfatal_source_commands": list(
-                        required.payload.get(
-                            "nonfatal_source_commands", []
-                        )
-                        or []
-                    ),
-                },
-            )
+            return required
         additional = self._run_verification_commands(
             supplemental,
             root,
@@ -8923,6 +8933,7 @@ class AutoAgentsSelfRepairRunner:
             for part in (required.summary, *skipped, additional.summary)
             if part
         )
+        from .repair_verification import merge_verification_payloads
         return _VerificationResult(
             additional.ok,
             summary,
@@ -8932,26 +8943,8 @@ class AutoAgentsSelfRepairRunner:
                 required.termination_reasons + additional.termination_reasons
             ),
             recoverable=required.recoverable or additional.recoverable,
-            payload={
-                "source_commands": [
-                    *list(required.payload.get("source_commands", []) or []),
-                    *list(additional.payload.get("source_commands", []) or []),
-                ],
-                "nonfatal_source_commands": [
-                    *list(
-                        required.payload.get(
-                            "nonfatal_source_commands", []
-                        )
-                        or []
-                    ),
-                    *list(
-                        additional.payload.get(
-                            "nonfatal_source_commands", []
-                        )
-                        or []
-                    ),
-                ],
-            },
+            duration_seconds=required.duration_seconds + additional.duration_seconds,
+            payload=merge_verification_payloads(required, additional),
         )
 
     def _revalidate_verification_manifest(self, root, manifest, dependency_state):
@@ -8970,7 +8963,10 @@ class AutoAgentsSelfRepairRunner:
                 write_json(request, manifest)
                 argv = [self._verification_python(), str(Path(__file__).with_name('verification_manifest.py')),
                         str(root), str(request)]
-                with self._verification_argv(argv, root, dependency_state=dependency_state) as arguments:
+                # This fixed reader only rechecks inputs. Lifecycle diagnostics
+                # belong to acceptance launches, not every certificate lookup.
+                with self._verification_argv(argv, root, dependency_state=dependency_state,
+                                             supervisor_checks=False) as arguments:
                     if event is None:
                         result = subprocess.run(arguments, cwd=root, capture_output=True, text=True, timeout=30)
                     else:
@@ -9149,6 +9145,9 @@ class AutoAgentsSelfRepairRunner:
                 process.returncode = process.returncode or 125
                 if cancel_event is not None:
                     cancel_event.set()
+            if process.termination_reason or process.infrastructure_error or not process.ok:
+                process.ok = False
+                process.returncode = process.returncode or 125
             timing = {'command': source_command, 'seconds': float(process.duration_seconds),
                 'collected_cases': len(collected) if isinstance(collected, list) else None,
                 'passed_cases': len(process.executed_tests), 'cache_hit': bool(getattr(process, 'cached', False)),
@@ -9231,6 +9230,8 @@ class AutoAgentsSelfRepairRunner:
             if (
                 allow_pytest_no_tests
                 and process.returncode == 5
+                and not process.termination_reason and not process.infrastructure_error
+                and not process.cleanup_incomplete
                 and _is_pytest_verification_command(command)
             ):
                 if command_failures:
@@ -9257,6 +9258,7 @@ class AutoAgentsSelfRepairRunner:
                         "proof_refs": proof_refs, "executed_tests": executed_tests, "certificate_hits": certificate_hits,
                         "command_timings": command_timings,
                         "completion_inputs": completion_inputs,
+                        "cleanup_incomplete": bool(process.cleanup_incomplete),
                     },
                 )
         return _VerificationResult(
@@ -9381,6 +9383,13 @@ class _VerificationResult:
     duration_seconds: float = 0.0
     payload: dict[str, object] = field(default_factory=dict)
 
+    @property
+    def passed_cleanly(self) -> bool:
+        return (self.ok and not self.recoverable and not self.timed_out
+                and not any(self.returncodes) and not any(self.termination_reasons)
+                and not self.payload.get('cleanup_incomplete') and not self.payload.get('cancelled')
+                and self.payload.get('outcome') != 'invalid')
+
     def to_dict(self) -> dict[str, object]:
         return {
             "ok": self.ok,
@@ -9396,7 +9405,7 @@ class _VerificationResult:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "_VerificationResult":
         return cls(
-            ok=bool(payload.get("ok", False)),
+            ok=payload.get("ok") is True,
             summary=str(payload.get("summary", "")),
             commands=tuple(str(item) for item in payload.get("commands", []) or []),
             returncodes=tuple(

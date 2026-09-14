@@ -222,12 +222,16 @@ def test_process_death_before_import_rollback_is_recovered_on_restart(restart):
 
 
 def test_import_waits_for_cancelled_worker_cleanup_before_reusing_it(restart):
+    import time
+    from types import SimpleNamespace
+    from unittest.mock import Mock
     job, working = _new_job(restart, restart.payload)
+    sleep = Mock()
     with patch("auto_agents.repair_restart.RESTART_QUIESCENCE_SECONDS", 1), \
-         patch("auto_agents.repair_restart.time.sleep") as sleep, \
+         patch("auto_agents.repair_restart.time", SimpleNamespace(monotonic=time.monotonic, sleep=sleep)), \
          patch("auto_agents.repair_restart._quiescent", side_effect=[False, True, True]):
         assert import_cancelled_repair(restart.store, job, working, restart.repository)
-    sleep.assert_called_once()
+    sleep.assert_called_once_with(0.1)
 
 
 @pytest.mark.parametrize("interrupted", [False, True])

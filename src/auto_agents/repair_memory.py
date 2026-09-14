@@ -40,7 +40,7 @@ def read_record(runner, reference):
         if directory.parent.is_symlink() or directory.is_symlink() or path.is_symlink():
             return None
         value = json.loads(path.read_text())
-        return value if value.get('id') == identity and digest(value) == reference['digest'] else None
+        return value if isinstance(value, dict) and value.get('id') == identity and digest(value) == reference['digest'] else None
     except (OSError, ValueError, TypeError, KeyError):
         return None
 
@@ -330,6 +330,8 @@ def remember_check_timings(runner, workspace, group, plan, result, *, phase):
     for row in timings:
         if not row.get('cache_hit'):
             known[row['command']] = row
+    if getattr(runner, '_experiment_store', None) is None:
+        return  # Lightweight callers retain scheduling hints, not durable receipts.
     record = save_record(runner, 'verification_schedule', {
         'phase': phase, 'plan': plan, 'timings': timings, 'ok': result.ok,
         'job': (getattr(runner, '_repair_control_binding', None) or {}).get('job', ''),

@@ -79,7 +79,14 @@ def review_and_verify(runner, workspace, review_call):
             review = review_call()
         except BaseException:
             event.set()
-            # The executor joins before the caller can modify/remove a worktree.
+            # Preserve the review exception while still delivering cleanup
+            # failures to the owner before it checkpoints/removes its workspace.
+            try:
+                future.result()
+            except BaseException:
+                pass
+            if worker._verification_cleanup_incomplete:
+                runner._verification_cleanup_incomplete = True
             raise
         if not review.ok:
             event.set()
@@ -100,6 +107,7 @@ def review_and_verify(runner, workspace, review_call):
     expanded.payload['concurrent_review'] = True
     expanded.payload['review_rejected'] = not review.ok
     if worker._verification_cleanup_incomplete:
+        runner._verification_cleanup_incomplete = True
         expanded.ok = False
         expanded.payload['cleanup_incomplete'] = True
         expanded.summary += '\nverification process cleanup incomplete; stop before further candidate changes'
