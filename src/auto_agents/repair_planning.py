@@ -25,7 +25,8 @@ from .repair_feedback import sanitize_evidence
 from .verification_ledger import source_identity
 from .repair_test_refs import pytest_targets
 from .repair_planning_input import plan_delta, source_delta, working_input
-from .repair_capability_checks import capability_fingerprint
+from .repair_capability_checks import (capability_fingerprint, planning_capability_fingerprint,
+                                      retained_capabilities_match)
 
 POLICY_VERSION = 2
 MAX_PLAN_REVIEWS = 3
@@ -195,7 +196,14 @@ def _invoke(runner, workspace, stage, instruction, context):
     started = time.monotonic()
     try:
         with runner._phase_timer(stage.removeprefix('self_repair_')):
-            result = runner.target_orchestrator._call_with_failover(request)
+            from .models import ProvidersExhaustedError
+            try:
+                result = runner.target_orchestrator._call_with_failover(request)
+            except ProvidersExhaustedError as error:
+                raise PlanningBlocked(stage + ' provider unavailable: ' + error.category,
+                    code='provider_failed', retry_kind='transport', evidence=request_id,
+                    actual={'category': error.category, 'providers': error.providers,
+                            'report': getattr(error.result, 'supervision_report_path', '')}) from error
     finally:
         atomic_json(directory / 'metrics.json', {'stage': stage, 'seconds': time.monotonic() - started,
             'input_chars': len(json.dumps(context, ensure_ascii=False)),
@@ -208,8 +216,13 @@ def _invoke(runner, workspace, stage, instruction, context):
         if (changed_guard_paths(before, capture_repository_guard(workspace, ignore_run_artifacts=True))
                 or changed_guard_paths(target_before, capture_repository_guard(runner.target_project_root, ignore_run_artifacts=True))):
             raise PlanningBlocked('read-only planning changed retained source or target', code='source_changed')
+        if ('environment' in context
+                and context['environment'] != digest(runner._full_suite_environment_fingerprint())):
+            raise PlanningBlocked('execution environment changed during planning; evidence requires refresh',
+                                  code='environment_changed')
     if not result.ok:
-        raise PlanningBlocked(stage + ' provider failed: ' + runner._agent_failure_detail(result), code='provider_failed')
+        raise PlanningBlocked(stage + ' provider failed: ' + runner._agent_failure_detail(result),
+                              code='provider_failed', retry_kind='transport', evidence=request_id)
     raw = result.summary or result.stdout or (request.output_path.read_text() if request.output_path.exists() else '')
     try:
         payload = _extract_json_object(raw)
@@ -225,6 +238,9 @@ def _invoke(runner, workspace, stage, instruction, context):
     if stage in {'self_repair_scope_review', 'self_repair_scope_format'}:
         from .repair_scope_recovery import admit_result
         admit_result(identity, payload)
+        atomic_json(directory / 'request.json', identity)
+    elif stage == 'self_repair_plan_review' and context.get('scope_findings'):
+        identity['scope_result_digest'] = digest(sanitize_evidence(payload))
         atomic_json(directory / 'request.json', identity)
     return payload, request_id
 
@@ -244,7 +260,10 @@ def _retained_scope(runner, receipt, finding):
         request, context, result = [json.loads(path.read_text()) for path in paths]
         decisions = [row for row in result.get('decisions', []) if row.get('finding_id') == finding['finding_id']]
         return (request.get('stage') in {'self_repair_scope_review', 'self_repair_scope_format',
-                                       'self_repair_component_delta_review'} and len(decisions) == 1
+                                       'self_repair_component_delta_review', 'self_repair_plan_review'} and len(decisions) == 1
+                and (request.get('stage') != 'self_repair_plan_review'
+                     or (request.get('review_binding', {}).get('input') == digest(context)
+                         and request.get('scope_result_digest') == digest(result)))
                 and (request.get('stage') != 'self_repair_component_delta_review' or result.get('decision') == 'APPROVE')
                 and request.get('request_id') == identity
                 and all(decisions[0].get(key) == receipt.get(key) for key in (
@@ -252,7 +271,8 @@ def _retained_scope(runner, receipt, finding):
                 and context.get('source') == receipt.get('source')
                 and context.get('source_commit') == receipt.get('source_commit')
                 and context.get('environment') == receipt.get('environment')
-                and any(finding_key(row) == finding_key(finding) for row in context.get('findings', [])))
+                and any(finding_key(row) == finding_key(finding)
+                        for row in context.get('scope_findings', context.get('findings', []))))
     except (OSError, ValueError, TypeError, AttributeError):
         return False
 
@@ -412,7 +432,7 @@ def _scope_revalidation_reason(runner, workspace, finding, environment):
     if not old:
         return 'new observation'
     for key, expected in (('policy', POLICY_VERSION), ('contract', experiment.contract_fingerprint),
-                          ('engine_base', experiment.base_commit), ('finding_key', finding_key(finding))):
+                          ('finding_key', finding_key(finding))):
         if old.get(key) != expected:
             return key + ' changed'
     if not _retained_scope(runner, old, finding):
@@ -421,6 +441,8 @@ def _scope_revalidation_reason(runner, workspace, finding, environment):
         return 'scope evidence unresolved'
     if old.get('verdict') == 'required':
         return ''
+    if old.get('engine_base') != experiment.base_commit:
+        return 'engine_base changed'
     if old.get('environment') != environment:
         return 'execution environment changed'
     fact = read_record(runner, old.get('fact_ref', {}))
@@ -448,22 +470,8 @@ def review_scope(runner, workspace, findings):
         return
     context = _context(runner, workspace)
     context['findings'] = pending
-    context['scope_revalidation'] = {item['finding_id']: {
-        'previous': experiment.scope_decisions.get(item['finding_id']),
-        'reason': reasons[item['finding_id']]} for item in pending}
-    manifests = {item['finding_id']: _scope_dependencies(workspace, context, item,
-        experiment.scope_decisions.get(item['finding_id'], {})) for item in pending}
-    context['scope_dependencies_complete'] = all(value.get('complete') for value in manifests.values())
-    context['scope_unresolved_dependencies'] = {key: value.get('unresolved', [])
-        for key, value in manifests.items() if not value.get('complete')}
-    deltas = {}
-    for row in context['scope_revalidation'].values():
-        previous = row.get('previous') or {}
-        commit = previous.get('source_commit')
-        if commit:
-            if commit not in deltas:
-                deltas[commit] = source_delta(workspace, commit)
-            row['source_delta'] = deltas[commit]
+    from .repair_resume_review import scope_context
+    scope_context(runner, workspace, context, pending, reasons)
     scope_key = 'scope:' + digest([context['source'], context['environment'], experiment.base_commit,
                                    experiment.contract_fingerprint, [finding_key(f) for f in values]])
     from .repair_probe_recovery import run_pending_probes
@@ -696,7 +704,7 @@ def _review_reuse_failure(runner, receipt, group):
         request, context, result, proposal = [json.loads(path.read_text()) for path in paths]
         if not (request.get('stage') == 'self_repair_plan_review'
                 and request.get('request_id') == reviewer and proposal.get('request_id') == planner
-                and proposal.get('stage') in {'self_repair_component_plan', 'self_repair_plan_format'}
+                and proposal.get('stage') in {'self_repair_component_plan', 'self_repair_plan_format', 'self_repair_manual_plan'}
                 and context.get('planner_request') == planner
                 and context.get('source') == receipt.get('source')
                 and context.get('source_commit') == receipt.get('source_commit')
@@ -707,7 +715,6 @@ def _review_reuse_failure(runner, receipt, group):
                 and result.get('decision') == 'APPROVE' and result.get('issues') == []
                 and receipt.get('execution_mode', receipt['plan'].get('mode', 'implement')) == _review_execution_mode(receipt['plan'], result)
                 and set(result.get('scenario_ids', [])) == {row['scenario_id'] for row in receipt['plan']['scenarios']}
-                and all(probe.get('matches') for probe in receipt.get('probe_results', []))
                 and receipt['plan'] == validate_plan(receipt['plan'], group, set(runner._experiment.contract_obligation_ids))):
             return 'independent review no longer matches its source, scenarios or proposal'
         binding = request.get('review_binding')
@@ -721,6 +728,14 @@ def _review_reuse_failure(runner, receipt, group):
         elif (context.get('proposed_plan') != receipt.get('plan')
               or context.get('probe_results') != receipt.get('probe_results')):
             return 'legacy review lacks an original evidence digest; independent review required'
+        if proposal.get('stage') == 'self_repair_manual_plan':
+            from .repair_manual_plan import retained_proposal
+            if not retained_proposal(runner, proposal, receipt):
+                return 'manual proposal provenance is missing or changed'
+        from .repair_probe_review import admit as admit_probes
+        probe_checks = admit_probes(runner, group, context, result)
+        if probe_checks is None or receipt.get('probe_acceptance_commands', []) != probe_checks:
+            return 'current probe observations lack independent reconciliation or retained acceptance'
         return ''
     except (OSError, TypeError, ValueError, AttributeError, KeyError, PlanningBlocked):
         return 'review artifacts missing or invalid'
@@ -945,9 +960,16 @@ def prepare_component(runner, workspace):
         return retained
     findings = [f for f in experiment.findings.values() if f.status in {'confirmed', 'reopened'}
                 and (f.finding_id in group.get('finding_ids', []) or f.repair_group_id == group['group_id'])]
-    review_scope(runner, workspace, findings)
+    from .repair_resume_review import prepare_refresh, scope_context, admit_refresh, INSTRUCTION as REFRESH_INSTRUCTION
+    refresh = prepare_refresh(runner, workspace, group, findings)
+    if refresh is None:
+        review_scope(runner, workspace, findings)
     context = _context(runner, workspace)
-    context['findings'] = [f.to_dict() for f in findings if not nonblocking_scope(experiment, f)]
+    context['findings'] = (refresh['findings'] if refresh is not None else
+                          [f.to_dict() for f in findings if not nonblocking_scope(experiment, f)])
+    if refresh is not None:
+        context['scope_findings'] = refresh['pending']
+        scope_context(runner, workspace, context, refresh['pending'], refresh['reasons'])
     group['finding_ids'] = [f['finding_id'] for f in context['findings']]
     context['component'] = group
     context['work'] = link_definition(runner, group)
@@ -960,17 +982,32 @@ def prepare_component(runner, workspace):
                            'unless a concrete current defect requires code changes. Do not rewrite completed mechanisms.'}
     signature = _component_signature(group)
     strategy = digest([POLICY_VERSION, experiment.base_commit, experiment.contract_fingerprint,
-                       signature, context['environment'], capability_fingerprint(context['runtime_capabilities']),
+                       signature, context['environment'], planning_capability_fingerprint(context['runtime_capabilities']),
                        [finding_key(f) for f in context['findings']]])
     reuse_failures, invalid_approvals = [], set()
+    from .repair_manual_plan import selected_revision
+    manual_revision = selected_revision(runner, group)
     for receipt in experiment.planning_receipts.values():
         original_group = receipt.get('component', group)
-        if receipt.get('decision') != 'APPROVE':
+        if (receipt.get('decision') != 'APPROVE' or receipt.get('component_signature') != signature
+                or receipt.get('contract') != experiment.contract_fingerprint):
+            continue
+        if manual_revision is not None and receipt.get('request_id') != manual_revision.get('reviewer_request'):
+            reuse_failures.append({'request_id': receipt.get('request_id'),
+                                   'reason': 'explicit manual revision supersedes this proposal'})
             continue
         failure = _review_reuse_failure(runner, receipt, original_group)
-        if (not receipt.get('runtime_capabilities')
-                or receipt.get('runtime_capability_semantics', receipt.get('runtime_capabilities')) != capability_fingerprint(context['runtime_capabilities'])):
-            failure = failure or 'planning runtime capabilities changed or were not recorded'
+        if not failure:
+            compatible = retained_capabilities_match(runner, receipt, context['runtime_capabilities'])
+            context['runtime_capability_comparison'] = {
+                'request_id': receipt['request_id'], 'observed_capabilities_unchanged': compatible,
+                'instruction': 'Compare the observed features and owner digests. The v1 validation_protocol '
+                               'annotation records controller custody, not a new runtime requirement. '
+                               'Fresh observations still do not certify the candidate.'}
+            if not compatible:
+                failure = 'planning runtime capabilities changed or were not recorded'
+        if refresh is not None:
+            failure = failure or 'retained scope requires independent refresh with the plan'
         if receipt.get('component_signature') == signature:
             if (failure and receipt.get('engine_base') == experiment.base_commit
                     and receipt.get('contract') == experiment.contract_fingerprint
@@ -1009,7 +1046,9 @@ def prepare_component(runner, workspace):
         if same:
             runner._candidate_group = {**group, **receipt['plan'], 'planning_receipt': receipt['request_id'],
                                        'finding_scenario_bindings': bindings,
-                                       'retained_acceptance': work_memory(runner, group).get('acceptance_inventory', [])}
+                                       'retained_acceptance': list(dict.fromkeys([
+                                           *work_memory(runner, group).get('acceptance_inventory', []),
+                                           *receipt.get('probe_acceptance_commands', [])]))}
             _apply_execution_mode(runner, receipt, context['source'])
             runner._experiment_store.record_health(experiment, status='plan_reused', detail=receipt['request_id'])
             return receipt
@@ -1143,8 +1182,12 @@ def prepare_component(runner, workspace):
         'Use 1 to 3 probes, each explicit pytest nodes (at most 8 targets) or python -B -c memory diagnostics. '
         'Include concrete negative, inverse positive, recovery and interaction mechanisms; no broad suite probes.')
     if episode.get('phase') == 'reviewing':
-        # An interrupted independent request consumed its slot, not its draft.
-        episode.update(pending_round=False, resume_phase='draft' if needs_amendment else 'review')
+        if episode.get('review_recovery', {}).get('status') in {'running', 'failed'} and not needs_amendment:
+            # Transport failure did not reject the plan. Its separate persisted
+            # dispatch limit bounds recovery without spending design attempts.
+            episode.update(pending_round=True, phase='review')
+        else:
+            episode.update(pending_round=False, resume_phase='draft' if needs_amendment else 'review')
     elif episode.get('status') == 'approved' and previous and previous.get('draft'):
         # Lost/invalid review artifacts require another independent review, not
         # rewriting a still available draft from scratch.
@@ -1245,9 +1288,12 @@ def prepare_component(runner, workspace):
             probes = [_probe(runner, workspace, spec) for spec in plan['probes']]
             review_context = {**context, 'proposed_plan': plan, 'planner_request': planner_id,
                               'probe_results': probes, 'previous_revision': previous}
+            from .repair_probe_review import prepare as prepare_probes, admit as admit_probes, INSTRUCTION as PROBE_INSTRUCTION
+            prepare_probes(runner, group, review_context)
             episode['phase'] = 'reviewing'
             runner._experiment_store.save(experiment)
-            review, reviewer_id = _invoke(runner, workspace, 'self_repair_plan_review',
+            from .repair_plan_recovery import invoke_review
+            review, reviewer_id = invoke_review(runner, workspace, 'self_repair_plan_review',
                 'Independently audit the proposed component plan. Inspect its changes, previous feedback and '
                 'affected interactions; retain unchanged established decisions instead of reconstructing history. '
                 'Start from plan_delta, source_delta and unresolved feedback. Challenge the changed mechanisms '
@@ -1262,9 +1308,17 @@ def prepare_component(runner, workspace):
                 'implementation_required:boolean,remaining_changes:[...]}. '
                 'Set implementation_required=false and remaining_changes=[] only after confirming that the '
                 'CURRENT source already implements every planned mechanism; the controller will still run all verification. '
-                'Do not demand unrelated hardening or rewrite the proposed plan.', review_context)
+                'Do not demand unrelated hardening or rewrite the proposed plan. '
+                + (REFRESH_INSTRUCTION if refresh is not None else '') + PROBE_INSTRUCTION, review_context)
+            if refresh is not None and admit_refresh(runner, workspace, review_context, reviewer_id, review):
+                # Scope changed on independent evidence. Retain the proposal,
+                # but recompute the actual required finding set before writing.
+                episode.update(pending_round=False, phase='complete', latest_decision='scope_changed')
+                runner._experiment_store.save(experiment)
+                return prepare_component(runner, workspace)
+            probe_checks = admit_probes(runner, group, review_context, review)
             approved = (review.get('decision') == 'APPROVE' and _text(review.get('reason'))
-                        and review.get('issues') == [] and all(p['matches'] for p in probes)
+                        and review.get('issues') == [] and probe_checks is not None
                         and _texts(review.get('scenario_ids'))
                         and set(review['scenario_ids']) == {s['scenario_id'] for s in plan['scenarios']})
             receipt = {'policy': POLICY_VERSION, 'strategy': strategy, 'source': context['source'],
@@ -1275,7 +1329,8 @@ def prepare_component(runner, workspace):
                 'runtime_capabilities': digest(context['runtime_capabilities']),
                 'runtime_capability_semantics': capability_fingerprint(context['runtime_capabilities']),
                 'decision': 'APPROVE' if approved else 'REVISE', 'revision': context['revision'],
-                'probe_results': probes, 'feedback': [review], 'execution_mode': _review_execution_mode(plan, review)}
+                'probe_results': probes, 'probe_acceptance_commands': probe_checks or [],
+                'feedback': [review], 'execution_mode': _review_execution_mode(plan, review)}
             experiment.planning_receipts[key] = receipt
             reference = remember_revision(runner, group, {'parent_revision': previous['id'],
                 'draft': plan, 'source': context['source'], 'source_commit': context['source_commit'],
@@ -1294,7 +1349,8 @@ def prepare_component(runner, workspace):
                                feedback=[], latest_decision='APPROVE')
                 memory = work_memory(runner, group)
                 memory['acceptance_inventory'] = list(dict.fromkeys([*memory.get('acceptance_inventory', []),
-                    *group.get('focused_tests', []), *plan['quick_checks'], *(s['check'] for s in plan['scenarios'])]))
+                    *group.get('focused_tests', []), *plan['quick_checks'], *(s['check'] for s in plan['scenarios']),
+                    *(probe_checks or [])]))
                 runner._experiment_store.save(experiment)
                 runner._candidate_group = {**group, **plan, 'planning_receipt': reviewer_id,
                                            'retained_acceptance': memory['acceptance_inventory']}

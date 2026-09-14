@@ -1,0 +1,90 @@
+{
+  "incident_job": "55b5e9bc4270493fb66d797a",
+  "incident_engine": "97a4c50e05f25f4f43e93c6153ec3b94ed6ed60a",
+  "runtime_code_commit": "a4359562e056c42c6c290413d50624bdc2813ad7",
+  "full_suite": {
+    "source_commit": "739ea4713ea1ae91c2d4d08cd394f066eb670818",
+    "ok": true,
+    "cases": 3247,
+    "shards": 168,
+    "seconds": 1678.3981540079985,
+    "report": "/tmp/self-repair-resume-fix-m35tw483/full-suite/result.json"
+  },
+  "followup_regressions": {
+    "source_commit": "a4359562e056c42c6c290413d50624bdc2813ad7",
+    "ok": true,
+    "cases": 552,
+    "coverage": "all tests/test_repair_*.py",
+    "seconds": 210.29670366899518,
+    "report": "/tmp/self-repair-resume-fix-m35tw483/probe-review-regressions/result.json"
+  },
+  "archived_probe_rehearsal": {
+    "controller_commit": "b7f9ec79659f820af629fc60bdc46be2b6d38f5f",
+    "candidate_commit": "607f2483c82b12938ff33c97ad9da2d1f164b853",
+    "seconds_before_model": 67.70359360499424,
+    "model_calls": 0,
+    "scenarios": 13,
+    "pending_scope_decisions": 2,
+    "checks_unchanged": true,
+    "probe_outcomes": [
+      {
+        "outcome": "pass",
+        "matches": false
+      },
+      {
+        "outcome": "pass",
+        "matches": true
+      },
+      {
+        "outcome": "pass",
+        "matches": true
+      }
+    ],
+    "original_source_unchanged": true,
+    "original_state_modified": false,
+    "report": "/tmp/self-repair-resume-fix-m35tw483/archive-probes-clean/report.json"
+  },
+  "native_archived_review": {
+    "status": "completed_requires_plan_revision",
+    "executed": true,
+    "user_authorized": true,
+    "controller_commit": "fcb4682",
+    "candidate_commit": "607f2483c82b12938ff33c97ad9da2d1f164b853",
+    "request_id": "f26bde7baec14642bc6596609e110742",
+    "model_calls": 1,
+    "provider_ok": true,
+    "model_seconds": 605.7770147659903,
+    "total_rehearsal_seconds": 666.1072908510105,
+    "review_decision": "REVISE",
+    "planning_approved": false,
+    "scenario_decisions": 13,
+    "scope_decisions": 2,
+    "scope_decisions_admitted": true,
+    "probe_reconciliation_admitted": true,
+    "checks_unchanged": true,
+    "remaining_issue": "The retained plan needs a concrete registered-dependency-link correction and reuse/recovery fixture coverage.",
+    "next_prepared_action": "amend_plan",
+    "next_model_request_dispatched": false,
+    "source_unchanged": true,
+    "original_source_unchanged": true,
+    "original_state_modified": false,
+    "previous_combined_review_seconds": 1693.6147713319951,
+    "review_duration_reduction_percent": 64.23,
+    "report": "/tmp/self-repair-authorized-review-s0iaijwj/review/report.json",
+    "review_result": "/tmp/self-repair-authorized-review-s0iaijwj/review/target/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/planning/f26bde7baec14642bc6596609e110742/result.json"
+  },
+  "original_project_resumed": false,
+  "repair_candidate_accepted": false,
+  "limitations": [
+    "Final runtime code has the full baseline suite plus the complete affected repair regression suite, not a second full-suite run.",
+    "The authorized native rehearsal completed one independent review and stopped before the requested amendment; no repair candidate or original project workflow was executed.",
+    "The comparison measures review duration only: the previous run failed in transport and this review returned REVISE, so it does not establish end-to-end self-repair throughput."
+  ],
+  "manual_plan_revision": {
+    "status": "draft_installed",
+    "code_commit": "29a908e256cc615f48d86fc468d6de9eb55c2077",
+    "request_id": "3c10aa8871154b6cb35e57c7d3e200b3",
+    "requires_independent_review": true,
+    "report": "docs/self-repair-g02-plan-revision-validation.json"
+  }
+}

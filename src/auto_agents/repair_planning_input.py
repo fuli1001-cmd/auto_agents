@@ -57,7 +57,7 @@ def working_input(context, directory, stage):
         for key in ('implementation_steps', 'focused_tests'):
             if key in component and (scope or component[key] == prior_component.get(key)):
                 component[key] = reference('component.' + key)
-    if scope:
+    if scope or working.get('scope_findings'):
         # Scope needs the observation's evidence and original obligations, not
         # a second copy of every implementation scenario and approval receipt.
         component = working.get('component', {})
@@ -65,7 +65,7 @@ def working_input(context, directory, stage):
             if key not in {'group_id', 'title', 'contract_obligation_ids', 'finding_ids',
                            'touched_paths', 'depends_on', 'status'}:
                 component[key] = reference('component.' + key)
-        if 'previous_revision' in working:
+        if scope and 'previous_revision' in working:
             working['previous_revision'] = reference('previous_revision')
         for identity, row in working.get('scope_revalidation', {}).items():
             old = row.get('previous')
@@ -74,7 +74,7 @@ def working_input(context, directory, stage):
                     'verdict', 'reason', 'trigger', 'consequence', 'support_basis', 'disproof',
                     'evidence', 'request_id', 'source_commit', 'fact_ref')}
                 row['complete_previous'] = reference('scope_revalidation.' + identity + '.previous')
-    elif incremental:
+    if not scope and incremental:
         previous = working['previous_revision']
         draft = previous.get('draft')
         if isinstance(draft, dict):
@@ -91,4 +91,34 @@ def working_input(context, directory, stage):
                     'scenario_id', 'kind', 'trigger', 'expected', 'obligation_ids', 'finding_ids')}
                     for row in (draft.get('scenarios') or []) if isinstance(row, dict)]
             working['previous_revision'] = summary
+    # In long archives every finding carried the same 64 unresolved entries.
+    # Intern identical lists without dropping a single unresolved dependency.
+    unresolved = working.get('scope_unresolved_dependencies', {})
+    if sum(len(str(value)) for value in unresolved.values()) > 4000:
+        catalogue, index = {}, {}
+        for identity, value in unresolved.items():
+            from .repair_control import digest
+            key = digest(value)
+            if key not in index:
+                index[key] = 'dependencies_' + str(len(index) + 1)
+                catalogue[index[key]] = value
+            unresolved[identity] = {'dependency_set': index[key]}
+        working['dependency_sets'] = catalogue
+    plan = working.get('proposed_plan')
+    if isinstance(plan, dict):
+        # Commands remain exact atomic invocations. A table removes repetition
+        # between scenario checks and quick checks without flattening cohorts.
+        catalogue = {}
+        def command_ref(command):
+            if not isinstance(command, str):
+                return command
+            if command not in catalogue:
+                catalogue[command] = 'command_' + str(len(catalogue) + 1)
+            return {'command_ref': catalogue[command]}
+        plan['quick_checks'] = [command_ref(command) for command in plan.get('quick_checks', [])]
+        for scenario in plan.get('scenarios', []):
+            for key in ('check', 'quick_check'):
+                if key in scenario:
+                    scenario[key] = command_ref(scenario[key])
+        working['command_table'] = {identity: command for command, identity in catalogue.items()}
     return working
