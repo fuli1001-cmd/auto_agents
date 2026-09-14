@@ -1,0 +1,371 @@
+{
+  "version": 1,
+  "status": "draft",
+  "requires_independent_review": true,
+  "group_id": "g02_invocation_semantics",
+  "contract_fingerprint": "36ce0076d74a6994e48a2cd0",
+  "source": "dbc0d6323354a92deb678654eba337a5af10c7102d35a02083e0a78d77f79941",
+  "source_commit": "607f2483c82b12938ff33c97ad9da2d1f164b853",
+  "parent_plan_digest": "b2451831ec4533773b3ea35f67d3bd3596d358e0806194e286a6159192891461",
+  "reason": "User requested revision of the concrete registered-dependency plan gap identified by independent review f26bde7baec14642bc6596609e110742. Retain completed fixes and all original acceptance.",
+  "basis": {
+    "review_request": "f26bde7baec14642bc6596609e110742",
+    "review_result_digest": "5b43cf8b6d2cdded3b782647ca2333d126ec33124ee272425f725cd6a636d030",
+    "historical_parser_probe": {
+      "command": "python -B -c 'import ast, os, pathlib, sys, types; p=pathlib.Path(\"src/auto_agents/verification_supervisor_checks.py\"); f=next(n for n in ast.parse(p.read_text()).body if isinstance(n,ast.FunctionDef) and n.name==\"_launcher_source_root\"); launcher=p.with_name(\"verification_sandbox.py\").resolve(); state={}; fake=lambda value: types.SimpleNamespace(read_bytes=lambda: state[\"argv\"]) if str(value)==\"/proc/123/cmdline\" else pathlib.Path(value); ns={\"Path\":fake,\"os\":os}; exec(compile(ast.Module(body=[f],type_ignores=[]),str(p),\"exec\"),ns); results=[]\nfor arguments in ([sys.executable,str(launcher),\"--metadata\",\"{}\"],[sys.executable,\"-I\",str(launcher),\"--metadata\",\"{}\"]):\n state[\"argv\"]=b\"\\0\".join(os.fsencode(value) for value in arguments)+b\"\\0\"\n try: result=str(ns[\"_launcher_source_root\"](123))\n except ValueError as error: result=str(error)\n results.append(result)\nprint(results)\nassert results==[str(launcher.parent)]*2, results'",
+      "expected": "behavior_failure",
+      "purpose": "Bounded, read-only reproduction of the current isolated-interpreter parser mismatch with the unisolated layout as its inverse control. This exercises the current parser in memory; it does not authenticate a running owner or replace the real pre-owner acceptance required in step 8."
+    },
+    "historical_parser_assessment": {
+      "disposition": "already_fixed",
+      "evidence": [
+        "Authenticated baseline reference e32cba3e33f44e799cea296c1607e0de contains independent APPROVE feedback for request 65f812e249da4d138a39a1e5d5f95f3f at source 5dad47414512b99082736f8dd35dd6055f3cfc8b.",
+        "The original expected outcome remains behavior_failure. The current supplied observation is pass with returncode 0 and proof reference e31004a3573e85254e22d7c90d808d7496225c8e0b66f26c60a6398a02a05665.",
+        "src/auto_agents/verification_supervisor_checks.py:50 now accounts for the single supported -I flag; :59 retains live TracerPid and producer-source authentication.",
+        "tests/test_verification_supervisor_checks.py:75 preserves both producer layouts; :143 retains unsupported-layout rejection. The previous code review explicitly resolved live-launcher-source-binding-rejects-isolated-interpreter."
+      ],
+      "probe_id": "50108bf9debc934f7e9dd609545df6945a9e36d63f42f43aa5631981acb67ce2",
+      "reason": "The formerly failing parser reproduction now passes because the earlier candidate implemented the correction. Preserve the historical failure expectation; repaired source need not reproduce it. This reconciliation grants no candidate acceptance credit: initial-owner lifecycle observations and nested production compatibility checks remain mandatory.",
+      "scenario_ids": [
+        "g02_trace_custody_recovers"
+      ]
+    }
+  },
+  "plan": {
+    "implementation_steps": [
+      "Keep mode=implement only for the three active g02 findings: gate-trace-evidence-exclusion-drops-real-dependencies, gate-trace-custody-overrides-clean-execution-mode and live-launcher-source-binding-rejects-isolated-interpreter. Current HEAD is 5dad47414512b99082736f8dd35dd6055f3cfc8b. TraceCustody, exclusive runtime allocation, protected receipt consumption, final confinement, identity-aware cleanup and all five custody acceptance functions already exist; retain these mechanisms and validate them rather than rebuilding them. Historical statements about absent functions or command-writable evidence describe earlier source and are superseded by this inspection. Preserve completed invocation parsing, pytest selection, execution-marker transport, authority recovery and cache identity mechanisms. Retain all 13 scenario IDs, their existing finding bindings, obligations, full acceptance commands and unrelated work through controller materialization. Historical findings and review issue IDs remain references, not additional implementation scope. Steps 5–8 assign the concrete corrections and additional fixture obligations for the three affected scenarios.",
+      "Validate the retained _pytest_selection_config repair without rewriting it: preserve the distinction between missing configuration and a build-only pyproject.toml, continue searching for substantive settings, and treat its empty fallback as selected configuration that prevents individual-target fallback. Current native-pytest differential diagnostics agree for the original counterexample and its negative/inclusive override controls; continue using authenticated retained sources.",
+      "Preserve explicit configuration, ancestor and individual-target search ordering, setup.py and --rootdir behavior, and pytest.toml/.pytest.toml precedence. Preserve configuration addopts, inline PYTEST_ADDOPTS and CLI precedence, collection patterns, default targets and retained pythonpath inputs. Existing runner execution remains the differential oracle.",
+      "Retain the existing acceptance identities test_public_resume_requires_executable_owned_node_coverage and test_public_resume_rechecks_retained_default_filename_exclusion. The three bare-pyproject variants already cover structured, legacy, manual and explicit-fix commands with fresh and retained bindings. Preserve the real owned-test execution marker, inclusive controls, early rejection assertions and intervening ExecutionMarker transport; no test extension is needed.",
+      "Retain the already implemented clean-versus-retained custody execution behavior. None selects clean defaults; an explicitly supplied mapping, including an empty mapping, selects retained execution. Keep the effective environment's existing digest-bound transport, candidate sandbox/src precedence, activation/cwd/runner inputs, bookkeeping and authenticated lifecycle propagation. Do not reintroduce an env -i boundary ahead of custody_exec or restore ambient values after bootstrap. Preserve executor-only and tracing-off execution, exclusive private runtime reservations, inode/owner/collision checks, short socket paths, existing bootstrap and Landlock order, ancestor restrictions, protected evidence handles, successful cleanup, and final write-root separation from evidence and sibling jobs. The native review f26bde7baec14642bc6596609e110742 confirmed this correction in source 607f248; maintain it and its existing tests rather than implementing it again.",
+      "Correct the remaining registered-dependency regression in gate_execution.py. Carry the executor's existing dependency_links mapping into the physical traversal used by _observed_input_manifest for both ordinary and denied observations. At each encountered symlink inside the gate checkout, check the exact installed relative path against that mapping before generic project-symlink rejection. Follow it only when its actual target agrees with the validated registered target and the existing read-only dependency binding; matching a basename, lexical prefix or caller-supplied trace claim is insufficient. Continue physical traversal through the resolved target, preserving the alias binding and resolved shared-file/stat/negative-lookup dependencies instead of excluding the alias subtree. Keep the registered target mapping in the existing execution/cache identity so a target change invalidates reuse across different disposable checkout paths. Unregistered, mismatched, retargeted, unresolved or otherwise unrepresentable links must not certify completeness. Preserve actual '..' traversal and intermediate external symlink dependencies. Retain the already implemented bookkeeping fix: exclude only pinned trace/receipt/directory identities or actual private runtime objects after resolution, never a lexical evidence-directory prefix. Preserve positive stat-only inputs, ENOENT parent observations, and EACCES/EPERM without reading denied content. Preserve authenticated single-read custody, producer/job/boundary matching, complete-footer and successful-dispatch/cleanup requirements, network observations, live-owner/policy invalidation, and legacy execution without unsupported proof. Make this bounded correction in the existing executor/manifest path; no new tracer, listener, namespace or candidate-runtime activation mechanism is required.",
+      "Extend the existing _custody_cache_probe helper and retain all its current controls and parameter identities. Use an external shared dependency directory and an executor-installed registered .conda link. Have the actual gate read a shared input through that link in both observed_inputs and auto. After the first real run, require protected complete tracing with the resolved shared dependency and the registered binding represented. An unrelated source change must reuse with zero additional dispatch. Changing the shared input must cause exactly one real dispatch and its behavioral assertion failure; restore a valid baseline before testing the original directly-read, stat-only and negative-lookup input changes so failures cannot mask one another. A change to the registered target must invalidate reuse; unsupported or mismatched link observations must not certify completeness. Run the same registered-link control in the healthy baseline of test_gate_trace_custody_recovers_after_incomplete_run: the signalled run stays incomplete/non-reusable, correcting its fault input causes a fresh healthy run, and a subsequent unrelated change reuses that complete result. Keep the existing parent-side dispatch counting without network input. Preserve the previous evidence-relative '..', stat-only, negative lookup, environment/PYTHONPATH, tampering, socket, named/active/relative-prefix Conda, shared snapshots and public-resume assertions. All 13 scenario identities, check and quick_check invocations, quick_required flags, original focused/root-cause/upstream command cohorts and quick-check cohorts remain exact. Existing Conda/Vitest execution checks do not by themselves discharge trace completeness or cache reuse: cross-check them with the registered-link reuse/recovery cases under the same inherited production owner, with private chmod/fchmod/utime succeeding and shared content/metadata mutations denied. Run the existing unsupported-symlink controls alongside these cases before code review.",
+      "Retain the completed launcher parser correction and all lifecycle acceptance. _launcher_source_root accepts exactly the generated direct-script and single -I layouts, while preserving strict producer-path resolution, live TracerPid/launcher_pid agreement and producer-source digests; arbitrary flags and -c/-m substitutes remain rejected. Preserve [True]/[False] candidate-source cases, digest substitution and foreign-PID rejection, absent/foreign-report controls, and restored authentic-report reuse. The old parser reproduction's behavior_failure expectation remains in its original immutable proposal and in the independent already_fixed assessment from f26bde7baec14642bc6596609e110742; it is replaced in this draft's active diagnostics by the current registered-link counterexample, not rewritten as historical success. Keep the selected launcher's existing pre-owner checks for real initial-owner creation, legacy ownership, startup denial, owner death and missing EXITKILL, with source-bound observations consumed by inherited quick/expanded checks. Retain negotiated tracing protocol 1 and ancestor narrowing. Do not start a second ptracer, kill a nested launcher, add a listener or require an unavailable namespace. Actual lifecycle or managed Vitest prerequisite failures remain verification_environment_blocked with phase/owner/protocol and errno/source evidence; they receive no acceptance credit. Submit this manual revision to an independent reviewer before any candidate write or acceptance claim."
+    ],
+    "mode": "implement",
+    "not_applicable": {},
+    "probes": [
+      {
+        "command": "python -B -c 'import ast,hashlib,json,os,re,stat,sys\nfrom pathlib import Path\nfrom typing import Mapping,Optional,Sequence\nsys.path.insert(0,str(Path('\"'\"'src'\"'\"').resolve()))\nsource=Path('\"'\"'src/auto_agents/gate_execution.py'\"'\"')\ntree=ast.parse(source.read_text())\nnames={'\"'\"'_sha256'\"'\"','\"'\"'_path_observation_digest'\"'\"','\"'\"'_resolve_observed_path'\"'\"','\"'\"'_observed_input_manifest'\"'\"'}\nbody=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]\nnamespace=dict(globals(),__package__='\"'\"'auto_agents'\"'\"')\nexec(compile(ast.Module(body=body,type_ignores=[]),str(source),'\"'\"'exec'\"'\"'),namespace)\nlink=Path('\"'\"'/bin'\"'\"');control=Path('\"'\"'/etc/hostname'\"'\"');shared=link.resolve()/'\"'\"'dash'\"'\"'\nif not link.is_symlink() or not shared.is_file() or not control.is_file():\n raise RuntimeError('\"'\"'registered-link diagnostic fixtures unavailable'\"'\"')\ntrace='\"'\"''\"'\"'.join('\"'\"'42 stat('\"'\"'+json.dumps(str(p))+'\"'\"') = 0\\n'\"'\"' for p in (control,link,shared))\nmanifest,network=namespace['\"'\"'_observed_input_manifest'\"'\"'](Path('\"'\"'/unused-readonly-diagnostic'\"'\"'),Path('\"'\"'/'\"'\"'),{'\"'\"'bin'\"'\"':link.resolve()},trace_text=trace)\nprint(json.dumps({'\"'\"'manifest'\"'\"':manifest,'\"'\"'network'\"'\"':network},sort_keys=True))\nassert control.relative_to('\"'\"'/'\"'\"').as_posix() in manifest and shared.relative_to('\"'\"'/'\"'\"').as_posix() in manifest, '\"'\"'registered alias discarded control/shared dependencies'\"'\"'\n'",
+        "expected": "behavior_failure",
+        "purpose": "Read-only current registered-link counterexample using existing /bin and shared/control files. RuntimeError means unavailable diagnostics, not a behavioral failure. This memory diagnostic does not replace production-owner reuse, recovery or shared-denial acceptance."
+      },
+      {
+        "command": "python -m pytest -q 'tests/test_verification_input_trace.py::test_gate_trace_custody_preserves_valid_reuse[observed_inputs]' 'tests/test_verification_input_trace.py::test_gate_trace_custody_preserves_valid_reuse[auto]' 'tests/test_verification_input_trace.py::test_nested_gate_tracing_keeps_private_and_shared_boundaries[observed_inputs]' 'tests/test_verification_input_trace.py::test_nested_gate_tracing_keeps_private_and_shared_boundaries[auto]'",
+        "expected": "pass",
+        "purpose": "Establish the existing real-dispatch custody and private/shared-operation baseline in both scopes. Before the fixture extensions in step 7, passing these nodes cannot discharge the evidence-relative lookup or clean-environment findings. After implementation, acceptance must execute the added assertions through the same production owner."
+      },
+      {
+        "command": "python -m pytest -q 'tests/test_verification_supervisor_checks.py::test_all_fresh_owner_checks_through_two_production_boundaries[True]' 'tests/test_verification_supervisor_checks.py::test_all_fresh_owner_checks_through_two_production_boundaries[False]' 'tests/test_verification_execution_context.py::test_named_conda_vitest_discovery_preserves_activation_cwd_and_shared_environment[True]' 'tests/test_verification_execution_context.py::test_relative_prefix_and_named_launchers_share_execution_semantics[prefix]'",
+        "expected": "pass",
+        "purpose": "Preserve inherited-owner compatibility with differing and equal candidate sources, plus retained activation and relative-prefix execution. These inherited checks consume authenticated launcher observations. Their success alone does not exercise initial-owner creation with the isolated producer layout."
+      }
+    ],
+    "quick_checks": [
+      "python -m pytest -q 'tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage[nested_config_bare_pyproject_included-structured]' 'tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage[nested_config_bare_pyproject_included-legacy]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion[nested_config_bare_pyproject_included-manual]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion[nested_config_bare_pyproject_included-explicit_fix]'",
+      "python -m pytest -q 'tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage[nested_config_excluded-legacy]' 'tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage[nested_config_bare_pyproject_overridden_excluded-explicit_fix]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion[nested_config_excluded-manual]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion[nested_config_bare_pyproject_overridden_excluded-structured]'",
+      "python -m pytest -q 'tests/test_session_verification_ownership.py::test_public_resume_blocks_unresolved_owned_proof_id[pytest---junit-xml-legacy-tests/test_owned.py::test_owned-True]' 'tests/test_session_verification_ownership.py::test_public_resume_blocks_unresolved_owned_proof_id[pytest---junit-prefix-manual-tests/test_owned.py::test_owned-True]' 'tests/test_execution_binding.py::test_mixed_shell_command_preserves_real_argument_boundaries[False]' 'tests/test_execution_binding.py::test_cache_options_belong_to_the_actual_runner[vitest run a && python -m pytest b-vitest run a --no-cache && python -m pytest b]'",
+      "python -m pytest -q 'tests/test_verification_input_trace.py::test_nested_gate_tracing_keeps_private_and_shared_boundaries[observed_inputs]' 'tests/test_verification_input_trace.py::test_nested_gate_tracing_keeps_private_and_shared_boundaries[auto]' tests/test_verification_input_trace.py::test_existing_gate_cache_regression_under_production_owner 'tests/test_verification_input_trace.py::test_public_resume_tracing_inside_production_owner[global_plan_switch-observed_inputs]' 'tests/test_verification_input_trace.py::test_public_resume_tracing_inside_production_owner[global_plan_switch-auto]' tests/test_infrastructure_repair_v3.py::test_gate_environment_uses_a_short_isolated_socket_runtime tests/test_gate_execution.py::test_gate_environment_injects_ports_and_clears_stale_values",
+      "python -m pytest -q 'tests/test_verification_supervisor_checks.py::test_all_fresh_owner_checks_through_two_production_boundaries[True]' 'tests/test_verification_supervisor_checks.py::test_all_fresh_owner_checks_through_two_production_boundaries[False]'",
+      "python -m pytest -q 'tests/test_verification_input_trace.py::test_gate_trace_custody_preserves_valid_reuse[observed_inputs]' 'tests/test_verification_input_trace.py::test_gate_trace_custody_preserves_valid_reuse[auto]' 'tests/test_verification_input_trace.py::test_gate_trace_custody_recovers_after_incomplete_run[observed_inputs]' 'tests/test_verification_input_trace.py::test_gate_trace_custody_recovers_after_incomplete_run[auto]' tests/test_gate_result_cache.py::test_observed_input_cache_invalidates_when_a_symlink_is_retargeted tests/test_gate_result_cache.py::test_descriptor_stat_does_not_certify_symlink_dependencies"
+    ],
+    "scenarios": [
+      {
+        "check": "python -m pytest -q tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion",
+        "evidence": [
+          "HEAD d616135020f11b503f91540f711c978b73a49093 already contains the planned repair in src/auto_agents/session_verification.py:1049; no additional implementation is needed for this counterexample.",
+          "Memory probe 2 passed against installed pytest 9.0.3: a build-only root pyproject.toml selects empty settings in both implementations.",
+          "tests/test_session_verification_ownership.py:1770 and :2012 retain all three bare-pyproject variants across four command representations and fresh/retained bindings; inclusive assertions require execution of the owned test.",
+          "The intervening ExecutionMarker transport remains intact; tests/execution_marker.py:1 reports execution from the original observation point without granting host-filesystem writes."
+        ],
+        "expected": "Admission agrees with installed pytest: the root pyproject.toml supplies empty configuration, the owned node remains executable, and the repaired candidate passes through actual owned-test execution. Ambient files and retained authority remain unchanged.",
+        "finding_ids": [],
+        "kind": "compatibility",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage[nested_config_bare_pyproject_included-structured]' 'tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage[nested_config_bare_pyproject_included-legacy]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion[nested_config_bare_pyproject_included-manual]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion[nested_config_bare_pyproject_included-explicit_fix]'",
+        "scenario_id": "g02_bare_pyproject_preserves_valid_selection",
+        "trigger": "Require tests/a/test_owned.py::test_owned, execute files in tests/a and tests/b, and retain a build-only root pyproject.toml plus tests/a/pytest.ini with python_functions=test_control. Exercise all four command representations and fresh/retained bindings."
+      },
+      {
+        "check": "python -m pytest -q tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion",
+        "evidence": [
+          "Memory probe 2 passed the no-pyproject inverse control and both substantive tox.ini overrides: native and retained selection agree on excluding test_control or inclusive test_* patterns.",
+          "src/auto_agents/session_verification.py:932 validates fresh selection; :453 rechecks retained inventories; :941 rejects uncovered mandatory nodes.",
+          "tests/test_session_verification_ownership.py:1975 asserts zero baseline/writer/gate dispatch on exclusion, retry_fix=false ownership diagnostics, repeated retained rejection and unchanged ambient configuration."
+        ],
+        "expected": "Reject the excluded requirement before baseline, writer, collection or cache access. Report session, workflow, handoff, task, requirement and contract ownership with retry_fix=false. Repeated retained rejection preserves the original binding and ambient gates. Inclusive overrides and explicit valid files remain accepted.",
+        "finding_ids": [],
+        "kind": "failure",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage[nested_config_excluded-legacy]' 'tests/test_session_verification_ownership.py::test_public_resume_requires_executable_owned_node_coverage[nested_config_bare_pyproject_overridden_excluded-explicit_fix]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion[nested_config_excluded-manual]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_default_filename_exclusion[nested_config_bare_pyproject_overridden_excluded-structured]'",
+        "reference_ids": [
+          "session-filtered-command-falsely-covers-owned-node"
+        ],
+        "scenario_id": "g02_actual_exclusions_remain_blocking",
+        "trigger": "Remove the bare root pyproject.toml so nested fallback applies, or provide a substantive configuration that excludes the mandatory node. Include explicit configuration, filename/function patterns, inline deselection and conflicting configuration/environment/CLI overrides."
+      },
+      {
+        "check": "python -m pytest -q tests/test_session_verification_ownership.py::test_public_resume_blocks_unresolved_owned_proof_id tests/test_execution_binding.py::test_mixed_shell_command_preserves_real_argument_boundaries tests/test_execution_binding.py::test_cache_options_belong_to_the_actual_runner",
+        "evidence": [
+          "Memory probe 1 passed on current source with pytest 9.0.3 for both JUnit options and --log-auto-indent in separate and equals forms; only the control file remains executable.",
+          "src/auto_agents/execution_binding.py:285 and :350 retain shared value-taking option parsing; these mechanisms are unchanged from the previous revision.",
+          "tests/test_session_verification_ownership.py:1528 retains owned report-value rejection, including an unrelated passing proof; full original acceptance cohort remains in check."
+        ],
+        "expected": "Report values never satisfy required executable coverage. Reject the uncovered reference with owned retry_fix=false diagnostics before execution. Preserve original command text and unrelated passing proofs.",
+        "finding_ids": [],
+        "kind": "failure",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_session_verification_ownership.py::test_public_resume_blocks_unresolved_owned_proof_id[pytest---junit-xml-legacy-tests/test_owned.py::test_owned-True]' 'tests/test_session_verification_ownership.py::test_public_resume_blocks_unresolved_owned_proof_id[pytest---junit-prefix-manual-tests/test_owned.py::test_owned-True]' 'tests/test_execution_binding.py::test_mixed_shell_command_preserves_real_argument_boundaries[False]' 'tests/test_execution_binding.py::test_cache_options_belong_to_the_actual_runner[vitest run a && python -m pytest b-vitest run a --no-cache && python -m pytest b]'",
+        "reference_ids": [
+          "session-report-option-value-treated-as-executable-selector"
+        ],
+        "scenario_id": "g02_report_values_do_not_supply_evidence",
+        "trigger": "A retained Conda pytest command executes only a passing control and places the required node in --junit-xml or --junit-prefix, including separate and equals forms across legacy, manual and explicit-fix commands."
+      },
+      {
+        "check": "python -m pytest -q tests/test_session_verification_ownership.py::test_public_resume_accepts_typed_executable_reference tests/test_session_verification_ownership.py::test_public_resume_blocks_positional_owned_proof_id",
+        "evidence": [
+          "HEAD 1f0b9c718666e41ee789d3d08c579198c3a6fac4, tests/test_session_verification_ownership.py:801,829,938: ExecutionMarker and the awaited JavaScript sender are implemented; assertions still require the actual candidate value.",
+          "src/auto_agents/session_verification.py:654 retains real runner discovery and configured-filter exclusion; tests/execution_marker.py:65 preserves the existing token-bound append/replace transport.",
+          "Retain the existing configured-filter/manual positive and excluded positional-proof inverse before review; their completed implementation needs validation only."
+        ],
+        "expected": "Valid executable references retain their selection semantics and execute the owned evidence. Undefined proof IDs remain blocking. Vitest filters require actual retained-runner discovery, including configured exclusions. Await a token-bound loopback observation from that same test body before its existing value assertion. The parent must still observe VALUE = 1, so absent execution or a failed callback cannot pass. Preserve candidate/baseline payloads, all parameter identities, proof-source and ownership assertions, and confinement write roots.",
+        "finding_ids": [],
+        "kind": "compatibility",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e",
+          "root:3:6e185ca6ec"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_session_verification_ownership.py::test_public_resume_accepts_typed_executable_reference[command_vitest_configured_filter-manual]' 'tests/test_session_verification_ownership.py::test_public_resume_blocks_positional_owned_proof_id[True-owned.contract-vitest-config_excluded-manual]'",
+        "quick_required": true,
+        "reference_ids": [
+          "retained_execution_markers_conflict_with_confinement"
+        ],
+        "scenario_id": "g02_valid_executable_references_remain_supported",
+        "trigger": "Supply a real owned node, file, directory or retained Vitest filename filter alongside report options, environment assignments, a runner '--' delimiter or supported cwd/Conda launchers. Contrast these with undefined opaque proof IDs placed in positional arguments. The real Vitest test reads the candidate value and reaches its existing observation point inside the confined child, including the configured-filter/manual case; an excluded positional proof supplies the inverse control."
+      },
+      {
+        "check": "python -m pytest -q tests/test_verification_execution_context.py::test_runner_option_values_and_unknown_arity_do_not_become_targets tests/test_verification_execution_context.py::test_discovery_reports_environment_failure_separately_from_missing_selection",
+        "evidence": [
+          "Memory probe 1 confirmed unknown.targets is None on current source.",
+          "src/auto_agents/session_verification.py:1184 raises RunnerContextError for unknown option arity rather than defaulting source discovery.",
+          "tests/test_verification_execution_context.py:148 and :172 assert unsupported-invocation and environment/discovery/missing-selection distinctions with owned retry_fix=false diagnostics."
+        ],
+        "expected": "Unknown arity remains unresolved and produces an owned diagnostic rather than default discovery. Environment/discovery failure cannot establish missing-test evidence or success. No writer runs; retained references and ambient files remain intact.",
+        "finding_ids": [],
+        "kind": "failure",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e",
+          "root:3:6e185ca6ec"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_verification_execution_context.py::test_runner_option_values_and_unknown_arity_do_not_become_targets[True---log-auto-indent]' 'tests/test_verification_execution_context.py::test_discovery_reports_environment_failure_separately_from_missing_selection[environment]' 'tests/test_verification_execution_context.py::test_discovery_reports_environment_failure_separately_from_missing_selection[discovery]' 'tests/test_verification_execution_context.py::test_discovery_reports_environment_failure_separately_from_missing_selection[missing]'",
+        "scenario_id": "g02_unknown_arity_and_discovery_failures",
+        "trigger": "Use an unknown runner option before explicit sources, or a retained Vitest invocation with an unavailable environment, invalid configuration or excluded filename filter."
+      },
+      {
+        "check": "python -m pytest -q tests/test_session_verification_ownership.py::test_binding_round_trip_and_legacy_recovery_preserve_original_authority tests/test_session_verification_ownership.py::test_public_resume_before_first_baseline_uses_child_history",
+        "evidence": [
+          "The completed retained-authority component remains outside this repair's implementation scope.",
+          "tests/test_session_verification_ownership.py:1286 covers public recovery before first baseline after the ambient plan switches, including unavailable-history blockers.",
+          "tests/test_session_verification_ownership.py:2610 covers binding round trips and legacy authority recovery; selected parameter identities were checked from AST using installed pytest's ID formatter without collection."
+        ],
+        "expected": "Configuration revalidation uses the child's authenticated retained source. Original session, handoff, task, requirement, authorization and environment identities survive; missing history remains an owned blocker. The completed authority repair remains intact.",
+        "finding_ids": [],
+        "kind": "recovery",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_session_verification_ownership.py::test_binding_round_trip_and_legacy_recovery_preserve_original_authority[True]' 'tests/test_session_verification_ownership.py::test_public_resume_before_first_baseline_uses_child_history[retained]'",
+        "scenario_id": "g02_retained_authority_survives_revalidation",
+        "trigger": "Resume an older child before its first baseline after another workflow switches the live plan, or round-trip a legacy binding while retaining distinct original authority."
+      },
+      {
+        "check": "python -m pytest -q tests/test_session_verification_ownership.py::test_public_inventory_migration_resumes_existing_undelivered_receipt tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_unresolved_proof_inventory",
+        "evidence": [
+          "tests/test_session_verification_ownership.py:1626 retains repeated unresolved-inventory rejection and unchanged binding assertions.",
+          "tests/test_session_verification_ownership.py:4081 dispatches the restored_contract case to the real receipt recovery helper.",
+          "tests/test_session_verification_ownership.py:4024 requires repeated blocking before authority restoration, one bounded revalidation after restoration, no new writer attempt and preservation of custody, foreign bytes, index, modes and untracked work.",
+          "Source-delta dependency: src/auto_agents/gate_execution.py:1471,1538,1618 currently consumes command-writable trace evidence; the separate custody scenarios extend cache-reuse coverage while preserving this original recovery command cohort."
+        ],
+        "expected": "Preserve custody and valid keyed reuse; revalidate when relevant evidence changes. Unresolved inventory blocks before baseline or writer dispatch. Repeated resume preserves attempts, foreign bytes, index, modes and untracked files; restoration of a required prerequisite permits bounded recovery. Cross-source reuse additionally depends on the protected trace custody checks in g02_trace_custody_rejects_forgery and g02_trace_custody_recovers; this inventory scenario alone cannot discharge that dependency.",
+        "finding_ids": [],
+        "kind": "recovery",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_session_verification_ownership.py::test_public_inventory_migration_resumes_existing_undelivered_receipt[3-verification-restored_contract]' 'tests/test_session_verification_ownership.py::test_public_resume_rechecks_retained_unresolved_proof_inventory[legacy-pytest---junitxml]'",
+        "reference_ids": [
+          "gate-input-trace-replacement-authorizes-cross-source-reuse"
+        ],
+        "scenario_id": "g02_retained_receipt_and_inventory_recovery",
+        "trigger": "Resume an undelivered retained receipt or an older inventory that admitted unresolved evidence, with intervening foreign changes and a switched ambient plan; restore temporarily missing owned requirement authority to exercise bounded recovery."
+      },
+      {
+        "check": "python -m pytest -q tests/test_verification_execution_context.py::test_named_conda_vitest_discovery_preserves_activation_cwd_and_shared_environment tests/test_verification_execution_context.py::test_relative_prefix_and_named_launchers_share_execution_semantics",
+        "evidence": [
+          "HEAD 1f0b9c718666e41ee789d3d08c579198c3a6fac4, tests/test_verification_execution_context.py:64,110: named/active Conda, relative-prefix launchers, awaited JavaScript append and Python replacement are implemented.",
+          "The existing tests retain activation, effective cwd, CONDA_PREFIX, observed value, dependency/package snapshots and ambient-file assertions.",
+          "Previous revision review records a valid managed Vitest dependency receipt and an existing executable. Earlier PATH-only absence observations are historical; actual selected-runtime acceptance remains required.",
+          "Independent REVISE f26bde7baec14642bc6596609e110742: the parent retains a registered /bin -> /usr/bin alias and resolved shared input, current source returns an empty manifest; existing reuse/recovery helpers need this link control."
+        ],
+        "expected": "Discovery and execution preserve activation values, runner identity, argument boundaries and effective cwd applied once. Valid selected tests execute; shared environment/package contents and ambient gates remain unchanged. Preserve the JavaScript append history and Python replacement marker through the existing parent-owned receiver. Await JavaScript completion and propagate callback failures; keep the activation, cwd, CONDA_PREFIX, symlink, required-command, shared-environment/package snapshot and ambient-file assertions unchanged. Preserve the launcher tests unchanged and require the companion registered-link fixture to demonstrate complete tracing and actual reuse; successful launch alone is not evidence of input-trace completeness.",
+        "finding_ids": [
+          "gate-trace-registered-dependency-links-disable-valid-reuse"
+        ],
+        "kind": "interaction",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e",
+          "root:3:6e185ca6ec"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_verification_execution_context.py::test_named_conda_vitest_discovery_preserves_activation_cwd_and_shared_environment[True]' 'tests/test_verification_execution_context.py::test_relative_prefix_and_named_launchers_share_execution_semantics[prefix]'",
+        "quick_required": true,
+        "reference_ids": [
+          "retained_execution_markers_conflict_with_confinement",
+          "gate-trace-custody-overrides-clean-execution-mode"
+        ],
+        "scenario_id": "g02_launcher_discovery_execution_agree",
+        "trigger": "Run retained filename-filter discovery and verification through named, already-active and relative-prefix Conda environments, combining shell cwd, launcher --cwd, inline assignments, reports and redirections. The Vitest and pytest bodies read ../value.py, then report that observed value from inside confinement at their original marker-write positions. Cross-check supported Conda/dependency-link execution with the registered-link source-cache reuse/recovery fixture under the inherited production owner."
+      },
+      {
+        "check": "python -m pytest -q tests/test_repair_adaptive.py::test_declared_ini_overrides_preserve_environment_and_cli_precedence tests/test_repair_adaptive.py::test_inline_environment_assignment_remains_shell_assignment tests/test_vitest_selector_execution.py::test_multiple_selectors_preserve_file_and_test_name_pairing tests/test_vitest_selector_execution.py::test_selector_compilation_preserves_unicode_escaping_and_existing_filters tests/test_vitest_selector_execution.py::test_compiled_selectors_execute_exact_tests_with_real_vitest",
+        "evidence": [
+          "tests/test_repair_adaptive.py:102 and :112 retain override precedence and actual shell-assignment execution.",
+          "tests/test_execution_binding.py:37 and :43 retain runner-specific cache options and argument boundaries.",
+          "tests/test_vitest_selector_execution.py:15, :26 and :55 retain file/name associations, Unicode filters and exact real-Vitest execution assertions. These source files are unchanged; public acceptance was not run."
+        ],
+        "expected": "Override precedence and shell assignments remain intact. Cache flags apply to the actual runner. Vitest executes exactly the requested file/name associations with valid single-valued name-filter arguments.",
+        "finding_ids": [],
+        "kind": "interaction",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:3:6e185ca6ec"
+        ],
+        "quick_check": "python -m pytest -q tests/test_repair_adaptive.py::test_declared_ini_overrides_preserve_environment_and_cli_precedence tests/test_repair_adaptive.py::test_inline_environment_assignment_remains_shell_assignment tests/test_vitest_selector_execution.py::test_multiple_selectors_preserve_file_and_test_name_pairing tests/test_vitest_selector_execution.py::test_selector_compilation_preserves_unicode_escaping_and_existing_filters tests/test_vitest_selector_execution.py::test_compiled_selectors_execute_exact_tests_with_real_vitest",
+        "scenario_id": "g02_compilation_preserves_runner_semantics",
+        "trigger": "Compile conflicting configuration/environment/CLI overrides and mixed pytest/Vitest commands containing multiple literal Unicode selectors, existing filters and cache options."
+      },
+      {
+        "check": "python -m pytest -q tests/test_verification_input_trace.py::test_gate_trace_tampering_cannot_authorize_reuse tests/test_gate_result_cache.py::test_gate_trace_evidence_requires_custody",
+        "evidence": [
+          "src/auto_agents/verification_input_trace.py:109 validates only at registration; :226 accepts a nonempty owner and complete footer without custody.",
+          "src/auto_agents/gate_execution.py:482,1471,1538,1626 joins pathname consumption, writable runtime storage and completeness; gate_result_cache.py:195 grants cross-source reuse.",
+          "Related fixtures inspected: tests/test_gate_execution.py:383, tests/test_verification_input_trace.py:20,137 and tests/test_gate_result_cache.py:120,165. Their unchanged-input positive and changed-input inverse remain mandatory.",
+          "Add the named acceptance nodes during implementation; they do not yet exist and have not run."
+        ],
+        "expected": "The real evidence inode and its containing directory remain outside every untrusted descendant's writable roots; tampering with that evidence is denied, and replacements at the obsolete runtime pathname are ignored. No writable evidence descriptor reaches the command. Only the pinned, job-bound stream from the negotiated owner can establish completeness. Changed input forces a real execution and the owned assertion fails; fabricated, overwritten, stale or incomplete evidence never authorizes cross-source success. Observe actual dispatch, not cached stdout.",
+        "finding_ids": [],
+        "kind": "failure",
+        "obligation_ids": [
+          "root:1:6c57f38109"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_verification_input_trace.py::test_gate_trace_tampering_cannot_authorize_reuse[confined-replace-observed_inputs]' 'tests/test_verification_input_trace.py::test_gate_trace_tampering_cannot_authorize_reuse[confined-overwrite-auto]' 'tests/test_verification_input_trace.py::test_gate_trace_tampering_cannot_authorize_reuse[executor-replace-auto]' 'tests/test_verification_input_trace.py::test_gate_trace_tampering_cannot_authorize_reuse[executor-overwrite-observed_inputs]'",
+        "quick_required": true,
+        "reference_ids": [
+          "gate-input-trace-replacement-authorizes-cross-source-reuse"
+        ],
+        "scenario_id": "g02_trace_custody_rejects_forgery",
+        "trigger": "Under the selected production owner, execute the retained check through both executor-only and confined nested dispatch. After reading input.txt, try pathname replacement, in-place overwrite/truncation, or descriptor-alias writes, including a valid-looking JSON stream naming only unchanged pyproject.toml. Then change input.txt. Run both observed_inputs and auto. Consumer controls supply replacement/overwritten streams without protected custody, an absent footer, mismatched owner and replayed job receipt."
+      },
+      {
+        "check": "python -m pytest -q tests/test_verification_input_trace.py::test_gate_trace_custody_preserves_valid_reuse tests/test_verification_input_trace.py::test_nested_gate_tracing_keeps_private_and_shared_boundaries tests/test_verification_input_trace.py::test_existing_gate_cache_regression_under_production_owner tests/test_verification_input_trace.py::test_tracing_captures_fork_cwd_fd_and_negative_inputs tests/test_gate_result_cache.py::test_live_owner_change_invalidates_proof_with_unchanged_candidate_source tests/test_gate_result_cache.py::test_supervision_policy_changes_invalidate_existing_proofs",
+        "evidence": [
+          "tests/test_gate_execution.py:436-450 requires reuse for an unrelated change and actual failure after input.txt changes.",
+          "tests/test_verification_input_trace.py:20 already tests private metadata plus shared denial under both scopes; :107 covers fork/cwd/fd and negative inputs.",
+          "src/auto_agents/execution_binding.py:142 needs private fchmod; tests/test_session_execution_confinement.py:27-40 preserves private and shared inverse controls.",
+          "gate_result_cache.py:23-40 already fingerprints gate execution, sandbox, trace source and the negotiated live owner; retain that invalidation mechanism.",
+          "Independent REVISE f26bde7baec14642bc6596609e110742: the parent retains a registered /bin -> /usr/bin alias and resolved shared input, current source returns an empty manifest; existing reuse/recovery helpers need this link control."
+        ],
+        "expected": "The first real execution has a protected complete trace from the same negotiated owner; changing only unobserved source produces result-cache-observed-inputs without dispatch. Changing the real input invalidates reuse and executes the failing check. Private operations succeed, shared content and metadata mutations stay denied, and shared bytes/modes remain identical. Existing owner and execution-policy identity changes still invalidate proofs. The observation used to count dispatch must not introduce network input into this reusable proof. Registered dependency traversal must remain complete and reusable after an unrelated source change. A changed shared input or registered binding must invalidate reuse and cause real execution. The original unsupported-symlink controls stay blocking; keep all stat-only, negative-lookup and directly-read input controls.",
+        "finding_ids": [
+          "gate-trace-registered-dependency-links-disable-valid-reuse"
+        ],
+        "kind": "compatibility",
+        "obligation_ids": [
+          "root:1:6c57f38109"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_verification_input_trace.py::test_gate_trace_custody_preserves_valid_reuse[observed_inputs]' 'tests/test_verification_input_trace.py::test_gate_trace_custody_preserves_valid_reuse[auto]'",
+        "quick_required": true,
+        "reference_ids": [
+          "gate-input-trace-replacement-authorizes-cross-source-reuse",
+          "gate-trace-evidence-exclusion-drops-real-dependencies",
+          "gate-trace-custody-overrides-clean-execution-mode"
+        ],
+        "scenario_id": "g02_trace_custody_preserves_valid_reuse",
+        "trigger": "For each cache scope, run an untampered retained check with private chmod/fchmod/utime, shared reads and attempted shared mutations. Change only an unobserved source, then change an actually read input. Also retain fork/cwd/dirfd/negative-input tracing and the original production-owner cache regression. The same real gate now also reads a shared dependency through an executor-installed registered .conda link in both scopes; vary the shared input and registered target independently after a valid baseline."
+      },
+      {
+        "check": "python -m pytest -q tests/test_verification_input_trace.py::test_gate_trace_custody_recovers_after_incomplete_run tests/test_verification_input_trace.py::test_legacy_owner_executes_once_without_claiming_complete_trace tests/test_verification_metadata.py::test_unsupported_supervision_never_executes_the_command tests/test_verification_metadata.py::test_supervisor_death_kills_its_tracees tests/test_verification_supervisor_checks.py::test_death_check_detects_missing_exitkill_and_cleans_up",
+        "evidence": [
+          "verification_input_trace.py:134-146 marks signalled descendants incomplete and finishes only when every registered descendant retires.",
+          "verification_supervisor_checks.py:42-79 validates launcher PID and all recorded source digests; runtime_capabilities.production_namespace.nested_gate_metadata.standalone_owner_activation reports the supported pre-owner route.",
+          "Keep g02_retained_receipt_and_inventory_recovery and its original custody/authority recovery cohort unchanged.",
+          "The native review f26bde7baec14642bc6596609e110742 verified the supplied outer-controller source digests and confirmed the launcher parser fixed; future lifecycle acceptance still needs its own current source-bound observations.",
+          "Independent REVISE f26bde7baec14642bc6596609e110742: the parent retains a registered /bin -> /usr/bin alias and resolved shared input, current source returns an empty manifest; existing reuse/recovery helpers need this link control."
+        ],
+        "expected": "Incomplete evidence supplies an explicit non-reusable trace reason. Restoring the fault-control input causes one real fresh execution and permits later legitimate observed-input reuse; no sticky failed proof, stale stream, leaked writable handle or leftover descendant can certify recovery. A legacy owner executes the command without claiming complete tracing; startup denial prevents command execution; real owner death kills tracees, and the missing-EXITKILL control detects the inverse. Inherited tests read source-bound launcher observations and never start another ptracer or kill a nested launcher. The recovered complete trace retains the registered binding and resolved shared input. An unrelated change reuses without dispatch; changing the shared input forces execution and the expected assertion failure.",
+        "finding_ids": [
+          "gate-trace-registered-dependency-links-disable-valid-reuse"
+        ],
+        "kind": "recovery",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_verification_input_trace.py::test_gate_trace_custody_recovers_after_incomplete_run[observed_inputs]' 'tests/test_verification_input_trace.py::test_gate_trace_custody_recovers_after_incomplete_run[auto]' tests/test_verification_input_trace.py::test_legacy_owner_executes_once_without_claiming_complete_trace tests/test_verification_metadata.py::test_unsupported_supervision_never_executes_the_command tests/test_verification_metadata.py::test_supervisor_death_kills_its_tracees tests/test_verification_supervisor_checks.py::test_death_check_detects_missing_exitkill_and_cleans_up",
+        "quick_required": true,
+        "reference_ids": [
+          "gate-input-trace-replacement-authorizes-cross-source-reuse",
+          "live-launcher-source-binding-rejects-isolated-interpreter"
+        ],
+        "scenario_id": "g02_trace_custody_recovers",
+        "trigger": "A gate parent exits successfully after a traced descendant terminates by signal, making the owner's stream incomplete. Change the fixture's declared fault-control input to restore a healthy execution, then change only unobserved source. Exercise both scopes. Separately consume the selected launcher's fixed legacy-owner, startup-denial, owner-death and missing-EXITKILL observations. Use the same registered-link shared-input control in the healthy recovery helper for both cache scopes."
+      },
+      {
+        "check": "python -m pytest -q tests/test_verification_input_trace.py::test_public_resume_trace_tampering_keeps_owned_authority tests/test_verification_input_trace.py::test_public_resume_tracing_inside_production_owner tests/test_session_execution_confinement.py::test_public_resume_confines_shared_inputs_during_collection_and_execution",
+        "evidence": [
+          "tests/test_verification_input_trace.py:135-176 supplies both scopes and retained/global_plan_switch cases through real public resume but currently lacks tamper-then-value-change coverage.",
+          "session.py:4084-4098 assigns the real target and preserves the retained execution environment before confined_session_executor.",
+          "tests/test_session_execution_confinement.py:26-64 exercises metadata and filesystem operations during collection and execution; its nested=True case is the representative compatibility check.",
+          "Existing g02 launcher and configured-filter scenario quick_required flags and exact command cohorts remain retained."
+        ],
+        "expected": "The changed owned candidate cannot inherit cached success from the tampered earlier run: public verification actually executes and reports the owned failure. Construct candidate revisions through existing authenticated fixture custody; do not edit retained proof sources or forge receipts to reach the trigger. Preserve session/contract/environment identities, foreign plans and gates, bytes, index, modes and untracked work. Retained Conda, pytest and Vitest commands keep their original environment, cwd and argument semantics; existing private-operation success and shared denial remain enforced.",
+        "finding_ids": [],
+        "kind": "interaction",
+        "obligation_ids": [
+          "root:1:6c57f38109",
+          "root:2:1cbe8ffd4e"
+        ],
+        "quick_check": "python -m pytest -q 'tests/test_verification_input_trace.py::test_public_resume_trace_tampering_keeps_owned_authority[global_plan_switch-replace-observed_inputs]' 'tests/test_verification_input_trace.py::test_public_resume_trace_tampering_keeps_owned_authority[global_plan_switch-overwrite-auto]' 'tests/test_session_execution_confinement.py::test_public_resume_confines_shared_inputs_during_collection_and_execution[True]'",
+        "quick_required": true,
+        "reference_ids": [
+          "gate-input-trace-replacement-authorizes-cross-source-reuse"
+        ],
+        "scenario_id": "g02_trace_custody_public_resume_interaction",
+        "trigger": "Through real public Session.resume and its confined LocalGatePlanExecutor, retain the owned test while it attempts trace replacement or overwrite after reading value.py. Revalidate a legitimately created failing owned candidate after a prior success, with retained and switched ambient plans, under observed_inputs and auto. Keep the existing shared-environment collection/execution controls."
+      }
+    ],
+    "touched_paths": [
+      "src/auto_agents/gate_execution.py",
+      "src/auto_agents/verification_input_trace.py",
+      "src/auto_agents/verification_sandbox.py",
+      "tests/test_verification_input_trace.py",
+      "tests/test_gate_result_cache.py",
+      "src/auto_agents/verification_supervisor_checks.py",
+      "tests/test_verification_supervisor_checks.py"
+    ]
+  }
+}

@@ -133,11 +133,16 @@ def run(args):
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, dest)
     runner._experiment_store.save(state)
+    if args.revision:
+        from auto_agents.repair_manual_plan import propose
+        proposed = propose(runner, engine, json.loads(args.revision.read_text()))
+        (output / 'manual-revision.json').write_text(json.dumps(proposed, indent=2))
     before = source_identity(engine)
     started = time.monotonic()
     report = {'native': args.native, 'real_probes': args.native or args.probes, 'code_generated': False,
               'engine_published': False, 'original_project_resumed': False, 'repair_accepted': False,
               'source_commit': head_ref(engine), 'planning_approved': False,
+              'manual_revision': str(args.revision) if args.revision else None,
               'excluded_caller_path_aliases': removed_aliases}
     try:
         if args.native or args.probes:
@@ -173,4 +178,5 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True, help='new private directory')
     parser.add_argument('--native', action='store_true')
     parser.add_argument('--probes', action='store_true', help='real local probes; capture review without a provider call')
+    parser.add_argument('--revision', type=Path, help='apply an explicit unapproved revision to the private replay copy only')
     raise SystemExit(run(parser.parse_args()))

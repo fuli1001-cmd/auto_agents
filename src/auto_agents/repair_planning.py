@@ -704,7 +704,7 @@ def _review_reuse_failure(runner, receipt, group):
         request, context, result, proposal = [json.loads(path.read_text()) for path in paths]
         if not (request.get('stage') == 'self_repair_plan_review'
                 and request.get('request_id') == reviewer and proposal.get('request_id') == planner
-                and proposal.get('stage') in {'self_repair_component_plan', 'self_repair_plan_format'}
+                and proposal.get('stage') in {'self_repair_component_plan', 'self_repair_plan_format', 'self_repair_manual_plan'}
                 and context.get('planner_request') == planner
                 and context.get('source') == receipt.get('source')
                 and context.get('source_commit') == receipt.get('source_commit')
@@ -728,6 +728,10 @@ def _review_reuse_failure(runner, receipt, group):
         elif (context.get('proposed_plan') != receipt.get('plan')
               or context.get('probe_results') != receipt.get('probe_results')):
             return 'legacy review lacks an original evidence digest; independent review required'
+        if proposal.get('stage') == 'self_repair_manual_plan':
+            from .repair_manual_plan import retained_proposal
+            if not retained_proposal(runner, proposal, receipt):
+                return 'manual proposal provenance is missing or changed'
         from .repair_probe_review import admit as admit_probes
         probe_checks = admit_probes(runner, group, context, result)
         if probe_checks is None or receipt.get('probe_acceptance_commands', []) != probe_checks:
@@ -981,10 +985,16 @@ def prepare_component(runner, workspace):
                        signature, context['environment'], planning_capability_fingerprint(context['runtime_capabilities']),
                        [finding_key(f) for f in context['findings']]])
     reuse_failures, invalid_approvals = [], set()
+    from .repair_manual_plan import selected_revision
+    manual_revision = selected_revision(runner, group)
     for receipt in experiment.planning_receipts.values():
         original_group = receipt.get('component', group)
         if (receipt.get('decision') != 'APPROVE' or receipt.get('component_signature') != signature
                 or receipt.get('contract') != experiment.contract_fingerprint):
+            continue
+        if manual_revision is not None and receipt.get('request_id') != manual_revision.get('reviewer_request'):
+            reuse_failures.append({'request_id': receipt.get('request_id'),
+                                   'reason': 'explicit manual revision supersedes this proposal'})
             continue
         failure = _review_reuse_failure(runner, receipt, original_group)
         if not failure:
