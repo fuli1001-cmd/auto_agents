@@ -79,5 +79,12 @@
     "Final runtime code has the full baseline suite plus the complete affected repair regression suite, not a second full-suite run.",
     "The authorized native rehearsal completed one independent review and stopped before the requested amendment; no repair candidate or original project workflow was executed.",
     "The comparison measures review duration only: the previous run failed in transport and this review returned REVISE, so it does not establish end-to-end self-repair throughput."
-  ]
+  ],
+  "manual_plan_revision": {
+    "status": "draft_installed",
+    "code_commit": "29a908e256cc615f48d86fc468d6de9eb55c2077",
+    "request_id": "3c10aa8871154b6cb35e57c7d3e200b3",
+    "requires_independent_review": true,
+    "report": "docs/self-repair-g02-plan-revision-validation.json"
+  }
 }

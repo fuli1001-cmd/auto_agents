@@ -23,7 +23,10 @@
 
 安装草案只更新已停止引擎任务的规划记录，不启动 worker、调用模型、修改候选代码或恢复 sdgp。
 `scripts/revise_repair_plan.py` 默认只验证，显式 `--apply` 才保存草案；它检查任务停止、进程退出、源版本、契约、父方案及验收保留，并保留修改前的实验备份。
-实际安装结果另记于相邻的验证记录。
+修订已安装到停止的任务 `55b5e9bc4270493fb66d797a`，新请求为 `3c10aa8871154b6cb35e57c7d3e200b3`，
+草案记录为 `9200431532204b489cfeb0c27b98022a`。任务仍为 `blocked`，候选数保持 94，候选源码、既有批准、范围结论和历史候选记录均未改变。
+原命令下次恢复该修复任务时，将使用新草案进入独立审查。本次未启动修复或模型，也没有批准或实施这个候选。
+实际安装、备份位置和验证结果见[验证记录](self-repair-g02-plan-revision-validation.json)。
 
 诊断与测试材料：`/tmp/self-repair-plan-revision-92b1r791/` 下的 `rehearsal-current/report.json`、
 `parent-control-result.json` 和 `repair-regressions/result.json`。

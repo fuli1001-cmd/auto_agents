@@ -1,0 +1,69 @@
+{
+  "code_commit": "29a908e256cc615f48d86fc468d6de9eb55c2077",
+  "plan": "docs/self-repair-g02-plan-revision.json",
+  "plan_digest": "edf3252c67547022fd0c5e9ce93f8cc9c98b74f6878621012f03df740eee1ada",
+  "installation": {
+    "job": "55b5e9bc4270493fb66d797a",
+    "group": "g02_invocation_semantics",
+    "scenarios": 13,
+    "parent_revision": "ad80ec4bcaae4aad8480c39958f4b613",
+    "validated": true,
+    "applied": true,
+    "requires_independent_review": true,
+    "worker_started": false,
+    "model_calls": 0,
+    "request_id": "3c10aa8871154b6cb35e57c7d3e200b3",
+    "revision": {
+      "id": "9200431532204b489cfeb0c27b98022a",
+      "digest": "1761d6693171fc2bd038136d085a891a5685c939c2be9d583677c58ccc427845"
+    },
+    "status": "draft",
+    "candidate_modified": false,
+    "candidate_source_unchanged": true,
+    "attempt_count_preserved": 94,
+    "historical_approvals_preserved": true,
+    "scope_decisions_preserved": true,
+    "candidate_records_preserved": true,
+    "job_state_preserved": "blocked",
+    "source_unchanged": true,
+    "backup": "/home/fuli/.local/state/auto-agents/repair-control/4bebb69c28b7902b8b614a92/jobs/55b5e9bc4270493fb66d797a/working-evidence/.auto-agents/runs/session-6a0cedd6674d/self-repair/e9c1fb411d3beea48a7bdfd371a0ba586a1cc38a663ad0755bc7a2739aedecb4/planning/3c10aa8871154b6cb35e57c7d3e200b3/previous-experiment.json",
+    "plan_digest": "edf3252c67547022fd0c5e9ce93f8cc9c98b74f6878621012f03df740eee1ada"
+  },
+  "tests": {
+    "ok": true,
+    "cases": 563,
+    "coverage": "all tests/test_repair_*.py",
+    "seconds": 147.74252792100015,
+    "report": "/tmp/self-repair-plan-revision-92b1r791/repair-regressions/result.json"
+  },
+  "rehearsal": {
+    "seconds": 56.00010389900126,
+    "first_request": "self_repair_plan_review",
+    "probe_outcomes": [
+      {
+        "outcome": "behavior_failure",
+        "matches": true
+      },
+      {
+        "outcome": "pass",
+        "matches": true
+      },
+      {
+        "outcome": "pass",
+        "matches": true
+      }
+    ],
+    "original_checks_preserved": true,
+    "model_calls": 0,
+    "original_state_modified": false,
+    "report": "/tmp/self-repair-plan-revision-92b1r791/rehearsal-current/report.json"
+  },
+  "negative_probe_parent_control": {
+    "ok": true,
+    "source_commit": "5dad47414512b99082736f8dd35dd6055f3cfc8b",
+    "report": "/tmp/self-repair-plan-revision-92b1r791/parent-control-result.json"
+  },
+  "independent_review": "required; not performed for this manual draft",
+  "candidate_implementation": "not performed",
+  "original_project_resumed": false
+}
