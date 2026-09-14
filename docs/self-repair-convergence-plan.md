@@ -1,5 +1,10 @@
 # Self-repair convergence and private source handoffs
 
+The c93/c94 live run exposed gaps between this intended incremental workflow and
+its implementation. See the [2026-09-14 convergence review](self-repair-convergence-redesign.md)
+for measured failures, bounded routing corrections, and the proposed orchestration
+redesign. Its proposed architecture is distinct from the behavior implemented here.
+
 Self-repair retains one serial implementation workspace and chooses its next
 step from verification evidence. There is no root-level or candidate wall-clock
 budget. A step without meaningful progress can still be diagnosed and stopped.

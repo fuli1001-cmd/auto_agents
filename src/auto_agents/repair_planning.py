@@ -724,24 +724,63 @@ def _component_signature(group):
 def _implementation_bindings(runner, receipt, findings):
     """Only an actual independent code review can classify a covered correction."""
     from .repair_memory import component_key, read_record
-    memory = runner._experiment.component_memory.get(component_key(receipt.get('component', {})), {})
-    review = read_record(runner, memory.get('code_review', {}))
-    if not review or review.get('contract') != runner._experiment.contract_fingerprint:
+    canonical = receipt.get('component', {})
+    # The writer/reviewer receives the approved execution scope, which can be
+    # narrower or wider than the original grouping. Prefer that exact record;
+    # canonical-only records remain readable for older callers.
+    review = None
+    for group in ({**canonical, **receipt['plan']}, canonical):
+        memory = runner._experiment.component_memory.get(component_key(group), {})
+        if not isinstance(memory, dict):
+            return None
+        reference = memory.get('code_review')
+        if not reference:
+            continue
+        review = read_record(runner, reference)
+        if (not review or review.get('kind') != 'code_review'
+                or review.get('contract') != runner._experiment.contract_fingerprint
+                or review.get('environment') != receipt.get('environment')
+                or not isinstance(review.get('component'), dict)
+                or not all(_texts(review['component'].get(key, []), empty=True)
+                           for key in ('touched_paths', 'contract_obligation_ids', 'focused_tests'))
+                or component_key(review['component']) != component_key(group)
+                or review['component'].get('group_id') != canonical.get('group_id')
+                or review['component'].get('planning_receipt', receipt['request_id']) != receipt['request_id']):
+            return None  # A corrupt/current record cannot fall back to stale evidence.
+        break
+    if not review or not isinstance(review.get('result'), dict):
         return None
-    reviewed = {f['finding_id']: f for f in review['result'].get('findings', [])}
+    rows = review['result'].get('findings', [])
+    if not isinstance(rows, list) or not all(isinstance(f, dict) and _text(f.get('finding_id')) for f in rows):
+        return None
+    reviewed = {f['finding_id']: f for f in rows}
+    if len(reviewed) != len(rows):
+        return None
     scenarios = {s['scenario_id']: s for s in receipt['plan']['scenarios']}
     bindings = {}
     for finding in findings:
         item = reviewed.get(finding['finding_id'], {})
         ids = item.get('scenario_ids', [])
         if (finding_key(item) != finding_key(finding) or item.get('repair_kind') != 'implementation'
-                or not ids or not set(ids).issubset(scenarios)
+                or not _texts(ids) or not set(ids).issubset(scenarios)
                 or not all(finding.get('causal_obligation_id') in scenarios[key]['obligation_ids'] for key in ids)
                 or not finding.get('affected_paths') or not all(
                     path in receipt['plan']['touched_paths'] for path in finding['affected_paths'])):
             return None
         bindings[finding['finding_id']] = ids
     return bindings
+
+
+def _revision_finding_delta(runner, previous, findings):
+    """Evidence changes need semantic work, not repair of scenario references."""
+    known = previous.get('finding_keys')
+    if not isinstance(known, dict):
+        receipt = next((row for row in runner._experiment.planning_receipts.values()
+                        if row.get('request_id') == previous.get('reviewer_request')), {})
+        known = {f['finding_id']: finding_key(f) for f in receipt.get('findings', [])}
+    # Missing historical evidence cannot establish that an active defect was
+    # already addressed. An empty current finding set still allows revalidation.
+    return [f['finding_id'] for f in findings if known.get(f['finding_id']) != finding_key(f)]
 
 
 def _format_semantics_changed(original, corrected):
@@ -809,6 +848,11 @@ def _apply_execution_mode(runner, receipt, source):
     # Completed-component recovery markers are issued by the controller, never
     # by a proposed plan or a retained model response.
     runner._candidate_group.pop('completion_revalidation', None)
+    if runner._candidate_group.get('finding_scenario_bindings'):
+        # A bound independent code review supersedes an earlier observation
+        # that no writing was necessary, even when no command failed.
+        runner._candidate_group['mode'] = 'implement'
+        return
     # An unchanged, independently inspected implementation can go directly to
     # verification. New failure evidence still authorizes the original writer.
     if (receipt.get('source') == source and receipt.get('execution_mode') == 'verify_existing'
@@ -818,6 +862,7 @@ def _apply_execution_mode(runner, receipt, source):
 
 def _materialize_draft(payload, previous):
     if not isinstance(payload, dict) or 'amendment' not in payload:
+        _preserve_scenarios(previous, payload)
         return payload
     amendment = payload['amendment']
     if (not previous or not isinstance(previous.get('draft'), dict) or not isinstance(amendment, dict)
@@ -836,11 +881,22 @@ def _materialize_draft(payload, previous):
             raise PlanFormatError('step replacements need existing stable IDs and nonempty text', field='amendment.replace_steps')
         plan['implementation_steps'] = [replacements.get(identity, text)
             for identity, text in zip(previous['step_ids'], previous['draft']['implementation_steps'])]
-    original = {s['scenario_id'] for s in previous['draft'].get('scenarios', []) if isinstance(s, dict) and s.get('scenario_id')}
-    updated = {s.get('scenario_id') for s in plan.get('scenarios', []) if isinstance(s, dict)}
-    if not original.issubset(updated):
-        raise PlanningBlocked('amendment deletes retained acceptance scenarios', code='acceptance_removed')
+    _preserve_scenarios(previous, plan)
     return plan
+
+
+def _preserve_scenarios(previous, plan):
+    # Complete JSON replies must obey the same retention rule as amendments.
+    # Malformed fields still go through the normal format validator.
+    old = (previous or {}).get('draft')
+    if not isinstance(old, dict) or not isinstance(plan, dict):
+        return
+    if not isinstance(old.get('scenarios'), list) or not isinstance(plan.get('scenarios'), list):
+        return
+    original = {s['scenario_id'] for s in old['scenarios'] if isinstance(s, dict) and _text(s.get('scenario_id'))}
+    updated = {s['scenario_id'] for s in plan['scenarios'] if isinstance(s, dict) and _text(s.get('scenario_id'))}
+    if not original.issubset(updated):
+        raise PlanningBlocked('plan revision deletes retained acceptance scenarios', code='acceptance_removed')
 
 
 def prepare_component(runner, workspace):
@@ -935,6 +991,14 @@ def prepare_component(runner, workspace):
         context['component_delta'] = {key: value for key, value in group.items()
                                       if key not in {'status', 'completed_at', 'completed_by', 'title', 'group_id'}
                                       and previous.get('component', {}).get(key) != value}
+    changed_findings = (_revision_finding_delta(runner, previous, context['findings'])
+                        if previous and previous.get('status') == 'APPROVE' else [])
+    needs_amendment = bool(changed_findings)
+    if needs_amendment:
+        context['finding_delta'] = {'added_or_changed': changed_findings, 'prior_revision': previous['id'],
+            'instruction': 'The retained approval could not cover this current evidence. Amend the affected '
+                           'mechanisms and scenarios before independent review; changing finding references '
+                           'alone cannot resolve a semantic defect. Preserve all retained acceptance.'}
     # A new commit or label does not buy another window for the same unresolved design.
     key = 'episode:' + strategy
     if key not in experiment.repair_episodes and previous is None:
@@ -947,9 +1011,17 @@ def prepare_component(runner, workspace):
         'semantic_attempts': 0, 'format_corrections': 0, 'status': 'active', 'feedback': [],
         'source': context['source'], 'strategy': strategy,
         'resume_phase': 'review' if (previous and previous.get('status') == 'APPROVE'
+                                    and not needs_amendment
                                     and _component_signature(previous.get('component', {})) == signature) else 'draft'})
+    if needs_amendment:
+        # Migrate queued retained-plan reviews without renewing attempts or
+        # format-call budgets. Interrupted independent calls still cost a slot.
+        episode['resume_phase'] = 'draft'
+        if episode.get('phase') == 'review':
+            episode['phase'] = 'draft'
+        episode['pending_format'] = 0
     approved_draft = bool(previous and previous.get('status') == 'APPROVE' and previous.get('draft'))
-    recovering_receipt = (approved_draft and episode['semantic_attempts'] >= MAX_PLAN_REVIEWS
+    recovering_receipt = (approved_draft and not needs_amendment and episode['semantic_attempts'] >= MAX_PLAN_REVIEWS
                           and previous.get('reviewer_request') in invalid_approvals
                           and not episode.get('approval_recovery_used'))
     if recovering_receipt:
@@ -1024,11 +1096,11 @@ def prepare_component(runner, workspace):
         'Include concrete negative, inverse positive, recovery and interaction mechanisms; no broad suite probes.')
     if episode.get('phase') == 'reviewing':
         # An interrupted independent request consumed its slot, not its draft.
-        episode.update(pending_round=False, resume_phase='review')
+        episode.update(pending_round=False, resume_phase='draft' if needs_amendment else 'review')
     elif episode.get('status') == 'approved' and previous and previous.get('draft'):
         # Lost/invalid review artifacts require another independent review, not
         # rewriting a still available draft from scratch.
-        episode.update(pending_round=False, resume_phase='review')
+        episode.update(pending_round=False, resume_phase='draft' if needs_amendment else 'review')
     while episode['semantic_attempts'] < MAX_PLAN_REVIEWS or episode.get('pending_round'):
         if not episode.get('pending_round'):
             episode['semantic_attempts'] += 1
@@ -1090,7 +1162,8 @@ def prepare_component(runner, workspace):
                 reference = remember_revision(runner, group, {'parent_revision': previous.get('id') if previous else None,
                     'draft': payload, 'source': context['source'], 'source_commit': context['source_commit'],
                     'environment': context['environment'], 'planner_request': planner_id,
-                    'component': group, 'feedback': feedback, 'status': 'draft'})
+                    'component': group, 'finding_keys': {f['finding_id']: finding_key(f) for f in context['findings']},
+                    'feedback': feedback, 'status': 'draft'})
                 episode['latest_revision'] = reference
                 previous = {**read_record(runner, reference), 'draft': deepcopy(payload)}
                 plan = validate_plan(payload, group, set(experiment.contract_obligation_ids))
@@ -1159,6 +1232,7 @@ def prepare_component(runner, workspace):
             reference = remember_revision(runner, group, {'parent_revision': previous['id'],
                 'draft': plan, 'source': context['source'], 'source_commit': context['source_commit'],
                 'environment': context['environment'], 'planner_request': planner_id, 'component': group,
+                'finding_keys': {f['finding_id']: finding_key(f) for f in context['findings']},
                 'review': review, 'reviewer_request': reviewer_id, 'probe_results': probes,
                 'status': receipt['decision']})
             previous = {**read_record(runner, reference), 'draft': deepcopy(plan)}
