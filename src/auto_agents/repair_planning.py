@@ -715,7 +715,6 @@ def _review_reuse_failure(runner, receipt, group):
                 and result.get('decision') == 'APPROVE' and result.get('issues') == []
                 and receipt.get('execution_mode', receipt['plan'].get('mode', 'implement')) == _review_execution_mode(receipt['plan'], result)
                 and set(result.get('scenario_ids', [])) == {row['scenario_id'] for row in receipt['plan']['scenarios']}
-                and all(probe.get('matches') for probe in receipt.get('probe_results', []))
                 and receipt['plan'] == validate_plan(receipt['plan'], group, set(runner._experiment.contract_obligation_ids))):
             return 'independent review no longer matches its source, scenarios or proposal'
         binding = request.get('review_binding')
@@ -729,6 +728,10 @@ def _review_reuse_failure(runner, receipt, group):
         elif (context.get('proposed_plan') != receipt.get('plan')
               or context.get('probe_results') != receipt.get('probe_results')):
             return 'legacy review lacks an original evidence digest; independent review required'
+        from .repair_probe_review import admit as admit_probes
+        probe_checks = admit_probes(runner, group, context, result)
+        if probe_checks is None or receipt.get('probe_acceptance_commands', []) != probe_checks:
+            return 'current probe observations lack independent reconciliation or retained acceptance'
         return ''
     except (OSError, TypeError, ValueError, AttributeError, KeyError, PlanningBlocked):
         return 'review artifacts missing or invalid'
@@ -1033,7 +1036,9 @@ def prepare_component(runner, workspace):
         if same:
             runner._candidate_group = {**group, **receipt['plan'], 'planning_receipt': receipt['request_id'],
                                        'finding_scenario_bindings': bindings,
-                                       'retained_acceptance': work_memory(runner, group).get('acceptance_inventory', [])}
+                                       'retained_acceptance': list(dict.fromkeys([
+                                           *work_memory(runner, group).get('acceptance_inventory', []),
+                                           *receipt.get('probe_acceptance_commands', [])]))}
             _apply_execution_mode(runner, receipt, context['source'])
             runner._experiment_store.record_health(experiment, status='plan_reused', detail=receipt['request_id'])
             return receipt
@@ -1273,6 +1278,8 @@ def prepare_component(runner, workspace):
             probes = [_probe(runner, workspace, spec) for spec in plan['probes']]
             review_context = {**context, 'proposed_plan': plan, 'planner_request': planner_id,
                               'probe_results': probes, 'previous_revision': previous}
+            from .repair_probe_review import prepare as prepare_probes, admit as admit_probes, INSTRUCTION as PROBE_INSTRUCTION
+            prepare_probes(runner, group, review_context)
             episode['phase'] = 'reviewing'
             runner._experiment_store.save(experiment)
             from .repair_plan_recovery import invoke_review
@@ -1292,15 +1299,16 @@ def prepare_component(runner, workspace):
                 'Set implementation_required=false and remaining_changes=[] only after confirming that the '
                 'CURRENT source already implements every planned mechanism; the controller will still run all verification. '
                 'Do not demand unrelated hardening or rewrite the proposed plan. '
-                + (REFRESH_INSTRUCTION if refresh is not None else ''), review_context)
+                + (REFRESH_INSTRUCTION if refresh is not None else '') + PROBE_INSTRUCTION, review_context)
             if refresh is not None and admit_refresh(runner, workspace, review_context, reviewer_id, review):
                 # Scope changed on independent evidence. Retain the proposal,
                 # but recompute the actual required finding set before writing.
                 episode.update(pending_round=False, phase='complete', latest_decision='scope_changed')
                 runner._experiment_store.save(experiment)
                 return prepare_component(runner, workspace)
+            probe_checks = admit_probes(runner, group, review_context, review)
             approved = (review.get('decision') == 'APPROVE' and _text(review.get('reason'))
-                        and review.get('issues') == [] and all(p['matches'] for p in probes)
+                        and review.get('issues') == [] and probe_checks is not None
                         and _texts(review.get('scenario_ids'))
                         and set(review['scenario_ids']) == {s['scenario_id'] for s in plan['scenarios']})
             receipt = {'policy': POLICY_VERSION, 'strategy': strategy, 'source': context['source'],
@@ -1311,7 +1319,8 @@ def prepare_component(runner, workspace):
                 'runtime_capabilities': digest(context['runtime_capabilities']),
                 'runtime_capability_semantics': capability_fingerprint(context['runtime_capabilities']),
                 'decision': 'APPROVE' if approved else 'REVISE', 'revision': context['revision'],
-                'probe_results': probes, 'feedback': [review], 'execution_mode': _review_execution_mode(plan, review)}
+                'probe_results': probes, 'probe_acceptance_commands': probe_checks or [],
+                'feedback': [review], 'execution_mode': _review_execution_mode(plan, review)}
             experiment.planning_receipts[key] = receipt
             reference = remember_revision(runner, group, {'parent_revision': previous['id'],
                 'draft': plan, 'source': context['source'], 'source_commit': context['source_commit'],
@@ -1330,7 +1339,8 @@ def prepare_component(runner, workspace):
                                feedback=[], latest_decision='APPROVE')
                 memory = work_memory(runner, group)
                 memory['acceptance_inventory'] = list(dict.fromkeys([*memory.get('acceptance_inventory', []),
-                    *group.get('focused_tests', []), *plan['quick_checks'], *(s['check'] for s in plan['scenarios'])]))
+                    *group.get('focused_tests', []), *plan['quick_checks'], *(s['check'] for s in plan['scenarios']),
+                    *(probe_checks or [])]))
                 runner._experiment_store.save(experiment)
                 runner._candidate_group = {**group, **plan, 'planning_receipt': reviewer_id,
                                            'retained_acceptance': memory['acceptance_inventory']}

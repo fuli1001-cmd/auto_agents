@@ -38,9 +38,12 @@ def schema_for(stage):
         return obj({'decisions': array(SCOPE), 'probes': {'type': ['array', 'null'], 'items': probe}})
     if stage == 'self_repair_plan_review':
         issue = obj({key: TEXT for key in ('scenario_id', 'reason', 'counterexample', 'requested_change')})
+        probe = obj({'probe_id': TEXT, 'disposition': {'type': 'string', 'enum': ['already_fixed', 'planned_fix']},
+                     'scenario_ids': TEXTS, 'evidence': TEXTS, 'reason': TEXT})
         return obj({'decision': {'type': 'string', 'enum': ['APPROVE', 'REVISE']}, 'reason': TEXT,
                     'scenario_ids': TEXTS, 'issues': array(issue), 'implementation_required': {'type': 'boolean'},
-                    'remaining_changes': TEXTS, 'decisions': {'type': ['array', 'null'], 'items': SCOPE}})
+                    'remaining_changes': TEXTS, 'decisions': {'type': ['array', 'null'], 'items': SCOPE},
+                    'probe_assessments': {'type': ['array', 'null'], 'items': probe}})
     if stage == 'self_repair_candidate_review':
         finding = obj({**{key: TEXT for key in ('finding_id', 'causal_obligation_id', 'reason', 'counterexample',
                                                'required_test', 'defer_until', 'repair_group_id')},
