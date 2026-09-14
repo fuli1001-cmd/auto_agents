@@ -138,6 +138,22 @@ def test_combined_scope_is_bound_to_the_original_independent_evidence(approved, 
     assert not _retained_scope(runner, receipt, row)
 
 
+def test_combined_review_cannot_waive_a_known_regression(approved):
+    from auto_agents.repair_review_protocol import admit_scope
+    from auto_agents.repair_control import digest
+    from auto_agents.verification_ledger import source_identity
+    runner, state, plan, _ = approved
+    row = finding(runner, plan)
+    row['scope'].update(verdict='not_applicable', disproof='provider claims the prior counterexample is unsupported')
+    source = source_identity(runner.repo_root)
+    environment = digest(runner._full_suite_environment_fingerprint())
+    incoming = save_record(runner, 'code_review_input', {'source': source, 'environment': environment,
+                                                        'contract_fingerprint': state.contract_fingerprint})
+    assert admit_scope(runner, runner.repo_root, runner._candidate_group, [row], review_input=incoming,
+                       reviewed_source=source, reviewed_environment=environment) == []
+    assert row['finding_id'] not in state.scope_decisions
+
+
 def test_repeated_counterexample_gets_one_diagnosis_and_cannot_reset_through_renaming(approved):
     runner, state, plan, _ = approved
     first, _ = candidate(runner, plan, 1, identity='first-label')

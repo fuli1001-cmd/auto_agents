@@ -49,8 +49,11 @@ def admit_scope(runner, workspace, group, findings, *, review_input, reviewed_so
             _validate_scope({'decisions': [row]}, [finding], runner._experiment.contract_obligation_ids)
         except PlanningBlocked:
             continue
-        if row['verdict'] == 'unknown':
-            continue  # Diagnosis remains required; no waiver is created.
+        if row['verdict'] != 'required':
+            # A code reviewer may directly establish a blocker, but cannot
+            # waive a known obligation through its own scope annotation.
+            # Exclusions and unresolved scope keep the separate independent gate.
+            continue
         admitted.append(finding)
         decisions.append(row)
     if not admitted:
@@ -139,6 +142,6 @@ def controls_for(experiment, group):
     for identity in group.get('finding_ids', []):
         finding = getattr(experiment, 'findings', {}).get(identity)
         row = known.get(identity, {})
-        if finding and finding.status in {'confirmed', 'reopened'} and row.get('finding_key') == finding_key(finding):
+        if row and finding and finding.status in {'confirmed', 'reopened'} and row.get('finding_key') == finding_key(finding):
             result.append({'finding_id': identity, **row})
     return result

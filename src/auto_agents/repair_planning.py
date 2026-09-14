@@ -569,6 +569,8 @@ def validate_probes(probes):
 
 
 def validate_plan(plan, group, contract_ids):
+    from .repair_schedule import canonical_commands, pytest_parts
+    retained_commands = set(canonical_commands(group.get('focused_tests', []))[0])
     if not isinstance(plan, dict):
         raise PlanFormatError('component plan must be an object', field='plan', constraint='JSON object')
     for key in ('implementation_steps', 'touched_paths', 'quick_checks', 'scenarios'):
@@ -598,7 +600,9 @@ def validate_plan(plan, group, contract_ids):
         if not _texts(row.get('obligation_ids')) or not set(row['obligation_ids']).issubset(contract_ids):
             raise PlanningBlocked('scenario expands the frozen contract')
         covered.update(row['obligation_ids'])
-        if not _texts(row.get('finding_ids', []), empty=True) or not _test_command(row['check']):
+        retained_check = (bool(pytest_parts(row['check']))
+                          and canonical_commands([row['check']])[0][0] in retained_commands)
+        if not _texts(row.get('finding_ids', []), empty=True) or not (_test_command(row['check']) or retained_check):
             raise PlanningBlocked('scenario requires explicit acceptance nodes and finding mappings')
         if row.get('quick_check') is not None:
             if not _test_command(row['quick_check']):
@@ -1001,6 +1005,13 @@ def prepare_component(runner, workspace):
     changed_findings = (_revision_finding_delta(runner, previous, context['findings'])
                         if previous and previous.get('status') == 'APPROVE' else [])
     needs_amendment = bool(changed_findings)
+    reviewable_draft = False
+    if previous and previous.get('status') in {'draft', 'recovered_draft', 'legacy_draft'}:
+        try:
+            validate_plan(previous.get('draft'), group, set(experiment.contract_obligation_ids))
+            reviewable_draft = True
+        except PlanningBlocked:
+            pass
     if needs_amendment:
         context['finding_delta'] = {'added_or_changed': changed_findings, 'prior_revision': previous['id'],
             'instruction': 'The retained approval could not cover this current evidence. Amend the affected '
@@ -1017,7 +1028,7 @@ def prepare_component(runner, workspace):
     episode = experiment.repair_episodes.setdefault(key, {
         'semantic_attempts': 0, 'format_corrections': 0, 'status': 'active', 'feedback': [],
         'source': context['source'], 'strategy': strategy,
-        'resume_phase': 'review' if (previous and previous.get('status') == 'APPROVE'
+        'resume_phase': 'review' if reviewable_draft or (previous and previous.get('status') == 'APPROVE'
                                     and not needs_amendment
                                     and _component_signature(previous.get('component', {})) == signature) else 'draft'})
     if needs_amendment:
@@ -1098,7 +1109,9 @@ def prepare_component(runner, workspace):
         'Quick selection targets 3 commands, 12 collected cases, 180 estimated seconds; mandatory coverage may '
         'exceed these scheduling targets without invalidating the plan. Preserve each original command cohort. '
         'For parameterized acceptance, quick_check should name the exact relevant parameter case; check retains '
-        'full acceptance. Never substitute an arbitrary parameter unrelated to the scenario trigger. '
+        'full acceptance. A scenario check may retain an EXACT original pytest cohort, including a whole '
+        'test file; quick_check must select explicit nodes inside that cohort. Never substitute an '
+        'arbitrary parameter unrelated to the scenario trigger. '
         'Use 1 to 3 probes, each explicit pytest nodes (at most 8 targets) or python -B -c memory diagnostics. '
         'Include concrete negative, inverse positive, recovery and interaction mechanisms; no broad suite probes.')
     if episode.get('phase') == 'reviewing':

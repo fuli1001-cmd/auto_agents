@@ -73,7 +73,7 @@ def git(root, *args):
     return subprocess.check_output(['git', '-C', str(root), *args], text=True).strip()
 
 
-def run(output, configuration_project, provider):
+def run(output, configuration_project, provider, proposal=None):
     from auto_agents.adapters.codex import CodexAdapter
     from auto_agents.config import load_project_config
     from auto_agents.models import ProjectConfig
@@ -95,13 +95,14 @@ def run(output, configuration_project, provider):
         (root / '.gitignore').write_text('__pycache__/\n.pytest_cache/\n.auto-agents/\n.auto-agents-gate-runtime/\n')
     (target / 'sentinel.txt').write_text('preserve original target\n')
     (engine / 'source.py').write_text(BROKEN)
+    (engine / 'conftest.py').write_text('import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parent))\n')
     (engine / 'tests').mkdir()
     (engine / 'tests/test_alias_reuse.py').write_text(TESTS)
     for root in (engine, target):
         git(root, 'add', '.')
         git(root, 'commit', '-qm', 'freeze isolated pilot baseline')
     selected = load_project_config(configuration_project)
-    config = ProjectConfig()
+    config = ProjectConfig(project_name='self-repair-convergence-pilot')
     config.providers, config.efforts = selected.providers, selected.efforts
     config.active_provider, config.execution = provider, selected.execution
     if config.providers[provider].kind != 'codex':
@@ -154,10 +155,31 @@ def run(output, configuration_project, provider):
         with (output / 'events.jsonl').open('a') as stream:
             stream.write(json.dumps(events[-1]) + '\n')
     runner._control_phase_callback = event
+    negative_command = 'python -m pytest -q tests/test_alias_reuse.py::test_registered_alias_reuses'
+    positive_command = 'python -m pytest -q tests/test_alias_reuse.py::test_unregistered_alias_denied'
+    runner._candidate_failure_evidence = []
+    negative = runner._run_verification_commands([negative_command], engine)
+    if negative.ok or not any(row.get('failure_kind') == 'assertion' for row in runner._candidate_failure_evidence):
+        raise RuntimeError('pilot negative control did not produce a behavioral assertion failure')
+    positive = runner._run_verification_commands([positive_command], engine)
+    if not positive.ok:
+        raise RuntimeError('pilot compatibility control failed before any model request')
+    (output / 'baseline.json').write_text(json.dumps({'negative': negative.to_dict(), 'positive': positive.to_dict()}, indent=2))
+    if proposal:
+        from auto_agents.repair_memory import save_record, remember_revision
+        from auto_agents.repair_control import digest
+        from auto_agents.verification_ledger import source_identity
+        draft = json.loads(proposal.read_text())
+        origin = save_record(runner, 'retained_model_proposal', {'path': str(proposal), 'draft': draft,
+                            'acceptance_proof': False})
+        remember_revision(runner, group, {'draft': draft, 'component': group, 'status': 'recovered_draft',
+            'source': source_identity(engine), 'source_commit': state.base_commit,
+            'environment': digest(runner._full_suite_environment_fingerprint()),
+            'planner_request': origin['id'], 'requires_independent_review': True})
     results, phase_calls = [], []
     seen = set()
     start = time.monotonic()
-    for phase in ('initial', 'injected_regression'):
+    for phase in ('retained_plan' if proposal else 'initial', 'injected_regression'):
         if phase == 'injected_regression':
             workspace = runner._continuous_workspace / 'repair'
             (workspace / 'source.py').write_text(BROKEN)
@@ -200,6 +222,7 @@ def run(output, configuration_project, provider):
     final = runner._run_verification_commands([full], workspace)
     report = {'ok': final.ok, 'scope': 'two real-provider component repair cycles and complete fixture acceptance',
         'original_project_resumed': False, 'engine_published': False, 'final_engine_handoff_exercised': False,
+        'retained_untrusted_plan': str(proposal) if proposal else None,
         'seconds': time.monotonic() - start, 'phase_calls': phase_calls, 'calls': calls, 'results': results,
         'acceptance_sha256': hashlib.sha256(TESTS.encode()).hexdigest(), 'history': history_report(state),
         'final_verification': final.to_dict()}
@@ -213,5 +236,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True, help='new disposable directory; must not exist')
     parser.add_argument('--configuration-project', type=Path, required=True, help='read provider and effort settings only')
     parser.add_argument('--provider', required=True)
+    parser.add_argument('--proposal', type=Path, help='optional retained model plan as untrusted data; requires fresh probes and independent review')
     args = parser.parse_args()
-    raise SystemExit(run(args.output.resolve(), args.configuration_project.resolve(), args.provider))
+    raise SystemExit(run(args.output.resolve(), args.configuration_project.resolve(), args.provider, args.proposal))

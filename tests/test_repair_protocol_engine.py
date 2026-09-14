@@ -132,3 +132,44 @@ def test_current_repair_authority_overrides_old_no_writer_mode(setup, trigger):
             prepare_component(runner, runner.repo_root)
     assert runner._candidate_group['mode'] == 'implement'
     assert len(calls) == 2
+
+
+def test_original_file_cohort_is_retained_while_quick_checks_select_explicit_nodes(setup):
+    from auto_agents.repair_planning import prepare_component, validate_plan, PlanningBlocked
+    runner, state, plan, calls = setup
+    original = 'python -m pytest -q tests/test_contract.py'
+    state.finding_groups[0]['focused_tests'] = [original]
+    runner._candidate_group = dict(state.finding_groups[0])
+    for scenario in plan['scenarios']:
+        scenario['quick_check'] = scenario['check']
+        scenario['check'] = original
+    with patch('auto_agents.repair_planning._probe', return_value={'matches': True, 'outcome': 'pass'}):
+        receipt = prepare_component(runner, runner.repo_root)
+    assert [request.stage for request, _ in calls] == ['self_repair_component_plan', 'self_repair_plan_review']
+    assert all(row['check'] == original for row in receipt['plan']['scenarios'])
+    invalid = deepcopy(plan)
+    invalid['scenarios'][0]['check'] = original + ' -k unrelated'
+    with pytest.raises(PlanningBlocked, match='explicit acceptance'):
+        validate_plan(invalid, state.finding_groups[0], set(state.contract_obligation_ids))
+
+
+def test_environment_change_reaudits_valid_interrupted_draft_without_another_planner(setup):
+    from auto_agents.repair_planning import prepare_component
+    runner, state, plan, calls = setup
+    original = runner.target_orchestrator._call_with_failover
+    stages = []
+    def provider(request):
+        stages.append(request.stage)
+        if stages == ['self_repair_component_plan', 'self_repair_plan_review']:
+            raise KeyboardInterrupt
+        return original(request)
+    runner.target_orchestrator._call_with_failover = provider
+    with patch('auto_agents.repair_planning._probe', return_value={'matches': True, 'outcome': 'pass'}) as probe:
+        with pytest.raises(KeyboardInterrupt):
+            prepare_component(runner, runner.repo_root)
+        runner._experiment = runner._experiment_store.load()
+        runner._full_suite_environment_fingerprint = lambda: ('new-runtime',)
+        receipt = prepare_component(runner, runner.repo_root)
+    assert receipt['decision'] == 'APPROVE'
+    assert stages == ['self_repair_component_plan', 'self_repair_plan_review', 'self_repair_plan_review']
+    assert probe.call_count == 2 and not state.progress_credits
