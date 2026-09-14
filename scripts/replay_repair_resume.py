@@ -47,6 +47,14 @@ def run(args):
                  'AUTO_AGENTS_WORKER_ROOT', 'AUTO_AGENTS_CLUSTER_HOME'):
         os.environ[name] = str(output / name.lower())
     os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+    # This script may itself run inside a Codex tool shell. Its temporary sh/id/
+    # locale aliases were absent from the original standalone repair worker.
+    # Keep all operator paths; remove only that caller's generated alias prefix.
+    codex_aliases = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'tmp/arg0'
+    caller_paths = os.environ.get('PATH', os.defpath).split(os.pathsep)
+    removed_aliases = [p for p in caller_paths if Path(p).is_absolute()
+                       and Path(p).is_relative_to(codex_aliases) and Path(p).name.startswith('codex-arg')]
+    os.environ['PATH'] = os.pathsep.join(p for p in caller_paths if p not in removed_aliases)
     archive = args.experiment.resolve()
     archive_before = archive.read_bytes()
     original_source_before = source_identity(args.source.resolve())
@@ -129,7 +137,8 @@ def run(args):
     started = time.monotonic()
     report = {'native': args.native, 'real_probes': args.native or args.probes, 'code_generated': False,
               'engine_published': False, 'original_project_resumed': False, 'repair_accepted': False,
-              'source_commit': head_ref(engine), 'planning_approved': False}
+              'source_commit': head_ref(engine), 'planning_approved': False,
+              'excluded_caller_path_aliases': removed_aliases}
     try:
         if args.native or args.probes:
             receipt = prepare_component(runner, engine)
