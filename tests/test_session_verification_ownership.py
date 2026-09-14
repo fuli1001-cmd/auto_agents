@@ -2666,6 +2666,203 @@ def test_binding_round_trip_and_legacy_recovery_preserve_original_authority(tmp_
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
+@pytest.mark.parametrize('scope', ['observed_inputs', 'source_auto'])
+def test_public_resume_authenticated_history_with_supervised_input_tracing(tmp_path, monkeypatch, scope):
+    _supervised_public_resume(tmp_path, monkeypatch, scope, recover=True)
+
+
+@pytest.mark.parametrize('scope', ['observed_inputs', 'source_auto'])
+def test_public_resume_global_plan_switch_with_supervised_input_tracing(tmp_path, monkeypatch, scope):
+    _supervised_public_resume(tmp_path, monkeypatch, scope, recover=False)
+
+
+def _supervised_public_resume(tmp_path, monkeypatch, scope, *, recover):
+    from copy import deepcopy
+    import shutil
+    from auto_agents.config import load_task_plan
+    from auto_agents.gate_execution import LocalGatePlanExecutor
+    from auto_agents.session_verification import fingerprint
+    from auto_agents.verification_input_trace import owner_identity, resolved_trace
+    from auto_agents.verification_supervisor_checks import observation, LEGACY_SHA256
+    from test_engine_child_recovery import (
+        configure_local_writer, parent_workflow, resume_to_observation, ObservationBoundary,
+    )
+
+    # The trusted executor supplies the production owner. Candidate imports
+    # negotiate with that owner; this test never starts a replacement supervisor.
+    owner = owner_identity()
+    assert owner['metadata'] == owner['trace'] == 1, owner
+    assert shutil.which('strace'), 'the retained tracing acceptance requires strace'
+    if recover:
+        legacy = observation('legacy_owner')
+        assert legacy['launcher_pid'] > 0 and legacy['source_root']
+        assert legacy['returncode'] == 0 and legacy['count'] == 'executed\n'
+        assert legacy['legacy_sha256'] == LEGACY_SHA256 and legacy['shared_unchanged']
+        record = legacy['trace']
+        assert record['owner']['metadata'] == 1 and record['owner']['trace'] == 0
+        assert record['reason'] == 'live owner has no input tracing'
+        assert record['complete'] is False
+        assert resolved_trace(json.dumps(record)) is None
+
+    root, child = project(tmp_path)
+    store, snapshot, handoff = parent_workflow(root, child)
+    shared = [root / 'foreign.py', root / '.git/index']
+    controls = '''import errno, os, tempfile
+from pathlib import Path
+with tempfile.NamedTemporaryFile(dir=os.environ['TMPDIR']) as private:
+    path = Path(private.name)
+    path.chmod(0o750)
+    assert path.stat().st_mode & 0o777 == 0o750
+    os.fchmod(private.fileno(), 0o640)
+    os.utime(path, ns=(123, 456))
+    assert path.stat().st_mtime_ns == 456
+    os.utime(private.fileno(), ns=(123, 789))
+    assert path.stat().st_mtime_ns == 789
+    assert path.stat().st_mode & 0o777 == 0o640
+for name in SHARED:
+    path = Path(name)
+    before = path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        for action in (lambda: path.write_bytes(b'forbidden'),
+                       lambda: path.chmod(0o777), lambda: os.fchmod(fd, 0o777),
+                       lambda: os.chmod('/proc/self/fd/' + str(fd), 0o777),
+                       lambda: Path('/proc/self/fd/' + str(fd)).write_bytes(b'forbidden'),
+                       lambda: os.utime(path, ns=(1, 1)), lambda: os.utime(fd, ns=(1, 1))):
+            try:
+                action()
+            except OSError as error:
+                assert error.errno in (errno.EPERM, errno.EACCES, errno.EROFS), error
+            else:
+                raise AssertionError('shared input escaped confinement')
+    finally:
+        os.close(fd)
+    assert (path.read_bytes(), path.stat().st_mode, path.stat().st_mtime_ns) == before
+'''
+    # Both the actual collected gate and the real provider subprocess exercise
+    # metadata success and shared denial, before reporting their own success.
+    probe = 'SHARED = ' + repr(list(map(str, shared))) + '\n' + controls
+    owned_test = root / 'tests/test_owned.py'
+    owned_test.write_text(owned_test.read_text() + '\n'
+        + 'def test_confinement():\n' + ''.join('    ' + line + '\n' for line in probe.splitlines()))
+    (root / 'tests/test_setup.py').write_text(
+        'from pathlib import Path\ndef test_setup():\n'
+        '    assert Path("value.py").read_text() == "VALUE = 1\\n"\n')
+    config, plan = load_project_config(root), load_task_plan(root)
+    step = config.gates.steps[0]
+    step.targets.append('tests/test_owned.py::test_confinement')
+    step.depends_on_proofs = ['shared.setup']
+    step.cache_scope = 'source'
+    step.result_cache_scope = 'observed_inputs' if scope == 'observed_inputs' else 'auto'
+    assert not step.artifact_globs and not step.exclusive_resources and not step.dynamic_ports
+    config.gates.steps.append(VerificationStep(proof_id='shared.setup', runner='pytest',
+        targets=['tests/test_setup.py::test_setup'], levels=['affected', 'release']))
+    plan['tasks'][0]['workflow_id'] = child.workflow_id
+    plan['tasks'][0]['verification_refs'] = list(step.targets)
+    plan['tasks'].append({'task_id': 'task-foreign', 'title': 'Retained prerequisite owner',
+        'workflow_id': 'foreign-workflow', 'status': 'pending',
+        'requirement_ids': ['REQ-foreign'], 'verification_refs': ['shared.setup']})
+    plan['verification_steps'] = [item.to_dict() for item in config.gates.steps]
+    _retain_contract(root, child, config, plan)
+    configure_local_writer(root, child, probe + '\nPath("value.py").write_text("VALUE = 1\\n")')
+    child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/retained-supervised'
+    git(root, 'update-ref', child.baseline_git_ref, child.baseline_head_ref)
+    _binding_fixture(root, child)
+    retained = deepcopy(child.verification_binding)
+    if recover:
+        child.verification_binding['schema_version'] = 11
+        for key in ('execution_environment', 'source_provenance', 'session_mode'):
+            child.verification_binding.pop(key)
+        child.verification_binding['binding_fingerprint'] = fingerprint({
+            key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+    save_session_state(root, child)
+    _prepare_binding_child_resume(root, store, snapshot, handoff)
+    ambient = (_switch_ambient_binding_plan(root) if not recover else
+        {name: (root / name).read_bytes() for name in
+         ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')})
+    before = {str(path): (path.read_bytes(), path.stat().st_mode) for path in shared}
+    calls, results, resumed = [], [], []
+    run, retain_authority = LocalGatePlanExecutor.run, Session._retain_resume_authority
+    def observe_run(executor, command, **kwargs):
+        result = run(executor, command, **kwargs)
+        results.append((command, executor.metadata.get(command), result, owner_identity()))
+        return result
+    def observe_authority(session, state):
+        resumed.append(state.session_id)
+        return retain_authority(session, state)
+    monkeypatch.setattr(LocalGatePlanExecutor, 'run', observe_run)
+    monkeypatch.setattr(Session, '_retain_resume_authority', observe_authority)
+    collab_loop = Session._phase_collab_loop
+    def parent_boundary(session, state):
+        if state.session_id == 'parent':
+            raise ObservationBoundary()
+        return collab_loop(session, state)
+    monkeypatch.setattr(Session, '_phase_collab_loop', parent_boundary)
+    def observe_writer(state, prompt, candidate_root):
+        calls.append(state.session_id)
+        assert state.goal_execution_environment == child.goal_execution_environment
+        assert state.goal == child.goal and state.parent_handoff_id == handoff.handoff_id
+        assert candidate_root != root
+        assert (candidate_root / 'value.py').read_text() == 'VALUE = 0\n'
+        # configure_local_writer's retained subprocess performs the only edit.
+    resume_to_observation(root, monkeypatch, observe_writer, real_dispatch=True)
+    saved = load_session_state(root, child.session_id)
+    assert saved.status == 'completed', saved.to_dict()
+    assert calls == [child.session_id] and child.session_id in resumed
+    binding = saved.verification_binding
+    for key in ('repository', 'session_id', 'workflow_id', 'original_handoff_id',
+                'authorization', 'task_scope', 'task_ids', 'requirement_ids', 'tasks',
+                'contract_revision', 'contract_fingerprint', 'gates', 'plan', 'baseline_identity',
+                'required_proof_ids', 'proof_owners', 'regression_dependencies'):
+        assert binding[key] == retained[key], key
+    assert binding['schema_version'] == 13
+    assert binding['execution_environment'] == child.goal_execution_environment
+    assert binding['source_provenance']['revision'] == child.baseline_head_ref
+    assert binding['required_proof_ids'] == ['owned.contract', 'shared.setup']
+    assert {item['task_id'] for item in binding['proof_owners']['shared.setup']} == {'task-owned', 'task-foreign'}
+    selected = [(command, result, negotiated) for command, metadata, result, negotiated in results
+        if metadata and metadata.cache_scope == 'source'
+        and metadata.result_cache_scope == step.result_cache_scope and result.ok and not result.cached]
+    assert selected, [(command, result.to_dict()) for command, _, result, _ in results]
+    assert any('test_confinement' in command for command, _, _ in selected)
+    assert any('test_setup' in command and result.ok and not result.cached
+               for command, _, result, _ in results)
+    for command, result, negotiated in selected:
+        assert negotiated == owner
+        assert result.returncode == 0 and result.backend == 'local-isolated'
+        assert result.input_trace_complete or result.input_trace_reason
+        print(json.dumps({'command': command, 'owner': negotiated, 'returncode': result.returncode,
+            'input_trace_complete': result.input_trace_complete, 'input_trace_reason': result.input_trace_reason}))
+    if recover:
+        custody = deepcopy(saved.candidate_custody)
+        assert saved.baseline_git_ref.startswith('refs/auto-agents/gate-snapshots/')
+        for repository in (root, Path(custody['checkout'])):
+            for ref in {child.baseline_git_ref, saved.baseline_git_ref}:
+                git(repository, 'update-ref', '-d', ref)
+            expired = subprocess.run(['git', 'rev-parse', '--verify', saved.baseline_git_ref],
+                cwd=repository, capture_output=True, text=True)
+            assert expired.returncode != 0, 'the disposable baseline must really be unavailable'
+            assert git(repository, 'rev-parse', '--verify', child.baseline_head_ref).strip() == child.baseline_head_ref
+        _prepare_binding_child_resume(root, store, store.load(snapshot.workflow_id), store.load_handoff(handoff.handoff_id))
+        parent = load_session_state(root, 'parent')
+        parent.status = 'waiting_child'
+        save_session_state(root, parent)
+        resumed.clear()
+        resume_to_observation(root, monkeypatch, observe_writer, real_dispatch=True)
+        repeated = load_session_state(root, child.session_id)
+        assert repeated.status == 'completed' and child.session_id in resumed
+        assert calls == [child.session_id]
+        assert repeated.candidate_custody == custody
+        assert repeated.verification_binding == binding
+    else:
+        assert not (root / 'tests/test_future.py').exists()
+        assert all('test_future' not in command for command, _, _, _ in results)
+        assert load_project_config(root).gates.steps[0].proof_id == 'foreign.future'
+        assert load_task_plan(root)['tasks'][0]['status'] == 'pending'
+    assert {name: (root / name).read_bytes() for name in ambient} == ambient
+    assert {str(path): (path.read_bytes(), path.stat().st_mode) for path in shared} == before
+
+
 def _assert_reused_session_authority(tmp_path, monkeypatch):
     from copy import deepcopy
     from auto_agents.config import load_task_plan
