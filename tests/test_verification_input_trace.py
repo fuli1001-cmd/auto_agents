@@ -236,6 +236,10 @@ def _custody_cache_probe(scope, attack=None, confined=True, recovery=False):
     from test_gate_execution import _project, _config, _git
     root = Path.cwd()
     project = _project(root)
+    dependency = root / 'shared-dependency'; dependency.mkdir()
+    shared_input = dependency / 'input.txt'; shared_input.write_text('shared')
+    shared_input.chmod(0o640)
+    dependency_links = {'.conda': dependency}
     (project / 'input.txt').write_text('one')
     (project / 'stat-only.txt').write_text('one')
     (project / 'pyproject.toml').write_text('[build-system]\nrequires=[]\n')
@@ -245,6 +249,9 @@ def _custody_cache_probe(scope, attack=None, confined=True, recovery=False):
     program = '''import os, signal
 from pathlib import Path
 value = Path('input.txt').read_text()
+shared = Path('.conda/input.txt')
+assert Path('.conda').is_symlink()
+assert shared.read_text() == 'shared', 'shared dependency changed'
 lookup = Path(os.environ['PROBE_LOOKUP_ROOT'])
 assert '..' in lookup.parts
 assert (lookup / 'stat-only.txt').stat().st_size == 3, 'stat-only dependency changed'
@@ -326,11 +333,14 @@ for fd in os.environ.get('PROBE_HANDLES','').split(','):
         consumed.append((self.payload.copy(), result))
         return result
     def run():
-        with LocalGatePlanExecutor(project, config, metadata) as executor:
+        before = shared_input.read_bytes(), shared_input.stat().st_mode, shared_input.stat().st_mtime_ns
+        with LocalGatePlanExecutor(project, config, metadata, dependency_links=dependency_links) as executor:
             if confined:
                 shared = root / 'shared-target'; shared.mkdir(exist_ok=True)
                 executor.sandbox_target = shared
-            return executor.run(command, timeout_seconds=20, adaptive_timeout_enabled=False, idle_timeout_seconds=20)
+            result = executor.run(command, timeout_seconds=20, adaptive_timeout_enabled=False, idle_timeout_seconds=20)
+        assert (shared_input.read_bytes(), shared_input.stat().st_mode, shared_input.stat().st_mtime_ns) == before
+        return result
     with MonkeyPatch.context() as patch:
         patch.setattr(gates, 'run_supervised_shell_command', dispatch)
         if TraceCustody is not None:
@@ -349,6 +359,8 @@ for fd in os.environ.get('PROBE_HANDLES','').split(','):
             assert first.input_trace_complete, first
         if not attack:
             baseline = healthy if recovery else first
+            assert baseline.observed_inputs.get('.conda') == 'link:' + str(dependency), baseline.observed_inputs
+            assert '@' + str(shared_input) in baseline.observed_inputs, baseline.observed_inputs
             assert 'stat-only.txt' in baseline.observed_inputs, baseline.observed_inputs
             assert baseline.observed_inputs.get('!missing.txt') == 'missing', baseline.observed_inputs
             payload = consumed[-1][0]
@@ -368,6 +380,23 @@ for fd in os.environ.get('PROBE_HANDLES','').split(','):
             assert json.loads(stream.splitlines()[0])['owner'] == payload['owner']['owner']
             assert json.loads(stream.splitlines()[-1])['complete'] is True
         if not attack:
+            shared_input.write_text('changed')
+            count = len(dispatches)
+            failed = run()
+            assert not failed.ok and not failed.cached and 'shared dependency changed' in failed.stderr, failed
+            assert len(dispatches) == count + 1
+            shared_input.write_text('shared')
+            assert run().ok
+            # An unchanged source tree must not reuse a different registered binding.
+            alternate = root / 'alternate-dependency'; alternate.mkdir()
+            (alternate / 'input.txt').write_text('different')
+            dependency_links['.conda'] = alternate
+            count = len(dispatches)
+            failed = run()
+            assert not failed.ok and not failed.cached and 'shared dependency changed' in failed.stderr, failed
+            assert len(dispatches) == count + 1
+            dependency_links['.conda'] = dependency
+            assert run().ok
             for path, data, message in [('stat-only.txt', 'longer', 'stat-only dependency changed'),
                                         ('missing.txt', 'present', 'negative dependency changed')]:
                 # Independently restore the healthy baseline for each inverse.
@@ -382,11 +411,35 @@ for fd in os.environ.get('PROBE_HANDLES','').split(','):
                     (project / path).write_text('one')
                 else:
                     (project / path).unlink()
+            assert run().ok
         (project / 'input.txt').write_text('two')
         count = len(dispatches)
         third = run()
         assert not third.ok and not third.cached, third
         assert len(dispatches) == count + 1
+    if not attack:
+        # The same inherited owner must also enforce shared mutation denial.
+        # Denied writes are not stat-only inputs for a reusable read proof.
+        denial = '''import os
+from pathlib import Path
+shared = Path('.conda/input.txt')
+before = shared.read_bytes(), shared.stat().st_mode, shared.stat().st_mtime_ns
+fd = os.open(shared, os.O_RDONLY)
+try:
+    for action in (lambda: shared.write_text('bad'), lambda: shared.chmod(0o777),
+                   lambda: os.fchmod(fd,0o777), lambda: os.utime(fd,ns=(1,1))):
+        try: action()
+        except OSError as error: assert error.errno in (1,13,30), error
+        else: raise AssertionError('shared dependency was writable')
+finally: os.close(fd)
+assert (shared.read_bytes(), shared.stat().st_mode, shared.stat().st_mtime_ns) == before
+'''
+        denial_command = shlex.join([sys.executable, '-I', '-c', denial])
+        with LocalGatePlanExecutor(project, config, {}, dependency_links=dependency_links) as executor:
+            executor.sandbox_target = root / 'shared-target'
+            result = executor.run(denial_command, timeout_seconds=20,
+                adaptive_timeout_enabled=False, idle_timeout_seconds=20)
+        assert result.ok and not result.cached, result
 
 
 @pytest.mark.parametrize('scope', ['observed_inputs', 'auto'])

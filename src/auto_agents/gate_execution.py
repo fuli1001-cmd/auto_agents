@@ -422,7 +422,7 @@ def _metadata_resource_class(metadata: object) -> str:
     return value if value in {"heavy", "exclusive"} else "normal"
 
 
-def _metadata_signature(metadata: object) -> str:
+def _metadata_signature(metadata: object, dependency_links: Optional[Mapping[str, Path]] = None) -> str:
     payload = {
         "proof_ids": sorted(_metadata_list(metadata, "proof_ids")),
         "risk": str(getattr(metadata, "risk", "medium")),
@@ -440,6 +440,8 @@ def _metadata_signature(metadata: object) -> str:
         "dynamic_ports": sorted(_metadata_list(metadata, "dynamic_ports")),
         "artifact_globs": sorted(_metadata_list(metadata, "artifact_globs")),
     }
+    if dependency_links:
+        payload['dependency_links'] = {key: str(value) for key, value in dependency_links.items()}
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -471,12 +473,13 @@ def _path_observation_digest(path: Path) -> str:
 
 
 
-def _resolve_observed_path(path: Path, sandbox: Path):
+def _resolve_observed_path(path: Path, sandbox: Path, dependency_links: Mapping[str, Path]):
     """Walk the actual lookup before excluding private bookkeeping.
 
     A missing or non-directory component cannot be cancelled by a later '..'.
     External symlinks remain dependencies, including when their destination is
-    a runtime object. Project symlink traversal retains the conservative guard.
+    a runtime object. Only the executor's exact registered project links may
+    cross the checkout boundary; their resolved inputs remain dependencies.
     """
     current = Path(path.anchor)
     pending = list(path.parts[1:])
@@ -499,9 +502,14 @@ def _resolve_observed_path(path: Path, sandbox: Path):
                 raise ValueError('unresolved traversal through denied directory')
             return candidate, links, None
         if stat.S_ISLNK(value.st_mode):
-            if candidate.is_relative_to(sandbox):
-                raise ValueError('project symlink observation cannot certify inputs')
             target = os.readlink(candidate)
+            if candidate.is_relative_to(sandbox):
+                registered = dependency_links.get(candidate.relative_to(sandbox).as_posix())
+                if (registered is None or not registered.is_absolute()
+                        or target != str(registered)
+                        or registered.resolve(strict=True) != registered
+                        or not registered.is_dir()):
+                    raise ValueError('project symlink observation cannot certify inputs')
             links[candidate] = 'link:' + target
             followed += 1
             if followed > 40:
@@ -552,7 +560,7 @@ def _observed_input_manifest(
         candidate = Path(raw)
         if not candidate.is_absolute():
             candidate = sandbox / candidate
-        resolved, links, missing = _resolve_observed_path(candidate, sandbox)
+        resolved, links, missing = _resolve_observed_path(candidate, sandbox, dependency_links)
         for path, identity in links.items():
             link_inputs[name_of(path)] = identity
         expected = (bookkeeping or {}).get(str(resolved))
@@ -622,7 +630,6 @@ def _observed_input_manifest(
         ".auto-agents-gate-runtime",
         ".auto-agents-gate-tmp",
         ".auto-agents-gate-cache",
-        *dependency_links.keys(),
     }
     manifest: dict[str, str] = {**denied_inputs, **link_inputs}
     observed_paths = list(descriptor_paths)
@@ -660,10 +667,10 @@ def _observed_input_manifest(
             if missing is not None:
                 manifest["!" + name_of(missing)] = "missing"
             parent = (missing or resolved).parent
-            try:
-                parent_relative = parent.relative_to(sandbox.resolve()).as_posix()
-            except ValueError:
+            if (not parent.is_relative_to(sandbox)
+                    and not any(parent.is_relative_to(target) for target in dependency_links.values())):
                 continue
+            parent_relative = name_of(parent)
             if parent.exists() and parent_relative not in {"", "."}:
                 try:
                     manifest[parent_relative] = _path_observation_digest(parent)
@@ -1139,6 +1146,23 @@ class LocalGatePlanExecutor:
         self._timing_estimates: Optional[dict[str, Optional[float]]] = None
         self._lock = threading.Lock()
         self._source_admission_lock = threading.Lock()
+        self.result_cache.manifest_validator = self._manifest_matches
+
+    def _manifest_matches(self, manifest: Mapping[str, object]) -> bool:
+        from .verification_manifest import manifest_matches
+        # Installed aliases live in disposable checkouts, and need not exist
+        # as symlinks in the source repository. Their exact binding is also
+        # part of the cache identity. Replay all resolved inputs normally.
+        inputs = dict(manifest)
+        for relative, target in self.dependency_links.items():
+            if inputs.get(relative) == 'link:' + str(target):
+                try:
+                    if target.resolve(strict=True) != target or not target.is_dir():
+                        return False
+                except (OSError, RuntimeError):
+                    return False
+                del inputs[relative]
+        return manifest_matches(self.project_root, inputs)
 
     def __enter__(self) -> "LocalGatePlanExecutor":
         self.worktree_root.mkdir(parents=True, exist_ok=True)
@@ -1211,7 +1235,7 @@ class LocalGatePlanExecutor:
                 getattr(metadata, "cache_scope", "run_context")
             ).strip().lower(),
             result_cache_scope=_effective_result_cache_scope(metadata),
-            metadata_signature=_metadata_signature(metadata),
+            metadata_signature=_metadata_signature(metadata, self.dependency_links),
         )
         self._cache_miss_reasons[command] = reason
         if result is not None and result.backend == "result-cache-observed-inputs" and self.input_reuse_mode != "on":
@@ -1256,7 +1280,7 @@ class LocalGatePlanExecutor:
                 getattr(metadata, "cache_scope", "run_context")
             ).strip().lower(),
             result_cache_scope=_effective_result_cache_scope(metadata),
-            metadata_signature=_metadata_signature(metadata),
+            metadata_signature=_metadata_signature(metadata, self.dependency_links),
         )
 
     def _sandbox(self, lane: str, job_id: str) -> tuple[Path, bool]:
@@ -1423,7 +1447,7 @@ class LocalGatePlanExecutor:
         from contextlib import nullcontext
         from .repair_control import digest
         identity = digest([command, self.snapshot.tree_sha if self.snapshot else "",
-                           _metadata_signature(self.metadata.get(command)),
+                           _metadata_signature(self.metadata.get(command), self.dependency_links),
                            self.result_cache.environment_fingerprint, self.result_cache.context_fingerprint])
         started = time.monotonic()
         with (self.ledger.single_flight(identity, cancelled=cancel_event.is_set if cancel_event else None)

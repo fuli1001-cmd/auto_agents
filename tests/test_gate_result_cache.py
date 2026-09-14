@@ -289,6 +289,57 @@ def test_descriptor_stat_does_not_certify_symlink_dependencies(tmp_path):
     assert _observed_input_manifest(trace, tmp_path, {}) == ({}, False)
 
 
+@pytest.mark.parametrize('kind', ['registered', 'denied', 'parent', 'external_link',
+                                  'unregistered', 'mismatch', 'nested_alias', 'unresolved'])
+def test_registered_dependency_trace_requires_exact_binding(tmp_path, monkeypatch, kind):
+    import json
+    import auto_agents.gate_execution as gates
+    project = tmp_path / 'project'; project.mkdir()
+    shared = tmp_path / 'shared'; shared.mkdir()
+    source = shared / 'input'; source.write_text('shared')
+    (shared / 'sub').mkdir()
+    alias = project / '.conda'; alias.symlink_to(shared, target_is_directory=True)
+    links = {'.conda': shared}
+    observed = alias / 'input'
+    if kind == 'unregistered':
+        links = {}
+    elif kind == 'mismatch':
+        other = tmp_path / 'other'; other.mkdir()
+        links['.conda'] = other
+    elif kind == 'nested_alias':
+        (project / 'nested').mkdir()
+        (project / 'nested/.conda').symlink_to(shared, target_is_directory=True)
+        observed = project / 'nested/.conda/input'
+    elif kind == 'unresolved':
+        source.unlink(); (shared / 'sub').rmdir(); shared.rmdir()
+    elif kind == 'parent':
+        observed = alias / 'sub' / '..' / 'input'
+    elif kind == 'external_link':
+        (shared / 'indirect').symlink_to('sub', target_is_directory=True)
+        observed = alias / 'indirect' / '..' / 'input'
+    if kind == 'denied':
+        original = gates._sha256
+        def digest(path):
+            assert path != source, 'denied contents must not be read'
+            return original(path)
+        monkeypatch.setattr(gates, '_sha256', digest)
+    trace = tmp_path / 'trace.log'
+    trace.write_text('0 stat(' + json.dumps(str(observed)) + ') = '
+                     + ('-1 EACCES' if kind == 'denied' else '0') + '\n'
+                     + '0 stat(' + json.dumps(str(alias / 'missing')) + ') = -1 ENOENT\n')
+    manifest, network = _observed_input_manifest(trace, project, links)
+    assert not network
+    if kind in {'unregistered', 'mismatch', 'nested_alias', 'unresolved'}:
+        assert not manifest
+    else:
+        assert manifest['.conda'] == 'link:' + str(shared)
+        assert ('?@' if kind == 'denied' else '@') + str(source) in manifest
+        assert manifest['!@' + str(shared / 'missing')] == 'missing'
+        assert manifest['@' + str(shared)].startswith('dir:')
+        if kind == 'external_link':
+            assert manifest['@' + str(shared / 'indirect')] == 'link:sub'
+
+
 @pytest.mark.parametrize('scope', ['observed_inputs', 'auto'])
 @pytest.mark.parametrize('fault', ['replacement', 'overwrite', 'missing_footer', 'owner_mismatch', 'replayed_job'])
 def test_gate_trace_evidence_requires_custody(tmp_path, scope, fault):
