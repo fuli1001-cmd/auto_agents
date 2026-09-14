@@ -266,6 +266,8 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
             "component_plan": "正在细化当前组件方案", "scope_format": "正在纠正范围审核字段",
             "component_revalidation_prepare": "复用已完成方案，准备差异复核",
             "component_delta_review": "正在审查已完成组件的变更影响",
+            "component_delta_format": "正在修正审查输出格式",
+            "component_evidence_reused": "已复用有效验收，正在选择下一组件",
             "component_selected": "正在准备当前组修复",
             "scope_review": "正在独立判断问题是否必须修复",
             "plan_format": "正在局部纠正规划格式", "local_correction": "正在分析当前组件的局部修正",

@@ -31,7 +31,17 @@ CONTROL = obj({'command': TEXT, 'scenario_ids': TEXTS, 'purpose': TEXT})
 CONTROLS = {**obj({'negative': CONTROL, 'positive': CONTROL}), 'type': ['object', 'null']}
 
 
-def schema_for(stage):
+def schema_for(stage, context=None):
+    if stage in {'self_repair_component_delta_review', 'self_repair_component_delta_format'}:
+        decisions = array(deepcopy(SCOPE))
+        if context is not None:
+            ids = [finding['finding_id'] for finding in context.get('findings', [])]
+            decisions.update(minItems=len(ids), maxItems=len(ids))
+            if ids:
+                decisions['items']['properties']['finding_id'] = {'type': 'string', 'enum': ids}
+        return obj({'decision': {'type': 'string', 'enum': ['APPROVE', 'REJECT']}, 'reason': TEXT,
+                    'implementation_required': {'type': 'boolean'}, 'remaining_changes': TEXTS,
+                    'findings': TEXTS, 'deferred_findings': TEXTS, 'decisions': decisions})
     if stage in {'self_repair_scope_review', 'self_repair_scope_format'}:
         probe = obj({'command': TEXT, 'expected': {'type': 'string', 'enum': ['pass', 'behavior_failure']},
                      'purpose': TEXT, 'replaces_probe': {'type': ['string', 'null']}})

@@ -60,6 +60,16 @@ def prepare_completed(runner, workspace, group):
     if previous and previous.get('binding') == binding and previous.get('decision') != 'APPROVE':
         return None
     impact = completion.assess(runner, workspace, group)
+    if (impact['state'] == 'completed'
+            and getattr(runner, '_candidate_next_action', {}).get('kind') != 'revalidate_completed'):
+        # Selection may have observed a transiently different context. Do not
+        # turn a now-valid receipt into another review/test/candidate cycle.
+        # Refresh prerequisites and final-integration rules before rescheduling.
+        completion.refresh(runner, workspace)
+        canonical = next(g for g in runner._experiment.finding_groups if g['group_id'] == group['group_id'])
+        if canonical['status'] == 'completed':
+            return {'decision': 'COMPLETED', 'completion': reference,
+                    'reusable_checks': impact['reusable_checks'], 'affected_checks': []}
     memory['completion_assessment'] = {**impact, 'state': 'needs_revalidation',
         'implementation_completed': True, 'planning_reused': True}
     canonical = next(g for g in runner._experiment.finding_groups if g['group_id'] == group['group_id'])
@@ -115,7 +125,7 @@ def reject_prepared(runner, reason):
 
 def review_completed(runner, workspace, phase):
     """Combine historical scope and implementation delta review in one read-only call."""
-    from .repair_planning import (_invoke, _validate_scope, _text, record_scope_decisions,
+    from .repair_planning import (_validate_scope, _text, record_scope_decisions,
                                  PlanningBlocked, finding_key)
     from .repair_planning_input import source_delta
     from .verification_ledger import source_identity
@@ -191,6 +201,8 @@ def review_completed(runner, workspace, phase):
         'history or rewrite the plan. Incomplete dependency closures and external inputs still require factual '
         'inspection; unchanged files or passing quick tests alone are not proof of independence. '
         'For each supplied historical finding, recheck its previous disproof in this same review. '
+        'The decisions array must classify exactly the IDs in findings, once each. '
+        'Do not repeat IDs from resolved_in_completed_review; use decisions:[] when findings is empty. '
         'Return JSON {decision:APPROVE|REJECT,reason,implementation_required:false|true,remaining_changes:[], '
         'findings:[],deferred_findings:[],decisions:[{finding_id,verdict:not_applicable|follow_up|unknown|required,'
         'reason,evidence:[...],disproof,obligation_id,trigger,consequence,support_basis}]}. '
@@ -198,12 +210,11 @@ def review_completed(runner, workspace, phase):
         'concrete disproof. If a new defect, changed contract or unresolvable dependency requires broader work, '
         'return REJECT with the concrete reason. Full repair review will then handle it. '
         'This is an independent code/scope review, not test acceptance; the controller still executes affected checks.')
-    payload, request_id = _invoke(runner, workspace, 'self_repair_component_delta_review', instruction, context)
+    from .repair_delta_protocol import approval, review_reply
+    payload, request_id = review_reply(runner, workspace, instruction, context, proof, marker, memory)
     if _binding(runner, workspace, group, reference) != marker['binding']:
         raise PlanningBlocked('completed-component inputs changed during delta review', code='source_changed')
-    approved = (payload.get('decision') == 'APPROVE' and _text(payload.get('reason'))
-                and payload.get('implementation_required') is False and payload.get('remaining_changes') == []
-                and payload.get('findings') == [] and payload.get('deferred_findings', []) == [])
+    approved = approval(payload) and bool(_text(payload.get('reason')))
     decisions = []
     if approved:
         try:

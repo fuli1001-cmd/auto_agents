@@ -3920,6 +3920,17 @@ class AutoAgentsSelfRepairRunner:
                     diff_line_count=self._candidate_partial_diff_line_count,
                     infrastructure_failure=self._is_infrastructure_candidate_error(error),
                 )
+            if candidate.status == 'component_evidence_reused':
+                # No candidate was generated or accepted. A fresh deterministic
+                # receipt check corrected selection; preserve attempts/credits.
+                experiment.current_candidate_id = ''
+                store.save(experiment)
+                callback = getattr(self, '_control_phase_callback', None)
+                if callback:
+                    callback('component_evidence_reused', {
+                        'component': candidate.finding_group_id, 'reason': candidate.reason})
+                    callback('phase_started', {'phase': 'component_evidence_reused', **self._group_progress()})
+                continue
             if candidate.status == 'planning_blocked':
                 # Planning has its own durable identity and budget. Repeating an
                 # exhausted plan must not manufacture failed code candidates.
@@ -4625,7 +4636,12 @@ class AutoAgentsSelfRepairRunner:
                 self._candidate_attempt = attempt
                 self._candidate_prior_failures = list(prior_failures)
                 try:
-                    self._prepare_component_plan(repair_root)
+                    prepared = self._prepare_component_plan(repair_root)
+                    if prepared and prepared.get('decision') == 'COMPLETED':
+                        return SelfRepairResult(False, 'component_evidence_reused',
+                            reason='completion evidence remains valid; selecting the next component',
+                            experiment_id=experiment_id, base_commit=base_head,
+                            finding_group_id=self._candidate_group.get('group_id', ''))
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
                     return SelfRepairResult(False, 'planning_blocked', category=self.decision.category,
                         reason=str(error), experiment_id=experiment_id,
@@ -5619,7 +5635,7 @@ class AutoAgentsSelfRepairRunner:
                 approved.passed_obligations = list(self._experiment.obligations)
                 delete_ref(self.repo_root, candidate_ref)
                 return approved
-            except BaseException:
+            except BaseException as error:
                 self._candidate_keep_workspace = created
                 if created and candidate_id:
                     saved = self._preserve_interrupted_candidate(
@@ -5628,6 +5644,12 @@ class AutoAgentsSelfRepairRunner:
                     self._candidate_keep_workspace = not saved
                     if not saved:
                         self._report_candidate_phase("checkpoint_failed", f"Candidate worktree retained at {repair_root}; checkpoint could not be saved")
+                from .repair_planning import PlanningBlocked
+                if isinstance(error, PlanningBlocked):
+                    return SelfRepairResult(False, 'planning_blocked', reason=str(error),
+                        experiment_id=experiment_id, base_commit=base_head,
+                        finding_group_id=self._candidate_group.get('group_id', ''),
+                        next_action={'kind': 'blocked', 'planning_failure': error.detail})
                 raise
             finally:
                 if getattr(self, '_verification_cleanup_incomplete', False):
