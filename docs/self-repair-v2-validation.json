@@ -1,12 +1,105 @@
 {
-  "status": "final_regression_running",
-  "real_provider_scope": ["codex"],
+  "status": "complete_with_performance_target_shortfall",
+  "implementation_commit": "e686ec1",
+  "post_suite_fix_commit": "f1893ff",
+  "real_provider_scope": [
+    "codex"
+  ],
   "other_provider_live_validation_waived_by_user": true,
+  "full_docker_regression": {
+    "image": "sha256:77f8e18266896887f8468781f6cef0af7ce07e9b49b83dd2dacdc6ab26ca6031",
+    "source_snapshot": "28f47feabd14e04b28188d1e9651b40150e725814f285a5140b8d5451389d513",
+    "batches": 185,
+    "collected_node_instances": 3355,
+    "passed_node_instances": 3354,
+    "seconds": 1358.8984328369988,
+    "initial_failed_batches": [
+      "suite:tests/test_repair_v2_delivery.py:0"
+    ],
+    "fix": "Optional image housekeeping safely skips absent Docker CLI; accepted publication remains successful.",
+    "affected_real_docker_retests": {
+      "test_repair_v2_delivery": 12,
+      "test_repair_v2_cleanup": 3,
+      "all_passed": true
+    }
+  },
+  "focused_host_regression": {
+    "passed": 167
+  },
+  "native_codex_comparison": {
+    "case": "registered dependency alias reuse",
+    "paired_repetitions": 3,
+    "baseline_seconds": [
+      647.546646879,
+      630.8390746389996,
+      650.8855805029998
+    ],
+    "v2_seconds": [
+      139.1813847329995,
+      171.64584092299992,
+      171.698014986001
+    ],
+    "baseline_median_seconds": 647.546646879,
+    "v2_median_seconds": 171.64584092299992,
+    "elapsed_reduction": 0.7349289943044466,
+    "target_reduction": 0.75,
+    "target_met": false,
+    "same_configured_model": "gpt-6-astra",
+    "implementation_effort": "deep/high",
+    "planning_and_review_effort": "max",
+    "baseline_and_v2_tests": "same original four assertions; added tests also executed",
+    "resources": "Same WSL host and configured models; V2 uses bounded Docker containers (1 GiB per test container, 2 GiB per provider container). Legacy processes retain their existing supervision limits.",
+    "successes": {
+      "baseline": 3,
+      "v2": 3
+    }
+  },
+  "native_interruption": {
+    "status": "ready",
+    "seconds": 199.94386382099947,
+    "attempts": 1,
+    "model_calls": 4,
+    "interrupted": true,
+    "native_calls": [
+      [
+        "plan",
+        ""
+      ],
+      [
+        "implement",
+        "01a0a3f9-4c88-7121-b2c5-d62f94c1ee73"
+      ],
+      [
+        "implement",
+        "01a0a3f9-4c88-7121-b2c5-d62f94c1ee73"
+      ],
+      [
+        "review",
+        ""
+      ]
+    ]
+  },
+  "native_cross_module": {
+    "status": "ready",
+    "seconds": 229.59057772900087,
+    "attempts": 1,
+    "model_calls": 3
+  },
   "original_session": "6a0cedd6674d",
   "retained_candidate": "dc0dadebf320e24d01743bb365daa202d154214f",
-  "original_boundary_probe": "passed_without_modifying_original_project",
-  "native_interruption": {"passed": true, "same_writer_session_resumed": true},
-  "native_cross_module_repair": {"passed": true, "implementation_attempts": 1},
-  "speed_target_reduction": 0.75,
-  "speed_target_claimed_met": false
+  "original_boundary_probe": {
+    "ok": true,
+    "observed": {
+      "ok": true,
+      "status": "next_provider_boundary",
+      "session_id": "6a0cedd6674d",
+      "route_consumed": true
+    },
+    "original_project_modified": false
+  },
+  "limits": [
+    "Synthetic timing does not establish the same speedup for the original complex repair.",
+    "The 75 percent timing target was not met in the fixed-configuration sample.",
+    "No original sdgp business workflow was resumed during validation."
+  ]
 }
