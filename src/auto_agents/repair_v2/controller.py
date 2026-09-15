@@ -447,6 +447,9 @@ class Controller:
                 while True:
                     if self.cancel.is_set(): raise KeyboardInterrupt()
                     if self.state['phase'] not in ('audit', 'validate', 'boundary', 'regression'):
+                        if self.state.get('external_correction'):
+                            raise RepairBlocked('no_progress',
+                                'corrected source failed acceptance; implementation budget remains exhausted')
                         if not self.allow_implementation:
                             raise RepairBlocked('guarded_mode', 'existing source failed acceptance; code generation is not authorized')
                         if self.state['stagnant'] >= self.max_stagnant:
@@ -551,3 +554,57 @@ class Controller:
                 self.checkpoint(status='active', phase='audit',
                                 integration_parents=list(parents))
             self.store.event('integration_prepared', parents=list(parents), conflicts=conflicts)
+
+    def recover_corrected_source(self, repository, commit):
+        """Admit a new committed correction to acceptance, never refill agent retries.
+
+        This is an explicit resume of an exhausted transaction. The correction
+        retains both Git histories; source-identical commits cannot reopen it.
+        Other blockers and the same invocation remain untouched.
+        """
+        from .workspace import git
+        import subprocess
+        with self.store.locked():
+            self.state = self.store.load()
+            if (not self.state or self.state['status'] != 'blocked'
+                    or self.state.get('blocker', {}).get('code') != 'no_progress'
+                    or not self.resume_token or self.resume_token == self.state.get('resume_token')):
+                return False
+            if self.state['request_digest'] != digest(self.request.to_dict()):
+                raise RepairBlocked('request_changed', 'correction differs from the frozen repair contract')
+            root = self.workspace.prepare()
+            if git(root, 'diff', '--name-only', '--diff-filter=U'):
+                return False  # Preserve unresolved external work for explicit resolution.
+            self.workspace.checkpoint()
+            pending = self.state.get('correction_pending')
+            if pending:
+                before, parent = pending['source_before'], pending['parent']
+            else:
+                before = source_identity(root)
+                git(root, 'fetch', '--quiet', str(repository), commit)
+                parent = git(root, 'rev-parse', 'FETCH_HEAD^{commit}')
+                if subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', parent, 'HEAD'],
+                                  capture_output=True).returncode == 0:
+                    return False
+                # Persist before merging so a crash after Git commits the merge
+                # cannot strand the corrected bytes behind the old blocker.
+                self.checkpoint(correction_pending={'source_before': before, 'parent': parent})
+            try:
+                git(root, 'merge', '--no-edit', parent)
+            except subprocess.CalledProcessError:
+                conflicts = git(root, 'diff', '--name-only', '--diff-filter=U').splitlines()
+                if not conflicts: raise
+                self.checkpoint(resume_token=self.resume_token, blocker={'code': 'no_progress',
+                    'message': 'external correction has unresolved merge conflicts: ' + ', '.join(conflicts)})
+                self.store.event('correction_conflicted', parent=parent, paths=conflicts)
+                return False
+            after = source_identity(root)
+            if after == before:
+                self.checkpoint(correction_pending=None)
+                return False
+            correction = {'parent': parent, 'source_before': before, 'source_after': after,
+                          'resume_token': self.resume_token}
+            self.checkpoint(status='active', phase='audit', blocker={}, resume_token=self.resume_token,
+                            external_correction=correction, correction_pending=None)
+            self.store.event('corrected_source_recovered', **correction)
+            return True

@@ -223,3 +223,45 @@ def test_publication_uses_verified_receipt_and_only_updates_configured_remote(re
         result = integration.publish(request)
     assert result['ok'] and result['status'] == 'published'
     assert git(repair_request['config']['remote'], 'rev-parse', 'refs/heads/master') == approved['commit']
+
+
+def test_new_invocation_imports_controller_correction_into_exhausted_candidate(repair_request, monkeypatch):
+    driver, verifier = Driver(), Verifier()
+    original = driver.run
+    def no_fix(role, *args, **kwargs):
+        if role == 'implement':
+            driver.calls.append(role)
+            return AgentReply(True, 'No correction found', 'writer')
+        return original(role, *args, **kwargs)
+    monkeypatch.setattr(driver, 'run', no_fix)
+    with patch('auto_agents.repair_worker.engine_environment', return_value=('python', 'fixed-env')), \
+         patch.object(integration, '_components', side_effect=components(driver, verifier)):
+        failed = integration.repair_entry(repair_request)
+    root = Path(failed['v2_transaction'])
+    before = Store(root).load()
+    assert before['blocker']['code'] == 'no_progress'
+    public = ControlStore(repair_request['config']['root'])
+    public.transition(repair_request['job']['id'], 'blocked', failed)
+    project = repair_request['job']['payload']['project']
+    subscriber = public.register({'project': project, 'token': 'new-invocation',
+                                 'repair': repair_request['job']['payload']})
+    identity = public.submit(subscriber, repair_request['job']['payload'])
+    # A new immutable controller checkout is pinned for this invocation.
+    origin = Path(repair_request['config']['implementation_root'])
+    corrected = origin.with_name('corrected-controller')
+    subprocess.run(['git', 'clone', '-q', str(origin), str(corrected)], check=True)
+    (corrected / 'source.py').write_text('value = 1\n')
+    git(corrected, 'commit', '-qam', 'Correct the exhausted repair')
+    renewed = {**repair_request, 'config': {**repair_request['config'], 'implementation_root': str(corrected)},
+               'job': public.job(identity)}
+    calls = len(driver.calls)
+    with patch('auto_agents.repair_worker.engine_environment', return_value=('python', 'fixed-env')), \
+         patch.object(integration, '_components', side_effect=components(driver, verifier)):
+        accepted = integration.repair_entry(renewed)
+    assert accepted['ok'], accepted
+    assert driver.calls[calls:] == ['review']
+    after = Store(root).load()
+    assert after['attempts'] == before['attempts'] and after['replans'] == before['replans']
+    assert (Path(repair_request['config']['source_root']) / 'source.py').read_text() == 'value = 1\n'
+    assert (Path(project) / 'keep.txt').read_text() == 'original user data'
+    assert integration.verify_receipt(accepted)['boundary']

@@ -355,3 +355,134 @@ def test_codex_output_fragments_do_not_each_write_durable_progress(job):
     progress = [e for e in events if e['kind'] == 'agent_progress']
     assert any(e.get('event') == 'item/completed' for e in progress)
     assert not any(e.get('event', '').lower().endswith('delta') for e in progress)
+
+
+def test_exhausted_repair_accepts_committed_correction_without_more_implementation(job):
+    runner = controller(job, Driver(fail=True))
+    blocked = dict(runner.run())
+    repo = runner.workspace.source
+    (repo / 'source.py').write_text('value = 1\n')
+    git(repo, 'commit', '-qam', 'Correct the retained failure')
+    runner.resume_token = 'new-invocation'
+    assert runner.recover_corrected_source(repo, git(repo, 'rev-parse', 'HEAD'))
+    recovered = runner.store.load()
+    for field in ('attempts', 'calls', 'stagnant', 'replans', 'plan', 'sessions'):
+        assert recovered[field] == blocked[field]
+    assert recovered['phase'] == 'audit'
+    calls = len(runner.driver.calls)
+    final = runner.run()
+    assert final['status'] == 'ready'
+    assert runner.driver.calls[calls:] == [('review', 'reviewer')]
+    assert final['attempts'] == blocked['attempts']
+    assert runner.store.read(final['receipt'])['snapshot'] != blocked['snapshot']
+
+
+def test_exhausted_repair_ignores_same_invocation_and_source_identical_commit(job):
+    runner = controller(job, Driver(fail=True))
+    runner.resume_token = 'old-invocation'
+    runner.run()
+    blocked = runner.store.load()
+    repo = runner.workspace.source
+    git(repo, 'commit', '--allow-empty', '-qm', 'Metadata only')
+    commit = git(repo, 'rev-parse', 'HEAD')
+    assert not runner.recover_corrected_source(repo, commit)
+    runner.resume_token = 'new-invocation'
+    assert not runner.recover_corrected_source(repo, commit)
+    unchanged = runner.store.load()
+    assert unchanged.pop('correction_pending', None) is None
+    assert unchanged == blocked
+    calls = len(runner.driver.calls)
+    assert runner.run()['status'] == 'blocked'
+    assert len(runner.driver.calls) == calls
+
+
+def test_failed_external_correction_cannot_buy_more_writer_calls(job):
+    runner = controller(job, Driver(fail=True))
+    blocked = dict(runner.run())
+    repo = runner.workspace.source
+    (repo / 'source.py').write_text('value = 2\n')
+    git(repo, 'commit', '-qam', 'Insufficient correction')
+    runner.resume_token = 'new-invocation'
+    assert runner.recover_corrected_source(repo, git(repo, 'rev-parse', 'HEAD'))
+    calls = len(runner.driver.calls)
+    final = runner.run()
+    assert final['status'] == 'blocked' and final['blocker']['code'] == 'no_progress'
+    assert runner.driver.calls[calls:] == [('review', 'reviewer')]
+    assert final['attempts'] == blocked['attempts'] and final['replans'] == blocked['replans']
+    runner.resume_token = 'third-invocation'
+    assert not runner.recover_corrected_source(repo, git(repo, 'rev-parse', 'HEAD'))
+    assert runner.run()['status'] == 'blocked'
+    assert runner.driver.calls[calls:] == [('review', 'reviewer')]
+
+
+def test_external_correction_preserves_merge_conflicts_without_spending_budget(job):
+    runner = controller(job, Driver(fail=True))
+    blocked = runner.run()
+    (runner.workspace.candidate / 'source.py').write_text('value = 3\n')
+    runner.workspace.checkpoint()
+    repo = runner.workspace.source
+    (repo / 'source.py').write_text('value = 1\n')
+    git(repo, 'commit', '-qam', 'Conflicting correction')
+    runner.resume_token = 'new-invocation'
+    assert not runner.recover_corrected_source(repo, git(repo, 'rev-parse', 'HEAD'))
+    final = runner.store.load()
+    assert final['status'] == 'blocked' and final['calls'] == blocked['calls']
+    assert git(runner.workspace.candidate, 'diff', '--name-only', '--diff-filter=U') == 'source.py'
+    runner.resume_token = 'third-invocation'
+    assert not runner.recover_corrected_source(repo, git(repo, 'rev-parse', 'HEAD'))
+    assert '<<<<<<<' in (runner.workspace.candidate / 'source.py').read_text()
+
+
+def test_external_correction_does_not_reopen_other_blockers(job):
+    runner = controller(job)
+    runner.run()
+    runner.checkpoint(status='blocked', blocker={'code': 'read_only_violation', 'message': 'untrusted edit'})
+    before = runner.store.load()
+    runner.resume_token = 'new-invocation'
+    assert not runner.recover_corrected_source('/does/not/exist', 'not-a-commit')
+    assert runner.store.load() == before
+
+
+def test_external_correction_recovers_crash_after_git_merge(job, monkeypatch):
+    runner = controller(job, Driver(fail=True))
+    blocked = dict(runner.run())
+    repo = runner.workspace.source
+    (repo / 'source.py').write_text('value = 1\n')
+    git(repo, 'commit', '-qam', 'Correction surviving a controller crash')
+    runner.resume_token = 'new-invocation'
+    save = runner.store.save
+    def crash(state):
+        if state.get('external_correction'): raise OSError('simulated disk failure after merge')
+        save(state)
+    with monkeypatch.context() as m:
+        m.setattr(runner.store, 'save', crash)
+        with pytest.raises(OSError, match='disk failure'):
+            runner.recover_corrected_source(repo, git(repo, 'rev-parse', 'HEAD'))
+    assert (runner.workspace.candidate / 'source.py').read_text() == 'value = 1\n'
+    assert runner.store.load()['status'] == 'blocked'
+    assert runner.store.load()['correction_pending']
+    resumed = controller(job, runner.driver)
+    resumed.resume_token = 'next-invocation'
+    # The imported commit is local and durable, even if its origin disappears.
+    assert resumed.recover_corrected_source('/missing/origin', 'unused')
+    final = resumed.run()
+    assert final['status'] == 'ready' and final['attempts'] == blocked['attempts']
+    assert not final['correction_pending']
+
+
+def test_corrected_source_still_requires_original_boundary_acceptance(job):
+    runner = controller(job, Driver(fail=True))
+    blocked = dict(runner.run())
+    repo = runner.workspace.source
+    (repo / 'source.py').write_text('value = 1\n')
+    git(repo, 'commit', '-qam', 'Pass tests but not recovery boundary')
+    runner.resume_token = 'new-invocation'
+    assert runner.recover_corrected_source(repo, git(repo, 'rev-parse', 'HEAD'))
+    observed = []
+    def boundary(identity, source, cancel):
+        observed.append(identity)
+        return {'ok': False, 'snapshot': identity, 'observed': 'child recovery still fails'}
+    runner.boundary = boundary
+    assert runner.run()['status'] == 'blocked'
+    assert observed and runner.state['failures'][0]['unit'] == 'original-boundary'
+    assert runner.state['attempts'] == blocked['attempts']
