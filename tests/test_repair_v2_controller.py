@@ -492,7 +492,8 @@ def test_acceptance_runs_previous_counterexamples_first_without_omitting_tests(j
     runner = controller(job)
     runner.state = {'failures': [
         {'failed': ['tests/test_last.py::test_crash[x]']},
-        {'requirement': 'value', 'check': 'Recheck tests/test_middle.py::test_scope[blocking] after forwarding kwargs'},
+        {'requirement': 'value', 'check': 'Recheck test_scope[blocking] after forwarding kwargs',
+         'reason': 'Regression in tests/test_middle.py'},
     ]}
     units = [ValidationUnit('unrelated', 'python -m pytest -q tests/test_first.py',
                             expected_nodes=('tests/test_first.py::test_first',)),

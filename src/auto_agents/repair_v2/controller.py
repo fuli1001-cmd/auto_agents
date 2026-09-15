@@ -357,8 +357,10 @@ class Controller:
                                  for field in ('reason', 'counterexample', 'check', 'command', 'unit'))
         def priority(unit):
             nodes = unit.expected_nodes
-            if any(node in explicit or node in descriptions or node.split('[', 1)[0] in descriptions
-                   for node in nodes): return 0
+            # Reviews can name a pytest function without repeating its file.
+            names = {name for node in nodes for qualified in (node, node.partition('::')[2])
+                     for name in (qualified, qualified.split('[', 1)[0]) if name}
+            if set(nodes) & explicit or any(name in descriptions for name in names): return 0
             if any(node.split('::', 1)[0] in descriptions for node in nodes): return 1
             return 2
         return sorted(units, key=priority)
