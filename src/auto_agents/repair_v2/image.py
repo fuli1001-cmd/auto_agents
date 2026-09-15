@@ -99,12 +99,15 @@ def _tool_image(root, python, driver, *, codex_binary=None):
                  'stat', 'readlink', 'realpath', 'touch', 'find', 'grep', 'sed', 'awk', 'head', 'tail',
                  'sort', 'uniq', 'wc', 'cut', 'tr', 'sleep', 'timeout', 'true', 'false', 'id', 'uname',
                  'which', 'tar', 'gzip', 'xargs', 'diff', 'date', 'ps', 'kill', 'unshare', 'mount',
-                 'umount', 'ip', 'ss', 'curl', 'ldd', 'openssl'):
+                 'umount', 'ip', 'ss', 'curl', 'ldd', 'openssl', 'dirname', 'basename', 'printf',
+                 'du', 'df', 'mktemp', 'tee', 'ln', 'rmdir', 'expr', 'rg'):
         source = next((Path(p) / name for p in ('/usr/bin', '/usr/sbin', '/bin', '/sbin')
                        if (Path(p) / name).is_file()), None)
+        if source is None and shutil.which(name): source = Path(shutil.which(name))
         if source:
             copy_file(source)
             copy_file(source, destination='/bin/' + name)
+            copy_file(source, destination='/usr/bin/' + name)
     node = shutil.which('node')
     if node:
         copy_file(node); copy_file(node, destination='/usr/bin/node')
@@ -203,6 +206,12 @@ def _tool_image(root, python, driver, *, codex_binary=None):
     code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
         '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'PYTHONDONTWRITEBYTECODE=1', image, 'python', '-c',
         'import sqlite3,ssl,bz2,lzma,ctypes,uuid,regex,pytest; print("toolchain ready")'], timeout=30)
+    if code: raise RepairBlocked('image_validation_failed', text[-2000:])
+    # Native agents use these utilities for repository discovery. A missing
+    # dirname previously turned a parent walk into an endless shell loop.
+    code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only', image,
+        '/bin/sh', '-ec', 'test "$(dirname /work/tests)" = /work; '
+        'test "$(basename /work/tests)" = tests; command -v mktemp >/dev/null; rg --version'], timeout=15)
     if code: raise RepairBlocked('image_validation_failed', text[-2000:])
     code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only', image,
         str(Path(paths['base']) / 'bin/python'), '-c', 'import pytest,regex; print("base interpreter ready")'], timeout=30)

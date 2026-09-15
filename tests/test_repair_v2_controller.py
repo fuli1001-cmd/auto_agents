@@ -234,3 +234,124 @@ def test_missing_native_session_recovers_once_without_discarding_plan(job):
     assert result['status'] == 'ready' and result['session_recoveries'] == {'implement': 1}
     assert [role for role, _ in driver.calls].count('plan') == 1
     assert result['attempts'] == 1
+
+
+def protected_job(job):
+    from dataclasses import replace
+    request, store, workspace = job
+    tests = workspace.source / 'tests'; tests.mkdir()
+    (tests / 'test_value.py').write_text('def test_value():\n    assert value == 1\n')
+    git(workspace.source, 'add', '.'); git(workspace.source, 'commit', '-qm', 'retain regression')
+    request = replace(request, engine_base=git(workspace.source, 'rev-parse', 'HEAD'))
+    workspace.base = request.engine_base
+    return request, store, workspace
+
+
+def test_test_audit_returns_all_failures_to_same_writer_before_formal_acceptance(job):
+    job = protected_job(job)
+    driver, verifier = Driver(), Verifier()
+    original, turns = driver.run, []
+    def run(role, prompt, root, **kwargs):
+        if role == 'implement':
+            turns.append(prompt)
+            if len(turns) == 1:
+                (Path(root) / 'tests/test_value.py').write_text('def test_value():\n    assert True\n')
+            else:
+                assert "value == 1" in prompt and 'test_value.py' in prompt
+                (Path(root) / 'tests/test_value.py').write_text('def test_value():\n    assert value == 1\n')
+        return original(role, prompt, root, **kwargs)
+    driver.run = run
+    state = controller(job, driver, verifier).run()
+    assert state['status'] == 'ready' and state['attempts'] == 2
+    assert driver.calls == [('plan', ''), ('implement', 'writer'), ('implement', 'writer'), ('review', '')]
+    assert len(verifier.calls) == 1
+
+
+def test_unchanged_test_audit_failure_consumes_persistent_no_progress_budget(job):
+    job = protected_job(job)
+    driver = Driver(); original = driver.run
+    def run(role, prompt, root, **kwargs):
+        if role == 'implement':
+            (Path(root) / 'tests/test_value.py').write_text('def test_value():\n    assert True\n')
+        return original(role, prompt, root, **kwargs)
+    driver.run = run
+    verifier = Verifier()
+    state = controller(job, driver, verifier).run()
+    assert state['blocker']['code'] == 'no_progress' and state['attempts'] == 4
+    assert state['replans'] == 1 and verifier.calls == []
+    calls = list(driver.calls)
+    resumed = controller(job, driver, verifier); resumed.resume_token = 'new-job'
+    assert resumed.run()['status'] == 'blocked' and driver.calls == calls
+
+
+def test_imported_test_issue_is_visible_to_initial_plan_and_implementation(job):
+    job = protected_job(job)
+    job[2].prepare()
+    (job[2].candidate / 'tests/test_value.py').write_text('def test_value():\n    assert True\n')
+    driver = Driver(); original = driver.run
+    def run(role, prompt, root, **kwargs):
+        if role in ('plan', 'implement'):
+            assert 'missing_assertions' in prompt and 'value == 1' in prompt
+        if role == 'implement':
+            (Path(root) / 'tests/test_value.py').write_text('def test_value():\n    assert value == 1\n')
+        return original(role, prompt, root, **kwargs)
+    driver.run = run
+    assert controller(job, driver).run()['status'] == 'ready'
+
+
+def test_completed_implementation_resumes_at_audit_after_interruption(job):
+    runner = controller(job)
+    def interrupt(root): raise KeyboardInterrupt()
+    runner.audit = interrupt
+    with pytest.raises(KeyboardInterrupt): runner.run()
+    saved = job[1].load()
+    assert saved['phase'] == 'audit' and saved['attempts'] == 1
+    resumed = controller(job, runner.driver).run()
+    assert resumed['status'] == 'ready'
+    assert runner.driver.calls == [('plan', ''), ('implement', 'writer'), ('review', '')]
+
+
+def test_old_terminal_audit_resumes_retained_source_without_repeating_agent_turn(job):
+    job = protected_job(job)
+    runner = controller(job)
+    def old_audit(root):
+        # Reproduce the state emitted before the audit checkpoint was added.
+        runner.checkpoint(phase='implement', attempts=0)
+        raise RepairBlocked('tests_weakened', 'old syntax-only audit rejected the candidate')
+    runner.audit = old_audit
+    state = runner.run()
+    assert state['status'] == 'blocked' and state['calls'] == 2
+    assert controller(job, runner.driver).run()['status'] == 'blocked'
+    resumed = controller(job, runner.driver); resumed.resume_token = 'explicit-new-job:1'
+    state = resumed.run()
+    assert state['status'] == 'ready' and state['attempts'] == 1
+    assert runner.driver.calls == [('plan', ''), ('implement', 'writer'), ('review', '')]
+    assert resumed.run()['attempts'] == 1
+
+
+def test_guarded_mode_does_not_run_weakened_tests(job):
+    job = protected_job(job)
+    job[2].prepare()
+    (job[2].candidate / 'tests/test_value.py').write_text('def test_value():\n    assert True\n')
+    runner = controller(job); runner.allow_implementation = False
+    state = runner.run()
+    assert state['blocker']['code'] == 'guarded_mode'
+    assert runner.driver.calls == [] and runner.verifier.calls == []
+
+
+def test_codex_output_fragments_do_not_each_write_durable_progress(job):
+    import json
+    driver = Driver(); original = driver.run
+    def run(role, prompt, root, **kwargs):
+        if role == 'plan':
+            for event in ('item/commandExecution/outputDelta', 'item/agentMessage/delta', 'assistant.delta'):
+                kwargs['progress']({'session': 'writer', 'event': event})
+            kwargs['progress']({'session': 'writer', 'event': 'item/completed'})
+        return original(role, prompt, root, **kwargs)
+    driver.run = run
+    runner = controller(job, driver)
+    assert runner.run()['status'] == 'ready'
+    events = [json.loads(line) for line in (runner.store.root / 'events.jsonl').read_text().splitlines()]
+    progress = [e for e in events if e['kind'] == 'agent_progress']
+    assert any(e.get('event') == 'item/completed' for e in progress)
+    assert not any(e.get('event', '').lower().endswith('delta') for e in progress)
