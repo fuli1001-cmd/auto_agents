@@ -386,12 +386,14 @@ class TestInvocation:
                 for target in self.targets or ()]
 
 
-def test_invocations(command: str) -> list[TestInvocation]:
+def test_invocations(command: str, *, environment=None) -> list[TestInvocation]:
     """Parse retained shell context without evaluating shell or runner code.
 
     None targets means unknown option arity, distinct from default discovery.
     option_offset addresses the runner boundary in the original shell text,
     so preflight preserves quoting and distinguishes launcher and runner '--'.
+    Supplying environment includes inherited pytest options for execution
+    admission; omission keeps retained command ownership independent of them.
     """
     invocations = []
     cwd = '.'
@@ -447,9 +449,12 @@ def test_invocations(command: str) -> list[TestInvocation]:
         offset = word_ends[option_start - 1]
         env_args = []
         if runner == 'pytest':
+            env_options = (environment or {}).get('PYTEST_ADDOPTS', '')
             for token in prefix:
                 if token.startswith('PYTEST_ADDOPTS='):
-                    env_args = shlex.split(token.partition('=')[2])
+                    # An explicit empty assignment clears inherited options.
+                    env_options = token.partition('=')[2]
+            env_args = shlex.split(env_options)
         arguments = [*env_args, *options]
         redirections = {len(env_args) + index for index, word in enumerate(raw_words[option_start:])
                         if re.match(r'^\d*[<>]', word)}

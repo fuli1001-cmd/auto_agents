@@ -171,12 +171,20 @@ def imported_test_sources(seeds, *, options, config_directory, cwd, read_source)
         if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if isinstance(value, ast.ClassDef):
                 for base in value.bases:
+                    # Generic parameters do not remove the base's inherited
+                    # checks. Follow the defining class without evaluating
+                    # __class_getitem__ or importing candidate code.
+                    while isinstance(base, ast.Subscript):
+                        base = base.value
                     if isinstance(base, ast.Name) and base.id in found:
                         resolve(path, base.id, seen)
                     elif isinstance(base, ast.Attribute):
                         if not resolve_attribute(path, base, seen):
                             raise ValueError('retained class base cannot be resolved: '
                                              + path + '::' + name)
+                    elif not isinstance(base, ast.Name):
+                        raise ValueError('retained class base cannot be resolved: '
+                                         + path + '::' + name)
             return
         if isinstance(value, tuple):
             node, alias = value

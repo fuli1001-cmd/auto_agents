@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import ast
 import json
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -19,9 +20,9 @@ from .git_ops import head_ref
 from .io_utils import read_json
 
 
-# Re-seal v4 receipts before reuse: their source inventory can omit inherited
-# checks reached through module-qualified or locally chained class bases.
-_PROOF_INVENTORY_VERSION = 5
+# Re-seal older receipts before reuse: v5 can omit checks inherited through
+# parameterized generic bases, even when the selected node remains unchanged.
+_PROOF_INVENTORY_VERSION = 6
 
 _PYTEST_CONFIG_NAMES = ('pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
                         'pyproject.toml', 'tox.ini', 'setup.cfg')
@@ -1056,7 +1057,9 @@ def _validate_required_node_selection(session, state, commands):
     covered = set()
     for command in commands:
         try:
-            for invocation in test_invocations(command):
+            # Ownership stays bound to the retained command. Execution credit
+            # must also account for the environment the public runner inherits.
+            for invocation in test_invocations(command, environment=os.environ):
                 if invocation.runner != 'pytest' or invocation.targets is None:
                     continue
                 cwd = (session.project_root / invocation.cwd).resolve()

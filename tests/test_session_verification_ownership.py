@@ -1774,7 +1774,7 @@ def test_public_resume_rejects_pytest_configuration_deselection(tmp_path, monkey
                                      'nested_config_bare_pyproject_overridden_excluded',
                                      'nested_config_bare_pyproject_overridden_included',
                                      'inline_deselect', 'setup_only', 'setup_only_addopts',
-                                     'setup_only_config', 'setup_only_env', 'setup_plan',
+                                     'setup_only_config', 'setup_only_env', 'setup_only_inherited', 'setup_plan',
                                      'fixtures', 'fixtures_per_test', 'funcargs', 'version',
                                      'help', 'short_help', 'setup_show'])
 def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeypatch, source, selector,
@@ -1845,6 +1845,8 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         'setup_only_addopts': ['-o', 'addopts=--setup-only'],
         'setup_only_config': [],
         'setup_only_env': [],
+        'setup_only_inherited': [],
+        'setup_only_inherited_cleared_included': [],
         'setup_plan': ['--setup-plan'],
         'fixtures': ['--fixtures'],
         'fixtures_per_test': ['--fixtures-per-test'],
@@ -1952,6 +1954,8 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     elif selector == 'setup_only_env':
         command = "PYTEST_ADDOPTS='--setup-only' " + command
         args = ['--setup-only']
+    elif selector == 'setup_only_inherited_cleared_included':
+        command = "PYTEST_ADDOPTS='' " + command
     config.gates.steps[0].targets = targets
     config.gates.steps[0].args = args
     if source != 'structured':
@@ -1980,6 +1984,11 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
             _binding_fixture(root, child)
         save_session_state(root, child)
         retained_binding = json.loads(json.dumps(child.verification_binding))
+    if selector.startswith('setup_only_inherited'):
+        # Change the actual inherited environment after constructing the
+        # retained binding. No setup-only option is added to its command.
+        assert '--setup-only' not in command
+        monkeypatch.setenv('PYTEST_ADDOPTS', '--setup-only')
     ambient = {path: (root / path).read_bytes() for path in
                ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
     dispatched = []
@@ -2039,12 +2048,19 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
     'nested_config_bare_pyproject_included',
     'nested_config_bare_pyproject_overridden_excluded',
     'nested_config_bare_pyproject_overridden_included',
-    'setup_only', 'setup_only_addopts', 'setup_only_config', 'setup_only_env',
+    'setup_only', 'setup_only_addopts', 'setup_only_config', 'setup_only_env', 'setup_only_inherited',
     'setup_plan', 'fixtures_per_test', 'setup_show',
 ])
 def test_public_resume_rechecks_retained_default_filename_exclusion(tmp_path, monkeypatch, source, selector):
     test_public_resume_requires_executable_owned_node_coverage(
         tmp_path, monkeypatch, source, selector, retained=True)
+
+
+@pytest.mark.parametrize('source', ['legacy', 'explicit_fix', 'manual'])
+@pytest.mark.parametrize('retained', [False, True])
+def test_public_resume_inline_options_clear_inherited_setup_only(tmp_path, monkeypatch, source, retained):
+    test_public_resume_requires_executable_owned_node_coverage(
+        tmp_path, monkeypatch, source, 'setup_only_inherited_cleared_included', retained=retained)
 
 
 @pytest.mark.parametrize('reference', ['node', 'proof_id'])
@@ -2231,7 +2247,9 @@ def test_public_resume_retains_manual_regression_sharing_foreign_future_file(
 
 @pytest.mark.parametrize('legacy', [False, True])
 @pytest.mark.parametrize('imports', ['direct', 'pythonpath', 'reexport',
-                                   'inheritance', 'inheritance_local', 'inheritance_reexport'])
+                                   'inheritance', 'inheritance_local', 'inheritance_reexport',
+                                   'inheritance_generic', 'inheritance_generic_named',
+                                   'inheritance_generic_reexport'])
 @pytest.mark.parametrize('outcome', ['weakening', 'intact_failure', 'passing'])
 def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatch, legacy, imports, outcome):
     from copy import deepcopy
@@ -2246,6 +2264,7 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
     marker = ExecutionMarker(tmp_path / 'imported-regression-executed')
     name = 'test_regression' if imports == 'direct' else 'check_regression'
     inherited = imports.startswith('inheritance')
+    generic = imports.startswith('inheritance_generic')
     helper = 'regression_helpers.py' if imports == 'direct' else 'qa/regression_helpers.py'
     (root / helper).parent.mkdir(exist_ok=True)
     expected = 1 if outcome == 'passing' else 0
@@ -2258,11 +2277,14 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
                          f'    def {name}(self):\n'
                          '        ' + marker.source('Path("value.py").read_text()', append=True) + '\n'
                          f'        assert "VALUE = {expected}" in Path("value.py").read_text()\n')
+    if generic:
+        helper_source = helper_source.replace('class BaseRegression:',
+            'from typing import Generic, TypeVar\nT = TypeVar("T")\nclass BaseRegression(Generic[T]):')
     (root / helper).write_text(helper_source)
     if imports != 'direct':
         (root / 'pytest.ini').write_text('[pytest]\npython_functions = test_* check_*\npythonpath = qa\n')
     module = 'regression_helpers'
-    if imports in {'reexport', 'inheritance_reexport'}:
+    if imports in {'reexport', 'inheritance_reexport', 'inheritance_generic_reexport'}:
         exported = 'BaseRegression' if inherited else name
         (root / 'qa/regression_exports.py').write_text(f'from regression_helpers import {exported}\n')
         module = 'regression_exports'
@@ -2270,11 +2292,17 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
     (root / path).write_text(f'from {module} import {name}\n')
     node = name
     if inherited:
+        preamble = f'import {module} as helpers\n'
         declaration = 'class TestRegression(helpers.BaseRegression): pass\n'
         if imports == 'inheritance_local':
             declaration = ('class RetainedBase(helpers.BaseRegression): pass\n'
                            'class TestRegression(RetainedBase): pass\n')
-        (root / path).write_text(f'import {module} as helpers\n' + declaration)
+        if generic:
+            declaration = 'class TestRegression(helpers.BaseRegression[int]): pass\n'
+            if imports == 'inheritance_generic_named':
+                preamble = f'from {module} import BaseRegression\n'
+                declaration = 'class TestRegression(BaseRegression[int]): pass\n'
+        (root / path).write_text(preamble + declaration)
         node = 'TestRegression::' + name
     foreign = VerificationStep(proof_id='foreign.release', runner='pytest', levels=['release'],
                                targets=[path + '::' + node], impact_paths=[])
@@ -2291,7 +2319,7 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
         child.workflow_id = WorkflowStore(root).create_root(WorkflowRef('fix', child.session_id)).workflow_id
         child.authorization_policy = authorization_policy_for_state(auto_approve=True).to_dict()
         with monkeypatch.context() as previous:
-            previous.setattr(verification, '_PROOF_INVENTORY_VERSION', 4 if inherited else 3)
+            previous.setattr(verification, '_PROOF_INVENTORY_VERSION', 5 if generic else 4 if inherited else 3)
             verification.bind_session(Session(Orchestrator(root), mode='fix', auto_approve=True), child)
         # Reconstruct the old inventory that did not protect imported bodies.
         for entry in (helper, 'qa/regression_exports.py'):
@@ -2332,7 +2360,7 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
         return Session(orch, mode='fix', auto_approve=True).resume(child.session_id)
     saved = resume()
     assert writers == ['fix']
-    assert saved.verification_binding['proof_inventory_version'] == 5
+    assert saved.verification_binding['proof_inventory_version'] == 6
     assert saved.verification_binding['proof_sources'][helper] == helper_source
     assert saved.verification_binding['proof_source_owners'][helper][0]['task_id'] == 'task-foreign'
     if outcome == 'weakening':
@@ -3665,7 +3693,7 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(
         assert result.status == 'completed', result.to_dict()
         assert len(calls) == 1, 'inventory recovery must reuse the frozen candidate'
         binding = result.verification_binding
-        assert binding['proof_inventory_version'] == 5
+        assert binding['proof_inventory_version'] == 6
         for key in ('repository', 'authorization', 'tasks', 'task_scope', 'contract_revision',
                     'original_handoff_id', 'baseline_identity', 'execution_environment'):
             assert binding[key] == authority[key]
@@ -4570,6 +4598,7 @@ def test_public_inventory_migration_resumes_existing_undelivered_receipt(
     pytest.param(1, False, id='False'), pytest.param(1, True, id='True'),
     pytest.param(2, False, id='v2-False'), pytest.param(2, True, id='v2-True'),
     pytest.param(4, False, id='v4-False'), pytest.param(4, True, id='v4-True'),
+    pytest.param(5, False, id='v5-False'), pytest.param(5, True, id='v5-True'),
 ])
 def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_path, monkeypatch, intermediate_writer, previous_version):
     from copy import deepcopy
@@ -4623,7 +4652,7 @@ def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_p
     ambient = _switch_ambient_binding_plan(root)
     saved, calls, _ = run_session(root, monkeypatch)
     assert saved.status == 'completed' and calls == []
-    assert saved.verification_binding['proof_inventory_version'] == 5
+    assert saved.verification_binding['proof_inventory_version'] == 6
     assert saved.verification_binding['binding_fingerprint'] != authority['binding_fingerprint']
     for key in ('authorization', 'tasks', 'task_scope', 'contract_revision', 'original_handoff_id'):
         assert saved.verification_binding[key] == authority[key]
