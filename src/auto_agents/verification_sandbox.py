@@ -368,7 +368,14 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
             'AUTO_AGENTS_REPAIR_CONTROL_DISABLED': '1',
         } if execution_environment is None else dict(execution_environment)
         from auto_agents.verification_input_trace import file_identity
-        runtime_identity = json.dumps(file_identity(runtime_parent.lstat()))
+        reservation_identity = file_identity(runtime_parent.lstat())
+        if not nested:
+            # This launch enters unshare --map-root-user below. The same
+            # directory retains its device/inode/type, but its owning UID is
+            # 0 in the recipient's user namespace. Issue the token in that
+            # namespace; never rewrite an inherited token during validation.
+            reservation_identity[2] = 0
+        runtime_identity = json.dumps(reservation_identity)
         bookkeeping_environment = {
             'CODEX_HOME': str(codex_home), 'AUTO_AGENTS_VERIFICATION_SANDBOX': '1',
             RUNTIME_ROOT_ENV: str(runtime_parent), RUNTIME_ID_ENV: runtime_identity,

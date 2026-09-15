@@ -349,11 +349,16 @@ def test_gate_trace_evidence_requires_custody(tmp_path, scope, fault):
 import json, os, subprocess, sys
 from pathlib import Path
 from auto_agents.verification_input_trace import TraceCustody
+from auto_agents.verification_input_trace import file_identity
+from auto_agents.verification_sandbox import runtime_reservation, RUNTIME_ID_ENV
 from auto_agents.gate_execution import LocalGatePlanExecutor
 from auto_agents.gates import GateCommandMetadata
 sys.path.insert(0, {str(Path(__file__).parent)!r})
 from test_gate_execution import _project, _config
 from pytest import MonkeyPatch
+pool=runtime_reservation()
+assert json.loads(os.environ[RUNTIME_ID_ENV])==file_identity(pool.lstat())
+assert pool.lstat().st_uid==os.getuid()
 root=Path.cwd(); project=_project(root)
 config=_config(root); config.verification_policy_version=3
 command='cat tracked.txt'

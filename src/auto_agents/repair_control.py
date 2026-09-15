@@ -668,6 +668,7 @@ def _ensure_supervisor(config):
     names = {"PATH", "HOME", "LANG", "LC_ALL", "SSH_AUTH_SOCK", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "AUTO_AGENTS_REPAIR_CONTROL_ROOT"}
     names.update({"AUTO_AGENTS_STORAGE_ROOT", "AUTO_AGENTS_STORAGE_DISABLED", "AUTO_AGENTS_STORAGE_MAINTENANCE",
                   "TMPDIR", "WSL_DISTRO_NAME", "AUTO_AGENTS_VERIFICATION_SANDBOX", "AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT",
+                  "AUTO_AGENTS_VERIFICATION_RUNTIME_ID",
                   "AUTO_AGENTS_SUPERVISOR_CHECKS", "AUTO_AGENTS_VERIFICATION_PRIVATE_SHM"})
     environment = {key: value for key, value in os.environ.items() if key in names}
     with (root / "supervisor.log").open("ab") as output:
@@ -1291,7 +1292,7 @@ class Supervisor:
                     atomic_json(root / "request.json", payload)
                     environment = {key: value for key, value in os.environ.items()
                                    if key in {"PATH", "HOME", "LANG", "CODEX_HOME", "XDG_STATE_HOME", "AUTO_AGENTS_WORKER_ROOT", "AUTO_AGENTS_VERIFICATION_ROOT", "AUTO_AGENTS_VERIFICATION_SANDBOX", "AUTO_AGENTS_STORAGE_ROOT", "AUTO_AGENTS_STORAGE_DISABLED", "AUTO_AGENTS_STORAGE_MAINTENANCE",
-                                              "TMPDIR", "AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT", "AUTO_AGENTS_SUPERVISOR_CHECKS", "AUTO_AGENTS_VERIFICATION_PRIVATE_SHM"}}
+                                              "TMPDIR", "AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT", "AUTO_AGENTS_VERIFICATION_RUNTIME_ID", "AUTO_AGENTS_SUPERVISOR_CHECKS", "AUTO_AGENTS_VERIFICATION_PRIVATE_SHM"}}
                     environment["AUTO_AGENTS_REPAIR_CONTROL_CONFIG"] = str(self.store.root / "operator.json")
                     if context["job"]:
                         environment["AUTO_AGENTS_REPAIR_JOB"] = context["job"]

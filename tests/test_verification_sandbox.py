@@ -23,6 +23,61 @@ def test_verification_cannot_grant_write_access_to_live_project(tmp_path):
             pass
 
 
+def test_runtime_reservation_keeps_identity_across_namespaces_and_rejects_forgery(tmp_path):
+    from test_verification_metadata import execute
+
+    inner = '''
+import json, os, uuid
+from pathlib import Path
+from auto_agents.verification_input_trace import file_identity
+from auto_agents.verification_sandbox import runtime_reservation, RUNTIME_ID_ENV, ConfinementPreflightError
+from auto_agents.gate_execution import short_job_runtime_root
+pool = runtime_reservation()
+token = os.environ[RUNTIME_ID_ENV]
+identity = json.loads(token)
+assert identity == file_identity(pool.lstat())
+assert identity[2] == os.getuid()
+for field in range(4):
+    forged = list(identity)
+    forged[field] += 1
+    os.environ[RUNTIME_ID_ENV] = json.dumps(forged)
+    try:
+        runtime_reservation()
+    except ConfinementPreflightError as error:
+        assert error.diagnostic['phase'] == 'runtime_allocation'
+        assert error.diagnostic['attempted_location'] == str(pool)
+        assert error.diagnostic['errno'] == 1
+    else:
+        raise AssertionError('forged reservation identity was accepted')
+    finally:
+        os.environ[RUNTIME_ID_ENV] = token
+assert runtime_reservation() == pool
+leaf = short_job_runtime_root(uuid.uuid4().hex)
+assert leaf.parent == pool and leaf.stat().st_uid == os.getuid()
+assert leaf.stat().st_mode & 0o777 == 0o700
+(leaf / '.auto-agents-runtime.json').unlink()
+leaf.rmdir()
+print(json.dumps({'pool': str(pool), 'identity': identity}))
+'''
+    execute(tmp_path, f'''
+import json, os, subprocess, sys
+from pathlib import Path
+from auto_agents.verification_input_trace import file_identity
+from auto_agents.verification_sandbox import verification_argv, runtime_reservation, RUNTIME_ID_ENV
+pool = runtime_reservation()
+identity = json.loads(os.environ[RUNTIME_ID_ENV])
+assert identity == file_identity(pool.lstat())
+assert identity[2] == os.getuid()
+root = Path.cwd() / 'nested'
+root.mkdir()
+with verification_argv([sys.executable, '-c', {inner!r}], root, Path(SHARED).parent) as argv:
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+assert result.returncode == 0, result.stdout + result.stderr
+assert json.loads(result.stdout) == {{'pool': str(pool), 'identity': identity}}
+assert runtime_reservation() == pool
+''')
+
+
 @pytest.mark.skipif(shutil.which("codex") is None, reason="local Codex sandbox not installed")
 def test_actual_sandbox_protects_live_inputs_and_keeps_candidate_writable(tmp_path):
     project, candidate = tmp_path / "project", tmp_path / "candidate"
