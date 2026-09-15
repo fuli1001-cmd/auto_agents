@@ -429,3 +429,13 @@ def test_prepared_gate_keeps_shared_prefix_readonly(tmp_path, monkeypatch):
     assert _snapshot(source) == before
     assert _snapshot(provisioned) == installed_before
     assert {path: (root / path).read_bytes() for path in ambient} == ambient
+
+
+@pytest.mark.parametrize('command,expected', [
+    ('python -m pytest ::test_contract', '::test_contract'),
+    ('cd qa && python -m pytest ::test_contract', '::test_contract'),
+    ("cd qa && python -m pytest ' ::test_contract'", ' ::test_contract'),
+    ('cd qa && python -m pytest tests/test_contract.py::test_contract', 'qa/tests/test_contract.py::test_contract'),
+])
+def test_repository_targets_does_not_invent_missing_pytest_path(command, expected):
+    assert parse_invocations(command)[0].repository_targets == [expected]

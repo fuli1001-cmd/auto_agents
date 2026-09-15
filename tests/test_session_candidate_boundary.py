@@ -241,7 +241,8 @@ def test_unavailable_writer_confinement_blocks_before_dispatch(tmp_path, monkeyp
     assert diagnostic['contract_fingerprint']
     if failure != 'unavailable':
         assert diagnostic['phase'] == 'writer_preflight'
-        assert diagnostic['launcher_protocol'] == '--writer-landlock'
+        assert diagnostic['launcher_protocol'] == (
+            '--writer-landlock' if os.environ.get('AUTO_AGENTS_VERIFICATION_SANDBOX') else '--namespace')
         assert diagnostic['supervisor_version'] == 1
         assert diagnostic['errno'] == 1
     assert 'writer confinement is unavailable' in result.execution_log[-1]['result']
@@ -256,3 +257,15 @@ def test_unavailable_writer_confinement_blocks_before_dispatch(tmp_path, monkeyp
         assert not repeated.candidate_custody.get('delivered_revision')
         assert any(entry.get('diagnostic') == diagnostic for entry in repeated.execution_log)
     assert not calls and _shared_image(root, dependency) == before
+
+
+@pytest.mark.parametrize('location', ['runtime', 'legacy'])
+def test_nested_writer_preserves_all_shared_boundaries(tmp_path, monkeypatch, location):
+    monkeypatch.setenv('AUTO_AGENTS_VERIFICATION_SANDBOX', '1')
+    test_claude_writer_cannot_write_shared_or_dependency_targets(tmp_path, monkeypatch, location)
+
+
+@pytest.mark.parametrize('failure', ['private_chmod', 'private_fchmod'])
+def test_nested_writer_private_metadata_failure_blocks_dispatch(tmp_path, monkeypatch, failure):
+    monkeypatch.setenv('AUTO_AGENTS_VERIFICATION_SANDBOX', '1')
+    test_unavailable_writer_confinement_blocks_before_dispatch(tmp_path, monkeypatch, failure)

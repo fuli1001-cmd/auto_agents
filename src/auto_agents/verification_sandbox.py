@@ -497,7 +497,9 @@ class CandidateWriterBoundary:
                     json.dumps([str(self.root), str(self.scratch)]), *argv]
         from .gate_execution import discover_dependency_links
         entries = {':root': 'read', '/tmp': 'write', str(self.root): 'write',
-                   str(self.scratch): 'write'}
+                   str(self.scratch): 'write', str(self.root / '.git'): 'write'}
+        # validate_checkout admitted an independent private Git directory.
+        # Writers may stage there; the shared repository remains read-only.
         # /tmp is a fresh mount, not the host's temporary directory. Shared
         # inputs restored below it are explicitly read-only, including metadata.
         preserve = [self.root, self.scratch, self.shared, Path(__file__).resolve().parents[2]]
@@ -522,9 +524,14 @@ class CandidateWriterBoundary:
         entries[str(self.root)] = entries[str(self.scratch)] = 'write'
         profile = '{filesystem={' + ','.join(json.dumps(k) + '=' + json.dumps(v)
                                              for k, v in entries.items()) + '},network={enabled=true}}'
+        # The top-level mount sandbox needs the same descendant/metadata
+        # supervisor as nested writers, including denial of new namespaces.
+        metadata = [sys.executable, str(Path(__file__).resolve()), '--metadata',
+                    json.dumps({'roots': [str(self.root), str(self.scratch)],
+                                'readonly': [path for path, access in entries.items() if access == 'read' and not path.startswith(':')]})]
         sandbox = [self.executables['codex'], 'sandbox', '-c', 'features.network_proxy=false',
                    '-c', 'permissions.autoagents_writer=' + profile, '-P', 'autoagents_writer',
-                   '-C', str(self.root), '--include-managed-config', '--', *argv]
+                   '-C', str(self.root), '--include-managed-config', '--', *metadata, *argv]
         payload = {'cwd': str(self.root), 'preserve': list(map(str, preserve)),
                    'command': sandbox, 'mount': self.executables['mount']}
         return [self.executables['unshare'], '--user', '--map-root-user', '--mount',

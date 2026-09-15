@@ -382,9 +382,14 @@ class TestInvocation:
 
     @property
     def repository_targets(self):
-        return [posixpath.normpath(posixpath.join(self.cwd, target.split('::', 1)[0]))
-                + ('::' + target.split('::', 1)[1] if '::' in target else '')
-                for target in self.targets or ()]
+        resolved = []
+        for target in self.targets or ():
+            path, separator, selector = target.partition('::')
+            # Keep a missing path missing. Joining it to cwd would manufacture
+            # a selector that baseline classification mistakes for exact proof.
+            path = posixpath.normpath(posixpath.join(self.cwd, path)) if path.strip() else path
+            resolved.append(path + separator + selector)
+        return resolved
 
 
 def test_invocations(command: str, *, environment=None) -> list[TestInvocation]:
