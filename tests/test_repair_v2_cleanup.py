@@ -43,7 +43,17 @@ def test_image_gc_keeps_pending_repairs_and_recent_images(tmp_path, monkeypatch)
         if command[1:3] == ['image', 'inspect']:
             return 0, json.dumps([{'Config': {'Labels': {'org.auto-agents.registry': images.owner()}}}])
         return 0, ''
-    with patch('auto_agents.repair_v2.docker.run', side_effect=run):
+    with patch('auto_agents.repair_v2.docker.run', side_effect=run), \
+         patch('auto_agents.repair_v2.images.shutil.which', return_value='/usr/bin/docker'):
         assert images.maintain() == ['sha256:1']
     assert ['docker', 'image', 'rm', 'image:1'] in calls
     assert not any('volume' in c for c in calls)
+
+
+def test_unavailable_optional_image_cleanup_does_not_fail_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv('AUTO_AGENTS_STORAGE_ROOT', str(tmp_path / 'storage'))
+    with patch('auto_agents.repair_v2.images.shutil.which', return_value=None):
+        assert images.maintain() == []
+    with patch('auto_agents.repair_v2.images.shutil.which', return_value='/usr/bin/docker'), \
+         patch('auto_agents.repair_v2.docker.run', side_effect=OSError('daemon unavailable')):
+        assert images.maintain() == []

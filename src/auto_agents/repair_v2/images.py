@@ -4,6 +4,7 @@ import fcntl
 import json
 from datetime import datetime, timezone
 import re
+import shutil
 from pathlib import Path
 import time
 
@@ -49,9 +50,10 @@ def release(transaction):
             atomic_json(path, value)
 
 
-def maintain(*, keep=2, age_days=14):
+def _maintain(*, keep=2, age_days=14):
     """Do not touch unknown images, active containers, pins or Docker volumes."""
     from .docker import run
+    if not shutil.which('docker'): return []
     removed = []
     with locked() as root:
         try:
@@ -93,3 +95,9 @@ def maintain(*, keep=2, age_days=14):
                         code, _ = run(['docker', 'image', 'rm', tag], timeout=20)
                         if not code: removed.append(value['Id'])
     return removed
+
+
+def maintain(*, keep=2, age_days=14):
+    # Housekeeping must never turn accepted delivery into a repair failure.
+    try: return _maintain(keep=keep, age_days=age_days)
+    except (OSError, ValueError, KeyError, TypeError): return []
