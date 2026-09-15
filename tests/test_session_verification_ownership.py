@@ -4324,11 +4324,11 @@ def _assert_receipt_policy_mismatch(tmp_path, monkeypatch, policy, change, *, bo
         switch()
     identities = []
     original_identity = candidate.verification_identity
-    def identity(session, state):
+    def identity(session, state, **kwargs):
         ambient = session.config.gates
         before = deepcopy(ambient.to_dict())
         try:
-            result = original_identity(session, state)
+            result = original_identity(session, state, **kwargs)
             identities.append(result)
             return result
         finally:
