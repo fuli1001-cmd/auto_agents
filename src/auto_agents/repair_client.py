@@ -260,6 +260,7 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
         phase = progress.get("phase") or progress.get("kind", "")
         if progress.get('engine') == 'v2':
             labels = {'plan': '正在统一规划修复', 'implement': '正在连续实施修复',
+                      'audit': '正在检查既有测试是否完整保留',
                       'validate': '正在集中验收：测试与独立审查并行',
                       'regression': '正在验证修复前后的行为差异',
                       'boundary': '正在验证原会话恢复', 'deliver': '正在交付已验收引擎'}
@@ -267,7 +268,7 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
                 return f"集中验收：测试 {progress.get('completed', 0)}/{progress.get('total', 0)} 项完成"
             label = labels.get(phase, '正在执行统一修复')
             attempt = progress.get('attempt', 0)
-            return (f'已完成 {attempt} 次实施；' if attempt else '') + label
+            return (f'已提交 {attempt} 次实施结果；' if attempt else '') + label
         labels = {
             "engine_source_sync": "正在同步本地与远端引擎版本",
             "request_contract_planning": "正在规划验收检查", "request_contract_ready": "验收检查已就绪",

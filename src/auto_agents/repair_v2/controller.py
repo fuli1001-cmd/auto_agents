@@ -87,6 +87,7 @@ class Controller:
             self.state['calls'] = call
             self.store.save(self.state)
         reference = self.store.artifact('agent-input', {'role': role, 'prompt': prompt, 'source': before})
+        self.checkpoint(active_call={'call': call, 'role': role, 'source': before, 'input': reference})
         self.store.event('agent_started', role=role, call=call, input=reference)
         started = time.monotonic()
 
@@ -96,7 +97,7 @@ class Controller:
                     if self.state['sessions'].get(role) != event['session']:
                         self.state['sessions'][role] = event['session']
                         self.store.save(self.state)
-            if event.get('event', '').endswith(('/delta', '.delta')):
+            if event.get('event', '').lower().endswith('delta'):
                 return  # Native transcripts hold deltas; journal records transitions.
             self.store.event('agent_progress', role=role, **event)
 
@@ -127,13 +128,24 @@ class Controller:
                 self.checkpoint(sessions=sessions, session_recoveries=recovered)
                 self.store.event('native_session_recovered', role=role, old_session=session)
                 return self.agent(role, fallback_prompt or prompt, root, schema=schema, cancel=cancel)
-        if not reply.ok: raise RepairBlocked('provider_failed', reply.error or 'provider did not complete the turn')
+        if reply.timed_out and role == 'implement' and source_identity(root) != before:
+            # A model's final message is not acceptance evidence. A stopped
+            # time slice can submit its actual edits to the same mandatory
+            # audit/tests/review; partial code never becomes approved here.
+            self.checkpoint(implementation_timebox={'call': call, 'source_before': before,
+                                                   'source_after': source_identity(root)})
+            self.store.event('implementation_timeboxed', **self.state['implementation_timebox'])
+            return reply
+        if not reply.ok:
+            code = 'provider_timeout' if reply.timed_out else 'provider_failed'
+            raise RepairBlocked(code, reply.error or 'provider did not complete the turn')
         return reply
 
     def context(self):
         return json.dumps({'goal': self.request.goal,
             'requirements': [asdict(item) for item in self.request.acceptance],
-            'evidence': self.request.evidence}, ensure_ascii=False)
+            'evidence': self.request.evidence,
+            'test_preservation_findings': self.state.get('test_preservation_findings', [])}, ensure_ascii=False)
 
     def plan(self, root, *, rediagnose=False):
         self.phase('plan')
@@ -149,6 +161,9 @@ class Controller:
         if rediagnose:
             prompt += '\nTwo implementations made no verified progress. Reconsider the root cause using these concrete failures:\n'
             prompt += json.dumps(self.state['failures'], ensure_ascii=False)
+        prompt += ('\nPreserve each original test entry, parameter case and assertion. Conjunctive strengthening '
+                   'and literal parameter extensions retaining the old cases are supported. For other test '
+                   'refactors, keep the original checks explicit and add separate new cases.')
         reply = self.agent('plan', prompt, root)
         if not reply.text.strip(): raise RepairBlocked('plan_missing', 'provider returned no implementation plan')
         reference = self.store.artifact('plan', {'text': reply.text, 'request': self.state['request_digest']})
@@ -159,20 +174,40 @@ class Controller:
         prompt = ('Implement the complete repair plan in this private candidate. Resolve cross-module issues together. '
             'Preserve unrelated work and existing tests. Do not modify Git metadata or weaken verification. '
             'Use small diagnostics only when necessary; the controller runs formal acceptance after this turn. '
+            'Prioritize a testable correction for the supplied failures before exploring additional variants. '
+            'Use the image-provided python for diagnostics. At the execution deadline the controller may '
+            'submit partial edits to formal acceptance, so keep changes coherent as you work. '
             'A previous passing check is not permission to skip a changed requirement. Finish with a concise change summary.\n'
             + self.context() + '\nPLAN:\n' + self.store.read(self.state['plan'])['text'])
         if self.state['failures']:
             prompt += '\nCorrect these current failures without rebuilding unchanged planning history:\n'
             prompt += json.dumps(self.state['failures'], ensure_ascii=False)
         self.agent('implement', prompt, root)
-        from .audit import protect_tests
-        protect_tests(self.workspace.source, self.request.engine_base, root)
+        self.workspace.checkpoint()
+        # A completed implementation is durable even if its local audit fails.
+        # Restarting at this boundary must not repeat the model turn.
+        self.checkpoint(attempts=self.state['attempts'] + 1, phase='audit')
+
+    def test_findings(self, root):
+        from .audit import test_protection_findings
+        findings = test_protection_findings(self.workspace.source, self.request.engine_base, root)
         for parent in self.state.get('integration_parents', []):
-            protect_tests(root, parent, root)
+            findings.extend(test_protection_findings(root, parent, root))
+        return findings
+
+    def audit(self, root):
+        self.phase('audit')
+        findings = self.test_findings(root)
+        identity = source_identity(root)
+        self.checkpoint(test_audit=self.store.artifact('test-audit', {'source': identity, 'findings': findings}),
+                        test_preservation_findings=findings)
+        if findings:
+            self.record_failures(findings, identity)
+            return False
         self.workspace.checkpoint()
         identity, snapshot = self.workspace.freeze()
-        self.checkpoint(snapshot=identity, snapshot_path=str(snapshot), attempts=self.state['attempts'] + 1,
-                        phase='validate')
+        self.checkpoint(snapshot=identity, snapshot_path=str(snapshot), phase='validate')
+        return True
 
     def review(self, identity, snapshot, cancel=None):
         try: return self._review(identity, snapshot, cancel)
@@ -257,8 +292,17 @@ class Controller:
             self.checkpoint(validation=self.store.artifact('validation', asdict(validation)))
             raise KeyboardInterrupt()
         if validation.infrastructure:
+            if not validation.failures:
+                validation.failures = [{'unit': check.get('unit', 'verification'),
+                    'reason': check.get('diagnostic') or check.get('excerpt') or 'verification infrastructure failed (exit ' + str(check.get('returncode')) + ')'}
+                    for check in validation.checks if check.get('infrastructure')]
+                if not validation.failures:
+                    validation.failures = [{'unit': 'verification', 'reason': 'verification infrastructure failed without structured diagnostics'}]
             self.checkpoint(validation=self.store.artifact('validation', asdict(validation)))
-            raise RepairBlocked('verification_infrastructure', json.dumps(validation.failures, ensure_ascii=False))
+            if review.findings:
+                self.checkpoint(failures=[*validation.failures, *review.findings])
+            raise RepairBlocked('verification_infrastructure', '; '.join(
+                str(failure.get('reason') or 'verification infrastructure failure') for failure in validation.failures))
         executed = {node for check in validation.checks for node in check.get('passed', [])}
         missing = [node for row in review.coverage for node in row['nodes'] if not any(
             actual == node or actual.startswith(node + '[') or actual.startswith(node + '::')
@@ -301,6 +345,12 @@ class Controller:
             return True
         failures = [*validation.failures, *review.findings]
         if not failures: raise RepairBlocked('invalid_validation', 'incomplete acceptance has no actionable failure')
+        self.record_failures(failures, identity,
+            passed_tests={node for check in validation.checks if check.get('ok') for node in check.get('passed', [])})
+        return False
+
+    def record_failures(self, failures, identity, *, passed_tests=()):
+        """All concrete candidate failures share the same persistent budget."""
         def keys(rows):
             # Traceback paths, elapsed times and wording do not measure progress.
             values = set()
@@ -316,14 +366,23 @@ class Controller:
         current = keys(failures)
         best = {tuple(item) for item in self.state.get('best_failure_keys', [])}
         progressed = bool(best and current < best)
+        resolved = {tuple(item) for item in self.state.get('resolved_failure_keys', [])}
+        verified = {key for key in best if key[0] in ('test', 'missing') and key[1] in passed_tests}
+        # Newly surfaced findings are not stagnation when every old test
+        # failure has actually passed. Each failure earns this credit once;
+        # an A/B oscillation cannot repeatedly replenish the budget.
+        if best and verified == best and verified - resolved: progressed = True
+        resolved.update(verified)
         if not best or progressed: best = current
         self.checkpoint(failures=failures, best_failure_keys=sorted(best),
+                        resolved_failure_keys=sorted(resolved),
                         stagnant=0 if progressed else self.state['stagnant'] + 1, phase='implement')
         self.store.event('acceptance_failed', snapshot=identity, failures=failures, progressed=progressed)
-        return False
 
     def run(self):
         with self.store.locked():
+            recover_review = False
+            recover_timeout = False
             self.state = self.store.load() or {'version': 2, 'request_digest': digest(self.request.to_dict()),
                 'status': 'active', 'phase': 'prepare', 'plan': None, 'sessions': {}, 'attempts': 0,
                 'calls': 0, 'failures': [], 'stagnant': 0, 'replans': 0}
@@ -344,13 +403,27 @@ class Controller:
                 else: return self.state
             # An unchanged failure does not acquire a new recovery allowance on restart.
             if self.state['status'] == 'blocked':
+                # Earlier V2 controllers made a recoverable test audit terminal,
+                # before counting/checkpointing the completed implementation.
+                # One explicit resume re-audits its exact retained bytes under
+                # the upgraded controller, preserving plan, session and budget.
+                old_audit = (self.state.get('blocker', {}).get('code') in {'tests_weakened', 'tests_invalid'}
+                             and not self.state.get('audit_recovery_version') and self.state.get('plan'))
                 retryable = self.state.get('blocker', {}).get('code') in {
                     'provider_failed', 'provider_configuration', 'docker_unavailable', 'disk_space',
-                    'verification_infrastructure', 'upstream_unavailable', 'disk_observation', 'execution_failed'}
-                if not (retryable and self.resume_token and self.resume_token != self.state.get('resume_token')):
+                    'verification_infrastructure', 'upstream_unavailable', 'disk_observation', 'execution_failed',
+                    'provider_timeout', 'provider_cleanup_failed'}
+                if not ((retryable or old_audit) and self.resume_token and self.resume_token != self.state.get('resume_token')):
                     return self.state
+                if old_audit:
+                    self.checkpoint(phase='audit', attempts=self.state['attempts'] + 1, audit_recovery_version=1)
+                    self.store.event('test_audit_recovered', previous=self.state['blocker'])
+                recover_review = self.state.get('blocker', {}).get('code') == 'verification_infrastructure'
+                recover_timeout = (self.state.get('phase') == 'implement' and
+                    self.state.get('blocker', {}).get('code') == 'provider_failed' and
+                    self.state.get('blocker', {}).get('message') == 'provider call exceeded its configured time budget')
             self.checkpoint(resume_token=self.resume_token)
-            self.checkpoint(status='active')
+            self.checkpoint(status='active', blocker={})
             try:
                 root = self.workspace.prepare()
                 self.verifier.prepare()
@@ -359,17 +432,21 @@ class Controller:
                 if self.state.get('session_provider') not in (None, provider):
                     self.checkpoint(sessions={})
                 self.checkpoint(session_provider=provider)
+                if recover_review:
+                    self.recover_cancelled_review(root)
+                if recover_timeout:
+                    self.recover_timed_out_implementation(root)
                 if not self.state.get('plan'):
+                    self.checkpoint(test_preservation_findings=self.test_findings(root))
                     if self.allow_implementation:
                         self.plan(root)
                     else:
                         reference = self.store.artifact('plan', {'text': 'Verify the existing selected source without code generation.',
                                                                'request': self.state['request_digest']})
-                        identity, snapshot = self.workspace.freeze()
-                        self.checkpoint(plan=reference, snapshot=identity, snapshot_path=str(snapshot), phase='validate')
+                        self.checkpoint(plan=reference, phase='audit')
                 while True:
                     if self.cancel.is_set(): raise KeyboardInterrupt()
-                    if self.state['phase'] not in ('validate', 'boundary', 'regression'):
+                    if self.state['phase'] not in ('audit', 'validate', 'boundary', 'regression'):
                         if not self.allow_implementation:
                             raise RepairBlocked('guarded_mode', 'existing source failed acceptance; code generation is not authorized')
                         if self.state['stagnant'] >= self.max_stagnant:
@@ -378,6 +455,7 @@ class Controller:
                             self.checkpoint(replans=self.state['replans'] + 1, stagnant=0)
                             self.plan(root, rediagnose=True)
                         self.implement(root)
+                    if self.state['phase'] == 'audit' and not self.audit(root): continue
                     if self.validate(): return self.state
             except KeyboardInterrupt:
                 self.cancel.set()
@@ -394,6 +472,55 @@ class Controller:
                     'message': sanitize(f'{type(error).__name__}: {error}')[:2000]})
                 self.store.event('blocked', **self.state['blocker'])
                 return self.state
+
+    def recover_timed_out_implementation(self, root):
+        """Recover older timeout checkpoints before spending another model turn."""
+        call = self.state.get('active_call')
+        if not call:
+            events = self.store.root / 'events.jsonl'
+            if not events.is_file(): return False
+            for line in reversed(events.read_text().splitlines()):
+                try: event = json.loads(line)
+                except ValueError: continue  # A killed legacy writer may leave a partial final journal line.
+                if not isinstance(event, dict): continue
+                if event.get('kind') == 'agent_started' and event.get('call') == self.state['calls']:
+                    call = event
+                    break
+        if not call or call.get('role') != 'implement' or call.get('call') != self.state['calls']: return False
+        original = self.store.read(call['input'])
+        if (original.get('role') != 'implement' or not isinstance(original.get('source'), str)
+                or len(original['source']) != 64): return False
+        after = source_identity(root)
+        if original.get('source') == after: return False
+        self.workspace.checkpoint()
+        self.checkpoint(phase='audit', attempts=self.state['attempts'] + 1,
+            implementation_timebox={'call': self.state['calls'], 'source_before': original['source'], 'source_after': after})
+        self.store.event('implementation_timeout_recovered', **self.state['implementation_timebox'])
+        return True
+
+    def recover_cancelled_review(self, root):
+        """Repair the old cancellation/infra mix-up using retained evidence only."""
+        from pathlib import Path
+        if not self.state.get('validation') or not self.state.get('review'): return False
+        validation = self.store.read(self.state['validation'])
+        saved = self.store.read(self.state['review'])
+        identity = self.state.get('snapshot')
+        bad = [c for c in validation.get('checks', []) if not c.get('ok')]
+        if (not validation.get('cancelled') or validation.get('failures') or not bad
+                or any(c.get('returncode') != 130 or 'execution' in c for c in bad)
+                or validation.get('snapshot') != identity or saved.get('snapshot') != identity
+                or self.state.get('review_input') != digest([self.state['request_digest'], identity,
+                    self.state.get('verification_runtime'), self.state['failures']])):
+            return False
+        if source_identity(root) != identity or source_identity(Path(self.state['snapshot_path'])) != identity:
+            return False
+        review = review_result(saved['text'], identity, {r.identity for r in self.request.acceptance})
+        if not review.findings: return False
+        self.store.event('cancelled_review_recovered', snapshot=identity, findings=review.findings,
+                         validation=self.state['validation'], review=self.state['review'])
+        self.record_failures(review.findings, identity,
+            passed_tests={node for check in validation['checks'] if check.get('ok') for node in check.get('passed', [])})
+        return True
 
     def integrate(self, repository, parents):
         """Reconcile upstream on the same candidate, keeping original repair budget."""
@@ -421,7 +548,6 @@ class Controller:
                     'unit': 'upstream-integration', 'reason': 'Resolve these merge conflicts while preserving both histories',
                     'paths': conflicts}], integration_parents=list(parents))
             else:
-                identity, snapshot = self.workspace.freeze()
-                self.checkpoint(status='active', phase='validate', snapshot=identity, snapshot_path=str(snapshot),
+                self.checkpoint(status='active', phase='audit',
                                 integration_parents=list(parents))
             self.store.event('integration_prepared', parents=list(parents), conflicts=conflicts)

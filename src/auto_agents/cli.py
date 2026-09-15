@@ -2657,6 +2657,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     storage_parser = subparsers.add_parser("storage", help="Inspect and maintain registered generated files.")
     storage_sub = storage_parser.add_subparsers(dest="storage_action", required=True)
+    storage_sub.add_parser("clean", help="Clean all eligible local auto-agents resources, including verified legacy caches.")
     for action in ("status", "plan", "maintain"):
         child = storage_sub.add_parser(action)
         child.add_argument("--project")
@@ -2727,6 +2728,17 @@ def _dispatch(args) -> int:
                 payload = store.plan(scope)
             elif args.storage_action == "maintain":
                 payload = maintain(scope)
+            elif args.storage_action == "clean":
+                from .artifact_cleanup import clean
+                import time
+                last_progress = 0.0
+                def cleanup_progress(counts, freed):
+                    nonlocal last_progress
+                    now = time.monotonic()
+                    if now - last_progress >= 5:
+                        last_progress = now
+                        print(f"正在清理：已检查 {sum(counts.values())} 项，回收估算 {freed / 1024 ** 2:.1f} MiB", file=sys.stderr)
+                payload = clean(progress=cleanup_progress)
             elif args.storage_action == "apply":
                 payload = store.apply(args.plan)
             elif args.storage_action == "restore":

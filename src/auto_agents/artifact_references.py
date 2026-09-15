@@ -19,7 +19,7 @@ def _json(path):
     return json.loads(Path(path).read_text())
 
 
-def retained_repair_candidates(root, db):
+def delivered_repair_candidates(root, db):
     """Cancellation is not delivery. Release ancestors only after durable handoff."""
     jobs = {row[0]: row[1] for row in db.execute('SELECT id,state FROM jobs')}
     delivered = set()
@@ -51,9 +51,14 @@ def retained_repair_candidates(root, db):
             if contained.returncode:
                 break
             current = incoming.get('source_job')
+    return delivered
+
+
+def retained_repair_candidates(root, db):
+    delivered = delivered_repair_candidates(root, db)
     return any(state == 'cancelled' and identity not in delivered
                and (root / 'jobs' / identity / 'continuous/repair').exists()
-               for identity, state in jobs.items())
+               for identity, state in db.execute('SELECT id,state FROM jobs'))
 
 
 def project_protection(project, *, recovery=True):
@@ -178,18 +183,35 @@ def protection(row):
                 if _json(merge).get('pending', True):
                     return 'source_merge_pending'
             config = _json(root / "operator.json")
+            if config.get('source_root'):
+                source = Path(config['source_root'])
+                if path.is_relative_to(source) and not path.is_relative_to(source / '.auto-agents'):
+                    return 'source_repository'
             if config.get("implementation_root") == row["path"]:
                 return "installed_controller_runtime"
             if row["kind"] not in {"incomplete", "cache"}:
                 with contextlib.closing(sqlite3.connect((root / "control.sqlite3").as_uri() + "?mode=ro", uri=True)) as db:
-                    if db.execute("SELECT 1 FROM jobs WHERE state NOT IN ('completed','cancelled') LIMIT 1").fetchone():
-                        return "repair_or_recovery_pending"
-                    if retained_repair_candidates(root, db):
-                        return 'cancelled_repair_candidate_retained'
-                    if db.execute("SELECT 1 FROM subscribers WHERE state NOT IN ('finished','cancelled') LIMIT 1").fetchone():
-                        return "subscriber_pending"
-                    if db.execute("SELECT 1 FROM outbox WHERE state NOT IN ('published','invalidated','cancelled') LIMIT 1").fetchone():
-                        return "publication_pending"
+                    if path.is_relative_to(root / 'jobs') and len(path.relative_to(root / 'jobs').parts) > 1:
+                        job = path.relative_to(root / 'jobs').parts[0]
+                        current = db.execute('SELECT state FROM jobs WHERE id=?', (job,)).fetchone()
+                        if not current: return 'unknown_reference: repair job is missing'
+                        if current[0] not in ('completed', 'cancelled'): return 'repair_or_recovery_pending'
+                        if (current[0] == 'cancelled' and (root / 'jobs' / job / 'continuous/repair').exists()
+                                and job not in delivered_repair_candidates(root, db)):
+                            return 'cancelled_repair_candidate_retained'
+                        if db.execute("SELECT 1 FROM subscribers WHERE job=? AND state NOT IN ('finished','cancelled') LIMIT 1", (job,)).fetchone():
+                            return 'subscriber_pending'
+                        if db.execute("SELECT 1 FROM outbox WHERE job=? AND state NOT IN ('published','invalidated','cancelled') LIMIT 1", (job,)).fetchone():
+                            return 'publication_pending'
+                    else:
+                        if db.execute("SELECT 1 FROM jobs WHERE state NOT IN ('completed','cancelled') LIMIT 1").fetchone():
+                            return "repair_or_recovery_pending"
+                        if retained_repair_candidates(root, db):
+                            return 'cancelled_repair_candidate_retained'
+                        if db.execute("SELECT 1 FROM subscribers WHERE state NOT IN ('finished','cancelled') LIMIT 1").fetchone():
+                            return "subscriber_pending"
+                        if db.execute("SELECT 1 FROM outbox WHERE state NOT IN ('published','invalidated','cancelled') LIMIT 1").fetchone():
+                            return "publication_pending"
         if metadata.get("worker_root"):
             root = Path(metadata["worker_root"])
             for path in (root / "jobs").glob("*.json"):

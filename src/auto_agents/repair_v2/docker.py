@@ -24,11 +24,17 @@ from .cleanup import labels, reap_containers
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 
 
-def run(command, *, cancel=None, timeout=1800, output=None, env=None):
+def run(command, *, cancel=None, timeout=1800, output=None, env=None, observation=None):
     """Drain continuously, retain a bounded diagnostic tail and reap this group."""
     buffer, truncated, stopped = bytearray(), False, False
+    if observation is not None: observation.update(started=False, termination='', exit_code=None)
+    if cancel is not None and cancel.is_set():
+        if observation is not None: observation['termination'] = 'cancelled'
+        if output: Path(output).write_text('cancelled before process launch\n')
+        return 130, 'cancelled before process launch'
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          env=env, start_new_session=True) as process:
+                               env=env, start_new_session=True) as process:
+        if observation is not None: observation['started'] = True
         started = time.monotonic()
         termination = None
         with selectors.DefaultSelector() as selector:
@@ -39,6 +45,8 @@ def run(command, *, cancel=None, timeout=1800, output=None, env=None):
                     now = time.monotonic()
                     if termination is None and ((cancel is not None and cancel.is_set()) or now - started >= timeout):
                         stopped = True
+                        if observation is not None:
+                            observation['termination'] = 'cancelled' if cancel is not None and cancel.is_set() else 'timeout'
                         termination = now
                         try: os.killpg(process.pid, signal.SIGTERM)
                         except ProcessLookupError: pass
@@ -57,6 +65,7 @@ def run(command, *, cancel=None, timeout=1800, output=None, env=None):
                     if termination is not None and now - termination >= 6:
                         break
                 process.wait(timeout=5)
+                if observation is not None: observation['exit_code'] = process.returncode
             finally:
                 if process.poll() is None:
                     try: os.killpg(process.pid, signal.SIGKILL)
@@ -132,6 +141,9 @@ class DockerVerifier:
             except (OSError, ValueError, KeyError, TypeError):
                 pass  # A corrupt optimization record never blocks fresh proof.
 
+        if cancel.is_set():
+            return {'unit': unit.identity, 'command': unit.command, 'ok': False, 'cancelled': True,
+                    'excerpt': 'validation cancelled before source copy', 'failed': [], 'missing': [], 'infrastructure': False}
         identity = uuid.uuid4().hex
         base = self.root / 'executions' / identity
         source, output = base / 'source', base / 'result'
@@ -141,6 +153,9 @@ class DockerVerifier:
             return self._execute(snapshot_id, snapshot, unit, cancel, key, cache, inputs, identity, base, source, output, custody)
 
     def _execute(self, snapshot_id, snapshot, unit, cancel, key, cache, inputs, identity, base, source, output, custody):
+        if cancel.is_set():
+            return {'unit': unit.identity, 'command': unit.command, 'ok': False, 'cancelled': True,
+                    'excerpt': 'validation cancelled before container launch', 'failed': [], 'missing': [], 'infrastructure': False}
         name = 'aav2-' + identity
         command = ['docker', 'run', '--init', '--name', name, *labels(self.root, identity, kind='verification'), '--network', 'none', '--read-only',
             '--user', f'{os.getuid()}:{os.getgid()}', '--memory', '1g', '--pids-limit', '512', '--tmpfs', '/tmp:rw,nosuid,exec,mode=1777,size=4g',
@@ -164,14 +179,19 @@ class DockerVerifier:
         else:
             command += [self.image, '/bin/sh', '-c', unit.command]
         started = time.monotonic()
+        execution, state, info = {}, {}, ''
         try:
             custody['clear'] = False
-            code, text = run(command, cancel=cancel, timeout=self.timeout, output=base / 'output.log')
-            info_code, info = run(['docker', 'inspect', name, '--format', '{{json .State}}'], timeout=10)
-            state = json.loads(info) if not info_code else {}
+            code, text = run(command, cancel=cancel, timeout=self.timeout, output=base / 'output.log', observation=execution)
+            if execution.get('started') is not False:
+                info_code, info = run(['docker', 'inspect', name, '--format', '{{json .State}}'], timeout=10)
+                state = json.loads(info) if not info_code else {}
         finally:
-            removed, _ = run(['docker', 'rm', '-f', name], timeout=15)
-            custody['clear'] = removed == 0
+            if execution.get('started') is False:
+                custody['clear'] = True
+            else:
+                removed, _ = run(['docker', 'rm', '-f', name], timeout=15)
+                custody['clear'] = removed == 0
         evidence = json.loads((output / 'pytest.json').read_text()) if (output / 'pytest.json').exists() else {}
         collected, passed = set(evidence.get('collected', [])), set(evidence.get('passed', []))
         missing = [node for node in unit.expected_nodes if not any(
@@ -180,9 +200,21 @@ class DockerVerifier:
         valid_pytest = (parts is None or bool(collected) and (collection or collected <= passed)
                         and not evidence.get('failed') and not evidence.get('skipped') and not missing)
         unchanged = source_identity(source) == snapshot_id
-        infrastructure = bool(state.get('OOMKilled') or not state or code in (125, 126, 127))
-        result = {'unit': unit.identity, 'command': unit.command, 'ok': code == 0 and valid_pytest and not infrastructure and unchanged,
+        cancelled = execution.get('termination') == 'cancelled'
+        timed_out = execution.get('termination') == 'timeout'
+        start_error = code in (125, 126, 127) or execution.get('exit_code') in (125, 126, 127)
+        infrastructure = bool(state.get('OOMKilled') or start_error or not state and not cancelled)
+        reason = ('container exceeded its memory limit' if state.get('OOMKilled') else
+                  'Docker could not start the verification command' if start_error else
+                  'verification cancelled by controller' if cancelled else
+                  'verification exceeded its time limit' if timed_out else
+                  'verification container state unavailable: ' + info.strip() if not state else '')
+        if reason: text = text[-3400:] + '\n' + reason
+        result = {'unit': unit.identity, 'command': unit.command,
+            'ok': code == 0 and valid_pytest and not infrastructure and unchanged and not cancelled and not timed_out,
             'source_unchanged': unchanged,
+            'cancelled': cancelled, 'timed_out': timed_out, 'execution': execution, 'container_state': state,
+            'diagnostic': reason,
             'returncode': code, 'collected': sorted(collected), 'passed': sorted(passed),
             'failed': evidence.get('failed', []), 'skipped': evidence.get('skipped', []), 'missing': missing,
             'cache_hit': False, 'seconds': time.monotonic() - started, 'infrastructure': infrastructure,
@@ -330,7 +362,11 @@ class DockerVerifier:
                     for _ in done: dispatch()
         # Checks already in flight complete and retain their evidence. New
         # expensive copies/containers are not queued after a known failure.
-        failures = [{'unit': r['unit'], 'command': r['command'], 'reason': r['excerpt'],
-                     'failed': r['failed'], 'missing': r['missing']} for r in results if not r['ok'] and not (cancel.is_set() and (r.get('returncode') == 130 or r.get('cancelled')))]
+        actionable = [r for r in results if not r['ok'] and (r['infrastructure'] or r.get('failed') or not r.get('cancelled'))]
+        failures = [{'unit': r['unit'], 'command': r['command'],
+                     'reason': (r.get('diagnostic') if r['infrastructure'] else '') or r.get('excerpt')
+                               or 'verification failed without output (exit ' + str(r.get('returncode')) + ')',
+                     'failed': r['failed'], 'missing': r['missing'], 'infrastructure': r['infrastructure']}
+                    for r in actionable]
         return ValidationResult(not failures and not cancel.is_set(), identity, results, failures,
-            cancel.is_set(), any(r['infrastructure'] for r in results))
+            cancel.is_set(), any(r['infrastructure'] for r in actionable))

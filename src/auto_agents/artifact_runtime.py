@@ -13,7 +13,6 @@ import sys
 import time
 import threading
 import functools
-import shutil
 
 from .artifact_store import ArtifactStore, process_identity, storage_root
 
@@ -167,49 +166,8 @@ def schedule():
 
 
 def maintain(scope_filter=None):
-    store = ArtifactStore()
-    started = time.monotonic()
-    with store.locked(), store.connect(True) as db:
-        previous = db.execute("SELECT data FROM maintenance WHERE key='running'").fetchone()
-        if previous:
-            from .artifact_store import alive
-            if alive(json.loads(previous[0])):
-                return {"ok": True, "skipped": "maintenance_already_running"}
-        db.execute("INSERT OR REPLACE INTO maintenance VALUES('running',?)", (json.dumps(process_identity()),))
-    try:
-        totals = store.totals()
-        if scope_filter is not None:
-            totals = {key: value for key, value in totals.items()
-                      if key == scope_filter or (scope_filter.endswith(":") and key.startswith(scope_filter))}
-        limits = store.policy()["budgets"]
-        scopes = sorted(totals)
-        results = []
-        from .artifact_cache import maintain_caches
-        cache_results = maintain_caches(store, started + 5, scope_filter)
-        for scope in scopes:
-            if time.monotonic() - started >= 25:
-                break
-            budget = int(limits.get(scope.split(":", 1)[0], limits["user"]))
-            scopes_rows = store.rows(scope, limit=1)
-            disk_pressure = False
-            disk_needed = 0
-            if scopes_rows:
-                try:
-                    usage = shutil.disk_usage(Path(scopes_rows[0]["path"]).parent)
-                    disk_pressure = usage.free < usage.total * 0.1
-                    disk_needed = max(0, int(usage.total * 0.1) - usage.free)
-                except OSError:
-                    pass
-            plan = store.plan(scope, seconds=min(5, 25 - (time.monotonic() - started)), pressure=totals[scope] > budget or disk_pressure,
-                              reclaim_bytes=max(disk_needed, int(totals[scope] - budget * 0.8)))
-            results.append(store.apply(plan["id"], seconds=max(0.01, 30 - (time.monotonic() - started))))
-        result = {"ok": all(x["ok"] for x in results), "results": results, "cache_results": cache_results, "finished": time.time()}
-        with store.connect(True) as db:
-            db.execute("INSERT OR REPLACE INTO maintenance VALUES('last_result',?)", (json.dumps(result),))
-        return result
-    finally:
-        with store.connect(True) as db:
-            db.execute("DELETE FROM maintenance WHERE key='running'")
+    from .artifact_cleanup import clean
+    return clean(scope=scope_filter, seconds=30)
 
 
 @contextlib.contextmanager
