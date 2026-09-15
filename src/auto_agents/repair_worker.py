@@ -214,6 +214,9 @@ def repair(request):
     request["prepared_runtime"] = {"revision": revision, "fresh": fresh, "python": python,
                                    "environment": environment, 'source_selection': selection}
     execute_selected_worker(request, checkout, python)
+    if config.get('repair_engine') == 'v2':
+        from auto_agents.repair_v2.integration import repair as unified_repair
+        return unified_repair(request, checkout, python, environment, revision)
     from auto_agents.verification_sandbox import check_verification_sandbox
     check_verification_sandbox(checkout, python, Path(payload["project"]))
     from auto_agents.verification_input_trace import check_input_tracing
