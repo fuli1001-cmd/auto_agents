@@ -2317,7 +2317,7 @@ class Session:
             verify_reason = "" if verify["ok"] else str(verify["reason"])
             self._append_verification_log(state, "verify", verify)
             from .session_candidate import record_verification
-            record_verification(self, state, verify, identity=identity)
+            identity = record_verification(self, state, verify, identity=identity)
             self._save(state)
 
             if verify["ok"]:
@@ -2358,8 +2358,12 @@ class Session:
             with self._session_verification_config():
                 plan, commands = self._verification_plan_commands()
                 validate_selected_contracts(self, state, commands, metadata=plan.metadata)
-                if identity != verification_identity(self, state):
-                    raise ownership_error(state, 'verification inputs changed before completion')
+                current_identity = verification_identity(self, state)
+                if (not verify.get('execution_identity') or identity != verify['execution_identity']
+                        or identity != current_identity):
+                    raise ownership_error(state, 'verification inputs changed before completion',
+                                          execution_identity=verify.get('execution_identity'),
+                                          current_identity=current_identity)
         self._print("Verification passed!")
         self._run_session_persistence_action(state)
         state.status, state.resolution = 'completed', 'fixed'
@@ -3982,6 +3986,7 @@ class Session:
             return plan, commands
 
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
+        execution_identity = None
         publish_operation = getattr(
             self._health_runtime, "set_active_operation", None
         )
@@ -3990,14 +3995,19 @@ class Session:
         try:
             with self._session_verification_context():
                 state = self._current_state
+                if state is not None and state.candidate_custody.get('receipt'):
+                    from .session_candidate import verification_identity
+                    execution_identity = verification_identity(self, state, scope=scope)
                 key = verification_fingerprint([
                     scope, state.verification_binding, state.candidate_paths,
-                    state.fix_verify_command, head_ref(self.project_root),
+                    state.fix_verify_command, head_ref(self.project_root), execution_identity,
                 ]) if state is not None and state.verification_binding else ""
                 if key and key in state.verification_diagnostics:
                     return {**state.verification_diagnostics[key], "executed_commands": 0,
                             "diagnostic_reused": True}
                 result = self._run_verify_inner(scope)
+                if execution_identity is not None:
+                    result = {**result, 'execution_identity': execution_identity}
                 if key and result.get("retry_fix") is False:
                     state.verification_diagnostics = {key: result}
                     self._save(state)
@@ -4005,7 +4015,8 @@ class Session:
         except SessionOwnershipError as error:
             return {"ok": False, "reason": str(error), "retry_fix": False,
                     "failure_kind": "verification_ownership", "executed_commands": 0,
-                    "diagnostic": error.diagnostic}
+                    "diagnostic": error.diagnostic,
+                    **({'execution_identity': execution_identity} if execution_identity is not None else {})}
         finally:
             if callable(publish_operation):
                 publish_operation()

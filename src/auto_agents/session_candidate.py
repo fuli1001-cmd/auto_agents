@@ -448,7 +448,7 @@ def restore_receipt_modes(state, root):
                               conflicting_paths=sorted(state.candidate_paths), detail=str(error)) from error
 
 
-def verification_identity(session, state):
+def verification_identity(session, state, *, scope='final'):
     """Relevant private evidence, independent of resume epochs and shared edits."""
     with session._session_verification_config():
         from .workers import gate_environment_fingerprint
@@ -460,11 +460,11 @@ def verification_identity(session, state):
             extra_denylist=gates.distributed.extra_environment_denylist,
             project_root=session.project_root, environment=current_context(session, state).environment)
         from .session_verification import selected_requirement_contracts
-        plan, commands = session._verification_plan_commands()
+        plan, commands = session._verification_plan_commands(scope)
         contracts = {proof['requirement_id']: current for _, proof, current in
                      selected_requirement_contracts(session, state, commands, metadata=plan.metadata)}
         receipt = state.candidate_custody['receipt']
-        return fingerprint(['retained-config-contracts-v2', contracts, commands, receipt['fingerprint'], receipt['source_revision'],
+        return fingerprint(['execution-bound-receipt-v3', scope, contracts, commands, receipt['fingerprint'], receipt['source_revision'],
             state.verification_binding, state.fix_verify_command, state.full_verify,
             environment])
 
@@ -472,13 +472,20 @@ def verification_identity(session, state):
 def record_verification(session, state, result, *, identity=None):
     if not state.candidate_custody.get('receipt'):
         return
+    actual_identity = result.get('execution_identity')
+    if result.get('ok') and not actual_identity:
+        raise ownership_error(state, 'successful verification has no execution identity')
+    # A preflight identity cannot label a result produced in another context.
+    # Failures before execution may still carry their admission identity.
+    identity = actual_identity or identity or verification_identity(session, state)
     from copy import deepcopy
     state.execution_log.append({'action': 'receipt_verification',
-        'identity': identity or verification_identity(session, state),
+        'identity': identity,
         'receipt_fingerprint': state.candidate_custody['receipt']['fingerprint'],
         'binding_fingerprint': state.verification_binding['binding_fingerprint'],
         'verification': deepcopy(result)})
     session._save(state)
+    return identity
 
 
 def recover_receipt(session, state):
@@ -491,7 +498,8 @@ def recover_receipt(session, state):
         validate_selected_contracts(session, state, commands, metadata=plan.metadata)
         identity = verification_identity(session, state)
     retained = next((entry for entry in reversed(state.execution_log)
-        if entry.get('action') == 'receipt_verification' and entry.get('identity') == identity), None)
+        if entry.get('action') == 'receipt_verification' and entry.get('identity') == identity
+        and entry.get('verification', {}).get('execution_identity') == identity), None)
     if retained is None:
         # Legacy pass logs and delivered revisions do not attest this inventory.
         # A changed environment reopens diagnostics for the same candidate.
@@ -500,10 +508,16 @@ def recover_receipt(session, state):
             session._ensure_baseline(state)
         result = session._run_verify()
         session._append_verification_log(state, 'inventory_migration_verify', result)
-        record_verification(session, state, result, identity=identity)
+        identity = record_verification(session, state, result, identity=identity)
     else:
         result = retained['verification']
     if result['ok']:
+        current_identity = verification_identity(session, state)
+        if (not result.get('execution_identity') or result['execution_identity'] != identity
+                or identity != current_identity):
+            raise ownership_error(state, 'verification inputs changed before receipt completion',
+                                  execution_identity=result.get('execution_identity'),
+                                  current_identity=current_identity)
         if completed_delivery(state) and any(
                 entry.get('action') == 'receipt_completion' and entry.get('identity') == identity
                 and entry.get('delivered_revision') == state.candidate_custody['delivered_revision']

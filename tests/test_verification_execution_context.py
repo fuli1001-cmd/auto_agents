@@ -335,6 +335,72 @@ def test_public_resume_uses_admitted_environment_during_dispatch(tmp_path, monke
     assert changed and 'VALUE = 1' in marker.read_text().splitlines()
     assert 'qa/regression_helpers.py' in saved.verification_binding['proof_sources']
     assert {path: (root / path).read_bytes() for path in ambient} == ambient
+    for recovery in (False, True):
+        directory = tmp_path / ('receipt-recovery' if recovery else 'receipt-fresh')
+        directory.mkdir()
+        with monkeypatch.context() as case:
+            case.setattr(LocalGatePlanExecutor, '_run_command', run)
+            _verification_entry_environment_change(directory, case, recovery)
+
+
+def _verification_entry_environment_change(tmp_path, monkeypatch, recovery):
+    from auto_agents.session import Session
+    from auto_agents.session_candidate import verification_identity
+    from execution_marker import ExecutionMarker
+
+    root, child = project(tmp_path)
+    marker = ExecutionMarker(tmp_path / 'actual-environments')
+    proof = root / 'tests/test_owned.py'
+    source = 'import os\n' + proof.read_text()
+    source = source.replace('def test_owned():\n', 'def test_owned():\n    '
+                            + marker.source("os.environ['OWNED_EXPECTED_VALUE'] + '\\n'", append=True) + '\n')
+    source = source.replace('"VALUE = 1"', '"VALUE = " + os.environ["OWNED_EXPECTED_VALUE"]')
+    proof.write_text(source)
+    command = shlex.join([sys.executable, '-m', 'pytest', '-q', 'tests/test_owned.py::test_owned'])
+    ambient = _retain_command(root, child, command, 'tests/test_owned.py::test_owned')
+    monkeypatch.setenv('OWNED_EXPECTED_VALUE', '2')
+    verify = Session._run_verify
+    if recovery:
+        with monkeypatch.context() as interrupted:
+            def pause(*args, **kwargs):
+                raise KeyboardInterrupt()
+            interrupted.setattr(Session, '_run_verify', pause)
+            paused, calls, _ = run_session(root, interrupted)
+        assert paused.status == 'paused' and calls == ['fix'], paused.to_dict()
+        assert paused.candidate_custody['receipt'] and not marker.exists()
+    admissions, executions = [], []
+    def changed_at_entry(self, *args, **kwargs):
+        # The caller has already captured its receipt/admission identity.
+        admissions.append(verification_identity(self, self._current_state))
+        with monkeypatch.context() as temporary:
+            temporary.setenv('OWNED_EXPECTED_VALUE', '1')
+            actual = verification_identity(self, self._current_state)
+            result = verify(self, *args, **kwargs)
+            assert result['ok'], result
+            assert result['execution_identity'] == actual
+            executions.append(actual)
+            return result
+    monkeypatch.setattr(Session, '_run_verify', changed_at_entry)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status in {'blocked', 'failed'}, saved.to_dict()
+    assert calls == ([] if recovery else ['fix'])
+    assert admissions and executions and admissions[-1] != executions[-1]
+    assert marker.read_text().splitlines() == ['1']
+    record = next(entry for entry in reversed(saved.execution_log)
+                  if entry.get('action') == 'receipt_verification')
+    assert record['verification']['ok']
+    assert record['identity'] == record['verification']['execution_identity'] == executions[-1]
+    assert record['identity'] != admissions[-1]
+    assert not saved.candidate_custody.get('delivered_revision')
+    assert not any(entry.get('action') == 'receipt_completion' for entry in saved.execution_log)
+    monkeypatch.setattr(Session, '_run_verify', verify)
+    repeated, _, _ = run_session(root, monkeypatch)
+    assert repeated.status != 'completed', repeated.to_dict()
+    assert '2' in marker.read_text().splitlines(), 'the restored failing environment must really execute'
+    assert not any(entry.get('action') == 'receipt_verification'
+                   and entry.get('identity') == admissions[-1] and entry['verification']['ok']
+                   for entry in repeated.execution_log)
+    assert {path: (root / path).read_bytes() for path in ambient} == ambient
 
 
 def test_prepared_gate_keeps_shared_prefix_readonly(tmp_path, monkeypatch):
