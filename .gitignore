@@ -10,3 +10,4 @@ build/
 .DS_Store
 .auto-agents/state/repomap_cache.json
 .antigravitycli
+.auto-agents/maintenance/

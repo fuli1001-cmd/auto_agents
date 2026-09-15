@@ -122,7 +122,12 @@ def configure(source_root):
     installation = top / (digest(str(source))[:24] + ".json")
     if installation.exists():
         recorded = json.loads(installation.read_text())
-        return json.loads((Path(recorded["root"]) / "operator.json").read_text())
+        path = Path(recorded['root']) / 'operator.json'
+        config = json.loads(path.read_text())
+        if 'repair_engine' not in config:
+            config['repair_engine'] = 'v2'
+            atomic_json(path, config)
+        return config
     branch = git(source, "branch", "--show-current")
     remote = git(source, "config", "--get", f"branch.{branch}.remote", check=False).stdout.strip()
     ref = git(source, "config", "--get", f"branch.{branch}.merge", check=False).stdout.strip()
@@ -141,7 +146,10 @@ def configure(source_root):
     else:
         config = {"version": VERSION, "identity": identity, "root": str(state),
                   "source_root": str(source), "remote": url, "ref": ref,
-                  "python": str(Path(sys.executable).resolve()), "publish": True}
+                  "python": str(Path(sys.executable).resolve()), "publish": True, "repair_engine": "v2"}
+        atomic_json(config_path, config)
+    if 'repair_engine' not in config:
+        config['repair_engine'] = 'v2'
         atomic_json(config_path, config)
     atomic_json(installation, config)
     return config
@@ -204,7 +212,10 @@ class Store:
         return identity
 
     def submit(self, subscriber, payload):
-        key = digest([payload.get("symptom_key") or payload["fingerprint"], contract_identity(payload), payload["base"], payload["environment"]])
+        inputs = [payload.get('symptom_key') or payload['fingerprint'], contract_identity(payload), payload['base'], payload['environment']]
+        if payload.get('repair_engine') == 'v2':
+            inputs.extend([payload['project'], workflow_identity(payload)])
+        key = digest(inputs)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             subscription = db.execute("SELECT * FROM subscribers WHERE id=?", (subscriber,)).fetchone()
@@ -305,7 +316,7 @@ class Store:
                 # display a previous generation's candidate or phase as current.
                 start = db.execute("SELECT MAX(sequence) FROM events WHERE job=? AND kind='repairing'", (identity,)).fetchone()[0] or 0
                 progress = db.execute("SELECT kind,payload,created FROM events WHERE job=? AND sequence>? "
-                    "AND kind IN ('phase_started','candidate_result','request_contract_planning','request_contract_ready') "
+                    "AND kind IN ('phase_started','candidate_result','request_contract_planning','request_contract_ready','check_finished') "
                     "ORDER BY sequence DESC LIMIT 1", (identity, start)).fetchone()
                 previous = db.execute("SELECT payload FROM events WHERE job=? AND sequence>? AND kind='candidate_result' "
                                       "ORDER BY sequence DESC LIMIT 1", (identity, start)).fetchone()
@@ -656,7 +667,7 @@ def _ensure_supervisor(config):
     # provider credentials arrive in memory, never in the durable job payload.
     names = {"PATH", "HOME", "LANG", "LC_ALL", "SSH_AUTH_SOCK", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "AUTO_AGENTS_REPAIR_CONTROL_ROOT"}
     names.update({"AUTO_AGENTS_STORAGE_ROOT", "AUTO_AGENTS_STORAGE_DISABLED", "AUTO_AGENTS_STORAGE_MAINTENANCE",
-                  "TMPDIR", "AUTO_AGENTS_VERIFICATION_SANDBOX", "AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT",
+                  "TMPDIR", "WSL_DISTRO_NAME", "AUTO_AGENTS_VERIFICATION_SANDBOX", "AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT",
                   "AUTO_AGENTS_SUPERVISOR_CHECKS", "AUTO_AGENTS_VERIFICATION_PRIVATE_SHM"})
     environment = {key: value for key, value in os.environ.items() if key in names}
     with (root / "supervisor.log").open("ab") as output:
@@ -756,7 +767,7 @@ class Supervisor:
         if op == "ping":
             return {"ok": True, "version": VERSION, "pid": os.getpid(), "ticks": start_ticks(os.getpid()),
                     "implementation_revision": self.config.get("implementation_revision", ""),
-                    "capabilities": ["managed-verification-v1"]}
+                    "capabilities": ["managed-verification-v1", "unified-repair-v2"]}
         if op.startswith("verify-"):
             return self.verification_dispatch(request)
         if op == "register":
@@ -770,6 +781,7 @@ class Supervisor:
             payload = request["payload"]
             # Code/entrypoint come from the trusted installation, never a route.
             payload["engine_root"] = self.config["source_root"]
+            if self.config.get('repair_engine') == 'v2': payload['repair_engine'] = 'v2'
             job = self.store.submit(identity, payload)
             prior = self.resumes.pop(identity, None)
             if prior is not None:
@@ -934,6 +946,11 @@ class Supervisor:
                     db.execute("UPDATE subscribers SET state=?,updated=? WHERE id=? AND state='validating'",
                                ("verified" if result.get("ok") else "blocked", time.time(), subscriber_id))
                     if not result.get("ok"):
+                        if job['result'].get('engine') == 'v2':
+                            invalid = {**job['result'], 'ok': False, 'status': 'v2_boundary_failed',
+                                       'error': result.get('error') or result.get('proof', 'subscriber validation failed')}
+                            db.execute("UPDATE jobs SET state='blocked',result=? WHERE id=? AND generation=?",
+                                       (json.dumps(invalid), identity, generation))
                         self.store.record_subscriber_failure(db, subscriber_id, job, "validation",
                             result.get("error") or result.get("proof") or "未返回具体原因，请查看详细日志")
                 self.store.event(identity, "subscriber_validated", {"subscriber": subscriber_id, "ok": bool(result.get("ok"))})
@@ -1022,6 +1039,15 @@ class Supervisor:
 
     def fast_publish(self, identity):
         job = self.store.job(identity)
+        if job['state'] != 'completed' or not job['result'].get('ok'):
+            return
+        if job.get('result', {}).get('engine') == 'v2':
+            # V2 publication always validates its controller-owned receipt and
+            # integrated source, never enters the legacy Git-only fast path.
+            with self.store.connect() as db:
+                db.execute("UPDATE outbox SET state='integration_pending',due=? WHERE job=? AND state='pending'",
+                           (time.time(), identity))
+            return
         if job["state"] != "completed" or not job["result"].get("ok"):
             return
         try:

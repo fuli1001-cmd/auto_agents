@@ -1088,6 +1088,8 @@ class RootCauseCoordinator:
         *,
         include_private: bool = False,
     ) -> None:
+        from .storage_admission import CopyAdmission
+        admitted_copy = CopyAdmission(destination)
         ignored_names = {
             ".git",
             ".conda",
@@ -1106,6 +1108,17 @@ class RootCauseCoordinator:
         def ignore(current: str, names: List[str]) -> List[str]:
             current_path = Path(current)
             ignored = [name for name in names if name in ignored_names]
+            # Next.js caches can be hundreds of MiB per snapshot. Omit them
+            # only when Git confirms the directory is generated, and never
+            # omit tracked files or dirty changes under a similarly named path.
+            if ".next" in names and (source / ".git").exists():
+                relative = (current_path / ".next").relative_to(source).as_posix()
+                tracked = subprocess.run(["git", "ls-files", "-z", "--", relative],
+                                         cwd=source, capture_output=True)
+                generated = subprocess.run(["git", "check-ignore", "-q", "--", relative],
+                                           cwd=source, capture_output=True)
+                if tracked.returncode == 0 and not tracked.stdout and generated.returncode == 0:
+                    ignored.append(".next")
             if current_path.parent.name == "sessions" and "logs" in names:
                 ignored.append("logs")
             if current_path.name == ".auto-agents":
@@ -1165,6 +1178,7 @@ class RootCauseCoordinator:
             source,
             destination,
             ignore=ignore,
+            copy_function=admitted_copy,
             symlinks=True,
             dirs_exist_ok=cloned,
         )

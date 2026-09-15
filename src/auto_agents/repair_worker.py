@@ -173,6 +173,9 @@ def check_revision(runner, checkout, base):
 
 
 def repair(request):
+    if request['config'].get('repair_engine') == 'v2':
+        from auto_agents.repair_v2.integration import repair_entry
+        return repair_entry(request)
     from auto_agents.root_cause import RootCauseCoordinator
     from auto_agents.repository_guard import capture_repository_guard, guard_fingerprint
     config, job = request["config"], request["job"]
@@ -318,6 +321,9 @@ def carry_continuous_work(runner, revision):
 
 
 def publish(request):
+    if request['job'].get('result', {}).get('engine') == 'v2':
+        from auto_agents.repair_v2.integration import publish as unified
+        return unified(request)
     config, job = request["config"], request["job"]
     config = operator_policy(config)
     repository = Repository(config)
@@ -393,6 +399,9 @@ def publish(request):
 
 
 def validate_subscriber(request):
+    if request['job'].get('result', {}).get('engine') == 'v2':
+        from auto_agents.repair_v2.integration import validate_subscriber as unified
+        return unified(request)
     from auto_agents.root_cause import RootCauseCoordinator
     config, job, subscriber = request["config"], request["job"], request["subscriber"]
     payload = subscriber["payload"]["repair"]
