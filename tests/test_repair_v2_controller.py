@@ -486,3 +486,25 @@ def test_corrected_source_still_requires_original_boundary_acceptance(job):
     assert runner.run()['status'] == 'blocked'
     assert observed and runner.state['failures'][0]['unit'] == 'original-boundary'
     assert runner.state['attempts'] == blocked['attempts']
+
+
+def test_acceptance_runs_previous_counterexamples_first_without_omitting_tests(job):
+    runner = controller(job)
+    runner.state = {'failures': [
+        {'failed': ['tests/test_last.py::test_crash[x]']},
+        {'requirement': 'value', 'check': 'Recheck tests/test_middle.py::test_scope[blocking] after forwarding kwargs'},
+    ]}
+    units = [ValidationUnit('unrelated', 'python -m pytest -q tests/test_first.py',
+                            expected_nodes=('tests/test_first.py::test_first',)),
+             ValidationUnit('related', 'python -m pytest -q tests/test_middle.py',
+                            expected_nodes=('tests/test_middle.py::test_other',)),
+             ValidationUnit('counterexample', 'python -m pytest -q tests/test_middle.py',
+                            expected_nodes=('tests/test_middle.py::test_scope[blocking]',)),
+             ValidationUnit('failed', 'python -m pytest -q tests/test_last.py',
+                            expected_nodes=('tests/test_last.py::test_crash[x]',)),
+             ValidationUnit('required', 'python -m compileall src')]
+    ordered = runner.prioritize_failures(units)
+    assert [unit.identity for unit in ordered] == ['counterexample', 'failed', 'related', 'unrelated', 'required']
+    assert set(ordered) == set(units) and len(ordered) == len(units)
+    runner.state['failures'] = []
+    assert runner.prioritize_failures(units) == units

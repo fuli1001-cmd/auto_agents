@@ -271,7 +271,7 @@ class Controller:
         self.phase('validate')
         self.checkpoint(verification_runtime=getattr(self.verifier, 'runtime', ''))
         tests_cancel, review_cancel = threading.Event(), threading.Event()
-        units = self.units(snapshot)
+        units = self.prioritize_failures(self.units(snapshot))
         with ThreadPoolExecutor(max_workers=2) as pool:
             tests = pool.submit(self.verifier.validate, identity, snapshot, units, Cancellation(self.cancel, tests_cancel))
             reviewed = pool.submit(self.review, identity, snapshot, Cancellation(self.cancel, review_cancel))
@@ -348,6 +348,20 @@ class Controller:
         self.record_failures(failures, identity,
             passed_tests={node for check in validation.checks if check.get('ok') for node in check.get('passed', [])})
         return False
+
+    def prioritize_failures(self, units):
+        """Run retained counterexamples first without dropping any suite checks."""
+        failures = self.state.get('failures', [])
+        explicit = {node for row in failures for field in ('failed', 'missing') for node in row.get(field, [])}
+        descriptions = '\n'.join(str(row.get(field, '')) for row in failures
+                                 for field in ('reason', 'counterexample', 'check', 'command', 'unit'))
+        def priority(unit):
+            nodes = unit.expected_nodes
+            if any(node in explicit or node in descriptions or node.split('[', 1)[0] in descriptions
+                   for node in nodes): return 0
+            if any(node.split('::', 1)[0] in descriptions for node in nodes): return 1
+            return 2
+        return sorted(units, key=priority)
 
     def record_failures(self, failures, identity, *, passed_tests=()):
         """All concrete candidate failures share the same persistent budget."""
