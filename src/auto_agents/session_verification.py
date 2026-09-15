@@ -19,7 +19,9 @@ from .git_ops import head_ref
 from .io_utils import read_json
 
 
-_PROOF_INVENTORY_VERSION = 4
+# Re-seal v4 receipts before reuse: their source inventory can omit inherited
+# checks reached through module-qualified or locally chained class bases.
+_PROOF_INVENTORY_VERSION = 5
 
 _PYTEST_CONFIG_NAMES = ('pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
                         'pyproject.toml', 'tox.ini', 'setup.cfg')
@@ -1247,14 +1249,17 @@ def _pytest_discovery_excludes(args, ref, *, directory, collection_root, source_
 
 def _pytest_selection_restricted(args):
     # Fail closed on selectors whose actual coverage requires collection data.
-    # These remain valid CLI options; a bound child needs independent evidence
-    # before using them to discharge an exact mandatory node obligation.
+    # Collection, setup-only and introspection modes cannot attest a test body.
+    # These remain valid CLI options; a bound child needs independent execution
+    # evidence to discharge an exact mandatory node obligation.
     for arg in args:
         if arg == '--':
             break
         option = arg.split('=', 1)[0]
         if (option in {'--deselect', '--ignore', '--ignore-glob', '--lf', '--last-failed',
-                       '--collect-only', '--co', '--stepwise', '--sw'}
+                       '--collect-only', '--co', '--stepwise', '--sw',
+                       '--setup-only', '--setup-plan', '--fixtures', '--fixtures-per-test',
+                       '--funcargs', '--version', '--help', '-h'}
                 or arg.startswith(('-k', '-m'))):
             return True
         if 'addopts=' in arg and _pytest_selection_restricted(shlex.split(arg.partition('addopts=')[2])):

@@ -129,6 +129,37 @@ def imported_test_sources(seeds, *, options, config_directory, cwd, read_source)
                         found[target.id] = node.value
         return found, stars
 
+    def resolve_attribute(path, value, seen):
+        attributes = []
+        while isinstance(value, ast.Attribute):
+            attributes.insert(0, value.attr)
+            value = value.value
+        if not isinstance(value, ast.Name):
+            return False
+        imported = bindings(path)[0].get(value.id)
+        if not isinstance(imported, tuple):
+            return False
+        node, alias = imported
+        if isinstance(node, ast.Import):
+            # ``import pkg.helpers`` binds pkg; ``import pkg.helpers as h``
+            # binds the complete module. Preserve both qualification forms.
+            prefix = alias.name if alias.asname else alias.name.split('.')[0]
+            level = 0
+        else:
+            prefix = '.'.join(filter(None, (node.module, alias.name)))
+            level = node.level
+        target = module(path, '.'.join([prefix, *attributes[:-1]]), level)
+        if target is not None:
+            resolve(target, attributes[-1], seen)
+        elif ((len(attributes) > 1 and module(path, prefix, level) is not None)
+              or (isinstance(node, ast.ImportFrom)
+                  and module(path, node.module or '', node.level) is not None)):
+            # A local object's attributes are not necessarily submodules.
+            # Do not silently discard unresolved inherited verification code.
+            raise ValueError('retained qualified test export cannot be resolved: '
+                             + path + '::' + '.'.join([value.id, *attributes]))
+        return True
+
     def resolve(path, name, seen):
         identity = (path, name)
         if identity in seen:
@@ -140,8 +171,12 @@ def imported_test_sources(seeds, *, options, config_directory, cwd, read_source)
         if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if isinstance(value, ast.ClassDef):
                 for base in value.bases:
-                    if isinstance(base, ast.Name) and isinstance(found.get(base.id), tuple):
+                    if isinstance(base, ast.Name) and base.id in found:
                         resolve(path, base.id, seen)
+                    elif isinstance(base, ast.Attribute):
+                        if not resolve_attribute(path, base, seen):
+                            raise ValueError('retained class base cannot be resolved: '
+                                             + path + '::' + name)
             return
         if isinstance(value, tuple):
             node, alias = value
@@ -153,13 +188,8 @@ def imported_test_sources(seeds, *, options, config_directory, cwd, read_source)
         if isinstance(value, ast.Name):
             resolve(path, value.id, seen)
             return
-        if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
-            imported = found.get(value.value.id)
-            if isinstance(imported, tuple) and isinstance(imported[0], ast.Import):
-                target = module(path, imported[1].name)
-                if target is not None:
-                    resolve(target, value.attr, seen)
-                return
+        if isinstance(value, ast.Attribute) and resolve_attribute(path, value, seen):
+            return
         if value is None:
             for star in stars:
                 target = module(path, star.module or '', star.level)
