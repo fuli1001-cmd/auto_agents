@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .verification_sandbox import ConfinementPreflightError
+
 from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
 import fcntl
@@ -1726,6 +1728,11 @@ class LocalGatePlanExecutor:
                 progress("finish", command, result.duration_seconds)
             self.record_timing(command, result)
             return result
+        except ConfinementPreflightError as error:
+            # Keep the structured preflight stop through owned cleanup. It is
+            # not a candidate failure and must never trigger another writer.
+            error.diagnostic = {**error.diagnostic, "command": command}
+            raise
         except (OSError, RuntimeError, ValueError) as error:
             from .session_verification import SessionOwnershipError
             if isinstance(error, SessionOwnershipError):

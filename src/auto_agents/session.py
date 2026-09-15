@@ -75,6 +75,7 @@ from .persistence import (
     persistence_change_strategy,
 )
 from .performance_trace import PerformanceTrace
+from .verification_sandbox import ConfinementPreflightError
 from .session_verification import (
     SessionOwnershipError, bind_session, collection_command, diagnostic_owners,
     fingerprint as verification_fingerprint, owned_paths, record_candidate,
@@ -4330,291 +4331,305 @@ class Session:
             )
             return diagnostic_gate
 
-        # Resolve once so targeted and affected layers share identical proof
-        # metadata and therefore the same candidate certificate.
-        plan, commands = self._verification_plan_commands(scope)
+        try:
+            # Resolve once so targeted and affected layers share identical proof
+            # metadata and therefore the same candidate certificate.
+            plan, commands = self._verification_plan_commands(scope)
 
-        if state.verification_binding:
-            validate_selected_contracts(self, state, commands, metadata=plan.metadata)
-            for command in dict.fromkeys(commands):
-                collect = collection_command(command)
-                if not collect:
-                    continue
-                with self._session_gate_executor_context({collect: {}}, use_result_cache=False) as executor:
-                    collected = run_gate_plan(
-                        [collect], [], self.project_root, collect_all=False,
-                        command_timeout_seconds=min(60, self.config.gates.command_timeout_seconds),
-                        gate_executor=executor,
-                    )
-                record_gate(collected)
-                if not collected.ok:
-                    return outcome(
-                        False, "required verification entry could not be collected",
-                        retry_fix=False, failure_kind="verification_entry_unavailable",
-                        diagnostic={
-                            "session_id": state.session_id,
-                            "workflow_id": state.workflow_id,
-                            "contract_fingerprint": state.verification_binding["contract_fingerprint"],
-                            "command": command,
-                            "owners": diagnostic_owners(state, command),
-                            "output": self.orch._gate_raw_output(collected),
-                        },
-                    )
+            if state.verification_binding:
+                validate_selected_contracts(self, state, commands, metadata=plan.metadata)
+                for command in dict.fromkeys(commands):
+                    collect = collection_command(command)
+                    if not collect:
+                        continue
+                    with self._session_gate_executor_context({collect: {}}, use_result_cache=False) as executor:
+                        collected = run_gate_plan(
+                            [collect], [], self.project_root, collect_all=False,
+                            command_timeout_seconds=min(60, self.config.gates.command_timeout_seconds),
+                            gate_executor=executor,
+                        )
+                    record_gate(collected)
+                    if not collected.ok:
+                        return outcome(
+                            False, "required verification entry could not be collected",
+                            retry_fix=False, failure_kind="verification_entry_unavailable",
+                            diagnostic={
+                                "session_id": state.session_id,
+                                "workflow_id": state.workflow_id,
+                                "contract_fingerprint": state.verification_binding["contract_fingerprint"],
+                                "command": command,
+                                "owners": diagnostic_owners(state, command),
+                                "output": self.orch._gate_raw_output(collected),
+                            },
+                        )
 
-        # Layer 1: targeted bug verification
-        if self.mode == "fix" and state.fix_verify_command:
-            try:
-                verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
-                with self._session_gate_executor_context(
-                    {verify_command: plan.metadata.get(verify_command, {})}
-                ) as gate_executor:
-                    targeted_gate = run_gate_plan(
-                        [verify_command],
-                        [],
-                        self.project_root,
-                        collect_all=False,
-                        command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                        adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                        command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                        progress=self.orch._gate_progress_callback("session fix verification"),
-                        gate_executor=gate_executor,
-                    )
-            except Exception as exc:
-                from .execution_binding import ExecutionBindingError
-                if isinstance(exc, SessionOwnershipError):
-                    raise
-                if isinstance(exc, ExecutionBindingError):
-                    return outcome(False, str(exc), retry_fix=False,
-                                   failure_kind="verification_execution_binding")
-                return outcome(False, f"fix_verify_command error: {exc}")
-            record_gate(targeted_gate)
-            self.orch._classify_reported_infrastructure_failures(targeted_gate)
-            if not targeted_gate.ok:
-                command_result = targeted_gate.commands[0]
-                if command_result.infrastructure_error:
-                    return outcome(
-                        False,
-                        (
-                            "fix_verify_command reported infrastructure failure: "
-                            f"{command_result.infrastructure_failure_id or 'unknown'}"
-                        ),
-                    )
-                detail = (
-                    command_result.stderr
-                    or command_result.stdout
-                    or targeted_gate.summary
-                    or "non-zero exit"
-                ).strip()
-                if "EnvironmentLocationNotFound" in detail or "Not a conda environment:" in detail:
-                    return outcome(False, f"fix_verify_command environment error: {detail[:500]}",
-                                   retry_fix=False, failure_kind="verification_execution_binding")
-                if state.verification_binding and not extract_failure_info(targeted_gate).comparable:
-                    return outcome(False, f"fix_verify_command has no comparable failure identity: {detail[:500]}",
-                                   retry_fix=False, failure_kind="verification_inconclusive")
-                return outcome(False, f"fix_verify_command failed: {detail[:500]}")
-
-        # Layer 2: baseline-diff gate check
-        if not plan.commands and not plan.parallel_groups:
-            return outcome(True, "no verification steps or commands configured")
-        metadata = plan.metadata
-        force_current_candidate = bool(self._full_verify and scope == "final")
-        with self._session_gate_executor_context(
-            metadata,
-            use_result_cache=not force_current_candidate,
-        ) as gate_executor:
-            gate = run_gate_plan(
-                plan.commands,
-                plan.parallel_groups,
-                self.project_root,
-                collect_all=True,
-                parallel_workers=self.orch._gate_parallel_workers(),
-                command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                progress=self.orch._gate_progress_callback(
-                    f"session {scope} verification"
-                ),
-                gate_executor=gate_executor,
-            )
-        record_gate(gate)
-        self.orch._classify_reported_infrastructure_failures(gate)
-        extraction = extract_failure_info(gate)
-        required = set(state.verification_binding.get('required_proof_ids', []))
-        failed_owned = [result.command for result in gate.commands if not result.ok
-                        and (required.intersection(getattr(metadata.get(result.command), 'proof_ids', []))
-                             or result.command in state.verification_binding.get('required_commands', {}))]
-        if failed_owned:
-            return outcome(False, 'mandatory owned verification failed: ' + ', '.join(failed_owned),
-                           retry_fix=extraction.comparable, failure_kind='owned_verification_failed')
-        raw_output = self.orch._gate_raw_output(gate)
-        if not gate.ok and not extraction.comparable:
-            diagnostic_gate = run_identity_diagnostic(
-                gate,
-                label="session failure identity diagnostic",
-            )
-            if diagnostic_gate is not None:
-                diagnostic_output = self.orch._gate_raw_output(diagnostic_gate)
-                if diagnostic_output:
-                    raw_output = (
-                        f"{raw_output.rstrip()}\n\n"
-                        "=== Failure Identity Diagnostic ===\n"
-                        f"{diagnostic_output}"
+            # Layer 1: targeted bug verification
+            if self.mode == "fix" and state.fix_verify_command:
+                try:
+                    verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
+                    with self._session_gate_executor_context(
+                        {verify_command: plan.metadata.get(verify_command, {})}
+                    ) as gate_executor:
+                        targeted_gate = run_gate_plan(
+                            [verify_command],
+                            [],
+                            self.project_root,
+                            collect_all=False,
+                            command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                            adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                            command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                            progress=self.orch._gate_progress_callback("session fix verification"),
+                            gate_executor=gate_executor,
+                        )
+                except Exception as exc:
+                    from .execution_binding import ExecutionBindingError
+                    if isinstance(exc, (SessionOwnershipError, ConfinementPreflightError)):
+                        raise
+                    if isinstance(exc, ExecutionBindingError):
+                        return outcome(False, str(exc), retry_fix=False,
+                                       failure_kind="verification_execution_binding")
+                    return outcome(False, f"fix_verify_command error: {exc}")
+                record_gate(targeted_gate)
+                self.orch._classify_reported_infrastructure_failures(targeted_gate)
+                if not targeted_gate.ok:
+                    command_result = targeted_gate.commands[0]
+                    if command_result.infrastructure_error:
+                        return outcome(
+                            False,
+                            (
+                                "fix_verify_command reported infrastructure failure: "
+                                f"{command_result.infrastructure_failure_id or 'unknown'}"
+                            ),
+                        )
+                    detail = (
+                        command_result.stderr
+                        or command_result.stdout
+                        or targeted_gate.summary
+                        or "non-zero exit"
                     ).strip()
-                if diagnostic_gate.ok:
-                    return outcome(
-                        True,
-                        "transient gate failure cleared on one identity rerun",
-                        failure_kind="transient_verification",
-                    )
-                diagnostic_extraction = extract_failure_info(diagnostic_gate)
-                if diagnostic_extraction.comparable:
-                    extraction = diagnostic_extraction
-        if (
-            not gate.ok
-            and self.config.gates.verification_policy_version >= 3
-            and self.config.gates.incremental_mode == "auto"
-            and bool(self.config.gates.steps)
-            and state.baseline_git_ref
-        ):
-            failed_commands = list(
-                dict.fromkeys(
-                    result.command for result in gate.commands if not result.ok
+                    if "EnvironmentLocationNotFound" in detail or "Not a conda environment:" in detail:
+                        return outcome(False, f"fix_verify_command environment error: {detail[:500]}",
+                                       retry_fix=False, failure_kind="verification_execution_binding")
+                    if state.verification_binding and not extract_failure_info(targeted_gate).comparable:
+                        return outcome(False, f"fix_verify_command has no comparable failure identity: {detail[:500]}",
+                                       retry_fix=False, failure_kind="verification_inconclusive")
+                    return outcome(False, f"fix_verify_command failed: {detail[:500]}")
+
+            # Layer 2: baseline-diff gate check
+            if not plan.commands and not plan.parallel_groups:
+                return outcome(True, "no verification steps or commands configured")
+            metadata = plan.metadata
+            force_current_candidate = bool(self._full_verify and scope == "final")
+            with self._session_gate_executor_context(
+                metadata,
+                use_result_cache=not force_current_candidate,
+            ) as gate_executor:
+                gate = run_gate_plan(
+                    plan.commands,
+                    plan.parallel_groups,
+                    self.project_root,
+                    collect_all=True,
+                    parallel_workers=self.orch._gate_parallel_workers(),
+                    command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                    adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                    command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                    progress=self.orch._gate_progress_callback(
+                        f"session {scope} verification"
+                    ),
+                    gate_executor=gate_executor,
                 )
-            )
-            baseline_metadata = {
-                command: metadata.get(command, {}) for command in failed_commands
-            }
-            if failed_commands:
-                with self._session_gate_executor_context(
-                    baseline_metadata,
-                    source_ref=state.baseline_git_ref,
-                ) as baseline_executor:
-                    baseline_gate = run_gate_plan(
-                        failed_commands,
-                        [],
-                        self.project_root,
-                        collect_all=True,
-                        parallel_workers=self.orch._gate_parallel_workers(),
-                        command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                        adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                        command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                        progress=self.orch._gate_progress_callback(
-                            "session lazy baseline verification"
-                        ),
-                        gate_executor=baseline_executor,
-                    )
-                self.orch._classify_reported_infrastructure_failures(baseline_gate)
-                record_gate(baseline_gate)
-                self.orch._raise_for_baseline_termination(
-                    baseline_gate,
-                    context="session lazy baseline verification",
+            record_gate(gate)
+            self.orch._classify_reported_infrastructure_failures(gate)
+            extraction = extract_failure_info(gate)
+            required = set(state.verification_binding.get('required_proof_ids', []))
+            failed_owned = [result.command for result in gate.commands if not result.ok
+                            and (required.intersection(getattr(metadata.get(result.command), 'proof_ids', []))
+                                 or result.command in state.verification_binding.get('required_commands', {}))]
+            if failed_owned:
+                return outcome(False, 'mandatory owned verification failed: ' + ', '.join(failed_owned),
+                               retry_fix=extraction.comparable, failure_kind='owned_verification_failed')
+            raw_output = self.orch._gate_raw_output(gate)
+            if not gate.ok and not extraction.comparable:
+                diagnostic_gate = run_identity_diagnostic(
+                    gate,
+                    label="session failure identity diagnostic",
                 )
-                baseline_extraction = extract_failure_info(baseline_gate)
-                baseline_failures_to_add = baseline_extraction.failure_ids
-                if not baseline_gate.ok and not baseline_extraction.comparable:
-                    baseline_diagnostic = run_identity_diagnostic(
-                        baseline_gate,
-                        label="session lazy baseline identity diagnostic",
+                if diagnostic_gate is not None:
+                    diagnostic_output = self.orch._gate_raw_output(diagnostic_gate)
+                    if diagnostic_output:
+                        raw_output = (
+                            f"{raw_output.rstrip()}\n\n"
+                            "=== Failure Identity Diagnostic ===\n"
+                            f"{diagnostic_output}"
+                        ).strip()
+                    if diagnostic_gate.ok:
+                        return outcome(
+                            True,
+                            "transient gate failure cleared on one identity rerun",
+                            failure_kind="transient_verification",
+                        )
+                    diagnostic_extraction = extract_failure_info(diagnostic_gate)
+                    if diagnostic_extraction.comparable:
+                        extraction = diagnostic_extraction
+            if (
+                not gate.ok
+                and self.config.gates.verification_policy_version >= 3
+                and self.config.gates.incremental_mode == "auto"
+                and bool(self.config.gates.steps)
+                and state.baseline_git_ref
+            ):
+                failed_commands = list(
+                    dict.fromkeys(
+                        result.command for result in gate.commands if not result.ok
+                    )
+                )
+                baseline_metadata = {
+                    command: metadata.get(command, {}) for command in failed_commands
+                }
+                if failed_commands:
+                    with self._session_gate_executor_context(
+                        baseline_metadata,
                         source_ref=state.baseline_git_ref,
+                    ) as baseline_executor:
+                        baseline_gate = run_gate_plan(
+                            failed_commands,
+                            [],
+                            self.project_root,
+                            collect_all=True,
+                            parallel_workers=self.orch._gate_parallel_workers(),
+                            command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                            adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                            command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                            progress=self.orch._gate_progress_callback(
+                                "session lazy baseline verification"
+                            ),
+                            gate_executor=baseline_executor,
+                        )
+                    self.orch._classify_reported_infrastructure_failures(baseline_gate)
+                    record_gate(baseline_gate)
+                    self.orch._raise_for_baseline_termination(
+                        baseline_gate,
+                        context="session lazy baseline verification",
                     )
-                    if baseline_diagnostic is not None:
-                        if baseline_diagnostic.ok:
-                            baseline_failures_to_add = []
-                        else:
-                            diagnostic_extraction = extract_failure_info(
-                                baseline_diagnostic
-                            )
-                            if diagnostic_extraction.comparable:
-                                baseline_extraction = diagnostic_extraction
-                                baseline_failures_to_add = (
-                                    diagnostic_extraction.failure_ids
+                    baseline_extraction = extract_failure_info(baseline_gate)
+                    baseline_failures_to_add = baseline_extraction.failure_ids
+                    if not baseline_gate.ok and not baseline_extraction.comparable:
+                        baseline_diagnostic = run_identity_diagnostic(
+                            baseline_gate,
+                            label="session lazy baseline identity diagnostic",
+                            source_ref=state.baseline_git_ref,
+                        )
+                        if baseline_diagnostic is not None:
+                            if baseline_diagnostic.ok:
+                                baseline_failures_to_add = []
+                            else:
+                                diagnostic_extraction = extract_failure_info(
+                                    baseline_diagnostic
                                 )
-                state.baseline_failures = sorted(
-                    set(state.baseline_failures)
-                    | set(baseline_failures_to_add)
+                                if diagnostic_extraction.comparable:
+                                    baseline_extraction = diagnostic_extraction
+                                    baseline_failures_to_add = (
+                                        diagnostic_extraction.failure_ids
+                                    )
+                    state.baseline_failures = sorted(
+                        set(state.baseline_failures)
+                        | set(baseline_failures_to_add)
+                    )
+                    self._save(state)
+            current_failures = extraction.failure_ids
+            if not extraction.comparable and not gate.ok:
+                failed_commands = [
+                    result.command for result in gate.commands if not result.ok
+                ]
+                raw_log_path = self.orch._persist_failed_verification_log(
+                    raw_output,
+                    label="session-verify",
                 )
-                self._save(state)
-        current_failures = extraction.failure_ids
-        if not extraction.comparable and not gate.ok:
-            failed_commands = [
+                reason = (
+                    "verification inconclusive after one identity rerun; failed "
+                    "command did not yield stable test-case failure ids"
+                    if diagnostic_gate is not None
+                    else (
+                        "verification inconclusive; failed command has no supported "
+                        "stable-identity diagnostic"
+                    )
+                )
+                if failed_commands:
+                    reason += ": " + ", ".join(failed_commands[:3])
+                if raw_log_path:
+                    reason += f"; raw log: {raw_log_path}"
+                return outcome(
+                    False,
+                    reason,
+                    retry_fix=False,
+                    failure_kind="verification_inconclusive",
+                    raw_log_path=raw_log_path,
+                )
+            failed_gate_commands = {
                 result.command for result in gate.commands if not result.ok
-            ]
-            raw_log_path = self.orch._persist_failed_verification_log(
-                raw_output,
-                label="session-verify",
+            }
+            command_level_prefixes = (
+                "cmd:",
+                "cmd-timeout:",
+                "cmd-stalled:",
+                "cmd-terminated:",
             )
-            reason = (
-                "verification inconclusive after one identity rerun; failed "
-                "command did not yield stable test-case failure ids"
-                if diagnostic_gate is not None
-                else (
-                    "verification inconclusive; failed command has no supported "
-                    "stable-identity diagnostic"
+            relevant_non_comparable_baseline = any(
+                any(
+                    failure_id == f"{prefix}{command}"
+                    for prefix in command_level_prefixes
+                    for command in failed_gate_commands
                 )
+                or failure_id.startswith(("infra:", "reason:"))
+                for failure_id in map(str, state.baseline_failures)
             )
-            if failed_commands:
-                reason += ": " + ", ".join(failed_commands[:3])
-            if raw_log_path:
-                reason += f"; raw log: {raw_log_path}"
-            return outcome(
-                False,
-                reason,
-                retry_fix=False,
-                failure_kind="verification_inconclusive",
-                raw_log_path=raw_log_path,
-            )
-        failed_gate_commands = {
-            result.command for result in gate.commands if not result.ok
-        }
-        command_level_prefixes = (
-            "cmd:",
-            "cmd-timeout:",
-            "cmd-stalled:",
-            "cmd-terminated:",
-        )
-        relevant_non_comparable_baseline = any(
-            any(
-                failure_id == f"{prefix}{command}"
-                for prefix in command_level_prefixes
-                for command in failed_gate_commands
-            )
-            or failure_id.startswith(("infra:", "reason:"))
-            for failure_id in map(str, state.baseline_failures)
-        )
-        if (
-            not gate.ok
-            and extraction.comparable
-            and relevant_non_comparable_baseline
-        ):
-            raw_log_path = self.orch._persist_failed_verification_log(
-                raw_output,
-                label="session-verify",
-            )
-            reason = (
-                "verification failure identity changed from a command-level "
-                "baseline to stable test-case ids; baseline comparison is "
-                "non-comparable: "
-                + ", ".join(current_failures[:10])
-            )
-            if raw_log_path:
-                reason += f"; raw log: {raw_log_path}"
-            return outcome(
-                False,
-                reason,
-                retry_fix=False,
-                failure_kind="verification_inconclusive",
-                raw_log_path=raw_log_path,
-            )
-        new_failures = sorted(set(current_failures) - set(state.baseline_failures))
-        if new_failures:
-            return outcome(
-                False,
-                (
-                    f"{len(new_failures)} new failure(s) introduced: "
-                    + ", ".join(new_failures[:10])
-                ),
-            )
-        return outcome(True, gate.summary)
+            if (
+                not gate.ok
+                and extraction.comparable
+                and relevant_non_comparable_baseline
+            ):
+                raw_log_path = self.orch._persist_failed_verification_log(
+                    raw_output,
+                    label="session-verify",
+                )
+                reason = (
+                    "verification failure identity changed from a command-level "
+                    "baseline to stable test-case ids; baseline comparison is "
+                    "non-comparable: "
+                    + ", ".join(current_failures[:10])
+                )
+                if raw_log_path:
+                    reason += f"; raw log: {raw_log_path}"
+                return outcome(
+                    False,
+                    reason,
+                    retry_fix=False,
+                    failure_kind="verification_inconclusive",
+                    raw_log_path=raw_log_path,
+                )
+            new_failures = sorted(set(current_failures) - set(state.baseline_failures))
+            if new_failures:
+                return outcome(
+                    False,
+                    (
+                        f"{len(new_failures)} new failure(s) introduced: "
+                        + ", ".join(new_failures[:10])
+                    ),
+                )
+            return outcome(True, gate.summary)
+        except ConfinementPreflightError as error:
+            command = error.diagnostic.get("command", "")
+            diagnostic = {
+                **error.diagnostic,
+                "session_id": state.session_id,
+                "workflow_id": state.workflow_id,
+                "contract_fingerprint": state.verification_binding.get("contract_fingerprint", ""),
+                "command": command,
+                "owners": diagnostic_owners(state, command),
+                "retry_fix": False,
+            }
+            return outcome(False, str(error), retry_fix=False,
+                           failure_kind="verification_confinement", diagnostic=diagnostic)
 
     def _fix_verify_command_for_execution(self, command: str) -> str:
         from .execution_binding import validate_verification_binding
