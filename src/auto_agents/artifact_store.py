@@ -415,7 +415,7 @@ class ArtifactStore:
                 "policy": self.policy(),
                 "eligible_bytes": sum(r["bytes"] for r in items if r["reason"] == "eligible"),
                 "quarantine_bytes": sum(r["bytes"] for r in items if r["state"] == "quarantined"),
-                "inventory": "registered resources only; unregistered paths are never deleted",
+                "inventory": "registered resources only; verified legacy build caches are listed in clean reports",
                 "size_complete": len(rows) <= 1000 and all(r["size_complete"] for r in items),
                 "inventory_complete": len(rows) <= 1000, "reasons": "cached by the last plan; apply always revalidates"}
 
@@ -500,7 +500,7 @@ class ArtifactStore:
                 "freed_bytes": sum(r.get("freed_bytes", 0) for r in results),
                 "budget_exhausted": time.monotonic() >= deadline}
 
-    def _delete(self, row, deadline):
+    def _delete(self, row, deadline, *, immediate=False):
         if row["kind"] == "worktree":
             from .artifact_references import remove_worktree
             remove_worktree(row)
@@ -509,7 +509,7 @@ class ArtifactStore:
             return
         target = row.get("trash") or row["path"]
         with _parent_fd(row, target) as fd:
-            if row["state"] not in {"quarantining", "quarantined", "deleting"} and row["kind"] not in {"scratch", "incomplete"}:
+            if not immediate and row["state"] not in {"quarantining", "quarantined", "deleting"} and row["kind"] not in {"scratch", "incomplete"}:
                 row.update(state="quarantining", trash=str(Path(row["path"]).with_name(".auto-agents-trash-" + row["id"])), purge_after=time.time() + DAY)
                 self._save(row, "quarantining")
                 os.rename(Path(target).name, Path(row["trash"]).name, src_dir_fd=fd, dst_dir_fd=fd)
@@ -522,6 +522,36 @@ class ArtifactStore:
             os.fsync(fd)
             row["state"] = "deleted"
             self._save(row, "deleted")
+
+    def clean_artifact(self, identity, *, deadline=float('inf'), pressure=False):
+        """Apply the normal eligibility rules, without a second quarantine step."""
+        with self.locked():
+            row = self.get(identity)
+            self._reconcile(row)
+            reason = self.classify(row, time.time(), pressure)
+            row.update(measured=time.time(), last_reason=reason)
+            if reason == 'missing':
+                row['state'] = 'deleted'
+            elif reason != 'deleted' and not reason.startswith('unknown'):
+                try:
+                    size, complete = _allocated(row.get('trash') or row['path'], min(deadline, time.monotonic() + .2))
+                    if complete or size > row['bytes']: row['bytes'] = size
+                    row['size_complete'] = complete
+                except (OSError, ValueError) as error:
+                    reason = row['last_reason'] = 'unknown: ' + str(error)
+            self._save(row)
+            result = {'id': identity, 'path': row['path'], 'kind': row['kind'], 'reason': reason,
+                      'bytes': row['bytes'], 'size_complete': row['size_complete'], 'freed_bytes': 0}
+            if reason != 'eligible':
+                return {**result, 'result': 'absent' if reason in ('deleted', 'missing') else 'retained'}
+            from .artifact_references import deletion_guard
+            try:
+                with deletion_guard(row):
+                    self._delete(row, deadline, immediate=True)
+                return {**result, 'result': 'deleted', 'freed_bytes': row['bytes']}
+            except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
+                return {**result, 'result': 'deferred' if isinstance(error, TimeoutError) else 'error',
+                        'reason': str(error)}
 
     def restore(self, identity):
         with self.locked():
