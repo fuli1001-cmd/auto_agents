@@ -60,6 +60,53 @@ def _retain_command(root, child, command, reference):
             ('.auto-agents/config.json', '.auto-agents/state/task_plan.json')}
 
 
+def _python_shared_controls(source):
+    return '''
+def check_shared_inputs():
+    import errno, os
+    from pathlib import Path
+    prefix = Path(os.environ['CONDA_PREFIX'])
+    (prefix / 'private-context-scratch').write_text('permitted')
+    for base in (Path(SOURCE), prefix):
+        for relative in ('etc/conda/activate.d/context.sh', 'conda-meta/history'):
+            path = base / relative
+            try:
+                with path.open('r+'):
+                    pass
+            except OSError as error:
+                assert error.errno in (errno.EPERM, errno.EACCES, errno.EROFS)
+            else:
+                raise AssertionError('shared input allowed write access: ' + str(path))
+check_shared_inputs()
+'''.replace('SOURCE', repr(str(source)))
+
+
+def _javascript_shared_controls(source, packages):
+    return '''
+import {openSync, closeSync, writeFileSync} from 'node:fs';
+import {join} from 'node:path';
+function checkSharedInputs() {
+    const prefix = process.env.CONDA_PREFIX;
+    writeFileSync(join(prefix, 'private-context-scratch'), 'permitted');
+    const inputs = [PACKAGE];
+    for (const base of [SOURCE, prefix]) {
+        inputs.push(join(base, 'etc/conda/activate.d/context.sh'), join(base, 'conda-meta/history'));
+    }
+    for (const input of inputs) {
+        let fd;
+        try { fd = openSync(input, 'r+'); }
+        catch (error) {
+            if (['EPERM', 'EACCES', 'EROFS'].includes(error.code)) continue;
+            throw error;
+        }
+        closeSync(fd);
+        throw Error('shared input allowed write access: ' + input);
+    }
+}
+checkSharedInputs();
+'''.replace('SOURCE', json.dumps(str(source))).replace('PACKAGE', json.dumps(str(packages / 'vitest/package.json')))
+
+
 @pytest.mark.parametrize('active', [False, True])
 def test_named_conda_vitest_discovery_preserves_activation_cwd_and_shared_environment(tmp_path, monkeypatch, active):
     from execution_marker import ExecutionMarker
@@ -75,14 +122,17 @@ def test_named_conda_vitest_discovery_preserves_activation_cwd_and_shared_enviro
         monkeypatch.setenv('CONDA_SHLVL', '1')
     (root / 'web/tests').mkdir(parents=True)
     (root / 'web/vitest.config.js').write_text(
+        _javascript_shared_controls(source, packages) +
         'if (process.env.RETAINED_ACTIVATION !== "activated value") throw Error("activation lost");\n'
         'if (process.env.INLINE_CONTEXT !== "inline value") throw Error("assignment lost");\n'
         'export default {test: {include: ["tests/*.test.js"]}};\n')
     marker = ExecutionMarker(tmp_path / 'executions')
     (root / 'web/tests/owned.test.js').write_text(
+        _javascript_shared_controls(source, packages) +
         'import {test, expect} from "vitest";\n'
         'import {readFileSync} from "node:fs";\n'
         'test("retained", async () => {\n'
+        'checkSharedInputs();\n'
         'expect(process.env.RETAINED_ACTIVATION).toBe("activated value");\n'
         'expect(process.env.INLINE_CONTEXT).toBe("inline value");\n'
         'const value = readFileSync("../value.py", "utf8");\n'
@@ -119,8 +169,10 @@ def test_relative_prefix_and_named_launchers_share_execution_semantics(tmp_path,
     marker = ExecutionMarker(tmp_path / 'python-executed')
     # Use the provisioned engine interpreter while retaining Conda activation.
     (root / 'web/tests/test_context.py').write_text(
+        _python_shared_controls(source) +
         'import os\nfrom pathlib import Path\n'
         'def test_context():\n'
+        '    check_shared_inputs()\n'
         '    assert os.environ["RETAINED_ACTIVATION"] == "activated value"\n'
         '    assert os.environ["INLINE_CONTEXT"] == "inline value"\n'
         '    assert Path.cwd().name == "web"\n'
@@ -203,35 +255,77 @@ def test_discovery_reports_environment_failure_separately_from_missing_selection
         assert diagnostic['command']
     assert {path: (root / path).read_bytes() for path in ambient} == ambient
 
+    if failure == 'environment':
+        for selector in ('name', 'prefix'):
+            directory = tmp_path / ('pytest-' + selector)
+            directory.mkdir()
+            with monkeypatch.context() as isolated:
+                _pytest_environment_failure(directory, isolated, selector)
 
-def test_prepared_gate_keeps_shared_prefix_readonly(tmp_path):
-    from auto_agents.gate_execution import LocalGatePlanExecutor
-    from auto_agents.gates import GateCommandMetadata, run_gate_plan
-    from auto_agents.session_verification import prepare_retained_vitest_command
-    from test_gate_execution import _project, _config, _git
 
-    root = _project(tmp_path)
+def _pytest_environment_failure(tmp_path, monkeypatch, selector):
+    from copy import deepcopy
+    from execution_marker import ExecutionMarker
+
+    root, child = project(tmp_path)
+    conda = shutil.which('conda')
+    assert conda
+    body = ExecutionMarker(tmp_path / 'test-body')
+    (root / 'tests/test_owned.py').write_text(
+        'def test_owned():\n    ' + body.source("'executed'") + '\n')
+    environment = tmp_path / 'missing-environments'
+    option = ['-n', 'unavailable-retained'] if selector == 'name' else ['-p', str(environment / 'unavailable')]
+    command = shlex.join(['env', 'CONDA_ENVS_PATH=' + str(environment), conda, 'run', *option,
+                         'python', '-m', 'pytest', '-q', 'tests/test_owned.py'])
+    ambient = _retain_command(root, child, command, 'cmd:' + command)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status in {'failed', 'blocked'} and calls == ['fix'], saved.to_dict()
+    record = next(entry['verification'] for entry in saved.execution_log
+                  if entry.get('action') == 'receipt_verification')
+    diagnostic = record['diagnostic']
+    assert record['failure_kind'] == 'verification_environment'
+    assert diagnostic['failure_kind'] == 'environment'
+    assert diagnostic['phase'] == 'runner_preparation'
+    assert diagnostic['original_command'] == command
+    assert diagnostic['task_ids'] == ['task-owned']
+    assert diagnostic['requirement_ids'] == ['REQ-owned']
+    assert diagnostic['session_id'] == child.session_id and diagnostic['contract_fingerprint']
+    assert diagnostic['retry_fix'] is False and record['retry_fix'] is False
+    assert record['executed_commands'] == record['logical_commands'] == 0
+    assert not body.exists()
+    custody, attempt = deepcopy(saved.candidate_custody), saved.current_attempt
+    for _ in range(2):
+        repeated, calls, _ = run_session(root, monkeypatch)
+        assert repeated.status == 'blocked' and calls == []
+        assert repeated.candidate_custody == custody and repeated.current_attempt == attempt
+        assert any(entry.get('diagnostic') == diagnostic for entry in repeated.execution_log)
+        assert not body.exists()
+    assert {path: (root / path).read_bytes() for path in ambient} == ambient
+
+
+def test_prepared_gate_keeps_shared_prefix_readonly(tmp_path, monkeypatch):
+
+    root, child = project(tmp_path)
     conda, source, provisioned = _environment(tmp_path)
     before, installed_before = _snapshot(source), _snapshot(provisioned)
     hook = source / 'etc/conda/activate.d/context.sh'
     (root / 'test_context.py').write_text(
+        _python_shared_controls(source) +
         'import os\nfrom pathlib import Path\nimport pytest\n'
         'def test_context():\n'
+        '    check_shared_inputs()\n'
         '    assert os.environ["RETAINED_ACTIVATION"] == "activated value"\n'
         '    prefix = Path(os.environ["CONDA_PREFIX"])\n'
         f'    assert prefix != Path({str(source)!r})\n'
         '    (prefix / "private-scratch").write_text("permitted")\n'
         '    with pytest.raises(PermissionError):\n'
         f'        Path({str(hook)!r}).write_text("foreign mutation")\n')
-    _git(root, 'add', 'test_context.py')
-    _git(root, 'commit', '-m', 'retain activation check')
     command = shlex.join(['env', 'CONDA_ENVS_PATH=' + str(source.parent), conda, 'run',
                          '--name', source.name, '--no-capture-output', sys.executable,
                          '-m', 'pytest', '-q', 'test_context.py'])
-    with LocalGatePlanExecutor(root, _config(tmp_path), {command: GateCommandMetadata()}) as executor:
-        executor.prepare_retained_command = prepare_retained_vitest_command
-        executor.sandbox_target = root
-        result = run_gate_plan([command], [], root, collect_all=True, gate_executor=executor)
-    assert result.ok, result.summary
+    ambient = _retain_command(root, child, command, 'cmd:' + command)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed' and calls == ['fix'], saved.to_dict()
     assert _snapshot(source) == before
     assert _snapshot(provisioned) == installed_before
+    assert {path: (root / path).read_bytes() for path in ambient} == ambient

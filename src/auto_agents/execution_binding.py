@@ -22,6 +22,9 @@ class RunnerContextError(RuntimeError):
     def __init__(self, kind, message, command):
         super().__init__(message)
         self.kind, self.command = kind, command
+        self.diagnostic = {'failure_kind': kind, 'command': command,
+                           'phase': 'runner_discovery' if kind == 'discovery' else 'runner_preparation'}
+        self.partial_gate_result = None
 
 
 # Only these derived fields may change during this inventory transition.
@@ -32,7 +35,7 @@ _INVENTORY_FIELDS = frozenset({
     'schema_version', 'binding_fingerprint', 'proof_inventory_version', 'proof_graph',
     'required_references', 'required_proof_ids', 'proof_owners', 'required_commands',
     'required_proofs', 'regression_dependencies', 'verification_policy',
-    'proof_control_paths', 'proof_config_paths', 'proof_sources',
+    'proof_control_paths', 'proof_config_paths', 'proof_sources', 'proof_source_owners',
     'task_ids', 'requirement_ids',
 })
 

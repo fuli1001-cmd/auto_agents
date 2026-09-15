@@ -1601,17 +1601,23 @@ def run_gate_plan(
                                       len(command_list) + sum(len(group.commands) for group in parallel_groups))
         progress = observation
     if gate_executor is not None:
-        result = _run_overlapped_gate_plan(
-            command_list,
-            parallel_groups,
-            collect_all=collect_all,
-            parallel_workers=parallel_workers,
-            command_timeout_seconds=command_timeout_seconds,
-            adaptive_timeout_enabled=adaptive_timeout_enabled,
-            command_idle_timeout_seconds=command_idle_timeout_seconds,
-            progress=progress,
-            gate_executor=gate_executor,
-        )
+        try:
+            result = _run_overlapped_gate_plan(
+                command_list,
+                parallel_groups,
+                collect_all=collect_all,
+                parallel_workers=parallel_workers,
+                command_timeout_seconds=command_timeout_seconds,
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                command_idle_timeout_seconds=command_idle_timeout_seconds,
+                progress=progress,
+                gate_executor=gate_executor,
+            )
+        except BaseException as error:
+            partial = getattr(error, 'partial_gate_result', None)
+            if observation is not None and partial is not None:
+                observation.finish(partial)
+            raise
     else:
         result = _run_phased_gate_plan(
             command_list, parallel_groups, cwd, collect_all=collect_all,
@@ -1963,7 +1969,10 @@ def _run_overlapped_gate_plan(
                 try:
                     result = future.result()
                 except BaseException as error:
-                    fatal_error = error
+                    # Keep the first refusal while draining already dispatched
+                    # work. Later cancellation errors must not erase its cause.
+                    if fatal_error is None:
+                        fatal_error = error
                     stop_dispatch = True
                     cancel_event.set()
                     continue
@@ -1998,9 +2007,6 @@ def _run_overlapped_gate_plan(
             ),
             scheduler_elapsed,
         )
-    if fatal_error is not None:
-        raise fatal_error
-
     results = [
         serial_results[index]
         for index in range(len(commands))
@@ -2012,6 +2018,15 @@ def _run_overlapped_gate_plan(
             for command_index in range(len(group.commands))
             if (current_group, command_index) in parallel_results
         )
+    if fatal_error is not None:
+        from .execution_binding import RunnerContextError
+        from .verification_sandbox import ConfinementPreflightError
+        if isinstance(fatal_error, (ConfinementPreflightError, RunnerContextError)):
+            # A refused preflight is not a dispatched command. Preserve only
+            # actual results, including completed work in this same plan.
+            fatal_error.partial_gate_result = GateResult(
+                ok=False, commands=results, summary=str(fatal_error))
+        raise fatal_error
     failed = [result for result in results if not result.ok]
     reportable = [
         result for result in failed if result.termination_reason != "cancelled"

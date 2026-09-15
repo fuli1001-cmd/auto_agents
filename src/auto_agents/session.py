@@ -4053,7 +4053,7 @@ class Session:
                 self._candidate_source_ref = previous
                 manager.close()
 
-    def _session_gate_executor_context(self, metadata=None, *, source_ref="", **kwargs):
+    def _session_gate_executor_context(self, metadata=None, *, source_ref="", original_commands=None, **kwargs):
         state = self._current_state
         if state is not None and state.verification_binding:
             kwargs['contract_fingerprint'] = verification_fingerprint([
@@ -4064,6 +4064,7 @@ class Session:
         executor = self.orch._gate_executor_context(
             metadata, source_ref=source_ref or getattr(self, "_candidate_source_ref", ""), **kwargs
         )
+        executor.original_commands = dict(original_commands or {})
         if state is not None and state.verification_binding:
             from .session_verification import prepare_retained_vitest_command
             executor.prepare_retained_command = prepare_retained_vitest_command
@@ -4242,6 +4243,7 @@ class Session:
         2.  the scope's gate plan produces no *new* failures relative to the
             session-start baseline.
         """
+        from .execution_binding import RunnerContextError
         state = self._current_state
         if state is None:
             raise RuntimeError("session verification requires an active session state")
@@ -4335,6 +4337,9 @@ class Session:
             # Resolve once so targeted and affected layers share identical proof
             # metadata and therefore the same candidate certificate.
             plan, commands = self._verification_plan_commands(scope)
+            original_commands = {}
+            if self.mode == 'fix' and state.fix_verify_command:
+                original_commands[self._fix_verify_command_for_execution(state.fix_verify_command)] = state.fix_verify_command
 
             if state.verification_binding:
                 validate_selected_contracts(self, state, commands, metadata=plan.metadata)
@@ -4342,7 +4347,11 @@ class Session:
                     collect = collection_command(command)
                     if not collect:
                         continue
-                    with self._session_gate_executor_context({collect: {}}, use_result_cache=False) as executor:
+                    original_command = original_commands.get(command, command)
+                    with self._session_gate_executor_context(
+                        {collect: plan.metadata.get(command, {})},
+                        original_commands={collect: original_command}, use_result_cache=False,
+                    ) as executor:
                         collected = run_gate_plan(
                             [collect], [], self.project_root, collect_all=False,
                             command_timeout_seconds=min(60, self.config.gates.command_timeout_seconds),
@@ -4350,15 +4359,23 @@ class Session:
                         )
                     record_gate(collected)
                     if not collected.ok:
+                        item = plan.metadata.get(command)
+                        proof_ids = item.get('proof_ids', []) if isinstance(item, dict) else getattr(item, 'proof_ids', [])
+                        owners = diagnostic_owners(state, original_command, proof_ids=proof_ids)
                         return outcome(
                             False, "required verification entry could not be collected",
                             retry_fix=False, failure_kind="verification_entry_unavailable",
                             diagnostic={
                                 "session_id": state.session_id,
                                 "workflow_id": state.workflow_id,
+                                "handoff_id": state.verification_binding.get("original_handoff_id", state.parent_handoff_id),
                                 "contract_fingerprint": state.verification_binding["contract_fingerprint"],
                                 "command": command,
-                                "owners": diagnostic_owners(state, command),
+                                "original_command": original_command,
+                                "owners": owners,
+                                "task_ids": sorted({owner['task_id'] for owner in owners}),
+                                "requirement_ids": sorted({key for owner in owners for key in owner['requirement_ids']}),
+                                "retry_fix": False,
                                 "output": self.orch._gate_raw_output(collected),
                             },
                         )
@@ -4368,7 +4385,8 @@ class Session:
                 try:
                     verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
                     with self._session_gate_executor_context(
-                        {verify_command: plan.metadata.get(verify_command, {})}
+                        {verify_command: plan.metadata.get(verify_command, {})},
+                        original_commands={verify_command: state.fix_verify_command},
                     ) as gate_executor:
                         targeted_gate = run_gate_plan(
                             [verify_command],
@@ -4383,7 +4401,7 @@ class Session:
                         )
                 except Exception as exc:
                     from .execution_binding import ExecutionBindingError
-                    if isinstance(exc, (SessionOwnershipError, ConfinementPreflightError)):
+                    if isinstance(exc, (SessionOwnershipError, ConfinementPreflightError, RunnerContextError)):
                         raise
                     if isinstance(exc, ExecutionBindingError):
                         return outcome(False, str(exc), retry_fix=False,
@@ -4617,19 +4635,30 @@ class Session:
                     ),
                 )
             return outcome(True, gate.summary)
-        except ConfinementPreflightError as error:
+        except (ConfinementPreflightError, RunnerContextError) as error:
+            if error.partial_gate_result is not None:
+                record_gate(error.partial_gate_result)
             command = error.diagnostic.get("command", "")
+            original_command = error.diagnostic.get("original_command", command)
+            owners = diagnostic_owners(state, original_command,
+                                       proof_ids=error.diagnostic.get("proof_ids", ()))
             diagnostic = {
                 **error.diagnostic,
                 "session_id": state.session_id,
                 "workflow_id": state.workflow_id,
+                "handoff_id": state.verification_binding.get("original_handoff_id", state.parent_handoff_id),
                 "contract_fingerprint": state.verification_binding.get("contract_fingerprint", ""),
                 "command": command,
-                "owners": diagnostic_owners(state, command),
+                "original_command": original_command,
+                "owners": owners,
+                "task_ids": sorted({owner['task_id'] for owner in owners}),
+                "requirement_ids": sorted({key for owner in owners for key in owner['requirement_ids']}),
                 "retry_fix": False,
             }
+            kind = ("verification_" + error.kind if isinstance(error, RunnerContextError)
+                    else "verification_confinement")
             return outcome(False, str(error), retry_fix=False,
-                           failure_kind="verification_confinement", diagnostic=diagnostic)
+                           failure_kind=kind, diagnostic=diagnostic)
 
     def _fix_verify_command_for_execution(self, command: str) -> str:
         from .execution_binding import validate_verification_binding

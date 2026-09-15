@@ -119,6 +119,7 @@ print(json.dumps(report), flush=True)
 class ConfinementPreflightError(RuntimeError):
     def __init__(self, diagnostic):
         self.diagnostic = diagnostic
+        self.partial_gate_result = None
         super().__init__('confinement is unavailable: ' + json.dumps(diagnostic, sort_keys=True))
 
 

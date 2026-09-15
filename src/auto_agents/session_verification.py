@@ -19,7 +19,7 @@ from .git_ops import head_ref
 from .io_utils import read_json
 
 
-_PROOF_INVENTORY_VERSION = 3
+_PROOF_INVENTORY_VERSION = 4
 
 _PYTEST_CONFIG_NAMES = ('pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
                         'pyproject.toml', 'tox.ini', 'setup.cfg')
@@ -85,11 +85,19 @@ def bind_session(session, state) -> None:
     try:
         _bind_session(session, state)
     except Exception as error:
-        owned = [_task_owner(task) for task in _owned_tasks(state)] if isinstance(error, RunnerContextError) else []
-        diagnostic = (ownership_error(state, str(error), failure_kind=error.kind, command=error.command,
-                      owners=owned, task_ids=[owner['task_id'] for owner in owned],
-                      requirement_ids=sorted({key for owner in owned for key in owner['requirement_ids']}))
-                      if isinstance(error, RunnerContextError) else None)
+        from .verification_sandbox import ConfinementPreflightError
+        diagnostic = None
+        if isinstance(error, (RunnerContextError, ConfinementPreflightError)):
+            details = dict(error.diagnostic)
+            command = details.get('original_command', details.get('command', ''))
+            owned = diagnostic_owners(state, command, proof_ids=details.get('proof_ids', ()))
+            owned = owned or [_task_owner(task) for task in _owned_tasks(state)]
+            details.update(failure_kind=(error.kind if isinstance(error, RunnerContextError)
+                                         else 'verification_confinement'),
+                           original_command=command, owners=owned,
+                           task_ids=sorted({owner['task_id'] for owner in owned}),
+                           requirement_ids=sorted({key for owner in owned for key in owner['requirement_ids']}))
+            diagnostic = ownership_error(state, str(error), **details)
         state.verification_binding = original
         state.candidate_custody = original_custody
         if diagnostic is not None:
@@ -411,6 +419,18 @@ def _future_foreign_step(session, state, step, excluded):
         if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
                for node in ast.walk(tree)):
             return False
+        # Imported/re-exported tests have no local FunctionDef. Their retained
+        # binding is regression evidence; only proven absence permits removal.
+        for node in tree.body:
+            if isinstance(node, (ast.ImportFrom, ast.Import)) and any(
+                    alias.name == '*' or (alias.asname or alias.name) == function_name
+                    for alias in node.names):
+                return False
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and any(
+                    isinstance(name, ast.Name) and name.id == function_name
+                    for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                    for name in ast.walk(target)):
+                return False
     return True
 
 
@@ -702,7 +722,7 @@ def _retained_vitest_discovery(session, root, revision, invocation):
     from . import artifact_temp as tempfile
     from .gate_execution import discover_dependency_links
     from .session_candidate import _clone
-    from .verification_sandbox import verification_argv
+    from .verification_sandbox import verification_argv, ConfinementPreflightError
     from .execution_binding import prepare_conda_prefix, prepare_dependency_scratch
 
     key = fingerprint([str(root), revision, invocation.raw, invocation.cwd,
@@ -754,7 +774,12 @@ def _retained_vitest_discovery(session, root, revision, invocation):
                 path = (cwd / item['file']).resolve()
                 if path.is_relative_to(checkout):
                     selected.append(path.relative_to(checkout).as_posix())
-    except RunnerContextError:
+    except RunnerContextError as error:
+        error.diagnostic.update(command=invocation.raw, original_command=invocation.raw)
+        raise
+    except ConfinementPreflightError as error:
+        error.diagnostic = {**error.diagnostic, 'command': invocation.raw,
+                            'original_command': invocation.raw}
         raise
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         raise RunnerContextError('discovery', 'retained Vitest discovery is unavailable', invocation.raw) from error
@@ -845,6 +870,7 @@ def _seal_inventory(session, state):
 
     binding = state.verification_binding
     binding.setdefault('plan_fingerprint', fingerprint(binding.get('tasks', [])))
+    binding.pop('proof_source_owners', None)
     _seal_proof_graph(session, state)
     complete = GateConfig.from_dict(binding['proof_graph']['gates'])
     required, _ = _owned_inventory(state, complete, session)
@@ -929,12 +955,77 @@ def _seal_inventory(session, state):
     binding['proof_control_paths'] = sorted(controls)
     binding['proof_config_paths'] = sorted(config_controls)
     binding['proof_sources'] = proof_sources
+    _seal_imported_pytest_sources(session, state, gates, revision)
     _validate_required_node_selection(session, state, [
         *(step.command or command_from_verification_step(step, session.project_root) for step in gates.steps),
         *_legacy_commands(gates), state.fix_verify_command,
     ])
     binding['binding_fingerprint'] = fingerprint({key: value for key, value in binding.items()
                                                   if key != 'binding_fingerprint'})
+
+
+def _seal_imported_pytest_sources(session, state, gates, revision):
+    import configparser
+    from .gates import command_from_verification_step
+    from .pytest_proof_sources import effective_options, imported_test_sources
+    from os.path import commonpath
+
+    binding = state.verification_binding
+    sources = binding['proof_sources']
+    controls = set(binding['proof_control_paths'])
+    source_owners = {}
+    commands = {}
+    for step in gates.steps:
+        command = step.command or command_from_verification_step(step, session.project_root)
+        commands.setdefault(command, []).append(step.proof_id)
+    for command in [*_legacy_commands(gates), state.fix_verify_command]:
+        if command:
+            commands.setdefault(command, [])
+    configurations = {}
+    for path in binding['proof_config_paths']:
+        if sources.get(path) is not None:
+            try:
+                configurations[path] = _pytest_config_options(path, sources[path])
+            except (ValueError, configparser.Error):
+                continue  # Invalid configuration is diagnosed by preflight.
+    retained = dict(sources)
+
+    def read_source(path):
+        if path not in retained:
+            retained[path] = _historical_source(session, revision, path)
+        return retained[path]
+
+    for command, proof_ids in commands.items():
+        owners = diagnostic_owners(state, command, proof_ids=proof_ids)
+        for invocation in test_invocations(command):
+            if invocation.runner != 'pytest' or invocation.targets is None:
+                continue
+            cwd = session.project_root / invocation.cwd
+            selected_config = []
+            settings = _pytest_selection_config(session.project_root, cwd, invocation.arguments,
+                invocation.targets, configurations, source_exists=lambda path: read_source(path) is not None,
+                selected_config=selected_config)
+            options = effective_options(settings, invocation.arguments)
+            targets = [path.split('::', 1)[0] for path in invocation.repository_targets]
+            targets = targets or [invocation.cwd]
+            seeds = [path for path in list(sources) if path.endswith('.py') and path not in controls
+                     and sources[path] is not None and any(
+                         target == '.' or path == target or path.startswith(target.rstrip('/') + '/')
+                         for target in targets)]
+            directory = (Path(selected_config[0]).parent.as_posix() if selected_config else
+                         commonpath([str(Path(path).parent if Path(path).suffix else Path(path))
+                                     for path in targets]))
+            try:
+                imported = imported_test_sources(seeds, options=options, config_directory=directory,
+                                                 cwd=invocation.cwd, read_source=read_source)
+            except (ValueError, SyntaxError) as error:
+                raise ownership_error(state, str(error), owners=owners, command=command,
+                                      failure_kind='verification_proof_source') from error
+            sources.update(imported)
+            for path in [*seeds, *imported]:
+                rows = source_owners.setdefault(path, [])
+                rows.extend(owner for owner in owners if owner not in rows)
+    binding['proof_source_owners'] = source_owners
 
 
 def _validate_required_node_selection(session, state, commands):
@@ -1008,7 +1099,8 @@ def _validate_required_node_selection(session, state, commands):
                                   commands=[command for command in commands if command])
 
 
-def _pytest_selection_config(root, cwd, args, targets, configurations, *, source_exists):
+def _pytest_selection_config(root, cwd, args, targets, configurations, *, source_exists,
+                             selected_config=None):
     """Resolve retained discovery settings for this invocation only.
 
     Another command's configuration must never override this command's node
@@ -1036,7 +1128,11 @@ def _pytest_selection_config(root, cwd, args, targets, configurations, *, source
 
     def retained(path):
         try:
-            return configurations.get(path.resolve().relative_to(root.resolve()).as_posix())
+            relative = path.resolve().relative_to(root.resolve()).as_posix()
+            settings = configurations.get(relative)
+            if settings is not None and selected_config is not None:
+                selected_config[:] = [relative]
+            return settings
         except ValueError:
             return None
 
@@ -1047,7 +1143,7 @@ def _pytest_selection_config(root, cwd, args, targets, configurations, *, source
     base = Path(commonpath(directories)) if directories else cwd
 
     def search(starts):
-        bare_pyproject = False
+        bare_pyproject = None
         for start in dict.fromkeys(starts):
             for parent in (start, *start.parents):
                 for name in _PYTEST_CONFIG_NAMES:
@@ -1060,11 +1156,16 @@ def _pytest_selection_config(root, cwd, args, targets, configurations, *, source
                             relative = path.resolve().relative_to(root.resolve()).as_posix()
                         except ValueError:
                             continue
-                        bare_pyproject |= relative in configurations
+                        if relative in configurations and bare_pyproject is None:
+                            bare_pyproject = relative
         # Pytest remembers a build-only pyproject while looking for substantive
         # settings. Its empty fallback still counts as a selected config, so
         # individual-target search must not replace it with nested settings.
-        return {} if bare_pyproject else None
+        if bare_pyproject is not None:
+            if selected_config is not None:
+                selected_config[:] = [bare_pyproject]
+            return {}
+        return None
 
     settings = search([base])
     if settings is not None:
@@ -1606,6 +1707,9 @@ def collection_command(command: str) -> str:
 
 def diagnostic_owners(state, command: str, *, proof_ids=()) -> list[dict[str, object]]:
     owners = []
+    for owner in state.verification_binding.get('proof_source_owners', {}).get(command, []):
+        if owner not in owners:
+            owners.append(owner)
     for key in proof_ids:
         for owner in state.verification_binding.get('proof_owners', {}).get(key, []):
             if owner not in owners:

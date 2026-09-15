@@ -103,7 +103,14 @@ def test_public_resume_confines_shared_inputs_during_collection_and_execution(tm
                                     'execution-private_fchmod'])
 def test_public_resume_blocks_validation_if_confinement_unavailable(tmp_path, monkeypatch, failure):
     if failure != 'unavailable':
-        return _public_metadata_preflight_failure(tmp_path, monkeypatch, failure)
+        # Keep the retained public parameter IDs and the original direct-node
+        # case, then exercise the additional command-contract boundary.
+        for variant in ('direct', 'command' if failure.startswith('collection-') else 'partial'):
+            directory = tmp_path / variant
+            directory.mkdir()
+            with monkeypatch.context() as isolated:
+                _public_metadata_preflight_failure(directory, isolated, failure, variant=variant)
+        return
     root, hook = shared_environment(tmp_path)
     monkeypatch.setenv('CONFINEMENT_TEST_INPUT', 'retained')
     from auto_agents import verification_sandbox
@@ -134,7 +141,7 @@ def test_public_resume_blocks_validation_if_confinement_unavailable(tmp_path, mo
     assert hook.read_text() == 'original environment' and hook.stat().st_mode & 0o777 == 0o640
 
 
-def _public_metadata_preflight_failure(tmp_path, monkeypatch, failure):
+def _public_metadata_preflight_failure(tmp_path, monkeypatch, failure, *, variant='direct'):
     from copy import deepcopy
     from auto_agents import gate_execution, verification_sandbox
     from auto_agents.config import load_session_state, save_session_state
@@ -151,6 +158,25 @@ def _public_metadata_preflight_failure(tmp_path, monkeypatch, failure):
     configure_local_writer(root, child, "Path('value.py').write_text('VALUE = 1\\n')")
     # Exercise the targeted-command catch after the real required collection.
     child.fix_verify_command = 'python -m pytest -q tests/test_owned.py::test_owned'
+    second_command = 'python -m pytest -q tests/test_owned.py::test_second'
+    if variant != 'direct':
+        from auto_agents.config import load_project_config
+        from test_session_verification_ownership import _retain_contract
+        config = load_project_config(root)
+        config.gates.steps = []
+        config.gates.parallel_groups = []
+        config.gates.commands = [child.fix_verify_command]
+        if variant == 'partial':
+            test.write_text(test.read_text() + '\ndef test_second():\n    raise AssertionError("refused body executed")\n')
+            config.gates.commands.append(second_command)
+            # Both executions must be in the same gate call. An earlier
+            # targeted call would conceal lost partial-plan accounting.
+            child.fix_verify_command = ''
+        plan = {'tasks': [{'task_id': 'task-owned', 'title': 'Owned command preflight',
+                          'requirement_ids': ['REQ-owned'],
+                          'verification_refs': ['cmd:' + command for command in config.gates.commands]}],
+                'verification_steps': []}
+        _retain_contract(root, child, config, plan)
     save_session_state(root, child)
     from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
     child.workflow_id = WorkflowStore(root).create_root(WorkflowRef('fix', child.session_id)).workflow_id
@@ -169,19 +195,22 @@ def _public_metadata_preflight_failure(tmp_path, monkeypatch, failure):
     monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
     target_phase, operation = failure.split('-private_')
     active_phase = None
+    active_command = None
     run = gate_execution.LocalGatePlanExecutor._run_command
     def observed_run(self, command, **kwargs):
-        nonlocal active_phase
+        nonlocal active_phase, active_command
         active_phase = 'collection' if '--collect-only' in command else 'execution'
+        active_command = command
         try:
             return run(self, command, **kwargs)
         finally:
             active_phase = None
+            active_command = None
     monkeypatch.setattr(gate_execution.LocalGatePlanExecutor, '_run_command', observed_run)
     probe = verification_sandbox.metadata_probe_command
     def denied_probe(*args, **kwargs):
         argv = probe(*args, **kwargs)
-        if active_phase == target_phase:
+        if active_phase == target_phase and (variant != 'partial' or active_command == second_command):
             injected.append(active_phase)
             i = argv.index('-c') + 1
             argv[i] = ("import os,errno\n"
@@ -219,16 +248,29 @@ def _public_metadata_preflight_failure(tmp_path, monkeypatch, failure):
             assert diagnostic['workflow_id'] == child.workflow_id
             assert diagnostic['contract_fingerprint'] == result.verification_binding['contract_fingerprint']
             assert diagnostic['owners'] and 'task-owned' in json.dumps(diagnostic['owners'])
+            assert diagnostic['task_ids'] == ['task-owned']
+            assert diagnostic['requirement_ids'] == ['REQ-owned']
+            assert 'REQ-owned' in json.dumps(diagnostic['owners'])
             assert 'tests/test_owned.py' in diagnostic['command']
             assert ('--collect-only' in diagnostic['command']) == (target_phase == 'collection')
+            if variant != 'direct':
+                expected_command = second_command if variant == 'partial' else child.fix_verify_command
+                assert diagnostic['original_command'] == expected_command
+                assert result.verification_binding['proof_graph']['commands'][expected_command]
+                assert 'cmd:' + expected_command in diagnostic['owners'][0]['verification_refs']
             expected_launches = list(launched)
-            assert all(phase == 'collection' for phase in launched)
+            if variant == 'partial':
+                assert launched == ['collection', 'collection', 'execution']
+                assert record['logical_commands'] == record['executed_commands'] == 3
+                assert body.read_text() == 'executed'
+            else:
+                assert all(phase == 'collection' for phase in launched)
             assert bool(launched) == (target_phase == 'execution')
             assert record['executed_commands'] == len(expected_launches)
             assert record['logical_commands'] == len(expected_launches)
             assert record['certificate_hits'] == 0
             assert injected == [target_phase] and writers == ['fix']
-            assert not body.exists() and image() == before
+            assert body.exists() == (variant == 'partial') and image() == before
             custody, attempt = deepcopy(result.candidate_custody), result.current_attempt
             assert custody['receipt'] and result.verification_diagnostics
             for _ in range(2):
@@ -241,7 +283,7 @@ def _public_metadata_preflight_failure(tmp_path, monkeypatch, failure):
                                if e.get('action') == 'receipt_verification')
                 assert injected == [target_phase] and writers == ['fix']
                 assert launched == expected_launches
-                assert not body.exists() and image() == before
+                assert body.exists() == (variant == 'partial') and image() == before
         finally:
             server.shutdown()
             worker.join(timeout=5)

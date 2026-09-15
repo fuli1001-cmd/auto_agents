@@ -2203,6 +2203,118 @@ def test_public_resume_retains_manual_regression_sharing_foreign_future_file(
     assert {name: (root / name).read_bytes() for name in ambient} == ambient
 
 
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('imports', ['direct', 'pythonpath', 'reexport'])
+@pytest.mark.parametrize('outcome', ['weakening', 'intact_failure', 'passing'])
+def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatch, legacy, imports, outcome):
+    from copy import deepcopy
+    from auto_agents.config import load_task_plan
+    from auto_agents.authorization import authorization_policy_for_state
+    from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
+    import auto_agents.session as session_module
+    import auto_agents.session_verification as verification
+    from auto_agents.gate_execution import LocalGatePlanExecutor
+
+    root, child = project(tmp_path)
+    marker = ExecutionMarker(tmp_path / 'imported-regression-executed')
+    name = 'test_regression' if imports == 'direct' else 'check_regression'
+    helper = 'regression_helpers.py' if imports == 'direct' else 'qa/regression_helpers.py'
+    (root / helper).parent.mkdir(exist_ok=True)
+    expected = 1 if outcome == 'passing' else 0
+    helper_source = ('from pathlib import Path\n'
+        f'def {name}():\n'
+        '    ' + marker.source('Path("value.py").read_text()', append=True) + '\n'
+        f'    assert "VALUE = {expected}" in Path("value.py").read_text()\n')
+    (root / helper).write_text(helper_source)
+    if imports != 'direct':
+        (root / 'pytest.ini').write_text('[pytest]\npython_functions = test_* check_*\npythonpath = qa\n')
+    module = 'regression_helpers'
+    if imports == 'reexport':
+        (root / 'qa/regression_exports.py').write_text('from regression_helpers import check_regression\n')
+        module = 'regression_exports'
+    path = 'tests/test_regression.py'
+    (root / path).write_text(f'from {module} import {name}\n')
+    foreign = VerificationStep(proof_id='foreign.release', runner='pytest', levels=['release'],
+                               targets=[path + '::' + name], impact_paths=[])
+    config = load_project_config(root)
+    config.gates.steps[0].risk = 'critical'
+    config.gates.steps.append(foreign)
+    plan = load_task_plan(root)
+    plan['tasks'].append({'task_id': 'task-foreign', 'workflow_id': 'foreign-workflow',
+                         'title': 'Pending work with an existing regression', 'status': 'pending',
+                         'requirement_ids': ['REQ-foreign'], 'verification_refs': ['foreign.release']})
+    plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
+    _retain_contract(root, child, config, plan)
+    if legacy:
+        child.workflow_id = WorkflowStore(root).create_root(WorkflowRef('fix', child.session_id)).workflow_id
+        child.authorization_policy = authorization_policy_for_state(auto_approve=True).to_dict()
+        with monkeypatch.context() as previous:
+            previous.setattr(verification, '_PROOF_INVENTORY_VERSION', 3)
+            verification.bind_session(Session(Orchestrator(root), mode='fix', auto_approve=True), child)
+        # Reconstruct the old inventory that did not protect imported bodies.
+        for entry in (helper, 'qa/regression_exports.py'):
+            child.verification_binding['proof_sources'].pop(entry, None)
+        child.verification_binding.pop('proof_source_owners', None)
+        child.verification_binding['binding_fingerprint'] = verification.fingerprint({
+            key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
+        save_session_state(root, child)
+    ambient_config = load_project_config(root)
+    ambient_config.gates.steps = [foreign]
+    save_project_config(root, ambient_config)
+    save_task_plan(root, {**plan, 'tasks': [plan['tasks'][-1]], 'verification_steps': [foreign.to_dict()]})
+    ambient = {entry: (root / entry).read_bytes() for entry in
+               ('.auto-agents/config.json', '.auto-agents/state/task_plan.json', path, helper)}
+    dispatched, cache_accesses, writers = [], [], []
+    execute, cached = session_module.run_gate_plan, LocalGatePlanExecutor.cached_result
+    def observe(commands, *args, **kwargs):
+        dispatched.extend(commands)
+        return execute(commands, *args, **kwargs)
+    def observe_cache(self, command):
+        cache_accesses.append(command)
+        return cached(self, command)
+    monkeypatch.setattr(session_module, 'run_gate_plan', observe)
+    monkeypatch.setattr(LocalGatePlanExecutor, 'cached_result', observe_cache)
+    orch = Orchestrator(root)
+    def provider(request):
+        writers.append(request.purpose)
+        (request.cwd / 'value.py').write_text('VALUE = 1\n')
+        if outcome == 'weakening':
+            (request.cwd / helper).write_text(helper_source.replace(
+                'assert "VALUE = 0" in Path("value.py").read_text()', 'assert True'))
+        reply = 'Repaired value\nCOMMIT_MESSAGE: Repair owned value'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    monkeypatch.setattr(orch, '_call_with_failover', provider)
+    def resume():
+        return Session(orch, mode='fix', auto_approve=True).resume(child.session_id)
+    saved = resume()
+    assert writers == ['fix']
+    assert saved.verification_binding['proof_inventory_version'] == 4
+    assert saved.verification_binding['proof_sources'][helper] == helper_source
+    assert saved.verification_binding['proof_source_owners'][helper][0]['task_id'] == 'task-foreign'
+    if outcome == 'weakening':
+        assert saved.status != 'completed' and not dispatched and not cache_accesses
+        assert not marker.exists()
+        diagnostic = next(entry['diagnostic'] for entry in saved.execution_log
+                          if entry.get('diagnostic', {}).get('verification_ref') == helper)
+        assert diagnostic['owners'][0]['task_id'] == 'task-foreign'
+        assert diagnostic['owners'][0]['requirement_ids'] == ['REQ-foreign']
+        assert diagnostic['session_id'] == child.session_id and diagnostic['contract_fingerprint']
+        assert diagnostic['retry_fix'] is False
+        custody, attempt = deepcopy(saved.candidate_custody), saved.current_attempt
+        for _ in range(2):
+            repeated = resume()
+            assert repeated.status == 'blocked'
+            assert repeated.candidate_custody == custody and repeated.current_attempt == attempt
+            assert writers == ['fix'] and not dispatched and not cache_accesses
+    else:
+        assert (saved.status == 'completed') == (outcome == 'passing'), saved.to_dict()
+        assert 'VALUE = 1' in marker.read_text().splitlines()
+        assert dispatched
+    assert {entry: (root / entry).read_bytes() for entry in ambient} == ambient
+
+
 @pytest.mark.parametrize('reference', ['proof_id', 'target'])
 @pytest.mark.parametrize('coverage', ['whole_file', 'directory', 'node', 'mixed_future',
                                      'parameterized_node', 'parameterized_legacy_binding'])
@@ -3511,7 +3623,7 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(
         assert result.status == 'completed', result.to_dict()
         assert len(calls) == 1, 'inventory recovery must reuse the frozen candidate'
         binding = result.verification_binding
-        assert binding['proof_inventory_version'] == 3
+        assert binding['proof_inventory_version'] == 4
         for key in ('repository', 'authorization', 'tasks', 'task_scope', 'contract_revision',
                     'original_handoff_id', 'baseline_identity', 'execution_environment'):
             assert binding[key] == authority[key]
@@ -4468,7 +4580,7 @@ def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_p
     ambient = _switch_ambient_binding_plan(root)
     saved, calls, _ = run_session(root, monkeypatch)
     assert saved.status == 'completed' and calls == []
-    assert saved.verification_binding['proof_inventory_version'] == 3
+    assert saved.verification_binding['proof_inventory_version'] == 4
     assert saved.verification_binding['binding_fingerprint'] != authority['binding_fingerprint']
     for key in ('authorization', 'tasks', 'task_scope', 'contract_revision', 'original_handoff_id'):
         assert saved.verification_binding[key] == authority[key]
