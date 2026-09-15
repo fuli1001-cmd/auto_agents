@@ -161,3 +161,76 @@ def test_review_format_correction_cannot_drop_blocking_findings(job):
     driver.run = review
     state = controller(job, driver).run()
     assert state['status'] == 'blocked' and state['blocker']['code'] == 'review_semantics_changed'
+
+
+def test_source_context_never_claims_omitted_files_are_complete(job):
+    import json
+    from auto_agents.repair_v2.context import source_context
+    request, _, workspace = job
+    root = workspace.prepare()
+    full = json.loads(source_context(root, request.engine_base))
+    assert full['complete_repository_contents']
+    (root / 'large.txt').write_text('x' * 40000)
+    small = json.loads(source_context(root, request.engine_base))
+    assert not small['complete_repository_contents'] and 'large.txt' not in small['files']
+
+
+def test_failure_oscillation_cannot_keep_renewing_progress_budget(job):
+    verifier = Verifier()
+    count = 0
+    def oscillate(identity, root, units, cancel):
+        nonlocal count
+        count += 1
+        failures = [{'unit': 'check', 'failed': ['A', 'B'] if count % 2 else ['A'], 'reason': 'same unresolved defect'}]
+        return ValidationResult(False, identity, failures=failures)
+    verifier.validate = oscillate
+    state = controller(job, verifier=verifier).run()
+    assert state['status'] == 'blocked' and state['blocker']['code'] == 'no_progress'
+    assert state['attempts'] == 6 and state['replans'] == 1
+
+
+def test_failed_tests_cancel_slow_review_without_cancelling_the_repair(job):
+    import time
+    driver, verifier = Driver(), Verifier()
+    original = driver.run
+    def slow_review(role, *args, **kwargs):
+        if role != 'review': return original(role, *args, **kwargs)
+        deadline = time.monotonic() + 5
+        while not kwargs['cancel'].is_set():
+            if time.monotonic() > deadline: pytest.fail('review was not cancelled')
+            time.sleep(0.01)
+        return AgentReply(False, error='cancelled', interrupted=True)
+    driver.run = slow_review
+    verifier.validate = lambda identity, *args: ValidationResult(False, identity, failures=[{'unit': 'known', 'reason': 'failed'}])
+    runner = controller(job, driver, verifier)
+    state = runner.run()
+    assert state['blocker']['code'] == 'no_progress' and state['attempts'] == 4
+    assert not runner.cancel.is_set()
+
+
+def test_guarded_mode_never_generates_or_modifies_candidate_code(job):
+    request, store, workspace = job
+    driver = Driver()
+    runner = Controller(request, store, workspace, driver, Verifier(),
+                        units=lambda _: [], allow_implementation=False)
+    state = runner.run()
+    assert state['blocker']['code'] == 'guarded_mode'
+    assert all(role == 'review' for role, _ in driver.calls)
+    assert (workspace.candidate / 'source.py').read_text() == 'value = 0\n'
+
+
+def test_missing_native_session_recovers_once_without_discarding_plan(job):
+    driver = Driver(); original = driver.run
+    missing = False
+    def run(role, *args, **kwargs):
+        nonlocal missing
+        if role == 'implement' and kwargs['session'] and not missing:
+            missing = True
+            return AgentReply(False, error='thread not found', missing_session=True)
+        return original(role, *args, **kwargs)
+    driver.run = run
+    runner = controller(job, driver)
+    result = runner.run()
+    assert result['status'] == 'ready' and result['session_recoveries'] == {'implement': 1}
+    assert [role for role, _ in driver.calls].count('plan') == 1
+    assert result['attempts'] == 1

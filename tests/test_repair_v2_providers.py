@@ -62,3 +62,60 @@ def test_antigravity_does_not_invent_an_unsupported_effort_flag(tmp_path):
         driver = NativeDriver(config, None)
     with patch.object(driver, 'selected', return_value=('configured model', {})):
         assert '--effort' not in driver.arguments('plan', 'inspect this', '', None)
+
+
+def test_codex_preserves_separate_implementation_and_review_effort(tmp_path, monkeypatch):
+    native = tmp_path / '.codex'; native.mkdir()
+    (native / 'config.toml').write_text('model="base"\n')
+    (native / 'deep.config.toml').write_text('model="configured"\nmodel_reasoning_effort="high"\n')
+    (native / 'max.config.toml').write_text('model="configured"\nmodel_reasoning_effort="max"\n')
+    monkeypatch.setenv('CODEX_HOME', str(native))
+    config = ProviderConfig(kind='codex', binary='codex', profile_map={'deep': 'deep', 'max': 'max'})
+    with patch('shutil.which', return_value='/usr/bin/codex'):
+        driver = NativeDriver(config, None, effort='deep', review_effort='max')
+    assert driver.selected('implement')[1]['model_reasoning_effort'] == 'high'
+    assert driver.selected('plan')[1]['model_reasoning_effort'] == 'max'
+    assert driver.selected('review')[1]['model_reasoning_effort'] == 'max'
+
+
+def test_provider_credentials_are_scoped_to_selected_backend(tmp_path, monkeypatch):
+    sandbox = AgentSandbox(tmp_path / 'native', 'image', kind='codex')
+    root = tmp_path / 'source'; root.mkdir()
+    monkeypatch.setenv('OPENAI_API_KEY', 'selected')
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'unrelated')
+    monkeypatch.setenv('GH_TOKEN', 'unrelated')
+    with patch.object(sandbox, 'home', return_value=tmp_path / 'private'), \
+         patch('auto_agents.repair_v2.docker.run', return_value=(0, '')):
+        with sandbox.command('plan', root, ['/usr/bin/codex', '--help']) as command:
+            environment = [command[i + 1] for i, arg in enumerate(command) if arg == '-e']
+    assert 'OPENAI_API_KEY=selected' in environment
+    assert not any('unrelated' in value for value in environment)
+
+
+def test_transport_mapping_does_not_rewrite_proxy_credentials():
+    from auto_agents.repair_v2.providers import bridge_url
+    assert bridge_url('http://localhost-user:localhost-pass@localhost:7890') == \
+        'http://localhost-user:localhost-pass@host.docker.internal:7890'
+
+
+def test_codex_resume_keeps_native_context_without_exporting_entire_history(tmp_path):
+    import io
+    import json
+    config = ProviderConfig(kind='codex', binary='codex', profile_map={})
+    with patch('shutil.which', return_value='/usr/bin/codex'):
+        driver = NativeDriver(config, None)
+    messages = [
+        ('stdout', json.dumps({'id': 1, 'result': {}})),
+        ('stdout', json.dumps({'id': 2, 'result': {'thread': {'id': 'existing'}, 'model': 'configured'}})),
+        ('stdout', json.dumps({'method': 'item/completed', 'params': {'item': {
+            'type': 'agentMessage', 'phase': 'final_answer', 'text': 'done'}}})),
+        ('stdout', json.dumps({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})),
+    ]
+    process = SimpleNamespace(stdin=io.StringIO(), terminate=lambda: None)
+    with patch.object(driver, 'next_message', side_effect=messages), \
+         patch.object(driver, 'selected', return_value=('configured', {'model_reasoning_effort': 'max'})):
+        result = driver.codex(process, None, 'implement', 'continue', tmp_path, 'existing', None, None, None)
+    packets = [json.loads(line) for line in process.stdin.getvalue().splitlines()]
+    resume = next(row for row in packets if row['method'] == 'thread/resume')
+    assert resume['params']['threadId'] == 'existing' and resume['params']['excludeTurns'] is True
+    assert result.ok and result.session == 'existing' and result.text == 'done'

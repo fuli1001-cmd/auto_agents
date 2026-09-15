@@ -15,6 +15,18 @@ def main():
     request = json.loads(Path(sys.argv[1]).read_text())
     subscriber, result = request["subscriber"], request["result"]
     runtime = Path(result["runtime"]).resolve()
+    if result.get('engine') == 'v2':
+        # Validate with the immutable launch/controller implementation before
+        # importing any approved candidate module into this interpreter.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from auto_agents.repair_v2.integration import verify_receipt
+        from auto_agents.repair_v2.transaction import transaction_root
+        verify_receipt(result, expected_root=transaction_root(request['config'], subscriber['payload']['repair']))
+        # The business process below must import the delivered engine, not the
+        # controller modules used to check its receipt.
+        for name in list(sys.modules):
+            if name == 'auto_agents' or name.startswith('auto_agents.'):
+                del sys.modules[name]
     loaded = subprocess.run(["git", "-C", str(runtime), "rev-parse", "HEAD"],
                             check=True, capture_output=True, text=True, timeout=60).stdout.strip()
     changed = subprocess.run(["git", "-C", str(runtime), "diff", "HEAD", "--exit-code"],

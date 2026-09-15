@@ -69,8 +69,8 @@ class Workspace:
             origin = self.retained or self.source
             preparing = self.root / 'candidate.preparing'
             if preparing.exists():
-                raise RepairBlocked('incomplete_import',
-                    'Interrupted candidate import is preserved at ' + str(preparing))
+                # No provider sees this directory before the atomic rename.
+                shutil.rmtree(preparing)
             require_space(self.root, tree_bytes(origin) * 2)
             subprocess.run(['git', 'clone', '--quiet', '--no-local', '--no-hardlinks',
                             str(origin), str(preparing)], check=True)
@@ -86,10 +86,19 @@ class Workspace:
                 git(preparing, 'fetch', '--quiet', str(self.source), self.base)
                 try: git(preparing, 'merge', '--no-edit', self.base)
                 except subprocess.CalledProcessError as error:
-                    raise RepairBlocked('source_conflict', 'retained candidate requires merge resolution in ' + str(preparing)) from error
+                    conflicts = git(preparing, 'diff', '--name-only', '--diff-filter=U').splitlines()
+                    if not conflicts: raise
+                    atomic_json(self.root / 'import-conflicts.json', {'paths': conflicts, 'base': self.base})
             else: git(preparing, 'checkout', '--quiet', '--detach', self.base)
             preparing.rename(self.candidate)
         return self.candidate
+
+    def checkpoint(self):
+        # Only the controller writes Git metadata; native implementations see
+        # a read-only .git mount, including during conflict resolution.
+        git(self.candidate, 'add', '-A')
+        if git(self.candidate, 'status', '--porcelain') or (self.candidate / '.git/MERGE_HEAD').exists():
+            git(self.candidate, 'commit', '-qm', 'Checkpoint unified repair candidate')
 
     def freeze(self):
         before = inventory(self.candidate)
@@ -110,7 +119,57 @@ class Workspace:
             if git(staging, 'status', '--porcelain'):
                 git(staging, 'commit', '-qm', 'Freeze repair candidate')
             staging.rename(destination)
-            atomic_json(destination.parent / (identity + '.json'), {'identity': identity, 'files': before})
+            commit = git(destination, 'rev-parse', 'HEAD')
+            git(self.candidate, 'fetch', '--quiet', str(destination),
+                commit + ':refs/auto-agents/v2-snapshots/' + identity)
+            atomic_json(destination.parent / (identity + '.json'),
+                        {'identity': identity, 'commit': commit, 'files': before})
         if inventory(destination) != before:
             raise RepairBlocked('snapshot_changed', 'saved verification snapshot was modified')
         return identity, destination
+
+    def collect_snapshots(self, current, *, keep=2):
+        """Retain history in Git; bound redundant checked-out source directories."""
+        import json
+        root = self.root / 'snapshots'
+        saved = sorted((p for p in root.iterdir() if p.is_dir() and not p.is_symlink()
+                        and len(p.name) == 64 and all(c in '0123456789abcdef' for c in p.name)),
+                       key=lambda p: p.stat().st_mtime_ns, reverse=True) if root.exists() else []
+        retained = {current}
+        for path in saved:
+            if len(retained) >= max(1, keep): break
+            retained.add(path.name)
+        removed = []
+        for path in saved:
+            if path.name in retained: continue
+            manifest = root / (path.name + '.json')
+            if not manifest.is_file(): continue
+            record = json.loads(manifest.read_text())
+            reference = 'refs/auto-agents/v2-snapshots/' + path.name
+            try: commit = git(self.candidate, 'rev-parse', '--verify', reference)
+            except subprocess.CalledProcessError: continue
+            if record.get('commit') != commit or inventory(path) != record.get('files'): continue
+            # The manifest and reachable commit remain; no acceptance evidence
+            # is discarded and no dirty/unrecognized checkout is removed.
+            shutil.rmtree(path)
+            removed.append(path.name)
+        return removed
+
+    def materialize(self, identity):
+        import json
+        root = self.root / 'snapshots'
+        destination = root / identity
+        record = json.loads((root / (identity + '.json')).read_text())
+        if record.get('identity') != identity:
+            raise RepairBlocked('snapshot_changed', 'snapshot manifest identity changed')
+        if not destination.exists():
+            require_space(root, tree_bytes(self.candidate) * 2)
+            subprocess.run(['git', 'clone', '--quiet', '--no-local', '--no-hardlinks',
+                            str(self.candidate), str(destination)], check=True)
+            git(destination, 'fetch', '--quiet', str(self.candidate), record['commit'])
+            git(destination, 'checkout', '--quiet', '--detach', record['commit'])
+            for name, entry in record['files'].items():
+                if entry[0] == 'file': (destination / name).chmod(entry[2])
+        if inventory(destination) != record['files']:
+            raise RepairBlocked('snapshot_changed', 'materialized snapshot differs from its manifest')
+        return destination

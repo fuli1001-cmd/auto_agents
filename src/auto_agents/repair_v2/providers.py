@@ -16,6 +16,14 @@ from urllib.parse import urlsplit, urlunsplit
 from .types import AgentReply, RepairBlocked
 
 
+def bridge_url(value):
+    parsed = urlsplit(value)
+    if parsed.hostname not in ('127.0.0.1', 'localhost', '::1'): return value
+    userinfo = parsed.netloc.rsplit('@', 1)[0] + '@' if '@' in parsed.netloc else ''
+    authority = userinfo + 'host.docker.internal' + (':' + str(parsed.port) if parsed.port else '')
+    return urlunsplit((parsed.scheme, authority, parsed.path, parsed.query, parsed.fragment))
+
+
 def toml(value):
     if isinstance(value, dict):
         return '{' + ', '.join(json.dumps(k) + ' = ' + toml(v) for k, v in value.items()) + '}'
@@ -82,7 +90,7 @@ class AgentSandbox:
         # Exact inputs only. profiles/ also contains native session databases,
         # transcripts and logs; recursive copying amplifies them every phase.
         names = {
-            'codex': ['.codex/auth.json', '.codex/config.toml'],
+            'codex': ['.codex/auth.json', '.codex/config.toml', '.codex/AGENTS.md'],
             'claude-code': ['.claude/.credentials.json', '.claude/settings.json', '.claude.json'],
             'copilot-cli': ['.copilot/config.json', '.copilot/settings.json'],
             'antigravity': ['.gemini/antigravity-cli/settings.json',
@@ -92,6 +100,10 @@ class AgentSandbox:
             raise RepairBlocked('provider_unsupported', self.kind)
         for name in names:
             source, dest = original / name, path / name
+            override = {'.codex': 'CODEX_HOME', '.claude': 'CLAUDE_CONFIG_DIR',
+                        '.copilot': 'COPILOT_HOME'}.get(Path(name).parts[0])
+            if override and os.environ.get(override):
+                source = Path(os.environ[override]).expanduser() / Path(*Path(name).parts[1:])
             if not source.is_file(): continue
             if source.is_symlink() or any(p.is_symlink() for p in source.parents if p != original and original in p.parents):
                 raise RepairBlocked('provider_configuration', 'native configuration must not traverse a link: ' + name)
@@ -117,79 +129,137 @@ class AgentSandbox:
         return path
 
     @contextmanager
-    def command(self, role, root, arguments):
+    def command(self, role, root, arguments, *, credential_names=()):
         from .docker import run
-        root = Path(root).resolve()
-        home = self.home(role).resolve()
-        name = 'aa-agent-' + uuid.uuid4().hex
-        argv = ['docker', 'run', '--name', name, '-i', '--read-only', '--network', 'bridge',
-            '--user', f'{os.getuid()}:{os.getgid()}', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-            '--pids-limit', '512', '--memory', '2g', '--tmpfs', '/tmp:rw,nosuid,mode=1777',
-            '--tmpfs', '/run:rw,nosuid,mode=1777', '--workdir', str(root),
-            '--mount', 'type=bind,src=' + str(root) + ',dst=' + str(root) + (',readonly' if role != 'implement' else ''),
-            '--mount', 'type=bind,src=' + str(home) + ',dst=/agent-home',
-            '-e', 'HOME=/agent-home', '-e', 'PYTHONDONTWRITEBYTECODE=1']
-        if (root / '.git').exists():
-            argv += ['--mount', 'type=bind,src=' + str(root / '.git') + ',dst=' + str(root / '.git') + ',readonly']
-        # Executables are public, read-only tool inputs; no host home is mounted.
-        mounts = set()
-        for executable in ('node', 'codex', 'claude', 'copilot', 'agy'):
-            found = shutil.which(executable)
-            if not found: continue
-            found = Path(found)
-            resolved = found.resolve()
-            if 'node_modules' in resolved.parts:
-                index = resolved.parts.index('node_modules')
-                mounts.add(Path(*resolved.parts[:index - 1]))  # node prefix
-            else: mounts.add(resolved)
-            if found != resolved: mounts.add(found.parent)
-        for path in sorted(mounts):
-            argv += ['--mount', 'type=bind,src=' + str(path) + ',dst=' + str(path) + ',readonly']
-        prefixes = sorted({str(Path(shutil.which(n)).parent) for n in ('node', 'codex', 'claude', 'copilot', 'agy') if shutil.which(n)})
-        argv += ['-e', 'PATH=' + ':'.join([*prefixes, '/usr/bin', '/bin'])]
-        # Pass only model-auth/transport variables, never the business environment.
-        for key in os.environ:
-            if key.startswith(('OPENAI_', 'ANTHROPIC_', 'COPILOT_', 'GOOGLE_')) or key in (
-                    'GH_TOKEN', 'GITHUB_TOKEN', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
-                    'http_proxy', 'https_proxy', 'no_proxy', 'ALL_PROXY', 'all_proxy'):
-                value = os.environ[key]
-                if key.lower().endswith('_proxy') and key.lower() != 'no_proxy':
-                    parsed = urlsplit(value)
-                    if parsed.hostname in ('127.0.0.1', 'localhost'):
-                        authority = parsed.netloc.replace(parsed.hostname, 'host.docker.internal')
-                        value = urlunsplit((parsed.scheme, authority, parsed.path, parsed.query, parsed.fragment))
+        from .cleanup import labels, reap_containers
+        from .storage import execution_lease
+        lease = 'reviewer' if role == 'review' else 'writer'
+        reap_containers(self.root, kind='provider')
+        with execution_lease(self.root / 'leases' / lease):
+            root = Path(root).resolve()
+            home = self.home(role).resolve()
+            name = 'aa-agent-' + uuid.uuid4().hex
+            argv = ['docker', 'run', '--init', '--name', name, *labels(self.root, lease, kind='provider'), '-i', '--read-only', '--network', 'bridge',
+                '--user', f'{os.getuid()}:{os.getgid()}', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+                '--pids-limit', '512', '--memory', '2g', '--tmpfs', '/tmp:rw,nosuid,exec,mode=1777,size=4g',
+                '--tmpfs', '/run:rw,nosuid,mode=1777', '--workdir', str(root),
+                '--mount', 'type=bind,src=' + str(root) + ',dst=' + str(root) + (',readonly' if role != 'implement' else ''),
+                '--mount', 'type=bind,src=' + str(home) + ',dst=/agent-home',
+                '-e', 'HOME=/agent-home', '-e', 'PYTHONDONTWRITEBYTECODE=1']
+            if (root / '.git').exists():
+                argv += ['--mount', 'type=bind,src=' + str(root / '.git') + ',dst=' + str(root / '.git') + ',readonly']
+            # Executables are public, read-only tool inputs; no host home is mounted.
+            mounts = set()
+            selected = {'codex': None, 'claude-code': 'claude', 'copilot-cli': 'copilot', 'antigravity': 'agy'}[self.kind]
+            if selected:
+                found = shutil.which(selected)
+                if found:
+                    found = Path(found)
+                    # Bind the selected executable, not its enclosing HOME/bin or
+                    # node prefix (which may also contain unrelated account config).
+                    mounts.add(found)
+            for path in sorted(mounts):
+                argv += ['--mount', 'type=bind,src=' + str(path.resolve()) + ',dst=' + str(path) + ',readonly']
+            if self.kind == 'antigravity':
+                for leaf in ('bin', 'builtin'):
+                    public = Path.home() / '.gemini/antigravity-cli' / leaf
+                    if public.is_dir() and not public.is_symlink():
+                        argv += ['--mount', f'type=bind,src={public},dst=/agent-home/.gemini/antigravity-cli/{leaf},readonly']
+            prefixes = sorted({str(Path(shutil.which(n)).parent) for n in ('node', 'codex', 'claude', 'copilot', 'agy') if shutil.which(n)})
+            argv += ['-e', 'PATH=' + ':'.join([*prefixes, '/usr/bin', '/bin'])]
+            # A provider must not receive another provider's account credentials.
+            prefixes = {'codex': ('OPENAI_',), 'claude-code': ('ANTHROPIC_',),
+                        'copilot-cli': ('COPILOT_',), 'antigravity': ('GOOGLE_', 'GEMINI_', 'ANTIGRAVITY_')}[self.kind]
+            extra = set(credential_names)
+            if self.kind == 'copilot-cli': extra.update(('GH_TOKEN', 'GITHUB_TOKEN'))
+            if self.kind == 'claude-code': extra.add('CLAUDE_CODE_OAUTH_TOKEN')
+            for key in os.environ:
+                proxy = key.lower() in ('http_proxy', 'https_proxy', 'no_proxy', 'all_proxy')
+                if key.startswith(prefixes) or key in extra or proxy:
+                    value = os.environ[key]
+                    if (proxy and key.lower() != 'no_proxy') or key.lower().endswith('base_url'):
+                        value = bridge_url(value)
+                    if key.lower() == 'no_proxy': value += ',host.docker.internal'
                     argv += ['-e', key + '=' + value]
-                else: argv += ['-e', key]
-        try: yield [*argv, self.image, *arguments]
-        finally: run(['docker', 'rm', '-f', name], timeout=15)
+            try: yield [*argv, self.image, *arguments]
+            finally: run(['docker', 'rm', '-f', name], timeout=15)
 
 
 class NativeDriver:
-    def __init__(self, config, sandbox, *, effort='max', timeout=1800):
+    def __init__(self, config, sandbox, *, effort='max', review_effort=None, timeout=1800):
         self.config, self.sandbox, self.effort, self.timeout = config, sandbox, effort, timeout
+        self.review_effort = review_effort or effort
         self.binary = shutil.which(config.binary)
         if sandbox is not None: sandbox.kind = config.kind
         if not self.binary: raise RepairBlocked('provider_missing', config.binary + ' is unavailable')
         if config.kind not in ('codex', 'claude-code', 'copilot-cli', 'antigravity'):
             raise RepairBlocked('provider_unsupported', 'V2 has no native driver for ' + config.kind)
 
-    def selected(self):
-        profile = self.config.profile_map.get(self.effort, '')
+    def identity(self):
+        from .store import digest
+        import hashlib
+        binary = Path(self.binary).resolve()
+        value = hashlib.sha256()
+        with binary.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''): value.update(chunk)
+        model, settings = self.selected()
+        # Hash transport/model semantics, never persist native credentials.
+        return digest({'kind': self.config.kind, 'binary': value.hexdigest(), 'model': model,
+                       'settings': settings, 'arguments': self.config.extra_args, 'effort': self.effort,
+                       'review': self.selected('review'), 'review_effort': self.review_effort})
+
+    def preflight(self, root):
+        """Probe native protocol support without spending a model turn."""
+        from .docker import run
+        with self.sandbox.command('plan', root, ['/usr/bin/codex' if self.config.kind == 'codex' else self.binary, '--help']) as command:
+            code, help_text = run(command, timeout=30)
+        required = {'codex': ('app-server',), 'claude-code': ('--output-format', '--permission-mode', '--resume'),
+                    'copilot-cli': ('--mode', '--output-format', '--resume'),
+                    'antigravity': ('--mode', '--output-format', '--conversation')}
+        if code or any(flag not in help_text for flag in required[self.config.kind]):
+            raise RepairBlocked('provider_configuration',
+                self.config.kind + ' CLI lacks required native plan/resume support: ' + help_text[-1500:])
+        self.arguments('plan', 'capability probe', '', None)
+        return {'provider': self.config.kind, 'identity': self.identity()}
+
+    def selected(self, role=None):
+        effort = self.review_effort if role in ('plan', 'review') else self.effort
+        profile = self.config.profile_map.get(effort, '')
+        from ..prompting.runtime import last_option, _toml_overrides
+        explicit_model = last_option(self.config.extra_args, '--model', '-m')
         if self.config.kind == 'codex':
-            values = read_toml(Path.home() / '.codex/config.toml')
-            values.update(read_toml(Path.home() / '.codex' / (profile + '.config.toml')))
+            home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+            profile = last_option(self.config.extra_args, '--profile', '-p') or profile
+            values = {**read_toml('/etc/codex/config.toml'), **read_toml(home / 'config.toml')}
+            values.update(values.get('profiles', {}).get(profile, {}))
+            values.update(read_toml(home / (profile + '.config.toml')))
+            for key, value in _toml_overrides(self.config.extra_args).items():
+                parts = key.split('.')
+                target = values
+                for part in parts[:-1]: target = target.setdefault(part, {})
+                target[parts[-1]] = value
+            if explicit_model: values['model'] = explicit_model
             return values.get('model', ''), values
         if self.config.kind == 'copilot-cli':
             from ..adapters.copilot_cli import CopilotCliAdapter
             adapter = CopilotCliAdapter(self.config)
-            directory = adapter._resolve_config_dir(self.effort, Path.cwd())
-            return adapter._load_model_from_config_dir(directory) if directory else '', {}
-        return profile, {}
+            directory = adapter._resolve_config_dir(effort, Path.cwd())
+            return explicit_model or (adapter._load_model_from_config_dir(directory) if directory else ''), {}
+        return explicit_model or profile, {}
 
     def arguments(self, role, prompt, session, schema):
-        model, settings = self.selected()
+        model, settings = self.selected(role)
         kind = self.config.kind
-        if kind == 'codex': return [self.binary, 'app-server', '--stdio']
+        forbidden = ('--mode', '--permission-mode', '--resume', '--conversation', '--allow-all',
+                     '--dangerously-skip-permissions', '--dangerously-bypass-approvals-and-sandbox',
+                     '--sandbox', '--output-format', '--json-schema', '--output-schema', '--mcp-config')
+        for flag in self.config.extra_args:
+            if any(flag == key or flag.startswith(key + '=') for key in forbidden):
+                raise RepairBlocked('provider_configuration', 'phase-conflicting provider option: ' + flag)
+        if kind == 'codex':
+            # Model/config overrides are carried in thread/start. Only native
+            # app-server transport flags belong to this process invocation.
+            return ['/usr/bin/codex', 'app-server', '--stdio']
         if kind == 'claude-code':
             args = [self.binary, '-p', '--output-format', 'stream-json', '--verbose',
                 '--permission-mode', 'plan' if role == 'plan' else 'bypassPermissions',
@@ -211,9 +281,6 @@ class NativeDriver:
         if model: args += ['--model', model]
         # Phase and isolation are controller-owned; do not permit extra_args to
         # override them. Model endpoints and auth stay in private native config.
-        for flag in self.config.extra_args:
-            if flag.startswith(('--mode', '--permission', '--resume', '--conversation', '--allow', '--dangerously')):
-                raise RepairBlocked('provider_configuration', 'phase-conflicting provider option: ' + flag)
         args += list(self.config.extra_args)
         return args
 
@@ -222,19 +289,30 @@ class NativeDriver:
         require_space(root)
         self._next_space_check = 0
         args = self.arguments(role, prompt, session, schema)
-        with self.sandbox.command(role, root, args) as command:
+        _, settings = self.selected(role)
+        selected = settings.get('model_providers', {}).get(settings.get('model_provider', 'openai'), {})
+        credential_names = (selected['env_key'],) if selected.get('env_key') else ()
+        with self.sandbox.command(role, root, args, credential_names=credential_names) as command:
             with supervised_process(command) as process:
-                messages = queue.Queue()
+                messages = queue.Queue(maxsize=16)
+                finished = threading.Event()
                 def read(stream, label):
-                    for line in iter(stream.readline, ''): messages.put((label, line))
-                    messages.put((label, None))
+                    while not finished.is_set():
+                        line = stream.readline(4 * 1024 * 1024)
+                        item = (label, line if line else None)
+                        while not finished.is_set():
+                            try: messages.put(item, timeout=0.2); break
+                            except queue.Full: pass
+                        if not line: return
                 for stream, label in ((process.stdout, 'stdout'), (process.stderr, 'stderr')):
                     threading.Thread(target=read, args=(stream, label), daemon=True).start()
-                if self.config.kind == 'codex':
-                    return self.codex(process, messages, role, prompt, root, session, schema, progress, cancel)
-                if self.config.kind == 'claude-code': process.stdin.write(prompt + '\n'); process.stdin.flush()
-                process.stdin.close()
-                return self.cli(process, messages, progress, cancel)
+                try:
+                    if self.config.kind == 'codex':
+                        return self.codex(process, messages, role, prompt, root, session, schema, progress, cancel)
+                    if self.config.kind == 'claude-code': process.stdin.write(prompt + '\n'); process.stdin.flush()
+                    process.stdin.close()
+                    return self.cli(process, messages, progress, cancel)
+                finally: finished.set()
 
     def next_message(self, process, messages, deadline, cancel):
         if time.monotonic() >= getattr(self, '_next_space_check', 0):
@@ -249,8 +327,9 @@ class NativeDriver:
         except queue.Empty: return '', ''
 
     def cli(self, process, messages, progress, cancel):
-        text, errors, session, usage, done = '', [], '', {}, set()
-        terminal, success = False, False
+        from collections import deque
+        text, errors, session, usage, done = '', deque(maxlen=32), '', {}, set()
+        terminal, success, failed = False, False, False
         deadline = time.monotonic() + self.timeout
         try:
             while len(done) < 2:
@@ -271,22 +350,24 @@ class NativeDriver:
                     if isinstance(content, str) and content: text = content
                 if kind == 'result':
                     terminal = True
+                    failed = failed or bool(event.get('is_error', False))
                     success = not event.get('is_error', False) and event.get('status', 'SUCCESS') in ('SUCCESS', 'success', 'completed')
                     structured = event.get('structured_output')
                     text = json.dumps(structured) if structured is not None else event.get('result') or event.get('response') or text
                     usage = event.get('usage') or {}
                     if event.get('error'): errors.append(str(event['error']))
                 if kind in ('session.end', 'assistant.turn_end'): terminal = True; success = True
-                if kind in ('session.error', 'assistant.error', 'error'): success = False; errors.append(str(data or event))
+                if kind in ('session.error', 'assistant.error', 'error'): failed = True; success = False; errors.append(str(data or event))
             code = process.wait(timeout=5)
-            return AgentReply(code == 0 and terminal and success and bool(text.strip()), text, session,
+            return AgentReply(code == 0 and terminal and success and not failed and bool(text.strip()), text, session,
                               '\n'.join(errors)[-4000:], usage)
         except (InterruptedError, TimeoutError) as error:
             return AgentReply(False, text, session, str(error), usage, isinstance(error, InterruptedError))
 
     def codex(self, process, messages, role, prompt, root, session, schema, progress, cancel):
         deadline = time.monotonic() + self.timeout
-        request_id, pending, errors = 0, {}, []
+        from collections import deque
+        request_id, pending, errors = 0, {}, deque(maxlen=32)
         final, thread, usage = '', session, {}
         def send(method, params, identity=None):
             nonlocal request_id
@@ -297,8 +378,10 @@ class NativeDriver:
             process.stdin.write(json.dumps(packet) + '\n'); process.stdin.flush()
         send('initialize', {'clientInfo': {'name': 'auto_agents_repair_v2', 'version': '2'},
                             'capabilities': {'experimentalApi': True}})
-        model, settings = self.selected()
+        model, settings = self.selected(role)
         for key in ('mcp_servers', 'hooks', 'plugins'): settings.pop(key, None)
+        for provider in settings.get('model_providers', {}).values():
+            if provider.get('base_url'): provider['base_url'] = bridge_url(provider['base_url'])
         settings['mcp_servers'] = {}
         settings.setdefault('features', {})['apps'] = False
         try:
@@ -313,7 +396,10 @@ class NativeDriver:
                 except ValueError: continue
                 if 'id' in event and 'method' not in event:
                     method = pending.pop(event['id'], '')
-                    if event.get('error'): return AgentReply(False, final, thread, str(event['error']))
+                    if event.get('error'):
+                        detail = str(event['error'])
+                        missing = method == 'thread/resume' and bool(re.search(r'(thread|session).*(not found|does not exist|unknown)|unknown (thread|session)', detail, re.I))
+                        return AgentReply(False, final, thread, detail, missing_session=missing)
                     if method == 'initialize':
                         process.stdin.write('{"method":"initialized","params":{}}\n'); process.stdin.flush()
                         # The external container enforces phase-specific mounts.
@@ -321,7 +407,9 @@ class NativeDriver:
                         params = {'cwd': str(root), 'approvalPolicy': 'never',
                                   'sandbox': 'danger-full-access', 'config': settings}
                         if model: params['model'] = model
-                        if thread: params['threadId'] = thread
+                        if thread:
+                            params['threadId'] = thread
+                            params['excludeTurns'] = True
                         send('thread/resume' if thread else 'thread/start', params)
                     elif method in ('thread/start', 'thread/resume'):
                         thread = event['result']['thread']['id']
@@ -339,7 +427,9 @@ class NativeDriver:
                 method, params = event.get('method', ''), event.get('params') or {}
                 if 'id' in event:
                     # Missing user facts must be surfaced, not guessed as authorization.
-                    return AgentReply(False, final, thread, 'provider requires external input: ' + method)
+                    questions = params.get('questions') or []
+                    detail = '; '.join(str(q.get('question') or q.get('header') or '') for q in questions if isinstance(q, dict))
+                    return AgentReply(False, final, thread, 'provider requires external input: ' + method + (': ' + detail if detail else ''))
                 if progress: progress({'session': thread, 'event': method})
                 if method == 'item/completed':
                     item = params.get('item', {})
@@ -348,7 +438,7 @@ class NativeDriver:
                 if method == 'thread/tokenUsage/updated': usage = params.get('tokenUsage', {})
                 if method == 'turn/completed':
                     turn = params['turn']
-                    return AgentReply(turn.get('status') == 'completed' and bool(final.strip()), final, thread,
+                    return AgentReply(turn.get('status') == 'completed' and not turn.get('error') and bool(final.strip()), final, thread,
                                       str(turn.get('error') or ''), usage)
         except (InterruptedError, TimeoutError) as error:
             return AgentReply(False, final, thread, str(error), usage, isinstance(error, InterruptedError))

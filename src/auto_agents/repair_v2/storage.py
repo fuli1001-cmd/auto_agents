@@ -76,5 +76,9 @@ def recover_executions(root, active_mounts):
             except BlockingIOError:
                 continue
             shutil.rmtree(source)
+            target = base / 'target'
+            if target.is_dir() and not target.is_symlink() and not any(
+                    p == target or target in p.parents or p in target.parents for p in active_mounts):
+                shutil.rmtree(target)
             recovered.append(str(source))
     return recovered

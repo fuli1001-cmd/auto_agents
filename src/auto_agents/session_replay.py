@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 
-def main() -> None:
+def main() -> dict[str, object]:
     engine, target, session_id, mode = sys.argv[1:5]
     sys.path.insert(0, str(Path(engine) / "src"))
     from auto_agents.config import load_session_state
@@ -34,6 +34,9 @@ def main() -> None:
             prepare(project, session_id, mode)
         else:
             load_session_state(project, session_id)
+        # Child recovery may construct another Orchestrator. Keep every such
+        # instance at the same offline provider boundary within this process.
+        Orchestrator._call_with_failover = no_provider
         orchestrator = Orchestrator(project)
         orchestrator._call_with_failover = no_provider
         session = Session(orchestrator, mode=mode, auto_approve=True)
@@ -55,6 +58,7 @@ def main() -> None:
         if not payload["route_consumed"]:
             payload.update(ok=False, error="original engine request was not consumed before the next boundary")
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return payload
 
 
 if __name__ == "__main__":

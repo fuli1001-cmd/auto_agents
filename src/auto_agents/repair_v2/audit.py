@@ -25,6 +25,7 @@ def assertions(text):
 
 def protect_tests(base_repository, base_commit, candidate):
     candidate = Path(candidate)
+    protect_selection(base_repository, base_commit, candidate)
     names = git(base_repository, 'ls-tree', '-r', '--name-only', base_commit, '--', 'tests').splitlines()
     for name in names:
         if not name.endswith('.py'): continue
@@ -41,3 +42,30 @@ def protect_tests(base_repository, base_commit, candidate):
             raise RepairBlocked('tests_invalid', name + ': ' + str(error)) from error
         if not old_names <= new_names or old_checks - new_checks or new_skip - old_skip:
             raise RepairBlocked('tests_weakened', 'existing assertions or test entries weakened: ' + name)
+
+
+def protect_selection(base_repository, base_commit, candidate):
+    """Selection changes must not silently remove existing regression coverage."""
+    import configparser
+    try: import tomllib
+    except ImportError: import tomli as tomllib
+    selection = {'addopts', 'testpaths', 'python_files', 'python_classes', 'python_functions', 'norecursedirs'}
+    paths = ('pytest.ini', '.pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini')
+    def options(name, text):
+        if not text.strip(): return {}
+        if name == 'pyproject.toml':
+            values = tomllib.loads(text).get('tool', {}).get('pytest', {}).get('ini_options', {})
+        else:
+            parser = configparser.ConfigParser(interpolation=None); parser.read_string(text)
+            section = 'tool:pytest' if name == 'setup.cfg' else 'pytest'
+            values = dict(parser[section]) if parser.has_section(section) else {}
+        return {key: value for key, value in values.items() if key in selection}
+    import subprocess
+    for name in paths:
+        process = subprocess.run(['git', '-C', str(base_repository), 'show', base_commit + ':' + name],
+                                 capture_output=True, text=True)
+        before = options(name, process.stdout) if process.returncode == 0 else {}
+        path = Path(candidate) / name
+        after = options(name, path.read_text()) if path.is_file() else {}
+        if before != after:
+            raise RepairBlocked('tests_weakened', 'regression selection settings changed: ' + name)

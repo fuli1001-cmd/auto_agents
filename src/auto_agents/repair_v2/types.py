@@ -38,6 +38,7 @@ class AgentReply:
     error: str = ''
     usage: Dict[str, Any] = field(default_factory=dict)
     interrupted: bool = False
+    missing_session: bool = False
 
 
 @dataclass(frozen=True)

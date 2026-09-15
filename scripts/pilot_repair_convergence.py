@@ -74,7 +74,7 @@ def git(root, *args):
     return subprocess.check_output(['git', '-C', str(root), *args], text=True).strip()
 
 
-def run(output, configuration_project, provider, proposal=None):
+def run(output, configuration_project, provider, proposal=None, cycles=2):
     from auto_agents.adapters.codex import CodexAdapter
     from auto_agents.config import load_project_config
     from auto_agents.models import ProjectConfig
@@ -114,7 +114,7 @@ def run(output, configuration_project, provider, proposal=None):
         start = time.monotonic()
         print('provider start: ' + request.stage, flush=True)
         result = adapter.run(request)
-        calls.append({'stage': request.stage, 'seconds': time.monotonic() - start, 'ok': result.ok,
+        calls.append({'stage': request.stage, 'effort': request.effort, 'model': result.model, 'seconds': time.monotonic() - start, 'ok': result.ok,
             'prompt_chars': len(request.prompt), 'native_schema': '--output-schema' in result.command,
             'usage': asdict(result.usage) if is_dataclass(result.usage) else result.usage})
         (output / 'provider_calls.json').write_text(json.dumps(calls, indent=2))
@@ -186,7 +186,7 @@ def run(output, configuration_project, provider, proposal=None):
     results, phase_calls = [], []
     seen = set()
     start = time.monotonic()
-    for phase in ('retained_plan' if proposal else 'initial', 'injected_regression'):
+    for phase in ('retained_plan' if proposal else 'initial', 'injected_regression')[:cycles]:
         if phase == 'injected_regression':
             workspace = runner._continuous_workspace / 'repair'
             (workspace / 'source.py').write_text(BROKEN)
@@ -227,7 +227,7 @@ def run(output, configuration_project, provider, proposal=None):
     assert (workspace / 'tests/test_alias_reuse.py').read_text().startswith(TESTS), 'original acceptance was modified'
     assert (target / 'sentinel.txt').read_text() == 'preserve original target\n'
     final = runner._run_verification_commands([full], workspace)
-    report = {'ok': final.ok, 'scope': 'two real-provider component repair cycles and complete fixture acceptance',
+    report = {'ok': final.ok, 'scope': str(cycles) + ' real-provider component repair cycles and complete fixture acceptance',
         'original_project_resumed': False, 'engine_published': False, 'final_engine_handoff_exercised': False,
         'retained_untrusted_plan': str(proposal) if proposal else None,
         'seconds': time.monotonic() - start, 'phase_calls': phase_calls, 'calls': calls, 'results': results,
@@ -244,5 +244,6 @@ if __name__ == '__main__':
     parser.add_argument('--configuration-project', type=Path, required=True, help='read provider and effort settings only')
     parser.add_argument('--provider', required=True)
     parser.add_argument('--proposal', type=Path, help='original model result.json with adjacent request/input artifacts; requires fresh probes and independent review')
+    parser.add_argument('--cycles', type=int, choices=(1, 2), default=2)
     args = parser.parse_args()
-    raise SystemExit(run(args.output.resolve(), args.configuration_project.resolve(), args.provider, args.proposal))
+    raise SystemExit(run(args.output.resolve(), args.configuration_project.resolve(), args.provider, args.proposal, args.cycles))

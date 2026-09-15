@@ -173,6 +173,9 @@ def check_revision(runner, checkout, base):
 
 
 def repair(request):
+    if request['config'].get('repair_engine') == 'v2':
+        from auto_agents.repair_v2.integration import repair_entry
+        return repair_entry(request)
     from auto_agents.root_cause import RootCauseCoordinator
     from auto_agents.repository_guard import capture_repository_guard, guard_fingerprint
     config, job = request["config"], request["job"]
@@ -214,9 +217,6 @@ def repair(request):
     request["prepared_runtime"] = {"revision": revision, "fresh": fresh, "python": python,
                                    "environment": environment, 'source_selection': selection}
     execute_selected_worker(request, checkout, python)
-    if config.get('repair_engine') == 'v2':
-        from auto_agents.repair_v2.integration import repair as unified_repair
-        return unified_repair(request, checkout, python, environment, revision)
     from auto_agents.verification_sandbox import check_verification_sandbox
     check_verification_sandbox(checkout, python, Path(payload["project"]))
     from auto_agents.verification_input_trace import check_input_tracing
@@ -321,6 +321,9 @@ def carry_continuous_work(runner, revision):
 
 
 def publish(request):
+    if request['job'].get('result', {}).get('engine') == 'v2':
+        from auto_agents.repair_v2.integration import publish as unified
+        return unified(request)
     config, job = request["config"], request["job"]
     config = operator_policy(config)
     repository = Repository(config)
@@ -396,6 +399,9 @@ def publish(request):
 
 
 def validate_subscriber(request):
+    if request['job'].get('result', {}).get('engine') == 'v2':
+        from auto_agents.repair_v2.integration import validate_subscriber as unified
+        return unified(request)
     from auto_agents.root_cause import RootCauseCoordinator
     config, job, subscriber = request["config"], request["job"], request["subscriber"]
     payload = subscriber["payload"]["repair"]

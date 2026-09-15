@@ -147,3 +147,37 @@ def test_failed_validation_does_not_dispatch_remaining_copies(tmp_path):
         result = verifier.validate('source', tmp_path,
             [ValidationUnit(str(i), 'command ' + str(i)) for i in range(20)], threading.Event())
     assert not result.ok and seen == ['0']
+
+
+def test_snapshot_retention_preserves_reproducible_commits(tmp_path):
+    from auto_agents.repair_v2.workspace import Workspace
+    source = tmp_path / 'repo'; source.mkdir(); git(source, 'init', '-q')
+    (source / 'source.py').write_text('value = 0\n'); git(source, 'add', '.'); git(source, 'commit', '-qm', 'base')
+    workspace = Workspace(tmp_path / 'work', source, git(source, 'rev-parse', 'HEAD'))
+    candidate = workspace.prepare(); snapshots = []
+    for value in range(5):
+        (candidate / 'source.py').write_text(f'value = {value}\n')
+        workspace.checkpoint(); identity, path = workspace.freeze(); snapshots.append(identity)
+        workspace.collect_snapshots(identity)
+    assert len([p for p in (workspace.root / 'snapshots').iterdir() if p.is_dir()]) == 2
+    recovered = workspace.materialize(snapshots[0])
+    assert source_identity(recovered) == snapshots[0]
+    assert (recovered / 'source.py').read_text() == 'value = 0\n'
+
+
+def test_initial_merge_conflict_remains_in_one_candidate_for_implementation(tmp_path):
+    import subprocess
+    from auto_agents.repair_v2.workspace import Workspace
+    source = tmp_path / 'repo'; source.mkdir(); git(source, 'init', '-q')
+    (source / 'source.py').write_text('value = 0\n'); git(source, 'add', '.'); git(source, 'commit', '-qm', 'base')
+    retained = tmp_path / 'retained'; subprocess.run(['git', 'clone', '-q', str(source), str(retained)], check=True)
+    (retained / 'source.py').write_text('value = 1\n'); git(retained, 'add', '.'); git(retained, 'commit', '-qm', 'partial repair')
+    (source / 'source.py').write_text('value = 2\n'); git(source, 'add', '.'); git(source, 'commit', '-qm', 'upstream')
+    workspace = Workspace(tmp_path / 'work', source, git(source, 'rev-parse', 'HEAD'), retained=retained)
+    candidate = workspace.prepare()
+    assert '<<<<<<<' in (candidate / 'source.py').read_text()
+    (candidate / 'source.py').write_text('value = 3\n')
+    workspace.checkpoint()
+    assert not git(candidate, 'diff', '--name-only', '--diff-filter=U')
+    for parent in (git(retained, 'rev-parse', 'HEAD'), git(source, 'rev-parse', 'HEAD')):
+        git(candidate, 'merge-base', '--is-ancestor', parent, 'HEAD')

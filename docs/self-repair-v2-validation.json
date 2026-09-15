@@ -1,0 +1,12 @@
+{
+  "status": "final_regression_running",
+  "real_provider_scope": ["codex"],
+  "other_provider_live_validation_waived_by_user": true,
+  "original_session": "6a0cedd6674d",
+  "retained_candidate": "dc0dadebf320e24d01743bb365daa202d154214f",
+  "original_boundary_probe": "passed_without_modifying_original_project",
+  "native_interruption": {"passed": true, "same_writer_session_resumed": true},
+  "native_cross_module_repair": {"passed": true, "implementation_attempts": 1},
+  "speed_target_reduction": 0.75,
+  "speed_target_claimed_met": false
+}

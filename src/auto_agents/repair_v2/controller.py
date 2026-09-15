@@ -53,11 +53,20 @@ def review_result(text, snapshot, requirements):
     return ReviewResult(result['decision'] == 'APPROVE' and not findings, snapshot, findings, text, coverage)
 
 
+class Cancellation:
+    def __init__(self, parent, local): self.parent, self.local = parent, local
+    def is_set(self): return self.parent.is_set() or self.local.is_set()
+
+
 class Controller:
-    def __init__(self, request, store, workspace, driver, verifier, *, units, max_stagnant=2, max_replans=1):
+    def __init__(self, request, store, workspace, driver, verifier, *, units, max_stagnant=2, max_replans=1, boundary=None, resume_token='', allow_implementation=True, regression=None):
         self.request, self.store, self.workspace = request, store, workspace
         self.driver, self.verifier, self.units = driver, verifier, units
         self.max_stagnant, self.max_replans = max_stagnant, max_replans
+        self.regression = regression
+        self.allow_implementation = allow_implementation
+        self.boundary = boundary
+        self.resume_token = resume_token
         self.cancel = threading.Event()
         self.state_lock = threading.RLock()
 
@@ -68,9 +77,9 @@ class Controller:
 
     def phase(self, name):
         self.checkpoint(phase=name)
-        self.store.event('phase_started', phase=name)
+        self.store.event('phase_started', phase=name, attempt=self.state.get('attempts', 0))
 
-    def agent(self, role, prompt, root, *, schema=None):
+    def agent(self, role, prompt, root, *, schema=None, cancel=None, fallback_prompt=None):
         if self.cancel.is_set(): raise KeyboardInterrupt()
         before = source_identity(root)
         with self.state_lock:
@@ -94,7 +103,7 @@ class Controller:
         session = self.state['sessions'].get(role, '')
         if role == 'implement': session = session or self.state['sessions'].get('plan', '')
         reply = self.driver.run(role, prompt, root, session=session, schema=schema,
-                                progress=progress, cancel=self.cancel)
+                                progress=progress, cancel=cancel or self.cancel)
         with self.state_lock:
             if reply.session: self.state['sessions'][role] = reply.session
             self.store.save(self.state)
@@ -103,7 +112,21 @@ class Controller:
         self.store.artifact('agent-output', asdict(reply))
         if role != 'implement' and source_identity(root) != before:
             raise RepairBlocked('read_only_violation', role + ' modified protected source')
-        if reply.interrupted or self.cancel.is_set(): raise KeyboardInterrupt()
+        if self.cancel.is_set(): raise KeyboardInterrupt()
+        if reply.interrupted or cancel is not None and cancel.is_set():
+            if cancel is not None: raise InterruptedError('acceptance cancelled after a concrete failure')
+            raise KeyboardInterrupt()
+        if reply.missing_session and session:
+            recovered = dict(self.state.get('session_recoveries', {}))
+            if recovered.get(role, 0) < 1:
+                recovered[role] = 1
+                sessions = dict(self.state['sessions'])
+                sessions.pop(role, None)
+                if role in ('plan', 'implement'):
+                    sessions.pop('plan', None); sessions.pop('implement', None)
+                self.checkpoint(sessions=sessions, session_recoveries=recovered)
+                self.store.event('native_session_recovered', role=role, old_session=session)
+                return self.agent(role, fallback_prompt or prompt, root, schema=schema, cancel=cancel)
         if not reply.ok: raise RepairBlocked('provider_failed', reply.error or 'provider did not complete the turn')
         return reply
 
@@ -119,6 +142,10 @@ class Controller:
             'Do not edit source, execute a test suite or create separately approved component groups. '
             'Internal steps are only an implementation checklist. Preserve the requested scope and all mandatory tests. '
             'Use only supplied authorization; resolve implementation details from the repository.\n' + self.context())
+        from .context import source_context
+        prompt += '\nCURRENT SOURCE:\n' + source_context(root, self.request.engine_base)
+        prompt += ('\nUse the supplied source directly when sufficient; avoid repeating discovery or reading the same files. '
+                   'Keep the plan concise, with concrete changes and acceptance coverage; do not restate the request.')
         if rediagnose:
             prompt += '\nTwo implementations made no verified progress. Reconsider the root cause using these concrete failures:\n'
             prompt += json.dumps(self.state['failures'], ensure_ascii=False)
@@ -140,11 +167,26 @@ class Controller:
         self.agent('implement', prompt, root)
         from .audit import protect_tests
         protect_tests(self.workspace.source, self.request.engine_base, root)
+        for parent in self.state.get('integration_parents', []):
+            protect_tests(root, parent, root)
+        self.workspace.checkpoint()
         identity, snapshot = self.workspace.freeze()
         self.checkpoint(snapshot=identity, snapshot_path=str(snapshot), attempts=self.state['attempts'] + 1,
                         phase='validate')
 
-    def review(self, identity, snapshot):
+    def review(self, identity, snapshot, cancel=None):
+        try: return self._review(identity, snapshot, cancel)
+        except InterruptedError:
+            return ReviewResult(False, identity, text='Review cancelled after a concrete test failure.')
+
+    def _review(self, identity, snapshot, cancel=None):
+        key = digest([self.state['request_digest'], identity,
+                      self.state.get('verification_runtime'), self.state['failures']])
+        if self.state.get('review_input') == key and self.state.get('review'):
+            saved = self.store.read(self.state['review'])
+            if saved.get('snapshot') == identity:
+                self.store.event('review_reused', snapshot=identity)
+                return review_result(saved['text'], identity, {r.identity for r in self.request.acceptance})
         prompt = ('Independently review this immutable candidate against every frozen requirement and the original baseline. '
             'Inspect the diff, relevant source and coverage. Do not modify files or run a broad test suite. '
             'Block only demonstrated violations or introduced regressions, with a concrete counterexample and check. '
@@ -154,11 +196,15 @@ class Controller:
             'An approval maps every requirement to actual behavioral tests; generic passing tests are not coverage. '
             'Every finding must name one supplied requirement identity. APPROVE requires no findings.\n'
             + self.context() + '\nOriginal baseline: ' + self.request.engine_base
-            + '\nPlan:\n' + self.store.read(self.state['plan'])['text'])
+            + '\nPlan context (not acceptance evidence):\n' + self.store.read(self.state['plan'])['text'])
+        from .context import source_context
+        prompt += '\nCURRENT SOURCE AND DIFF:\n' + source_context(snapshot, self.request.engine_base)
+        prompt += ('\nUse this exact source and diff for review; retrieve additional dependencies only as needed. '
+                   'Do not repeat repository discovery when the supplied contents are complete.')
         if self.state.get('review'):
             prompt += '\nPrevious independent review (recheck the current delta):\n' + json.dumps(
                 self.store.read(self.state['review']), ensure_ascii=False)
-        reply = self.agent('review', prompt, snapshot, schema=REVIEW_SCHEMA)
+        reply = self.agent('review', prompt, snapshot, schema=REVIEW_SCHEMA, cancel=cancel)
         try: result = review_result(reply.text, identity, {r.identity for r in self.request.acceptance})
         except RepairBlocked as error:
             if self.state.get('review_format_retries', 0) >= 1: raise
@@ -173,13 +219,13 @@ class Controller:
             self.checkpoint(review_format_retries=1)
             reply = self.agent('review', 'Correct only the result envelope of the previous review; preserve all '
                 'substantive decisions and evidence. Return the requested JSON. Problem: ' + str(error)
-                + '\nOriginal response:\n' + reply.text, snapshot, schema=REVIEW_SCHEMA)
+                + '\nOriginal response:\n' + reply.text, snapshot, schema=REVIEW_SCHEMA, cancel=cancel)
             result = review_result(reply.text, identity, {r.identity for r in self.request.acceptance})
             if ((result.ok and original['decision'] != 'APPROVE')
                     or digest(result.findings) != digest(original['findings'])):
                 raise RepairBlocked('review_semantics_changed',
                     'format correction changed the independent verdict or blocking evidence')
-        self.checkpoint(review=self.store.artifact('review', asdict(result)))
+        self.checkpoint(review=self.store.artifact('review', asdict(result)), review_input=key)
         return result
 
     def validate(self):
@@ -189,21 +235,25 @@ class Controller:
             raise RepairBlocked('snapshot_changed', 'verification snapshot no longer matches its checkpoint')
         self.phase('validate')
         self.checkpoint(verification_runtime=getattr(self.verifier, 'runtime', ''))
+        tests_cancel, review_cancel = threading.Event(), threading.Event()
+        units = self.units(snapshot)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            tests = pool.submit(self.verifier.validate, identity, snapshot, self.units(snapshot), self.cancel)
-            reviewed = pool.submit(self.review, identity, snapshot)
+            tests = pool.submit(self.verifier.validate, identity, snapshot, units, Cancellation(self.cancel, tests_cancel))
+            reviewed = pool.submit(self.review, identity, snapshot, Cancellation(self.cancel, review_cancel))
             try:
                 # Observe either side's infrastructure failure immediately;
                 # waiting on tests first can leave a failed reviewer unnoticed.
                 for completed in as_completed((tests, reviewed)):
-                    completed.result()
+                    result = completed.result()
+                    if completed is tests and not result.ok: review_cancel.set()
+                    if completed is reviewed and result.findings: tests_cancel.set()
                 validation, review = tests.result(), reviewed.result()
             except BaseException:
                 self.cancel.set()
                 raise
         if validation.snapshot != identity or review.snapshot != identity or source_identity(snapshot) != identity:
             raise RepairBlocked('snapshot_changed', 'acceptance evidence belongs to a different source snapshot')
-        if validation.cancelled:
+        if validation.cancelled and not tests_cancel.is_set():
             self.checkpoint(validation=self.store.artifact('validation', asdict(validation)))
             raise KeyboardInterrupt()
         if validation.infrastructure:
@@ -218,18 +268,57 @@ class Controller:
             validation.failures.append({'reason': 'reviewed behavioral coverage was not executed', 'missing': missing})
         proof = self.store.artifact('validation', asdict(validation))
         self.checkpoint(validation=proof)
+        self.workspace.collect_snapshots(identity)
+        regression = None
+        if validation.ok and review.ok and self.regression is not None:
+            self.phase('regression')
+            observed = self.regression(identity, snapshot, review.coverage, self.cancel)
+            regression = self.store.artifact('regression', observed)
+            self.checkpoint(regression=regression)
+            if observed.get('infrastructure'):
+                raise RepairBlocked('verification_infrastructure', observed.get('reason', 'baseline environment failed'))
+            if not observed.get('ok') or observed.get('snapshot') != identity:
+                validation.ok = False
+                validation.failures.append({'unit': 'behavior-regression', 'reason': observed.get('reason', 'regression proof missing')})
+                proof = self.store.artifact('validation', asdict(validation))
+                self.checkpoint(validation=proof)
+        boundary = None
+        if validation.ok and review.ok and self.boundary is not None:
+            self.phase('boundary')
+            observed = self.boundary(identity, snapshot, self.cancel)
+            boundary = self.store.artifact('boundary', observed)
+            self.checkpoint(boundary=boundary)
+            if not observed.get('ok') or observed.get('snapshot') != identity:
+                validation.ok = False
+                validation.failures.append({'unit': 'original-boundary', 'reason': 'original recovery boundary failed',
+                                            'observed': observed.get('observed', observed)})
+                proof = self.store.artifact('validation', asdict(validation))
+                self.checkpoint(validation=proof)
         if validation.ok and review.ok:
             self.checkpoint(status='ready', phase='deliver', failures=[],
                 receipt=self.store.artifact('acceptance', {'request': self.state['request_digest'],
-                    'snapshot': identity, 'validation': proof, 'review': self.state['review']}))
+                    'snapshot': identity, 'validation': proof, 'review': self.state['review'], 'boundary': boundary, 'regression': regression}))
             return True
         failures = [*validation.failures, *review.findings]
         if not failures: raise RepairBlocked('invalid_validation', 'incomplete acceptance has no actionable failure')
-        old = {digest(f) for f in self.state['failures']}
-        current = {digest(f) for f in failures}
-        progressed = bool(old and current < old)
-        self.checkpoint(failures=failures, stagnant=0 if progressed else self.state['stagnant'] + 1,
-                        phase='implement')
+        def keys(rows):
+            # Traceback paths, elapsed times and wording do not measure progress.
+            values = set()
+            for row in rows:
+                if row.get('failed'):
+                    values.update(('test', n) for n in row['failed'])
+                elif row.get('missing'):
+                    values.update(('missing', n) for n in row['missing'])
+                elif row.get('requirement'):
+                    values.add(('review', row['requirement'], row.get('check', '')))
+                else: values.add(('unit', row.get('unit', row.get('command', row.get('reason', 'unknown')))))
+            return values
+        current = keys(failures)
+        best = {tuple(item) for item in self.state.get('best_failure_keys', [])}
+        progressed = bool(best and current < best)
+        if not best or progressed: best = current
+        self.checkpoint(failures=failures, best_failure_keys=sorted(best),
+                        stagnant=0 if progressed else self.state['stagnant'] + 1, phase='implement')
         self.store.event('acceptance_failed', snapshot=identity, failures=failures, progressed=progressed)
         return False
 
@@ -254,15 +343,35 @@ class Controller:
                     self.checkpoint(status='active', phase='validate')
                 else: return self.state
             # An unchanged failure does not acquire a new recovery allowance on restart.
-            if self.state['status'] == 'blocked': return self.state
+            if self.state['status'] == 'blocked':
+                retryable = self.state.get('blocker', {}).get('code') in {
+                    'provider_failed', 'provider_configuration', 'docker_unavailable', 'disk_space',
+                    'verification_infrastructure', 'upstream_unavailable', 'disk_observation', 'execution_failed'}
+                if not (retryable and self.resume_token and self.resume_token != self.state.get('resume_token')):
+                    return self.state
+            self.checkpoint(resume_token=self.resume_token)
             self.checkpoint(status='active')
             try:
                 root = self.workspace.prepare()
                 self.verifier.prepare()
-                if not self.state.get('plan'): self.plan(root)
+                if hasattr(self.driver, 'preflight'): self.driver.preflight(root)
+                provider = getattr(getattr(self.driver, 'config', None), 'kind', 'test')
+                if self.state.get('session_provider') not in (None, provider):
+                    self.checkpoint(sessions={})
+                self.checkpoint(session_provider=provider)
+                if not self.state.get('plan'):
+                    if self.allow_implementation:
+                        self.plan(root)
+                    else:
+                        reference = self.store.artifact('plan', {'text': 'Verify the existing selected source without code generation.',
+                                                               'request': self.state['request_digest']})
+                        identity, snapshot = self.workspace.freeze()
+                        self.checkpoint(plan=reference, snapshot=identity, snapshot_path=str(snapshot), phase='validate')
                 while True:
                     if self.cancel.is_set(): raise KeyboardInterrupt()
-                    if self.state['phase'] != 'validate':
+                    if self.state['phase'] not in ('validate', 'boundary', 'regression'):
+                        if not self.allow_implementation:
+                            raise RepairBlocked('guarded_mode', 'existing source failed acceptance; code generation is not authorized')
                         if self.state['stagnant'] >= self.max_stagnant:
                             if self.state['replans'] >= self.max_replans:
                                 raise RepairBlocked('no_progress', 'repair made no verified progress after its bounded rediagnosis')
@@ -279,3 +388,40 @@ class Controller:
                 self.checkpoint(status='blocked', blocker={'code': error.code, 'message': str(error)})
                 self.store.event('blocked', **self.state['blocker'])
                 return self.state
+            except Exception as error:
+                from ..repair_environment_log import sanitize
+                self.checkpoint(status='blocked', blocker={'code': 'execution_failed',
+                    'message': sanitize(f'{type(error).__name__}: {error}')[:2000]})
+                self.store.event('blocked', **self.state['blocker'])
+                return self.state
+
+    def integrate(self, repository, parents):
+        """Reconcile upstream on the same candidate, keeping original repair budget."""
+        from .workspace import git
+        with self.store.locked():
+            self.state = self.store.load()
+            if not self.state or self.state['status'] not in ('ready', 'active'):
+                raise RepairBlocked('integration_state', 'integration requires a retained accepted candidate')
+            root = self.workspace.prepare()
+            self.workspace.checkpoint()
+            conflicts = []
+            import subprocess
+            for parent in dict.fromkeys(parents):
+                git(root, 'fetch', '--quiet', str(repository), parent)
+                result = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-C', str(root),
+                                         'merge-base', '--is-ancestor', parent, 'HEAD'], capture_output=True)
+                if result.returncode == 0: continue
+                try: git(root, 'merge', '--no-edit', parent)
+                except subprocess.CalledProcessError:
+                    conflicts = git(root, 'diff', '--name-only', '--diff-filter=U').splitlines()
+                    if not conflicts: raise
+                    break
+            if conflicts:
+                self.checkpoint(status='active', phase='implement', failures=[{
+                    'unit': 'upstream-integration', 'reason': 'Resolve these merge conflicts while preserving both histories',
+                    'paths': conflicts}], integration_parents=list(parents))
+            else:
+                identity, snapshot = self.workspace.freeze()
+                self.checkpoint(status='active', phase='validate', snapshot=identity, snapshot_path=str(snapshot),
+                                integration_parents=list(parents))
+            self.store.event('integration_prepared', parents=list(parents), conflicts=conflicts)
