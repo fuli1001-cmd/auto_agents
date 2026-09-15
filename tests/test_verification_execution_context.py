@@ -303,6 +303,40 @@ def _pytest_environment_failure(tmp_path, monkeypatch, selector):
     assert {path: (root / path).read_bytes() for path in ambient} == ambient
 
 
+def test_public_resume_uses_admitted_environment_during_dispatch(tmp_path, monkeypatch):
+    from auto_agents.gate_execution import LocalGatePlanExecutor
+    from execution_marker import ExecutionMarker
+
+    root, child = project(tmp_path)
+    marker = ExecutionMarker(tmp_path / 'admitted-body')
+    (root / 'qa').mkdir()
+    (root / 'pytest.ini').write_text('[pytest]\n')
+    (root / 'qa/regression_helpers.py').write_text(
+        'import os\nfrom pathlib import Path\ndef test_context():\n'
+        '    assert os.environ["PYTEST_ADDOPTS"] == "-o pythonpath=qa"\n'
+        '    value = Path("value.py").read_text()\n'
+        '    ' + marker.source('value', append=True) + '\n'
+        '    assert value == "VALUE = 1\\n"\n')
+    (root / 'tests/test_context.py').write_text('from regression_helpers import test_context\n')
+    command = shlex.join([sys.executable, '-m', 'pytest', '-q', 'tests/test_context.py::test_context'])
+    ambient = _retain_command(root, child, command, 'tests/test_context.py::test_context')
+    monkeypatch.setenv('PYTEST_ADDOPTS', '-o pythonpath=qa')
+    run = LocalGatePlanExecutor._run_command
+    changed = []
+    def dispatch(self, command, **kwargs):
+        assert self.execution_environment['PYTEST_ADDOPTS'] == '-o pythonpath=qa'
+        changed.append(command)
+        with monkeypatch.context() as late:
+            late.setenv('PYTEST_ADDOPTS', '--setup-only')
+            return run(self, command, **kwargs)
+    monkeypatch.setattr(LocalGatePlanExecutor, '_run_command', dispatch)
+    saved, calls, _ = run_session(root, monkeypatch)
+    assert saved.status == 'completed' and calls == ['fix'], saved.to_dict()
+    assert changed and 'VALUE = 1' in marker.read_text().splitlines()
+    assert 'qa/regression_helpers.py' in saved.verification_binding['proof_sources']
+    assert {path: (root / path).read_bytes() for path in ambient} == ambient
+
+
 def test_prepared_gate_keeps_shared_prefix_readonly(tmp_path, monkeypatch):
 
     root, child = project(tmp_path)

@@ -2249,7 +2249,8 @@ def test_public_resume_retains_manual_regression_sharing_foreign_future_file(
 @pytest.mark.parametrize('imports', ['direct', 'pythonpath', 'reexport',
                                    'inheritance', 'inheritance_local', 'inheritance_reexport',
                                    'inheritance_generic', 'inheritance_generic_named',
-                                   'inheritance_generic_reexport'])
+                                   'inheritance_generic_reexport', 'inherited_pythonpath',
+                                   'inherited_pythonpath_v6'])
 @pytest.mark.parametrize('outcome', ['weakening', 'intact_failure', 'passing'])
 def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatch, legacy, imports, outcome):
     from copy import deepcopy
@@ -2263,6 +2264,9 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
     root, child = project(tmp_path)
     marker = ExecutionMarker(tmp_path / 'imported-regression-executed')
     name = 'test_regression' if imports == 'direct' else 'check_regression'
+    inherited_options = imports.startswith('inherited_pythonpath')
+    if inherited_options:
+        name = 'test_regression'
     inherited = imports.startswith('inheritance')
     generic = imports.startswith('inheritance_generic')
     helper = 'regression_helpers.py' if imports == 'direct' else 'qa/regression_helpers.py'
@@ -2281,8 +2285,13 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
         helper_source = helper_source.replace('class BaseRegression:',
             'from typing import Generic, TypeVar\nT = TypeVar("T")\nclass BaseRegression(Generic[T]):')
     (root / helper).write_text(helper_source)
-    if imports != 'direct':
+    if imports != 'direct' and not inherited_options:
         (root / 'pytest.ini').write_text('[pytest]\npython_functions = test_* check_*\npythonpath = qa\n')
+    elif inherited_options:
+        # Establish only the config root. The import path must come solely
+        # from the inherited environment, not configuration or inline args.
+        (root / 'pytest.ini').write_text('[pytest]\n')
+        monkeypatch.setenv('PYTEST_ADDOPTS', '-o pythonpath=qa')
     module = 'regression_helpers'
     if imports in {'reexport', 'inheritance_reexport', 'inheritance_generic_reexport'}:
         exported = 'BaseRegression' if inherited else name
@@ -2319,12 +2328,15 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
         child.workflow_id = WorkflowStore(root).create_root(WorkflowRef('fix', child.session_id)).workflow_id
         child.authorization_policy = authorization_policy_for_state(auto_approve=True).to_dict()
         with monkeypatch.context() as previous:
-            previous.setattr(verification, '_PROOF_INVENTORY_VERSION', 5 if generic else 4 if inherited else 3)
+            previous_version = 6 if imports == 'inherited_pythonpath_v6' else 5 if generic else 4 if inherited else 3
+            previous.setattr(verification, '_PROOF_INVENTORY_VERSION', previous_version)
             verification.bind_session(Session(Orchestrator(root), mode='fix', auto_approve=True), child)
         # Reconstruct the old inventory that did not protect imported bodies.
         for entry in (helper, 'qa/regression_exports.py'):
             child.verification_binding['proof_sources'].pop(entry, None)
         child.verification_binding.pop('proof_source_owners', None)
+        if inherited_options:
+            child.verification_binding.pop('proof_execution_context', None)
         child.verification_binding['binding_fingerprint'] = verification.fingerprint({
             key: value for key, value in child.verification_binding.items() if key != 'binding_fingerprint'})
         save_session_state(root, child)
@@ -2363,6 +2375,10 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
     assert saved.verification_binding['proof_inventory_version'] == 6
     assert saved.verification_binding['proof_sources'][helper] == helper_source
     assert saved.verification_binding['proof_source_owners'][helper][0]['task_id'] == 'task-foreign'
+    if inherited_options:
+        assert saved.verification_binding['proof_execution_context']['schema_version'] == 1
+        assert 'pythonpath' not in (root / 'pytest.ini').read_text()
+        assert 'qa' not in foreign.targets[0]
     if outcome == 'weakening':
         assert saved.status != 'completed' and not dispatched and not cache_accesses
         assert not marker.exists()
@@ -2383,6 +2399,116 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
         assert 'VALUE = 1' in marker.read_text().splitlines()
         assert dispatched
     assert {entry: (root / entry).read_bytes() for entry in ambient} == ambient
+
+
+@pytest.mark.parametrize('boundary', ['receipt', 'completed'])
+@pytest.mark.parametrize('outcome', ['weakening', 'intact_failure', 'passing'])
+def test_public_resume_refreshes_proof_sources_after_environment_change(tmp_path, monkeypatch, boundary, outcome):
+    from copy import deepcopy
+    from auto_agents.config import load_task_plan
+    from auto_agents.gate_execution import LocalGatePlanExecutor
+    import auto_agents.session as session_module
+
+    root, child = project(tmp_path)
+    old_marker = ExecutionMarker(tmp_path / 'old-context')
+    new_marker = ExecutionMarker(tmp_path / 'new-context')
+    old_helper, new_helper = 'qa_before/regression_helpers.py', 'qa_after/regression_helpers.py'
+    for path, marker, expected in ((old_helper, old_marker, 1),
+                                  (new_helper, new_marker, 1 if outcome == 'passing' else 0)):
+        (root / path).parent.mkdir()
+        (root / path).write_text('from pathlib import Path\ndef test_regression():\n'
+            '    ' + marker.source('Path("value.py").read_text()', append=True) + '\n'
+            f'    assert "VALUE = {expected}" in Path("value.py").read_text()\n')
+    old_source, new_source = (root / old_helper).read_text(), (root / new_helper).read_text()
+    (root / 'pytest.ini').write_text('[pytest]\n')
+    (root / 'tests/test_regression.py').write_text('from regression_helpers import test_regression\n')
+    foreign = VerificationStep(proof_id='foreign.release', runner='pytest', levels=['release'],
+                               targets=['tests/test_regression.py::test_regression'])
+    config = load_project_config(root)
+    config.gates.steps[0].risk = 'critical'
+    config.gates.steps.append(foreign)
+    plan = load_task_plan(root)
+    plan['tasks'].append({'task_id': 'task-foreign', 'title': 'Retained regression',
+                         'workflow_id': 'foreign-workflow', 'status': 'pending',
+                         'requirement_ids': ['REQ-foreign'], 'verification_refs': ['foreign.release']})
+    plan['verification_steps'] = [step.to_dict() for step in config.gates.steps]
+    _retain_contract(root, child, config, plan)
+    monkeypatch.setenv('PYTEST_ADDOPTS', '-o pythonpath=qa_before')
+    writers = []
+    orch = Orchestrator(root)
+    def provider(request):
+        writers.append(request.purpose)
+        (request.cwd / 'value.py').write_text('VALUE = 1\n')
+        if outcome == 'weakening':
+            (request.cwd / new_helper).write_text(new_source.replace(
+                'assert "VALUE = 0" in Path("value.py").read_text()', 'assert True'))
+        reply = 'Repaired value\nCOMMIT_MESSAGE: Repair owned value'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    monkeypatch.setattr(orch, '_call_with_failover', provider)
+    def resume():
+        return Session(orch, mode='fix', auto_approve=True).resume(child.session_id)
+    with monkeypatch.context() as interrupted:
+        if boundary == 'receipt':
+            def pause(*args, **kwargs):
+                raise KeyboardInterrupt()
+            interrupted.setattr(Session, '_run_session_persistence_action', pause)
+        saved = resume()
+    assert saved.status == ('paused' if boundary == 'receipt' else 'completed'), saved.to_dict()
+    assert writers == ['fix'] and 'VALUE = 1' in old_marker.read_text().splitlines()
+    assert not new_marker.exists()
+    assert any(entry.get('action') == 'receipt_verification' and entry['verification']['ok']
+               for entry in saved.execution_log)
+    previous_context = deepcopy(saved.verification_binding['proof_execution_context'])
+    custody = deepcopy(saved.candidate_custody)
+    assert new_helper not in saved.verification_binding['proof_sources']
+    ambient_config = load_project_config(root)
+    ambient_config.gates.steps = [foreign]
+    save_project_config(root, ambient_config)
+    save_task_plan(root, {**plan, 'tasks': [plan['tasks'][-1]], 'verification_steps': [foreign.to_dict()]})
+    protected = {path: (root / path).read_bytes() for path in (
+        '.auto-agents/config.json', '.auto-agents/state/task_plan.json', '.git/index',
+        'value.py', old_helper, new_helper)}
+    dispatched, caches = [], []
+    run, lookup = session_module.run_gate_plan, LocalGatePlanExecutor.cached_result
+    def observe(commands, *args, **kwargs):
+        dispatched.extend(commands)
+        return run(commands, *args, **kwargs)
+    def observe_cache(self, command):
+        caches.append(command)
+        return lookup(self, command)
+    monkeypatch.setattr(session_module, 'run_gate_plan', observe)
+    monkeypatch.setattr(LocalGatePlanExecutor, 'cached_result', observe_cache)
+    monkeypatch.setenv('PYTEST_ADDOPTS', '-o pythonpath=qa_after')
+    saved = resume()
+    assert saved.verification_binding['proof_execution_context'] != previous_context
+    assert saved.verification_binding['proof_sources'][old_helper] == old_source
+    assert saved.verification_binding['proof_sources'][new_helper] == new_source
+    assert saved.candidate_custody['receipt'] == custody['receipt']
+    assert saved.candidate_custody['checkout'] == custody['checkout']
+    assert writers == ['fix']
+    if outcome == 'weakening':
+        assert saved.status == 'blocked' and not dispatched and not caches and not new_marker.exists()
+        diagnostic = next(entry['diagnostic'] for entry in reversed(saved.execution_log)
+                          if entry.get('diagnostic', {}).get('verification_ref') == new_helper)
+        assert diagnostic['owners'][0]['task_id'] == 'task-foreign'
+        assert diagnostic['owners'][0]['requirement_ids'] == ['REQ-foreign']
+        assert diagnostic['retry_fix'] is False
+    else:
+        assert (saved.status == 'completed') == (outcome == 'passing'), saved.to_dict()
+        assert dispatched and 'VALUE = 1' in new_marker.read_text().splitlines()
+    if outcome != 'intact_failure':
+        count = len(dispatched)
+        after = deepcopy(saved.candidate_custody)
+        for _ in range(2):
+            repeated = resume()
+            assert repeated.status == saved.status
+            assert repeated.candidate_custody == after
+            assert len(dispatched) == count and writers == ['fix']
+            if outcome == 'weakening':
+                assert not caches and not new_marker.exists()
+    assert {path: (root / path).read_bytes() for path in protected} == protected
 
 
 @pytest.mark.parametrize('reference', ['proof_id', 'target'])

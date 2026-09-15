@@ -4012,6 +4012,20 @@ class Session:
 
     @contextlib.contextmanager
     def _session_verification_config(self):
+        state = self._current_state
+        if state is not None and state.verification_binding:
+            from .session_verification import _validate_binding_identity
+            _validate_binding_identity(self, state)
+            from .verification_context import execution_context
+            with execution_context(self, state):
+                with self._session_verification_config_bound():
+                    yield
+        else:
+            with self._session_verification_config_bound():
+                yield
+
+    @contextlib.contextmanager
+    def _session_verification_config_bound(self):
         """Install retained gates without snapshot, execution or persistence work."""
         state = self._current_state
         if state is None or not state.verification_binding:
@@ -4056,18 +4070,25 @@ class Session:
     def _session_gate_executor_context(self, metadata=None, *, source_ref="", original_commands=None, **kwargs):
         state = self._current_state
         if state is not None and state.verification_binding:
+            from .verification_context import current_context
+            context = current_context(self, state)
+            kwargs['environment_overrides'] = dict(context.operator_environment)
+            kwargs['execution_environment'] = dict(context.environment)
             kwargs['contract_fingerprint'] = verification_fingerprint([
                 state.verification_binding.get('binding_fingerprint', ''),
                 state.candidate_custody.get('receipt', {}).get('fingerprint', ''),
                 'session-write-boundary-v1',
+                state.verification_binding.get('proof_execution_context'),
             ])
         executor = self.orch._gate_executor_context(
             metadata, source_ref=source_ref or getattr(self, "_candidate_source_ref", ""), **kwargs
         )
         executor.original_commands = dict(original_commands or {})
         if state is not None and state.verification_binding:
+            from functools import partial
             from .session_verification import prepare_retained_vitest_command
-            executor.prepare_retained_command = prepare_retained_vitest_command
+            executor.prepare_retained_command = partial(prepare_retained_vitest_command,
+                                                        environment=context.environment)
         if state is not None and state.candidate_custody:
             receipt = state.candidate_custody.get('receipt', {})
             if (source_ref or getattr(self, '_candidate_source_ref', '')) == receipt.get('source_revision'):

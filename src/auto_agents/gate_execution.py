@@ -902,7 +902,7 @@ def gate_environment(
     runtime_profile: str = SHORT_RUNTIME_PROFILE,
     dynamic_ports: Optional[Mapping[str, int]] = None,
 ) -> dict[str, str]:
-    env = dict(base or os.environ)
+    env = dict(os.environ if base is None else base)
     for key in list(env):
         if (
             key in {
@@ -1081,6 +1081,7 @@ class LocalGatePlanExecutor:
         environment_overrides: Optional[Mapping[str, str]] = None,
         proof_audit_sample_rate: float = 0.0,
         input_reuse_mode: str = "on",
+        execution_environment: Optional[Mapping[str, str]] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
@@ -1115,6 +1116,9 @@ class LocalGatePlanExecutor:
         self.use_result_cache = bool(use_result_cache)
         self.preempt_requested = preempt_requested
         self.environment_overrides = dict(environment_overrides or {})
+        from types import MappingProxyType
+        self.execution_environment = (None if execution_environment is None else
+                                      MappingProxyType(dict(execution_environment)))
         self.proof_audit_sample_rate = min(
             1.0,
             max(0.0, float(proof_audit_sample_rate)),
@@ -1545,8 +1549,15 @@ class LocalGatePlanExecutor:
             if progress is not None:
                 progress("start", command, 0.0)
             from .pytest_invocation import compile_ini_overrides
+            retained_environment = getattr(self, 'execution_environment', None)
+            base_environment = dict(os.environ if retained_environment is None else retained_environment)
+            merged_environment = {**base_environment, **self.environment_overrides,
+                                  **dict(environment_overrides or {})}
+            if (retained_environment is not None
+                    and merged_environment.get('PYTEST_ADDOPTS', '') != base_environment.get('PYTEST_ADDOPTS', '')):
+                raise RunnerContextError('environment', 'pytest environment changed after source admission', command)
             compiled = compile_ini_overrides(command, sandbox,
-                {**os.environ, **self.environment_overrides, **dict(environment_overrides or {})})
+                merged_environment)
             retained_sources = []
             prepare_retained = getattr(self, 'prepare_retained_command', None)
             if prepare_retained is not None:
@@ -1576,7 +1587,7 @@ class LocalGatePlanExecutor:
                     env = gate_environment(
                         sandbox,
                         job_id=job_id,
-                        base={**os.environ, **merged_overrides},
+                        base=merged_environment,
                         runtime_root=runtime_root,
                         runtime_profile=requested_profile,
                         dynamic_ports=dynamic_ports,

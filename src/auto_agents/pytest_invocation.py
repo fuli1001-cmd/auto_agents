@@ -30,7 +30,7 @@ def _overrides(args):
 def compile_ini_overrides(command, cwd, environment=None):
     from .execution_binding import command_spans, executable_tokens
     from .session_verification import _pytest_config_options
-    environment = environment or os.environ
+    environment = os.environ if environment is None else environment
     try:
         spans = command_spans(command)
         # Shell chains retain their own cwd and expansion semantics.

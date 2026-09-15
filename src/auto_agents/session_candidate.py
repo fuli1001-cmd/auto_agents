@@ -452,12 +452,13 @@ def verification_identity(session, state):
     """Relevant private evidence, independent of resume epochs and shared edits."""
     with session._session_verification_config():
         from .workers import gate_environment_fingerprint
+        from .verification_context import current_context
         gates = session.config.gates
         environment = gate_environment_fingerprint(
             isolation_mode=gates.isolation.mode, environment_id=gates.distributed.mode,
             distributed=gates.distributed.enabled,
             extra_denylist=gates.distributed.extra_environment_denylist,
-            project_root=session.project_root)
+            project_root=session.project_root, environment=current_context(session, state).environment)
         from .session_verification import selected_requirement_contracts
         plan, commands = session._verification_plan_commands()
         contracts = {proof['requirement_id']: current for _, proof, current in

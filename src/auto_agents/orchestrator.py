@@ -20811,6 +20811,8 @@ class Orchestrator:
         source_ref: str = "",
         use_result_cache: bool = True,
         contract_fingerprint: str = "",
+        environment_overrides: Optional[Dict[str, str]] = None,
+        execution_environment: Optional[Dict[str, str]] = None,
     ):
         use_result_cache = bool(use_result_cache and not self._force_full_verify)
         result_context_fingerprint = self._gate_result_context_fingerprint()
@@ -20818,7 +20820,16 @@ class Orchestrator:
             result_context_fingerprint = hashlib.sha256(
                 (result_context_fingerprint + contract_fingerprint).encode()
             ).hexdigest()
-        operator_environment = self._operator_gate_environment()
+        operator_environment = (self._operator_gate_environment() if environment_overrides is None
+                                else dict(environment_overrides))
+        environment_identity = self._gate_baseline_cache.environment_fingerprint
+        if execution_environment is not None:
+            gates = self.config.gates
+            environment_identity = gate_environment_fingerprint(
+                isolation_mode=gates.isolation.mode, environment_id=gates.distributed.mode,
+                distributed=gates.distributed.enabled,
+                extra_denylist=gates.distributed.extra_environment_denylist,
+                project_root=self.project_root, environment=execution_environment)
         acceleration = self.config.execution.acceleration
         proof_audit_sample_rate = (
             acceleration.proof_audit_sample_rate
@@ -20833,7 +20844,7 @@ class Orchestrator:
                 self.config.gates,
                 metadata or {},
                 environment_fingerprint=(
-                    self._gate_baseline_cache.environment_fingerprint
+                    environment_identity
                 ),
                 result_context_fingerprint=result_context_fingerprint,
                 environment_overrides=operator_environment,
@@ -20845,7 +20856,7 @@ class Orchestrator:
             self.config.gates,
             metadata or {},
             environment_fingerprint=(
-                self._gate_baseline_cache.environment_fingerprint
+                environment_identity
             ),
             result_context_fingerprint=result_context_fingerprint,
             source_ref=source_ref,
@@ -20853,6 +20864,7 @@ class Orchestrator:
             cache_path=self._shared_gate_cache_path,
             preempt_requested=self._gate_preempt_probe,
             environment_overrides=operator_environment,
+            execution_environment=execution_environment,
             proof_audit_sample_rate=proof_audit_sample_rate,
             input_reuse_mode=acceleration.verification_input_mode,
         )

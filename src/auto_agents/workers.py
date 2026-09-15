@@ -398,6 +398,7 @@ def gate_environment_fingerprint(
     distributed: bool,
     extra_denylist: Sequence[str] = (),
     project_root: Optional[Path] = None,
+    environment: Optional[Mapping[str, str]] = None,
 ) -> str:
     dependency_state: dict[str, str] = {}
     if project_root is not None:
@@ -438,7 +439,7 @@ def gate_environment_fingerprint(
         "distributed": bool(distributed),
         "python": sys.version,
         "environment": sorted(
-            forwarded_environment(os.environ, extra_denylist).items()
+            forwarded_environment(os.environ if environment is None else environment, extra_denylist).items()
         ),
         "dependency_state": dependency_state,
     }

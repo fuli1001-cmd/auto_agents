@@ -36,6 +36,7 @@ _INVENTORY_FIELDS = frozenset({
     'required_references', 'required_proof_ids', 'proof_owners', 'required_commands',
     'required_proofs', 'regression_dependencies', 'verification_policy',
     'proof_control_paths', 'proof_config_paths', 'proof_sources', 'proof_source_owners',
+    'proof_execution_context',
     'task_ids', 'requirement_ids',
 })
 
@@ -619,7 +620,7 @@ def engine_verification_command(command: str, root: Path, python: str, source_ro
     return rewrite_simple_commands(command, compile_branch)
 
 
-def prepare_conda_prefix(prefix, checkout, shell_cwd):
+def prepare_conda_prefix(prefix, checkout, shell_cwd, *, environment=None):
     """Give a Conda launcher private scratch without changing its packages.
 
     Ask installed Conda to resolve its selector by emitting (not evaluating) its
@@ -645,7 +646,7 @@ def prepare_conda_prefix(prefix, checkout, shell_cwd):
         spans.append((start, len(prefix[:end].rstrip())))
         offset = end
     index = 0
-    environment = dict(os.environ)
+    environment = dict(os.environ if environment is None else environment)
     while index < len(words):
         word = words[index]
         if re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', word):
@@ -715,19 +716,19 @@ def prepare_dependency_scratch(checkout):
     return sources
 
 
-def prepare_runner_command(command, checkout, scratch):
+def prepare_runner_command(command, checkout, scratch, *, environment=None):
     """Prepare a bound invocation without changing its retained shell identity."""
     sources = []
     replacements = []
     offset = 0
-    for invocation in test_invocations(command):
+    for invocation in test_invocations(command, environment=environment):
         if invocation.targets is None:
             raise RunnerContextError('unsupported_invocation', 'runner option arity is unknown', invocation.raw)
         start = command.index(invocation.raw, offset)
         end = start + invocation.option_offset
         offset = start + len(invocation.raw)
         prepared, inputs = prepare_conda_prefix(
-            command[start:end], scratch, checkout / invocation.shell_cwd)
+            command[start:end], scratch, checkout / invocation.shell_cwd, environment=environment)
         replacements.append((start, end, prepared))
         sources.extend(inputs)
     for start, end, prepared in reversed(replacements):

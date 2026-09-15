@@ -85,8 +85,16 @@ def bind_session(session, state) -> None:
     original_custody = state.candidate_custody
     state.verification_binding = deepcopy(original)
     state.candidate_custody = deepcopy(original_custody)
+    was_binding = getattr(session, '_binding_in_progress', False)
+    session._binding_in_progress = True
     try:
-        _bind_session(session, state)
+        if state.verification_binding and 'task_scope' in state.verification_binding:
+            _validate_binding_identity(session, state)
+            from .verification_context import execution_context
+            with execution_context(session, state):
+                _bind_session(session, state)
+        else:
+            _bind_session(session, state)
     except Exception as error:
         from .verification_sandbox import ConfinementPreflightError
         diagnostic = None
@@ -107,6 +115,7 @@ def bind_session(session, state) -> None:
             raise diagnostic from error
         raise
     finally:
+        session._binding_in_progress = was_binding
         if had_source:
             session._retained_source_root = previous_source
         else:
@@ -136,8 +145,11 @@ def _bind_session(session, state) -> None:
             _validate_binding_inventory(session, state)
         elif any(scope.values()) and scope != state.verification_binding['task_scope']:
             raise ownership_error(state, 'retained task authority conflicts with session evidence')
+        from .verification_context import proof_context_descriptor
         upgrade_inventory = recover_scope or state.verification_binding.get('proof_inventory_version', 0) < _PROOF_INVENTORY_VERSION
-        if state.verification_binding.get('schema_version', 1) < 12 or upgrade_inventory:
+        refresh_context = state.verification_binding.get('proof_execution_context') != proof_context_descriptor(session, state)
+        rebuild_inventory = state.verification_binding.get('schema_version', 1) < 12 or upgrade_inventory
+        if rebuild_inventory or refresh_context:
             if state.candidate_custody.get('initial_source') and not original['contract_revision']:
                 # An unborn session froze its initial inputs in private custody.
                 # Resolve that authenticated source without changing the empty
@@ -162,8 +174,11 @@ def _bind_session(session, state) -> None:
                             not isinstance(retained, dict) or retained.get('gates') != original['gates']):
                         raise ownership_error(state, 'inventory migration conflicts with retained contract source',
                                               contract_path=path.relative_to(session.project_root).as_posix())
-            _seal_inventory(session, state)
-        if state.verification_binding.get('schema_version', 1) < 13 or upgrade_inventory:
+            if rebuild_inventory:
+                _seal_inventory(session, state)
+            else:
+                _seal_proof_sources(session, state, session_gates(session, state))
+        if state.verification_binding.get('schema_version', 1) < 13 or upgrade_inventory or refresh_context:
             _seal_authority(session, state)
             if state.candidate_custody:
                 from .execution_binding import bridge_inventory_upgrade
@@ -439,7 +454,12 @@ def _future_foreign_step(session, state, step, excluded):
 
 def validate_binding(session, state):
     _validate_binding_identity(session, state)
-    _validate_binding_inventory(session, state)
+    from .verification_context import execution_context, proof_context_descriptor
+    with execution_context(session, state):
+        _validate_binding_inventory(session, state)
+        if (not getattr(session, '_binding_in_progress', False)
+                and state.verification_binding.get('proof_execution_context') != proof_context_descriptor(session, state)):
+            bind_session(session, state)
 
 
 def _validate_binding_identity(session, state):
@@ -708,10 +728,10 @@ def _retained_vitest_filter_sources(session, revision, invocation, *, root=None,
     return [path for path in sources if path in selectable]
 
 
-def prepare_retained_vitest_command(command, checkout, scratch):
+def prepare_retained_vitest_command(command, checkout, scratch, *, environment=None):
     # Retain the existing session hook while preparing both supported runners.
     from .execution_binding import prepare_runner_command
-    return prepare_runner_command(command, checkout, scratch)
+    return prepare_runner_command(command, checkout, scratch, environment=environment)
 
 
 def _retained_vitest_discovery(session, root, revision, invocation):
@@ -728,8 +748,10 @@ def _retained_vitest_discovery(session, root, revision, invocation):
     from .verification_sandbox import verification_argv, ConfinementPreflightError
     from .execution_binding import prepare_conda_prefix, prepare_dependency_scratch
 
+    active = getattr(session, '_proof_execution_context', None)
+    environment = dict(active.environment if active is not None else os.environ)
     key = fingerprint([str(root), revision, invocation.raw, invocation.cwd,
-                       invocation.shell_cwd, dict(os.environ)])
+                       invocation.shell_cwd, environment])
     cache = getattr(session, '_retained_vitest_discovery_cache', None)
     if cache is None:
         cache = session._retained_vitest_discovery_cache = {}
@@ -751,7 +773,7 @@ def _retained_vitest_discovery(session, root, revision, invocation):
             descriptor, report_name = tempfile.mkstemp(prefix='.discovery-', suffix='.json', dir=checkout)
             os.close(descriptor)
             prepared_prefix, conda_sources = prepare_conda_prefix(
-                prefix, checkout, checkout / invocation.shell_cwd)
+                prefix, checkout, checkout / invocation.shell_cwd, environment=environment)
             command = (prepared_prefix + ' list --filesOnly --json=' + shlex.quote(report_name)
                        + ' --no-cache ' + invocation.raw[invocation.option_offset:])
             dependencies = discover_dependency_links(root)
@@ -764,8 +786,10 @@ def _retained_vitest_discovery(session, root, revision, invocation):
             # original shell location. Applying effective cwd here doubles it.
             shell = 'cd ' + shlex.quote(str(shell_cwd)) + ' && ' + command
             with verification_argv(['sh', '-c', shell], checkout, root,
-                    read_roots=[*dependencies.values(), *conda_sources]) as argv:
-                result = subprocess.run(argv, cwd=checkout, capture_output=True, text=True, timeout=30)
+                    read_roots=[*dependencies.values(), *conda_sources], execution_environment=environment,
+                    gate_environment_overrides={'TMPDIR': str(checkout), 'TMP': str(checkout), 'TEMP': str(checkout)}) as argv:
+                result = subprocess.run(argv, cwd=checkout, env=environment,
+                                        capture_output=True, text=True, timeout=30)
             if result.returncode:
                 raise RunnerContextError('discovery', 'retained Vitest discovery failed', invocation.raw)
             payload = json.loads(Path(report_name).read_text())
@@ -868,12 +892,17 @@ def _reference_kind(ref, gates, *, commands=(), source_exists=None):
 
 
 def _seal_inventory(session, state):
+    from .verification_context import execution_context
+    with execution_context(session, state):
+        _seal_inventory_in_context(session, state)
+
+
+def _seal_inventory_in_context(session, state):
     from .gates import command_from_verification_step
     from .models import GateConfig
 
     binding = state.verification_binding
     binding.setdefault('plan_fingerprint', fingerprint(binding.get('tasks', [])))
-    binding.pop('proof_source_owners', None)
     _seal_proof_graph(session, state)
     complete = GateConfig.from_dict(binding['proof_graph']['gates'])
     required, _ = _owned_inventory(state, complete, session)
@@ -911,6 +940,24 @@ def _seal_inventory(session, state):
                                 if key not in {'steps', 'commands', 'parallel_groups'}},
         'fix_verify_command': state.fix_verify_command,
     })
+    _seal_proof_sources(session, state, gates)
+
+
+def _seal_proof_sources(session, state, gates):
+    from .verification_context import execution_context
+    with execution_context(session, state):
+        _seal_proof_sources_in_context(session, state, gates)
+
+
+def _seal_proof_sources_in_context(session, state, gates):
+    from .gates import command_from_verification_step
+    from .verification_context import proof_context_descriptor
+
+    binding = state.verification_binding
+    previous_sources = dict(binding.get('proof_sources', {}))
+    previous_owners = deepcopy(binding.get('proof_source_owners', {}))
+    previous_controls = set(binding.get('proof_control_paths', []))
+    previous_configs = set(binding.get('proof_config_paths', []))
     proof_sources = {}
     targets = {(target.split('::', 1)[0], ()) for step in gates.steps
                for target in _effective_targets(step)}
@@ -959,10 +1006,23 @@ def _seal_inventory(session, state):
     binding['proof_config_paths'] = sorted(config_controls)
     binding['proof_sources'] = proof_sources
     _seal_imported_pytest_sources(session, state, gates, revision)
+    # Environment changes can add executable sources, but cannot revoke a
+    # retained regression's protection or rewrite its authenticated preimage.
+    for path, source in previous_sources.items():
+        if path in binding['proof_sources'] and binding['proof_sources'][path] != source:
+            raise ownership_error(state, 'retained proof source conflicts during context refresh: ' + path,
+                                  verification_ref=path, owners=previous_owners.get(path, []))
+        binding['proof_sources'][path] = source
+    for path, owners in previous_owners.items():
+        rows = binding['proof_source_owners'].setdefault(path, [])
+        rows.extend(owner for owner in owners if owner not in rows)
+    binding['proof_control_paths'] = sorted(previous_controls | set(binding['proof_control_paths']))
+    binding['proof_config_paths'] = sorted(previous_configs | set(binding['proof_config_paths']))
     _validate_required_node_selection(session, state, [
         *(step.command or command_from_verification_step(step, session.project_root) for step in gates.steps),
         *_legacy_commands(gates), state.fix_verify_command,
     ])
+    binding['proof_execution_context'] = proof_context_descriptor(session, state, gates)
     binding['binding_fingerprint'] = fingerprint({key: value for key, value in binding.items()
                                                   if key != 'binding_fingerprint'})
 
@@ -1000,7 +1060,8 @@ def _seal_imported_pytest_sources(session, state, gates, revision):
 
     for command, proof_ids in commands.items():
         owners = diagnostic_owners(state, command, proof_ids=proof_ids)
-        for invocation in test_invocations(command):
+        from .verification_context import current_context
+        for invocation in current_context(session, state).invocations(command):
             if invocation.runner != 'pytest' or invocation.targets is None:
                 continue
             cwd = session.project_root / invocation.cwd
@@ -1059,7 +1120,8 @@ def _validate_required_node_selection(session, state, commands):
         try:
             # Ownership stays bound to the retained command. Execution credit
             # must also account for the environment the public runner inherits.
-            for invocation in test_invocations(command, environment=os.environ):
+            from .verification_context import current_context
+            for invocation in current_context(session, state).invocations(command):
                 if invocation.runner != 'pytest' or invocation.targets is None:
                     continue
                 cwd = (session.project_root / invocation.cwd).resolve()
@@ -1294,7 +1356,10 @@ def _command_source_targets(command, *, session, revision, config_paths):
     """Inventory command inputs without running candidate configuration/hooks."""
     targets = set()
     try:
-        for invocation in test_invocations(command):
+        context = getattr(session, '_proof_execution_context', None)
+        parsed_invocations = (context.invocations(command) if context is not None else
+                              test_invocations(command, environment=os.environ))
+        for invocation in parsed_invocations:
             if invocation.targets is None:
                 raise RunnerContextError('unsupported_invocation', 'runner option arity is unknown', invocation.raw)
             cwd = Path(invocation.cwd)
@@ -1309,7 +1374,7 @@ def _command_source_targets(command, *, session, revision, config_paths):
                 targets.update((path, ()) for path in
                                _retained_vitest_filter_sources(session, revision, invocation))
         # Retain source protection for explicit non-runner scripts as well.
-        parsed = {invocation.raw for invocation in test_invocations(command)}
+        parsed = {invocation.raw for invocation in parsed_invocations}
         cwd = Path('.')
         for start, end in command_spans(command):
             raw = command[start:end].strip()
@@ -1740,6 +1805,16 @@ def diagnostic_owners(state, command: str, *, proof_ids=()) -> list[dict[str, ob
 
 def validate_selected_contracts(session, state, commands: list[str], *, metadata=None) -> None:
     """A frozen selector cannot attest a changed requirement contract."""
+    from .verification_context import execution_context
+    if state.verification_binding.get('proof_graph'):
+        _validate_binding_identity(session, state)
+    with execution_context(session, state):
+        if not getattr(session, '_binding_in_progress', False) and state.verification_binding.get('proof_graph'):
+            validate_binding(session, state)
+        _validate_selected_contracts(session, state, commands, metadata=metadata)
+
+
+def _validate_selected_contracts(session, state, commands, *, metadata=None):
     from .models import VerificationStep
 
     _validate_required_node_selection(session, state, commands)
