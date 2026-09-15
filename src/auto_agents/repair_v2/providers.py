@@ -165,8 +165,9 @@ class AgentSandbox:
                     public = Path.home() / '.gemini/antigravity-cli' / leaf
                     if public.is_dir() and not public.is_symlink():
                         argv += ['--mount', f'type=bind,src={public},dst=/agent-home/.gemini/antigravity-cli/{leaf},readonly']
-            prefixes = sorted({str(Path(shutil.which(n)).parent) for n in ('node', 'codex', 'claude', 'copilot', 'agy') if shutil.which(n)})
-            argv += ['-e', 'PATH=' + ':'.join([*prefixes, '/usr/bin', '/bin'])]
+            # Keep the image's pinned Python/toolchain PATH. Native drivers
+            # invoke their selected CLI by absolute path; host CLI directories
+            # must not replace the verification environment inside the image.
             # A provider must not receive another provider's account credentials.
             prefixes = {'codex': ('OPENAI_',), 'claude-code': ('ANTHROPIC_',),
                         'copilot-cli': ('COPILOT_',), 'antigravity': ('GOOGLE_', 'GEMINI_', 'ANTIGRAVITY_')}[self.kind]
@@ -182,7 +183,11 @@ class AgentSandbox:
                     if key.lower() == 'no_proxy': value += ',host.docker.internal'
                     argv += ['-e', key + '=' + value]
             try: yield [*argv, self.image, *arguments]
-            finally: run(['docker', 'rm', '-f', name], timeout=15)
+            finally:
+                code, detail = run(['docker', 'rm', '-f', name], timeout=15)
+                if code and not any(text in detail.lower() for text in ('no such container', 'no such object')):
+                    raise RepairBlocked('provider_cleanup_failed',
+                        'provider container could not be stopped; candidate retained for recovery')
 
 
 class NativeDriver:
@@ -362,7 +367,8 @@ class NativeDriver:
             return AgentReply(code == 0 and terminal and success and not failed and bool(text.strip()), text, session,
                               '\n'.join(errors)[-4000:], usage)
         except (InterruptedError, TimeoutError) as error:
-            return AgentReply(False, text, session, str(error), usage, isinstance(error, InterruptedError))
+            return AgentReply(False, text, session, str(error), usage, isinstance(error, InterruptedError),
+                              timed_out=isinstance(error, TimeoutError))
 
     def codex(self, process, messages, role, prompt, root, session, schema, progress, cancel):
         deadline = time.monotonic() + self.timeout
@@ -441,6 +447,7 @@ class NativeDriver:
                     return AgentReply(turn.get('status') == 'completed' and not turn.get('error') and bool(final.strip()), final, thread,
                                       str(turn.get('error') or ''), usage)
         except (InterruptedError, TimeoutError) as error:
-            return AgentReply(False, final, thread, str(error), usage, isinstance(error, InterruptedError))
+            return AgentReply(False, final, thread, str(error), usage, isinstance(error, InterruptedError),
+                              timed_out=isinstance(error, TimeoutError))
         finally:
             process.terminate()

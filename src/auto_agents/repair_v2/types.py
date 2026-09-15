@@ -39,6 +39,7 @@ class AgentReply:
     usage: Dict[str, Any] = field(default_factory=dict)
     interrupted: bool = False
     missing_session: bool = False
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
