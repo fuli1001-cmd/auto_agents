@@ -877,7 +877,7 @@ class WorkflowCoordinator:
 
     def _handoff_exit_ownership(self, state, handoff):
         from .session_verification import (
-            _validate_binding_identity, ownership_error, preimplementation_failure,
+            _validate_binding_identity, ownership_error, preimplementation_exit,
         )
         original = handoff
         if handoff.target == 'resume':
@@ -903,7 +903,7 @@ class WorkflowCoordinator:
             except (KeyError, TypeError, ValueError, OSError) as error:
                 raise ownership_error(state, 'candidate custody is unavailable or malformed') from error
             return 'private'
-        if preimplementation_failure(state) is not None:
+        if preimplementation_exit(state) is not None:
             return 'none'
         raise ownership_error(state, 'no child-owned receipt authorizes shared rollback',
                               conflicting_paths=sorted(state.candidate_paths))

@@ -45,13 +45,13 @@ def ownership_error(state, message, **details):
     })
 
 
-def preimplementation_failure(state):
-    """Positive preflight evidence, never an empty ownership record alone.
+def preimplementation_exit(state):
+    """Positive preflight or confirmed no-fix evidence, never emptiness alone.
 
     Resume resets the local attempt counter. Retained writer/attempt history
     therefore takes precedence over a current zero, even without a receipt.
     """
-    if (state.mode != 'fix' or state.status != 'blocked' or state.current_attempt
+    if (state.mode != 'fix' or state.status not in {'blocked', 'completed'} or state.current_attempt
             or state.candidate_paths or state.candidate_custody
             or state.lineage_changed_paths or state.active_handoff_id
             or state.last_child_result_ref or state.persistence_actions):
@@ -61,6 +61,16 @@ def preimplementation_failure(state):
                 'fix', 'receipt_writer_result', 'receipt_verification', 'receipt_completion',
                 'child_returned', 'fix_route_rejected'}:
             return None
+    if state.status == 'completed':
+        if state.resolution != 'not_a_bug':
+            return None
+        for entry in reversed(state.execution_log):
+            if entry.get('action') == 'not_a_bug':
+                # Legacy NOT_A_BUG records were emitted only after agreement.
+                return entry if entry.get('user_confirmed', True) is True else None
+            if entry.get('action') == 'fix_disposition':
+                return None  # An older agreement cannot discharge a later fix.
+        return None
     for entry in reversed(state.execution_log):
         if entry.get('action') == 'execution_preflight_blocked':
             if (entry.get('failure_kind') == state.resolution
@@ -68,6 +78,11 @@ def preimplementation_failure(state):
                 return entry
             return None
     return None
+
+
+def preimplementation_failure(state):
+    """Only blocked preflights may be reopened by an engine repair return."""
+    return preimplementation_exit(state) if state.status == 'blocked' else None
 
 
 def fingerprint(value: object) -> str:
@@ -913,7 +928,11 @@ def _reference_kind(ref, gates, *, commands=(), source_exists=None, reference_pa
         return 'proof'
     if ref.startswith('cmd:'):
         return 'command'
-    if ref.startswith('artifact:'):
+    # An explicit output role precedes filename/runner inference. A producer
+    # may publish Python source without declaring that source to be a test.
+    if ref.startswith('artifact:') or any(
+        fnmatchcase(ref, pattern) for step in gates.steps for pattern in step.artifact_globs
+    ):
         return 'artifact'
     if '::' in ref or ref.endswith('.py'):
         return 'selector'
@@ -931,8 +950,7 @@ def _reference_kind(ref, gates, *, commands=(), source_exists=None, reference_pa
     # Existence and provenance are checked separately when sealing the input.
     path = Path(ref)
     if (not path.is_absolute() and '..' not in path.parts and (
-            ref in reference_paths or ref.startswith('.auto-agents/docs/provider_references/')
-            or any(fnmatchcase(ref, pattern) for step in gates.steps for pattern in step.artifact_globs))):
+            ref in reference_paths or ref.startswith('.auto-agents/docs/provider_references/'))):
         return 'artifact'
     return 'proof'
 

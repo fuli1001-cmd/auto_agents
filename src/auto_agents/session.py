@@ -953,6 +953,13 @@ class Session:
                         if answer.strip().lower() not in ("n", "no"):
                             state.status = "completed"
                             state.resolution = "not_a_bug"
+                            state.execution_log.append({
+                                "attempt": 0,
+                                "action": "not_a_bug",
+                                "result": reason,
+                                "user_confirmed": True,
+                                "timestamp": self._now(),
+                            })
                             self._save(state)
                             return state
                         user_reply = self._prompt_user(
@@ -1037,6 +1044,7 @@ class Session:
                             "attempt": 0,
                             "action": "not_a_bug",
                             "result": reason,
+                            "user_confirmed": True,
                             "timestamp": self._now(),
                         })
                         self._save(state)

@@ -409,3 +409,147 @@ def test_engine_return_rechecks_blocked_child_without_resetting_budget(tmp_path,
     assert {key: getattr(saved, key) for key in expected} == expected
     assert failure in saved.execution_log
     assert len([row for row in saved.execution_log if row['action'] == 'engine_preflight_recheck']) == int(reopened)
+
+
+@pytest.mark.parametrize('reference,pattern', [
+    ('generated/schema.py', 'generated/*.py'),
+    ('generated/client.test.ts', 'generated/*.ts'),
+    ('generated/report.json', 'generated/*.json'),
+])
+def test_explicit_output_artifact_role_precedes_filename_inference(reference, pattern):
+    from auto_agents.models import SessionState
+    from auto_agents.session_verification import _owned_inventory
+
+    step = VerificationStep(proof_id='owned.contract', runner='pytest',
+                            targets=['tests/test_owned.py::test_owned'], artifact_globs=[pattern])
+    gates = GateConfig(steps=[step])
+    task = {'task_id': 'task-owned', 'requirement_ids': ['REQ-owned'],
+            'verification_refs': ['owned.contract', reference]}
+    state = SessionState(session_id='output-role', workflow_id='owned-workflow',
+        verification_binding={'tasks': [task], 'task_scope': {'task_ids': ['task-owned'], 'requirement_ids': []}})
+    assert _reference_kind(reference, gates) == 'artifact'
+    required, _ = _owned_inventory(state, gates)
+    assert required == ['owned.contract']
+
+    task['verification_refs'].append('tests/test_missing.py::test_missing')
+    with pytest.raises(SessionOwnershipError, match='has no executable proof') as error:
+        _owned_inventory(state, gates)
+    assert error.value.diagnostic['verification_ref'] == 'tests/test_missing.py::test_missing'
+
+    task['verification_refs'] = [reference]
+    with pytest.raises(SessionOwnershipError, match='no executable verification evidence'):
+        _owned_inventory(state, gates)
+    # A declared proof identity still takes priority over artifact matching.
+    step.proof_id = reference
+    assert _reference_kind(reference, gates) == 'proof'
+
+
+@pytest.mark.parametrize('route', ['fix', 'resume'])
+@pytest.mark.parametrize('reply_kind', ['legacy', 'structured'])
+def test_confirmed_not_a_bug_handoff_reports_completed_without_candidate(tmp_path, monkeypatch, route, reply_kind):
+    from auto_agents.models import AgentResult
+    from test_engine_child_recovery import ObservationBoundary
+    from test_session_verification_ownership import _prepare_binding_child_resume
+
+    # Keep read-only Git queries from refreshing the fixture's index stat
+    # cache; the byte assertion below still detects any staged mutation.
+    monkeypatch.setenv('GIT_OPTIONAL_LOCKS', '0')
+    root, child = project(tmp_path)
+    child.status = 'conversing'
+    store, snapshot, original = parent_workflow(root, child)
+    if route == 'resume':
+        _prepare_binding_child_resume(root, store, snapshot, original)
+    parent = load_session_state(root, 'parent')
+    parent.lineage_head_ref = child.baseline_head_ref
+    save_session_state(root, parent)
+    active = parent.active_handoff_id
+    (root / 'foreign.py').write_text('VALUE = 8\n')
+    git(root, 'add', 'foreign.py')
+    (root / 'foreign.py').write_text('VALUE = 9\n')
+    (root / 'foreign-note.txt').write_bytes(b'unrelated\0work')
+    protected = {name: (root / name).read_bytes() for name in (
+        'foreign.py', 'foreign-note.txt', '.git/index', '.auto-agents/state/task_plan.json')}
+    head, refs = head_ref(root), git(root, 'show-ref')
+    calls, confirmations = [], []
+    reason = 'The current behavior is intentional under the retained contract.'
+    reply = ('NOT_A_BUG: ' + reason if reply_kind == 'legacy' else
+             'FIX_DISPOSITION v1: ' + json.dumps({'decision': 'not_bug', 'summary': child.goal,
+                                                  'reason': reason}))
+    def provider(self, request):
+        calls.append(request.purpose)
+        assert request.purpose == 'fix_converse' and request.sandbox_mode == 'read-only'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+    def confirm(prompt):
+        confirmations.append(prompt)
+        return 'y'
+    def forbidden(*args, **kwargs):
+        pytest.fail('Confirmed no-fix completion must not implement, verify a candidate, or roll back shared work')
+    def observe_parent(self, state):
+        assert state.session_id == 'parent'
+        raise ObservationBoundary()
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
+    monkeypatch.setattr(Session, '_phase_fix_execute', forbidden)
+    monkeypatch.setattr(Session, '_ensure_baseline', forbidden)
+    monkeypatch.setattr(Session, '_phase_collab_loop', observe_parent)
+    monkeypatch.setattr(WorkflowCoordinator, '_rollback_handoff_uncommitted', forbidden)
+    session = Session(Orchestrator(root, user_input_fn=confirm), mode='collab', auto_approve=True)
+    with pytest.raises(ObservationBoundary):
+        session.resume('parent')
+    saved = load_session_state(root, child.session_id)
+    result = store.load_handoff(active).result
+    assert calls == ['fix_converse']
+    assert len(confirmations) == 1 and 'not a bug' in confirmations[0]
+    assert saved.status == result['status'] == 'completed'
+    assert saved.resolution == result['resolution'] == 'not_a_bug'
+    assert saved.current_attempt == 0 and saved.candidate_paths == saved.candidate_custody == {}
+    assert result['candidate_ownership'] == 'none'
+    assert result['changed_paths'] == result['commit_shas'] == result['rolled_back_paths'] == []
+    assert result['candidate_delivery'] == {} and result['head_after'] == ''
+    assert 'ownership_diagnostic' not in result and 'rollback_diagnostic' not in result
+    assert saved.execution_log[-1]['action'] == 'not_a_bug'
+    assert saved.execution_log[-1]['result'] == reason and saved.execution_log[-1]['user_confirmed'] is True
+    assert load_session_state(root, 'parent').lineage_changed_paths == parent.lineage_changed_paths
+    assert load_session_state(root, 'parent').lineage_head_ref == parent.lineage_head_ref
+    assert {name: (root / name).read_bytes() for name in protected} == protected
+    assert head_ref(root) == head and git(root, 'show-ref') == refs
+    with pytest.raises(ObservationBoundary):
+        session.resume('parent')
+    assert calls == ['fix_converse'] and len(confirmations) == 1
+    assert store.load_handoff(active).result == result
+
+
+@pytest.mark.parametrize('evidence', ['legacy_confirmation', 'absent', 'declined', 'prior_attempt', 'candidate', 'wrong_resolution'])
+def test_completed_exit_still_requires_positive_no_implementation_evidence(tmp_path, evidence):
+    from auto_agents.session_verification import preimplementation_failure
+    root, child = project(tmp_path)
+    _, snapshot, handoff = parent_workflow(root, child)
+    child.status, child.resolution = 'completed', 'not_a_bug'
+    child.execution_log = [{'action': 'not_a_bug', 'attempt': 0, 'result': 'Confirmed expected behavior'}]
+    if evidence == 'absent':
+        child.execution_log = []
+    elif evidence == 'declined':
+        child.execution_log[-1]['user_confirmed'] = False
+    elif evidence == 'prior_attempt':
+        child.execution_log.insert(0, {'action': 'implementation_attempts_retained', 'attempt': 1})
+    elif evidence == 'candidate':
+        child.candidate_paths = {'value.py': 'unattributed'}
+    elif evidence == 'wrong_resolution':
+        child.resolution = 'fixed'
+    save_session_state(root, child)
+    (root / 'value.py').write_bytes(b'foreign work\n')
+    coordinator = WorkflowCoordinator(Orchestrator(root))
+    result = coordinator._session_result(child, handoff)
+    assert preimplementation_failure(child) is None, 'A completed disposition must not be reopened as a failed preflight'
+    if evidence == 'legacy_confirmation':
+        assert result['status'] == 'completed' and result['resolution'] == 'not_a_bug'
+        assert result['candidate_ownership'] == 'none'
+        assert coordinator._rollback_handoff_uncommitted(snapshot, handoff) == []
+    else:
+        assert result['status'] == 'blocked' and result['resolution'] == 'verification_ownership'
+        assert result['candidate_ownership'] == 'unknown'
+        with pytest.raises(SessionOwnershipError):
+            coordinator._rollback_handoff_uncommitted(snapshot, handoff)
+    assert result['changed_paths'] == result['commit_shas'] == []
+    assert (root / 'value.py').read_bytes() == b'foreign work\n'
