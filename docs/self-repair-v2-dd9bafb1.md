@@ -29,3 +29,8 @@ metadata/trace owner，但测试仍在无 owner 的普通进程中期待完整�
 该验收已撤回，保留测试和审查证据。对照改为按模块独立运行，仅计入确实在测试体
 执行阶段失败的节点；收集错误及 setup/teardown 错误不证明行为回归。新增驱动证据
 区分 call_failed，相关对照、取消、存储与交付测试共 45 项通过。
+
+后续独立审查验证了 strict XPASS 的特殊报告：测试体通过，但 pytest 将报告标为
+failed 且不设置 wasxfail。可信驱动现通过 makereport 获取真实 call.excinfo，
+只记录实际测试体异常。真实 pytest 子进程覆盖 strict XPASS、预期失败、普通断言、
+unittest、setup 与 teardown，相关检查共 47 项通过。

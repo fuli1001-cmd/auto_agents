@@ -9,12 +9,15 @@ from auto_agents.repair_v2.pytest_driver import Evidence
 from auto_agents.repair_v2.workspace import git
 
 
-@pytest.mark.parametrize('phase,xfail,expected', [('setup', False, []), ('teardown', False, []),
-                                               ('call', True, []), ('call', False, ['tests/test_x.py::test_x'])])
-def test_only_unexpected_test_body_failures_supply_counterexamples(phase, xfail, expected):
+@pytest.mark.parametrize('phase,xfail,exception,expected', [('setup', False, True, []), ('teardown', False, True, []),
+    ('call', True, True, []), ('call', False, False, []), ('call', False, True, ['tests/test_x.py::test_x'])])
+def test_only_unexpected_test_body_failures_supply_counterexamples(phase, xfail, exception, expected):
     report = SimpleNamespace(when=phase, failed=True, passed=False, skipped=False, nodeid='tests/test_x.py::test_x')
     if xfail: report.wasxfail = 'expected failure'
     evidence = Evidence(); evidence.pytest_runtest_logreport(report)
+    hook = evidence.pytest_runtest_makereport(None, SimpleNamespace(when=phase, excinfo=object() if exception else None))
+    next(hook)
+    with pytest.raises(StopIteration): hook.send(SimpleNamespace(get_result=lambda: report))
     assert evidence.call_failed == expected
 
 
@@ -48,3 +51,43 @@ def test_baseline_collection_errors_cannot_mask_or_replace_behavior(tmp_path, co
     assert len(calls) == 2 and all(not ('test_new_api' in c and 'test_portable' in c) for c in calls)
     assert result['ok'] is accepted and result['demonstrated_regression'] is accepted
     assert result['counterexamples'] == (['tests/test_portable.py::test_value'] if accepted else [])
+
+
+def test_real_pytest_strict_xpass_and_fixture_errors_are_not_body_failures(tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+    source = '''import pytest
+import unittest
+@pytest.mark.xfail(strict=True)
+def test_unexpected_pass(): assert True
+@pytest.mark.xfail(strict=True)
+def test_expected_failure(): assert False
+def test_body_failure(): assert False
+@pytest.fixture
+def broken(): raise RuntimeError('setup failure')
+def test_setup(broken): pass
+@pytest.fixture
+def bad_cleanup():
+    yield
+    raise RuntimeError('teardown failure')
+def test_teardown(bad_cleanup): pass
+class TestUnittest(unittest.TestCase):
+    def test_body(self): self.assertEqual(1, 2)
+'''
+    (tmp_path / 'test_cases.py').write_text(source)
+    script = '''import json,pytest
+from pathlib import Path
+from auto_agents.repair_v2.pytest_driver import Evidence
+e=Evidence()
+code=pytest.main(['-q','-p','no:cacheprovider','test_cases.py'],plugins=[e])
+Path('evidence.json').write_text(json.dumps({'code':code,'body':e.call_failed,'failed':e.failed}))
+'''
+    process = subprocess.run([sys.executable, '-c', script], cwd=tmp_path, capture_output=True, text=True,
+        env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')})
+    assert process.returncode == 0, process.stdout + process.stderr
+    result = json.loads((tmp_path / 'evidence.json').read_text())
+    assert result['code'] == 1
+    assert set(result['body']) == {'test_cases.py::test_body_failure', 'test_cases.py::TestUnittest::test_body'}
+    assert 'test_cases.py::test_unexpected_pass' in result['failed']
