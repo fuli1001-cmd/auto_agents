@@ -585,6 +585,7 @@ import ctypes, json, os, shlex, sys
 from pathlib import Path
 from pytest import MonkeyPatch, raises
 from auto_agents.gate_execution import LocalGatePlanExecutor
+import auto_agents.gate_execution as gate_module
 from auto_agents.verification_input_trace import TraceCustody
 from auto_agents.verification_sandbox import RUNTIME_ROOT_ENV, RUNTIME_ID_ENV, ConfinementPreflightError
 from auto_agents.gates import GateCommandMetadata
@@ -597,6 +598,11 @@ pool=Path(os.environ[RUNTIME_ROOT_ENV]); sibling=pool/('sibling-'+secrets.token_
 command='printf actual-command-dispatched; test "$(cat tracked.txt)" = committed'
 metadata={{command:GateCommandMetadata(cache_scope='source',result_cache_scope='observed_inputs')}}
 original=TraceCustody.command
+dispatched=[]
+launch=gate_module.run_supervised_shell_command
+def observe_dispatch(*args,**kwargs):
+    dispatched.append(True)
+    return launch(*args,**kwargs)
 # Deny only the final Landlock restriction in a real child. No project body is
 # allowed to execute if that kernel call fails; the inherited owner stays live.
 def denied_boundary(self, argv, environment):
@@ -615,6 +621,7 @@ def run():
     with LocalGatePlanExecutor(project,config,metadata) as executor:
         return executor.run(command,timeout_seconds=20,adaptive_timeout_enabled=False,idle_timeout_seconds=20)
 with MonkeyPatch.context() as patch:
+    patch.setattr(gate_module,'run_supervised_shell_command',observe_dispatch)
     if {fault!r}=='denied_reservation':
         patch.setenv(RUNTIME_ROOT_ENV,str(Path(SHARED).parent)); patch.delenv(RUNTIME_ID_ENV,raising=False)
     elif {fault!r}=='invalid_reservation':
@@ -626,6 +633,7 @@ with MonkeyPatch.context() as patch:
         diagnostic=stopped.value.diagnostic
         assert diagnostic['phase']=='runtime_allocation' and diagnostic['socket_byte_budget']==100
         assert diagnostic['command']==command
+        assert not dispatched, 'failed allocation must stop before dispatch'
     else:
         refused=run()
         assert not refused.ok and 'actual-command-dispatched' not in refused.stdout, refused
