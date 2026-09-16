@@ -17,11 +17,19 @@ class Evidence:
 
     def pytest_runtest_logreport(self, report):
         if report.failed: self.failed.append(report.nodeid)
-        if report.when == 'call' and report.failed and not hasattr(report, 'wasxfail'):
-            self.call_failed.append(report.nodeid)
         if report.skipped or hasattr(report, 'wasxfail'): self.skipped.append(report.nodeid)
         if report.when == 'call' and report.passed and not hasattr(report, 'wasxfail'):
             self.passed.append(report.nodeid)
+
+    @pytest.hookimpl(hookwrapper=True, tryfirst=True)
+    def pytest_runtest_makereport(self, item, call):
+        outcome = yield
+        report = outcome.get_result()
+        # Strict XPASS is a failed report without a failing test body. Inspect
+        # the actual call exception, after pytest/unittest reporting hooks.
+        if (call.when == 'call' and call.excinfo is not None
+                and report.failed and not hasattr(report, 'wasxfail')):
+            self.call_failed.append(report.nodeid)
 
 
 def main():
