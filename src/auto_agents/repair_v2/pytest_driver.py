@@ -25,10 +25,15 @@ class Evidence:
     def pytest_runtest_makereport(self, item, call):
         outcome = yield
         report = outcome.get_result()
-        # Strict XPASS is a failed report without a failing test body. Inspect
-        # the actual call exception, after pytest/unittest reporting hooks.
+        # A call-phase failure alone does not prove the test body failed:
+        # strict XPASS has no exception, and unittest reports its fixtures in
+        # this phase too. Require the collected callable in the exception's
+        # traceback. Unknown/custom items fail closed for counterexample use.
+        code = getattr(getattr(item, 'obj', None), '__code__', None)
         if (call.when == 'call' and call.excinfo is not None
-                and report.failed and not hasattr(report, 'wasxfail')):
+                and report.failed and not hasattr(report, 'wasxfail')
+                and code is not None
+                and any(entry.frame.code.raw is code for entry in call.excinfo.traceback)):
             self.call_failed.append(report.nodeid)
 
 
