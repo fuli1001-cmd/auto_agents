@@ -420,15 +420,16 @@ def test_prepared_gate_keeps_shared_prefix_readonly(tmp_path, monkeypatch):
     hook = source / 'etc/conda/activate.d/context.sh'
     (root / 'test_context.py').write_text(
         _python_shared_controls(source) +
-        'import os\nfrom pathlib import Path\nimport pytest\n'
+        'import errno, os\nfrom pathlib import Path\nimport pytest\n'
         'def test_context():\n'
         '    check_shared_inputs()\n'
         '    assert os.environ["RETAINED_ACTIVATION"] == "activated value"\n'
         '    prefix = Path(os.environ["CONDA_PREFIX"])\n'
         f'    assert prefix != Path({str(source)!r})\n'
         '    (prefix / "private-scratch").write_text("permitted")\n'
-        '    with pytest.raises(PermissionError):\n'
-        f'        Path({str(hook)!r}).write_text("foreign mutation")\n')
+        '    with pytest.raises(OSError) as denied:\n'
+        f'        Path({str(hook)!r}).write_text("foreign mutation")\n'
+        '    assert denied.value.errno in (errno.EPERM, errno.EACCES, errno.EROFS)\n')
     command = shlex.join(['env', 'CONDA_ENVS_PATH=' + str(source.parent), conda, 'run',
                          '--name', source.name, '--no-capture-output', sys.executable,
                          '-m', 'pytest', '-q', 'test_context.py'])

@@ -518,7 +518,11 @@ def _validate_task_authority(state):
     scope = binding.get('task_scope', {})
     task_ids = set(scope.get('task_ids', []))
     requirement_ids = set(scope.get('requirement_ids', []))
-    if state.parent_handoff_id and not (task_ids or requirement_ids):
+    # A routed fix in a newly initialized, taskless project has no retained
+    # task authority to resolve. Existing task contracts still require scope,
+    # including tasks present in the unprojected retained plan.
+    has_task_contract = bool(binding.get('tasks') or binding.get('plan', {}).get('tasks'))
+    if state.parent_handoff_id and has_task_contract and not (task_ids or requirement_ids):
         raise ownership_error(state, 'retained child contract ownership is unresolved')
     if task_ids and requirement_ids:
         # These are two representations of the child's authority, not

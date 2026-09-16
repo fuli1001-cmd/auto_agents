@@ -583,10 +583,10 @@ def test_gate_custody_refusal_preserves_siblings_and_recovers(tmp_path, fault):
     execute(tmp_path, f'''
 import ctypes, json, os, shlex, sys
 from pathlib import Path
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, raises
 from auto_agents.gate_execution import LocalGatePlanExecutor
 from auto_agents.verification_input_trace import TraceCustody
-from auto_agents.verification_sandbox import RUNTIME_ROOT_ENV, RUNTIME_ID_ENV
+from auto_agents.verification_sandbox import RUNTIME_ROOT_ENV, RUNTIME_ID_ENV, ConfinementPreflightError
 from auto_agents.gates import GateCommandMetadata
 sys.path.insert(0,{str(Path(__file__).parent)!r})
 from test_gate_execution import _project,_config
@@ -620,11 +620,16 @@ with MonkeyPatch.context() as patch:
     elif {fault!r}=='invalid_reservation':
         patch.setenv(RUNTIME_ID_ENV,'[0,0,0,0]')
     else: patch.setattr(TraceCustody,'command',denied_boundary)
-    refused=run()
-assert not refused.ok and 'actual-command-dispatched' not in refused.stdout, refused
-if {fault!r}!='final_boundary':
-    assert 'runtime_allocation' in refused.stderr and 'socket_byte_budget' in refused.stderr, refused
-else: assert 'verification write boundary' in refused.stderr, refused
+    if {fault!r}!='final_boundary':
+        with raises(ConfinementPreflightError) as stopped:
+            run()
+        diagnostic=stopped.value.diagnostic
+        assert diagnostic['phase']=='runtime_allocation' and diagnostic['socket_byte_budget']==100
+        assert diagnostic['command']==command
+    else:
+        refused=run()
+        assert not refused.ok and 'actual-command-dispatched' not in refused.stdout, refused
+        assert 'verification write boundary' in refused.stderr, refused
 assert (sibling/'retained').read_bytes()==before
 healthy=run(); assert healthy.ok and not healthy.cached and healthy.input_trace_complete, healthy
 (project/'unrelated').write_text('new')

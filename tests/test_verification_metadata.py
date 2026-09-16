@@ -302,8 +302,13 @@ raise AssertionError('refused setup executed command')
     prefix = '\n'.join(name + '=' + repr(value) for name, value in {
         'SOURCE': source, 'ROOT': str(root), 'FAILURE': failure,
         'COMMAND': 'from pathlib import Path; Path(' + repr(str(marker)) + ').write_text("unexpected")'}.items())
-    result = subprocess.run([sys.executable, '-I', '-c', prefix + '\n' + script],
-                            capture_output=True, text=True, timeout=10)
+    command = [sys.executable, '-I', '-c', prefix + '\n' + script]
+    from auto_agents.verification_input_trace import owner_identity
+    if not owner_identity()['metadata']:
+        import auto_agents.verification_sandbox as sandbox
+        command = [sys.executable, str(Path(sandbox.__file__).resolve()), '--metadata',
+                   json.dumps({'roots': [str(root)]}), *command]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
     assert result.returncode == 125, result.stdout + result.stderr
     assert ('refused the boundary' if failure == 'registration' else 'Landlock setup refused') in result.stderr
     assert not marker.exists()
