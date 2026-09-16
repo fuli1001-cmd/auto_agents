@@ -23,6 +23,7 @@ from .io_utils import read_json
 # Re-seal older receipts before reuse: v5 can omit checks inherited through
 # parameterized generic bases, even when the selected node remains unchanged.
 _PROOF_INVENTORY_VERSION = 6
+_REFERENCE_ROLE_VERSION = 1
 
 _PYTEST_CONFIG_NAMES = ('pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
                         'pyproject.toml', 'tox.ini', 'setup.cfg')
@@ -42,6 +43,31 @@ def ownership_error(state, message, **details):
         'contract_fingerprint': binding.get('contract_fingerprint', ''),
         'task_scope': binding.get('task_scope', {}), 'retry_fix': False, **details,
     })
+
+
+def preimplementation_failure(state):
+    """Positive preflight evidence, never an empty ownership record alone.
+
+    Resume resets the local attempt counter. Retained writer/attempt history
+    therefore takes precedence over a current zero, even without a receipt.
+    """
+    if (state.mode != 'fix' or state.status != 'blocked' or state.current_attempt
+            or state.candidate_paths or state.candidate_custody
+            or state.lineage_changed_paths or state.active_handoff_id
+            or state.last_child_result_ref or state.persistence_actions):
+        return None
+    for entry in state.execution_log:
+        if entry.get('attempt', 0) or entry.get('action') in {
+                'fix', 'receipt_writer_result', 'receipt_verification', 'receipt_completion',
+                'child_returned', 'fix_route_rejected'}:
+            return None
+    for entry in reversed(state.execution_log):
+        if entry.get('action') == 'execution_preflight_blocked':
+            if (entry.get('failure_kind') == state.resolution
+                    and entry.get('retry_fix') is False and entry.get('result')):
+                return entry
+            return None
+    return None
 
 
 def fingerprint(value: object) -> str:
@@ -146,7 +172,9 @@ def _bind_session(session, state) -> None:
         elif any(scope.values()) and scope != state.verification_binding['task_scope']:
             raise ownership_error(state, 'retained task authority conflicts with session evidence')
         from .verification_context import proof_context_descriptor
-        upgrade_inventory = recover_scope or state.verification_binding.get('proof_inventory_version', 0) < _PROOF_INVENTORY_VERSION
+        upgrade_inventory = (recover_scope
+                             or state.verification_binding.get('proof_inventory_version', 0) < _PROOF_INVENTORY_VERSION
+                             or state.verification_binding.get('reference_role_version', 0) < _REFERENCE_ROLE_VERSION)
         refresh_context = state.verification_binding.get('proof_execution_context') != proof_context_descriptor(session, state)
         rebuild_inventory = state.verification_binding.get('schema_version', 1) < 12 or upgrade_inventory
         if rebuild_inventory or refresh_context:
@@ -503,6 +531,7 @@ def _validate_binding_inventory(session, state):
         from .gates import command_from_verification_step
         gates = GateConfig.from_dict(_complete_gates(state))
         _owned_inventory(state, gates, session)
+        _validate_reference_artifacts(session, state)
         # A valid retained fingerprint does not make an older admission's
         # selection assumptions executable. Recheck before baseline or writer
         # dispatch, using the sealed configuration and original commands.
@@ -662,8 +691,15 @@ def _owned_inventory(state, gates, session=None):
     owners = {}
     for ref in sorted(refs):
         kind = _session_reference_kind(session, state, gates, ref)
-        matches = [step for step in gates.steps if (
-            step.proof_id == ref if kind == 'proof' else _ref_covered(ref, step))]
+        if kind == 'artifact':
+            # Supporting inputs are not executable obligations. Published
+            # outputs still retain their producing proof, including prerequisites.
+            from fnmatch import fnmatchcase
+            matches = [step for step in gates.steps if any(
+                fnmatchcase(ref.removeprefix('artifact:'), pattern) for pattern in step.artifact_globs)]
+        else:
+            matches = [step for step in gates.steps if (
+                step.proof_id == ref if kind == 'proof' else _ref_covered(ref, step))]
         command_covered = kind in {'command', 'selector'} and (
             _command_covers(state.fix_verify_command, ref)
             or any(_command_covers(command, ref) for command in _legacy_commands(gates)))
@@ -863,12 +899,13 @@ def _retained_reference_exists(session, state, ref, *, commands=()):
 
 def _session_reference_kind(session, state, gates, ref):
     return _reference_kind(ref, gates, commands=[state.fix_verify_command],
+                           reference_paths=_retained_reference_catalog(session, state)[0],
                            source_exists=lambda value: _retained_reference_exists(
                                session, state, value,
                                commands=[*_legacy_commands(gates), state.fix_verify_command]))
 
 
-def _reference_kind(ref, gates, *, commands=(), source_exists=None):
+def _reference_kind(ref, gates, *, commands=(), source_exists=None, reference_paths=()):
     """An extension is not an artifact declaration: proof IDs can end in .json."""
     from fnmatch import fnmatchcase
 
@@ -876,9 +913,7 @@ def _reference_kind(ref, gates, *, commands=(), source_exists=None):
         return 'proof'
     if ref.startswith('cmd:'):
         return 'command'
-    if ref.startswith('artifact:') or any(
-        fnmatchcase(ref, pattern) for step in gates.steps for pattern in step.artifact_globs
-    ):
+    if ref.startswith('artifact:'):
         return 'artifact'
     if '::' in ref or ref.endswith('.py'):
         return 'selector'
@@ -892,7 +927,119 @@ def _reference_kind(ref, gates, *, commands=(), source_exists=None):
     if (any(_command_covers(command, ref) for command in [*_legacy_commands(gates), *commands])
             and source_exists is not None and source_exists(ref)):
         return 'selector'
+    # This is a managed reference namespace, not a filename extension rule.
+    # Existence and provenance are checked separately when sealing the input.
+    path = Path(ref)
+    if (not path.is_absolute() and '..' not in path.parts and (
+            ref in reference_paths or ref.startswith('.auto-agents/docs/provider_references/')
+            or any(fnmatchcase(ref, pattern) for step in gates.steps for pattern in step.artifact_globs))):
+        return 'artifact'
     return 'proof'
+
+
+def _retained_reference_bytes(session, state, path):
+    root = getattr(session, '_retained_source_root', None)
+    if root is None:
+        from .session_source import resolve_source
+        root = resolve_source(getattr(session, '_custody_control_root', session.project_root), state)
+    revision = _contract_source_revision(session, state)
+    if not revision and state.candidate_custody.get('initial_source'):
+        from .execution_binding import _session_source_revision
+        root = Path(state.candidate_custody['checkout'])
+        revision = _session_source_revision(state)
+    if revision:
+        result = subprocess.run(['git', 'show', f'{revision}:{path}'], cwd=root, capture_output=True)
+        return result.stdout if result.returncode == 0 else None
+    if not head_ref(root):
+        try:
+            return (root / path).read_bytes()
+        except OSError:
+            pass
+    return None
+
+
+def _retained_reference_catalog(session, state):
+    if session is None:
+        return {}, {}, {}
+    revision = _contract_source_revision(session, state)
+    key = (str(getattr(session, '_retained_source_root', session.project_root)), revision)
+    cache = getattr(session, '_reference_role_cache', {})
+    if revision and key in cache:
+        return cache[key]
+    from .requirements import provider_reference_paths
+    payloads = []
+    for path in ('.auto-agents/state/requirements_trace.json', '.auto-agents/state/provider_references.lock.json'):
+        source = _retained_reference_bytes(session, state, path)
+        payloads.append(json.loads(source) if source is not None else {})
+    trace, lock = payloads
+    paths = {}
+    for row in trace.get('requirements', []):
+        for path in provider_reference_paths(row):
+            paths[path] = paths.get(path, False) or bool(row.get('external_docs_required'))
+    for entry in lock.get('references', {}).values():
+        if isinstance(entry, dict) and entry.get('path'):
+            paths.setdefault(entry['path'], False)
+    result = paths, trace, lock
+    if revision:
+        cache[key] = result
+        session._reference_role_cache = cache
+    return result
+
+
+def _seal_reference_roles(session, state, gates):
+    from fnmatch import fnmatchcase
+    from .provider_contract import provider_reference_lock_entry
+    from .requirements import provider_reference_effective_status, PASSING_REFERENCE_STATUSES
+
+    paths, trace, lock = _retained_reference_catalog(session, state)
+    for ref, record in state.verification_binding['required_references'].items():
+        if record['kind'] != 'artifact':
+            continue
+        path = ref.removeprefix('artifact:')
+        if Path(path).is_absolute() or '..' in Path(path).parts or not path:
+            raise ownership_error(state, 'reference artifact leaves the repository', verification_ref=ref)
+        if any(fnmatchcase(path, pattern) for step in gates.steps for pattern in step.artifact_globs):
+            record.update(role='output', path=path)
+            continue
+        source = _retained_reference_bytes(session, state, path)
+        if source is None:
+            raise ownership_error(state, 'required reference artifact is unavailable: ' + path,
+                                  verification_ref=ref, owners=record['owners'])
+        entry = provider_reference_lock_entry(lock, path)
+        if (entry is not None or paths.get(path)) and provider_reference_effective_status(lock, trace, path) not in PASSING_REFERENCE_STATUSES:
+            raise ownership_error(state, 'provider reference provenance is unavailable: ' + path,
+                                  verification_ref=ref, owners=record['owners'])
+        record.update(role='reference', path=path, sha256=hashlib.sha256(source).hexdigest())
+        if entry is not None:
+            record['provider_lock'] = deepcopy(entry)
+    state.verification_binding['reference_role_version'] = _REFERENCE_ROLE_VERSION
+
+
+def _validate_reference_artifacts(session, state):
+    # The shared workspace is not the candidate. Its unrelated dirty input
+    # must neither replace retained evidence nor invalidate private evidence.
+    custody = state.candidate_custody
+    references = [(ref, record) for ref, record in state.verification_binding.get('required_references', {}).items()
+                  if record.get('role') == 'reference']
+    if not custody or not references:
+        return
+    from .session_source import validate_checkout
+    private_root = Path(custody['checkout'])
+    validate_checkout(getattr(session, '_custody_control_root', session.project_root), state, private_root)
+    from .provider_contract import provider_reference_contract_version, validate_provider_reference_v2
+    for ref, record in references:
+        path = private_root / record['path']
+        try:
+            valid = (path.resolve().is_relative_to(private_root.resolve())
+                     and hashlib.sha256(path.read_bytes()).hexdigest() == record['sha256'])
+            entry = record.get('provider_lock')
+            if valid and provider_reference_contract_version(entry) >= 2:
+                valid = not validate_provider_reference_v2(path, entry)
+        except (OSError, ValueError):
+            valid = False
+        if not valid:
+            raise ownership_error(state, 'required reference artifact changed or is unavailable: ' + record['path'],
+                                  verification_ref=ref, owners=record.get('owners', []))
 
 
 def _seal_inventory(session, state):
@@ -912,8 +1059,17 @@ def _seal_inventory_in_context(session, state):
     required, _ = _owned_inventory(state, complete, session)
     owners = binding['proof_graph']['proof_owners']
     owned_refs = _mandatory_refs(state)
+    previous_references = binding.get('required_references', {})
     binding['required_references'] = {ref: {'kind': _session_reference_kind(session, state, complete, ref),
         'owners': diagnostic_owners(state, ref)} for ref in sorted(owned_refs)}
+    _seal_reference_roles(session, state, complete)
+    for ref, previous in previous_references.items():
+        current = binding['required_references'].get(ref, {})
+        if any(key in previous and previous[key] != current.get(key)
+               for key in ('role', 'path', 'sha256', 'provider_lock')):
+            raise ownership_error(state, 'retained reference artifact conflicts during migration',
+                                  verification_ref=ref, owners=previous.get('owners', []))
+    _validate_reference_artifacts(session, state)
     gates = session_gates(session, state)
     required_commands = {command: [owner for ref in sorted(owned_refs) if _command_covers(command, ref)
                                    for owner in diagnostic_owners(state, ref)]
@@ -1822,6 +1978,7 @@ def _validate_selected_contracts(session, state, commands, *, metadata=None):
     from .models import VerificationStep
 
     _validate_required_node_selection(session, state, commands)
+    _validate_reference_artifacts(session, state)
     for path, source in state.verification_binding.get('proof_sources', {}).items():
         if path not in state.candidate_paths:
             continue
@@ -1867,7 +2024,9 @@ def selected_requirement_contracts(session, state, commands, *, metadata=None):
     # Mandatory ownership comes from the sealed inventory, never reconstructed
     # only from shell substrings. Expansion and command coalescing may remove
     # the literal node reference while retaining its full contract obligation.
-    task_ids = set(state.verification_binding.get('task_ids', []))
+    # Inventory summaries retain dependency provenance, not task authority.
+    # Selected executable regressions still bind their own contracts below.
+    task_ids = {task['task_id'] for task in _owned_tasks(state)}
     for command in commands:
         item = (metadata or {}).get(command)
         proof_ids = item.get('proof_ids', []) if isinstance(item, dict) else getattr(item, 'proof_ids', [])

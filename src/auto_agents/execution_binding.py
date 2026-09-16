@@ -37,6 +37,7 @@ _INVENTORY_FIELDS = frozenset({
     'required_proofs', 'regression_dependencies', 'verification_policy',
     'proof_control_paths', 'proof_config_paths', 'proof_sources', 'proof_source_owners',
     'proof_execution_context',
+    'reference_role_version',
     'task_ids', 'requirement_ids',
 })
 

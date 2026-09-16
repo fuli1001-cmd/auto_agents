@@ -706,6 +706,12 @@ class WorkflowCoordinator:
                 reason="failed session started a fresh durable resume boundary",
             )
             if not state.candidate_custody.get("receipt"):
+                if state.mode == 'fix' and state.current_attempt:
+                    # A crash can persist the attempt counter before the
+                    # writer result/receipt. A new local epoch must not erase
+                    # that evidence and manufacture a zero-candidate exit.
+                    state.execution_log.append({'action': 'implementation_attempts_retained',
+                        'attempt': state.current_attempt, 'timestamp': parent_session_now()})
                 state.current_attempt = 0
                 session._begin_attempt_epoch(state, reason="failed session resumed")
             state.status = (
@@ -813,14 +819,23 @@ class WorkflowCoordinator:
         from .repair_control import digest
         continuing_engine_child = (
             handoff.result.get('engine_recovery_binding') == digest(binding_payload)
-            and handoff.result.get('session_id') == binding_payload.get('child_session_id')
+            and bool(handoff.result.get('session_id'))
             and handoff.status in {'paused', 'waiting_user', 'waiting_child'}
         )
         blocked = ({'resolution': 'verified_engine_repair'} if continuing_engine_child
                    else self._execution_binding_result(binding_payload))
-        if blocked.get("resolution") == "verified_engine_repair" and binding_payload.get("child_session_id"):
-            blocked = self._resume_engine_bound_child(binding_payload, snapshot)
-            blocked['engine_recovery_binding'] = digest(binding_payload)
+        if blocked.get("resolution") == "verified_engine_repair":
+            from .session_verification import SessionOwnershipError
+            try:
+                child_id = self._engine_child_id(binding_payload, snapshot)
+                if continuing_engine_child and handoff.result['session_id'] != child_id:
+                    raise SessionOwnershipError('verified engine return conflicts with its retained child')
+                if child_id:
+                    blocked = self._resume_engine_bound_child(binding_payload, snapshot, child_id=child_id)
+                    blocked['engine_recovery_binding'] = digest(binding_payload)
+            except SessionOwnershipError as error:
+                blocked = {'status': 'blocked', 'resolution': 'engine_child_binding_mismatch',
+                           'summary': str(error), 'diagnostic': error.diagnostic, 'changed_paths': []}
         if blocked:
             # Reject legacy/restored foreign handoffs before checkpoints,
             # rollback, ambient run recovery, or a new provider call.
@@ -848,13 +863,8 @@ class WorkflowCoordinator:
             native_status in {"failed", "blocked"}
             and str(result.get("resolution", "")) != "active_run_conflict"
         ):
-            from .session_verification import SessionOwnershipError
-            try:
-                result["rolled_back_paths"] = self._rollback_handoff_uncommitted(snapshot, handoff)
-            except SessionOwnershipError as error:
-                native_status = "blocked"
-                result.update(status="blocked", resolution="verification_ownership",
-                              summary=str(error), rolled_back_paths=[])
+            self._finish_failed_handoff(snapshot, handoff, result)
+            native_status = str(result['status'])
         self.store.record_result(snapshot, handoff, status=native_status, result=result)
         if native_status in {"paused", "waiting_user", "waiting_child"}:
             parent_state.status = "waiting_child"
@@ -864,6 +874,63 @@ class WorkflowCoordinator:
         operation_id = f"return-{handoff.handoff_id}-{uuid4().hex[:8]}"
         self.store.consume_result(snapshot, handoff, operation_id=operation_id)
         return self._apply_child_result(parent_state, handoff)
+
+    def _handoff_exit_ownership(self, state, handoff):
+        from .session_verification import (
+            _validate_binding_identity, ownership_error, preimplementation_failure,
+        )
+        original = handoff
+        if handoff.target == 'resume':
+            try:
+                original = self.store.load_handoff(str(handoff.payload.get('resume_handoff_id', '')))
+            except (OSError, ValueError) as error:
+                raise ownership_error(state, 'original child handoff is unavailable') from error
+        if (original.child != WorkflowRef('fix', state.session_id)
+                or original.workflow_id != state.workflow_id
+                or original.handoff_id != state.parent_handoff_id
+                or original.payload.get('child_session_id', state.session_id) != state.session_id):
+            raise ownership_error(state, 'child exit identity conflicts with its handoff')
+        if state.verification_binding:
+            _validate_binding_identity(self.orch, state)
+        if state.candidate_custody:
+            from .session_source import validate_checkout
+            from .session_candidate import validate_receipt
+            if not state.verification_binding:
+                raise ownership_error(state, 'candidate custody has no verification authority')
+            try:
+                validate_checkout(self.project_root, state, Path(state.candidate_custody['checkout']))
+                validate_receipt(state)
+            except (KeyError, TypeError, ValueError, OSError) as error:
+                raise ownership_error(state, 'candidate custody is unavailable or malformed') from error
+            return 'private'
+        if preimplementation_failure(state) is not None:
+            return 'none'
+        raise ownership_error(state, 'no child-owned receipt authorizes shared rollback',
+                              conflicting_paths=sorted(state.candidate_paths))
+
+    def _finish_failed_handoff(self, snapshot, handoff, result):
+        from .session_verification import SessionOwnershipError
+        try:
+            if handoff.child is not None and handoff.child.kind == 'fix':
+                try:
+                    state = load_session_state(self.project_root, handoff.child.native_id)
+                except (OSError, ValueError) as error:
+                    raise SessionOwnershipError('child ownership is unavailable; refusing shared rollback',
+                        diagnostic={'session_id': handoff.child.native_id,
+                                    'handoff_id': handoff.handoff_id, 'retry_fix': False}) from error
+                ownership = self._handoff_exit_ownership(state, handoff)
+                result['candidate_ownership'] = ownership
+                if ownership == 'none':
+                    result.update(changed_paths=[], commit_shas=[], head_after='', rolled_back_paths=[])
+                    return
+            result['rolled_back_paths'] = self._rollback_handoff_uncommitted(snapshot, handoff)
+        except SessionOwnershipError as error:
+            # Keep the child's original structured failure. A rollback refusal
+            # is a second failure, never a replacement for that diagnostic.
+            if result.get('status') not in {'failed', 'blocked'}:
+                result.update(resolution='verification_ownership', summary=str(error))
+            result.update(status='blocked', rolled_back_paths=[], candidate_ownership='unknown',
+                          rollback_diagnostic={'reason': str(error), **error.diagnostic})
 
     def _handoff_checkpoint_root(
         self,
@@ -923,6 +990,18 @@ class WorkflowCoordinator:
         snapshot: WorkflowSnapshot,
         handoff: WorkflowHandoff,
     ) -> list[str]:
+        if handoff.child is not None and handoff.child.kind == 'fix':
+            from .session_verification import SessionOwnershipError
+            try:
+                child_state = load_session_state(self.project_root, handoff.child.native_id)
+            except (OSError, ValueError) as error:
+                raise SessionOwnershipError('child ownership is unavailable; refusing shared rollback',
+                    diagnostic={'session_id': handoff.child.native_id,
+                                'handoff_id': handoff.handoff_id, 'retry_fix': False}) from error
+            # A proved empty exit needs no rollback. A validated private
+            # candidate stays in custody and never authorizes shared copyback.
+            self._handoff_exit_ownership(child_state, handoff)
+            return []
         root = self._handoff_checkpoint_root(snapshot, handoff)
         manifest = read_json(root / "manifest.json", default={})
         if not isinstance(manifest, dict):
@@ -941,19 +1020,6 @@ class WorkflowCoordinator:
             and not path.startswith(".antigravitycli/")
         ]
         owned = None
-        if handoff.child is not None and handoff.child.kind == "fix":
-            from .session_verification import owned_paths, SessionOwnershipError
-            try:
-                child_state = load_session_state(self.project_root, handoff.child.native_id)
-            except (OSError, ValueError) as error:
-                raise SessionOwnershipError("child ownership is unavailable; refusing shared rollback",
-                    diagnostic={"session_id": handoff.child.native_id, "handoff_id": handoff.handoff_id,
-                                "retry_fix": False}) from error
-            if child_state.candidate_custody:
-                return []
-            if child_state.verification_binding:
-                owned = set(owned_paths(self.orch, child_state))
-                current = sorted(owned & {path for _, path in changed_entries(self.project_root, ignored_prefixes=())})
         if not current or handoff.child is None:
             return []
         if owned is None:
@@ -1029,11 +1095,43 @@ class WorkflowCoordinator:
             save_session_state(self.project_root, child_state)
         return sorted(current)
 
-    def _resume_engine_bound_child(self, payload, snapshot):
+    def _engine_child_id(self, payload, snapshot):
+        """Resolve a failed-handoff reference without rewriting the route digest."""
+        from .execution_binding import route_sources
+        from .session_verification import SessionOwnershipError
+        children = set()
+        for source in route_sources(payload):
+            if source.get('child_session_id'):
+                children.add(str(source['child_session_id']))
+            failed = source.get('failed_handoff_id')
+            if not failed:
+                continue
+            evidence_base = source.get('evidence_base')
+            if evidence_base and Path(evidence_base).expanduser().resolve() != self.project_root:
+                raise SessionOwnershipError('engine return evidence belongs to another repository')
+            try:
+                original = self.store.load_handoff(str(failed))
+            except (OSError, ValueError) as error:
+                raise SessionOwnershipError('engine return failed handoff is unavailable') from error
+            if (original.workflow_id != snapshot.workflow_id or original.child is None
+                    or original.child.kind != 'fix'):
+                raise SessionOwnershipError('engine return failed handoff has conflicting ownership')
+            try:
+                child = load_session_state(self.project_root, original.child.native_id)
+            except (OSError, ValueError) as error:
+                raise SessionOwnershipError('engine return retained child is unavailable') from error
+            if child.parent_handoff_id != original.handoff_id or child.workflow_id != original.workflow_id:
+                raise SessionOwnershipError('engine return failed handoff does not own the retained child')
+            children.add(original.child.native_id)
+        if len(children) > 1:
+            raise SessionOwnershipError('engine return names conflicting children')
+        return next(iter(children), '')
+
+    def _resume_engine_bound_child(self, payload, snapshot, *, child_id=None):
         """A verified engine route re-enters the saved child without reseeding it."""
         from .session import Session
 
-        child_id = str(payload["child_session_id"])
+        child_id = child_id or self._engine_child_id(payload, snapshot)
         try:
             state = load_session_state(self.project_root, child_id)
             original = self.store.load_handoff(state.parent_handoff_id)
@@ -1049,6 +1147,31 @@ class WorkflowCoordinator:
                           health_runtime=self.health_runtime)
         if not session._retain_resume_authority(state):
             return self._session_result(state, original)
+        from .session_verification import bind_session, preimplementation_failure, SessionOwnershipError
+        from .repair_control import digest
+        if preimplementation_failure(state) is not None:
+            # This entrypoint is reached only after the exact engine route
+            # has a verified return. Recheck the original contract, retaining
+            # its failure history and budgets, before reopening execution.
+            recovery_key = digest(payload)
+            if not any(entry.get('action') == 'engine_preflight_recheck'
+                       and entry.get('route_digest') == recovery_key for entry in state.execution_log):
+                try:
+                    self._handoff_exit_ownership(state, original)
+                    session._fix_verify_command_for_execution(state.fix_verify_command)
+                    bind_session(session, state)
+                except SessionOwnershipError as error:
+                    session._block_execution_binding(state, error, 'verification_ownership')
+                    return self._session_result(state, original)
+                except ValueError as error:
+                    session._block_execution_binding(state, str(error), 'verification_execution_binding')
+                    return self._session_result(state, original)
+                state.execution_log.append({'action': 'engine_preflight_recheck',
+                    'route_digest': recovery_key, 'handoff_id': original.handoff_id,
+                    'timestamp': parent_session_now()})
+                state.status = 'executing'
+                state.resolution = state.resume_phase = state.return_phase = ''
+                save_session_state(self.project_root, state)
         from .session_verification import engine_verification_refs
         refs = engine_verification_refs(state.fix_verify_command, self.project_root, payload)
         if refs and state.status != "completed" and not any(
@@ -1090,18 +1213,7 @@ class WorkflowCoordinator:
         state = self._drive_session(session, state, snapshot, root=False)
         result = self._session_result(state, original)
         if state.status in {"failed", "blocked"}:
-            if not state.verification_binding:
-                # Execution preflight can stop a legacy child before it has
-                # recorded candidate ownership. Its historical checkpoint is
-                # not authority to claim or roll back intervening work.
-                # Preserve the failure receipt for the parent's recovery.
-                result.update(changed_paths=[], commit_shas=[], rolled_back_paths=[])
-                return result
-            from .session_verification import SessionOwnershipError
-            try:
-                result["rolled_back_paths"] = self._rollback_handoff_uncommitted(snapshot, original)
-            except SessionOwnershipError as error:
-                result.update(status="blocked", resolution="verification_ownership", summary=str(error))
+            self._finish_failed_handoff(snapshot, original, result)
         return result
 
     def _drive_fix_child(self, handoff: WorkflowHandoff, snapshot: WorkflowSnapshot) -> Dict[str, object]:
@@ -1530,29 +1642,58 @@ class WorkflowCoordinator:
         return parent_state
 
     def _session_result(self, state: object, handoff: WorkflowHandoff) -> Dict[str, object]:
+        from .session_verification import SessionOwnershipError
         before = str(handoff.payload.get("head_before", ""))
         delivery = dict(getattr(state, 'candidate_custody', {}))
-        after = delivery.get('delivered_revision') or head_ref(self.project_root)
-        source = Path(delivery['checkout']) if delivery else self.project_root
-        return {
-            "candidate_delivery": delivery if state.status == "completed" and delivery.get('delivered_revision') else {},
+        ownership = 'unknown'
+        ownership_error = None
+        if state.mode == 'fix':
+            try:
+                ownership = self._handoff_exit_ownership(state, handoff)
+            except SessionOwnershipError as error:
+                ownership_error = error
+        after = delivery.get('delivered_revision', '') if ownership == 'private' else ''
+        source = Path(delivery['checkout']) if ownership == 'private' else self.project_root
+        reported_paths = sorted(set(state.candidate_paths) | set(state.lineage_changed_paths)) if ownership == 'private' else []
+        commit_base = delivery.get('base_revision', before)
+        if state.mode != 'fix':
+            # Preserve the other session protocols; only fix handoffs use
+            # the private-writer/positive-preflight ownership contract above.
+            ownership = 'private' if delivery else 'legacy'
+            after = delivery.get('delivered_revision') or head_ref(self.project_root)
+            source = Path(delivery['checkout']) if delivery else self.project_root
+            commit_base = before
+            reported_paths = (sorted(set(state.candidate_paths) | set(state.lineage_changed_paths))
+                              if state.verification_binding else _paths_between(self.project_root, before, after))
+        failure = next((entry for entry in reversed(state.execution_log)
+                        if entry.get('failure_kind') and entry.get('retry_fix') is False), {}) if state.status in {'failed', 'blocked'} else {}
+        summary = failure.get('result') or state.resolution or f"{state.mode} status={state.status}"
+        result = {
+            "candidate_delivery": delivery if state.status == "completed" and ownership == 'private' and after else {},
+            "candidate_ownership": ownership,
             "status": state.status,
             "resolution": state.resolution,
-            "summary": state.resolution or f"{state.mode} status={state.status}",
+            "summary": summary,
             "session_id": state.session_id,
             "state_ref": str(
                 Path(".auto-agents") / "state" / "sessions" / state.session_id / "session_state.json"
             ),
             "head_before": before,
             "head_after": after,
-            "commit_shas": _commits_between(source, before, after),
-            "changed_paths": (
-                sorted(set(state.candidate_paths) | set(state.lineage_changed_paths))
-                if getattr(state, "verification_binding", {})
-                else _paths_between(self.project_root, before, after)
-            ),
-            "failure_fingerprint": _failure_fingerprint(state.status, state.resolution),
+            "commit_shas": _commits_between(source, commit_base, after) if after else [],
+            "changed_paths": reported_paths,
+            "failure_fingerprint": _failure_fingerprint(state.status, str(summary)),
         }
+        if failure:
+            result.update(diagnostic=failure.get('diagnostic', {}),
+                          failure_kind=failure.get('failure_kind'), retry_fix=failure.get('retry_fix'))
+        if ownership == 'none':
+            result['rolled_back_paths'] = []
+        if ownership_error is not None:
+            result['ownership_diagnostic'] = {'reason': str(ownership_error), **ownership_error.diagnostic}
+            if state.status == 'completed':
+                result.update(status='blocked', resolution='verification_ownership', summary=str(ownership_error))
+        return result
 
     def _run_result(self, state: object, handoff: WorkflowHandoff) -> Dict[str, object]:
         before = str(handoff.payload.get("head_before", ""))
