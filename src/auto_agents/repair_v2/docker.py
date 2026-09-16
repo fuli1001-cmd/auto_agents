@@ -237,6 +237,7 @@ class DockerVerifier:
             'diagnostic': reason,
             'returncode': code, 'collected': sorted(collected), 'passed': sorted(passed),
             'failed': evidence.get('failed', []), 'skipped': evidence.get('skipped', []), 'missing': missing,
+            'call_failed': evidence.get('call_failed', []),
             'cache_hit': False, 'seconds': time.monotonic() - started, 'infrastructure': infrastructure,
             'output': str(base / 'output.log'), 'excerpt': text[-4000:], 'inputs': inputs}
         if result['ok'] and inputs['complete'] and not unit.fresh: atomic_json(cache, {'result': result, 'digest': digest(result)})
@@ -293,18 +294,30 @@ class DockerVerifier:
                 shutil.copy2(Path(snapshot) / 'conftest.py', baseline / 'conftest.py')
             workspace.checkpoint()
             identity = source_identity(baseline)
-            result = self.execute(identity, baseline, ValidationUnit('behavior-baseline',
-                'python -m pytest -q ' + ' '.join(shlex.quote(n) for n in nodes), fresh=True, profile='sandbox'), cancel)
+            # One new module may depend on an API absent from the old source.
+            # Keep it from preventing other, portable behavioral probes from
+            # executing. Collection/setup errors are never counterexamples.
+            grouped = {}
+            for node in nodes: grouped.setdefault(node.split('::', 1)[0], []).append(node)
+            units = [ValidationUnit('behavior-baseline:' + file,
+                'python -m pytest -q ' + ' '.join(shlex.quote(n) for n in batch), fresh=True, profile='sandbox')
+                for file, batch in grouped.items()]
+            result = self.validate(identity, baseline, units, cancel, collect_all=True)
             if cancel.is_set(): raise KeyboardInterrupt()
-            infrastructure = result.get('infrastructure') or result['returncode'] in (125, 126, 127, 130, 137)
-            demonstrated = result['returncode'] != 0 and not infrastructure
+            infrastructure = result.infrastructure or any(
+                check.get('returncode') in (125, 126, 127, 130, 137) for check in result.checks)
+            examples = sorted({node for check in result.checks if check.get('returncode') == 1
+                               for node in check.get('call_failed', [])})
+            demonstrated = bool(examples) and not infrastructure
+            detail = next((check for check in result.checks if check.get('call_failed')), None)
             return {'ok': not infrastructure and (demonstrated or not product_changed),
                     'snapshot': snapshot_id, 'base': base_commit, 'runtime': self.runtime,
                     'product_changed': product_changed, 'demonstrated_regression': demonstrated,
-                    'counterexamples': result['failed'], 'returncode': result['returncode'],
-                    'infrastructure': bool(infrastructure), 'output': result['output'],
-                    'reason': result['excerpt'] if demonstrated or infrastructure else
-                        'Original code passes every mapped check; add a behavioral regression test for the proposed fix.'}
+                    'counterexamples': examples, 'checks': result.checks,
+                    'infrastructure': bool(infrastructure),
+                    'output': detail.get('output', '') if detail else '',
+                    'reason': detail.get('excerpt', '') if demonstrated else
+                        'No executed behavioral counterexample on the original source; collection and setup errors do not establish a regression.'}
 
     def boundary(self, snapshot_id, snapshot, frozen_target, payload, cancel):
         """One deterministic, credential-free replay at the original boundary."""
