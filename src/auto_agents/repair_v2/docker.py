@@ -13,7 +13,7 @@ import time
 import uuid
 from contextlib import ExitStack
 
-from .dependencies import cache_key, execution_fingerprint, pytest_parts, witness
+from .dependencies import cache_key, pytest_parts, witness
 from .scheduling import Timings
 from .store import atomic_json, digest
 from .types import Cancellation, RepairBlocked, ValidationResult
@@ -135,7 +135,7 @@ class DockerVerifier:
                                'uid': os.getuid(), 'gid': os.getgid(), 'memory': '1g', 'tmpfs': 'exec,4g',
                                'boundary': Path(__file__).with_name('boundary_driver.py').read_text(),
                                'session': Path(__file__).parent.parent.joinpath('session_replay.py').read_text(),
-                               'kernel': os.uname().release, 'policy': 6, 'init': True})
+                               'kernel': os.uname().release, 'policy': 7, 'init': True})
         self.image = identity_text.strip()  # A mutable tag is not a verification input.
 
     def concurrency(self):
@@ -150,16 +150,14 @@ class DockerVerifier:
                     'excerpt': 'validation cancelled before dispatch', 'failed': [], 'missing': [], 'infrastructure': False}
         started = time.monotonic()
         inputs = witness(snapshot, unit, self.runtime)
-        if not inputs['complete'] and not unit.fresh:
-            inputs['execution'] = execution_fingerprint(snapshot)
         key = cache_key(snapshot_id, unit, inputs)
         cache = self.root / 'cache' / (key + '.json')
-        reusable = (inputs['complete'] or inputs.get('execution')) and not unit.fresh
+        reusable = inputs['complete'] and not unit.fresh
         if cache.exists() and reusable:
             try:
                 envelope = json.loads(cache.read_text())
                 result = envelope['result']
-                if (digest(result) == envelope.get('digest') and result.get('ok')
+                if (isinstance(result, dict) and digest(result) == envelope.get('digest') and result.get('ok')
                         and result.get('inputs') == inputs and result.get('command') == unit.command):
                     return {**result, 'unit': unit.identity, 'cache_hit': True, 'seconds': 0.0,
                             'total_seconds': time.monotonic() - started}
@@ -247,7 +245,7 @@ class DockerVerifier:
             'node_seconds': evidence.get('node_seconds', {}),
             'cache_hit': False, 'seconds': time.monotonic() - started, 'infrastructure': infrastructure,
             'output': str(base / 'output.log'), 'excerpt': text[-4000:], 'inputs': inputs}
-        if result['ok'] and (inputs['complete'] or inputs.get('execution')) and not unit.fresh:
+        if result['ok'] and inputs['complete'] and not unit.fresh:
             try: atomic_json(cache, {'result': result, 'digest': digest(result)})
             except OSError: pass  # Cache writes are optional; execution evidence is not.
         return result
@@ -402,10 +400,12 @@ class DockerVerifier:
         results = []
         pending = iter(unique.values())
         workers = self.concurrency()
+        cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count() or 1
+        capacity = max(workers, self.workers or max(1, cpus - 1))
         total_nodes = len({node for unit in unique.values() for node in unit.expected_nodes})
         stopped = threading.Event()
         execution_cancel = Cancellation(cancel, stopped)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        with ThreadPoolExecutor(max_workers=capacity) as pool:
             running = {}
             def dispatch():
                 unit = next(pending, None)
@@ -426,7 +426,10 @@ class DockerVerifier:
                             'total': len(unique), 'workers': workers, 'total_nodes': total_nodes,
                             'tested_nodes': len({node for check in results for node in check.get('collected', [])})})
                     if (collect_all or not failed) and not execution_cancel.is_set():
-                        for _ in done: dispatch()
+                        # Review/container memory can be released mid-run. Use
+                        # newly available slots without exceeding live limits.
+                        workers = min(capacity, self.concurrency())
+                        for _ in range(max(0, workers - len(running))): dispatch()
             except BaseException:
                 # Cancel siblings before the executor waits for them. Otherwise
                 # one raised error could wait for unrelated 30-minute checks.

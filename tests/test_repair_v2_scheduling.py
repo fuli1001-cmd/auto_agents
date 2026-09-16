@@ -4,7 +4,6 @@ import threading
 
 import pytest
 
-from auto_agents.repair_v2.dependencies import execution_fingerprint
 from auto_agents.repair_v2.docker import DockerVerifier
 from auto_agents.repair_v2.scheduling import Timings
 from auto_agents.repair_v2.types import RepairBlocked, ValidationUnit
@@ -82,7 +81,7 @@ def test_corrupt_or_unusable_timings_never_remove_tests(tmp_path):
 def cached_verifier(tmp_path, monkeypatch):
     source = tmp_path / 'source'; source.mkdir(); git(source, 'init', '-q')
     (source / '.gitignore').write_text('ignored.txt\n')
-    (source / 'test_x.py').write_text('def test_value(tmp_path): assert tmp_path.exists()\n')
+    (source / 'test_x.py').write_text('def test_value(): assert 1 == 1\n')
     git(source, 'add', '.'); git(source, 'commit', '-qm', 'source')
     verifier = DockerVerifier(tmp_path / 'verification', image='pinned'); verifier.runtime = 'runtime-1'
     node = 'test_x.py::test_value'
@@ -102,23 +101,27 @@ def cached_verifier(tmp_path, monkeypatch):
     return source, verifier, unit, launched
 
 
-def test_exact_cache_reuses_opaque_tests_and_binds_all_materialized_inputs(cached_verifier):
+def test_opaque_checks_do_not_reuse_passing_history(cached_verifier, monkeypatch):
     source, verifier, unit, launched = cached_verifier
+    from auto_agents.repair_v2 import docker
+    (source / 'test_x.py').write_text('import time\ndef test_value(): assert time.time() < 9999999999\n')
+    transport = docker.run
+    def failing_later(command, **kwargs):
+        code, text = transport(command, **kwargs)
+        if command[1] == 'run' and len(launched) > 1:
+            destination = next(arg for arg in command if arg.startswith('type=bind,src=') and arg.endswith(',dst=/result'))
+            out = Path(destination.split('src=', 1)[1].split(',dst=', 1)[0])
+            (out / 'pytest.json').write_text(json.dumps({'collected': list(unit.expected_nodes),
+                                                       'passed': [], 'failed': list(unit.expected_nodes)}))
+            return 1, 'clock-dependent assertion failed'
+        return code, text
+    monkeypatch.setattr(docker, 'run', failing_later)
     def execute(unit=unit): return verifier.execute(source_identity(source), source, unit, threading.Event())
     first = execute(); assert first['ok'] and not first['inputs']['complete']
-    assert execute()['cache_hit'] and len(launched) == 1
-    # Git and ignored files do not change delivered-source identity, but can
-    # change an opaque test's behavior and must invalidate its execution proof.
     identity = source_identity(source)
-    (source / 'ignored.txt').write_text('new input')
-    assert source_identity(source) == identity and not execute()['cache_hit']
-    assert execute()['cache_hit']
-    git(source, 'config', 'test.option', 'changed')
-    assert source_identity(source) == identity and not execute()['cache_hit']
-    verifier.runtime = 'runtime-2'
-    assert not execute()['cache_hit']
-    fresh = ValidationUnit(unit.identity, unit.command, unit.expected_nodes, fresh=True)
-    assert not execute(fresh)['cache_hit'] and not execute(fresh)['cache_hit']
+    second = execute()
+    assert source_identity(source) == identity and not second['ok'] and not second['cache_hit']
+    assert len(launched) == 2
     assert not list(verifier.root.glob('executions/*/source'))
 
 
@@ -135,16 +138,18 @@ def test_corrupt_cache_or_different_selection_runs_fresh(cached_verifier):
     assert not execute(changed)['cache_hit'] and len(launched) == 4
 
 
-def test_execution_fingerprint_binds_modes_times_and_links_without_following(tmp_path):
-    import os
-    path = tmp_path / 'value'; path.write_text('same')
-    first = execution_fingerprint(tmp_path)
-    info = path.stat(); os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
-    assert execution_fingerprint(tmp_path) != first
-    before = execution_fingerprint(tmp_path); path.chmod(0o700)
-    assert execution_fingerprint(tmp_path) != before
-    (tmp_path / 'link').symlink_to('/does/not/exist')
-    assert execution_fingerprint(tmp_path)
+def test_scheduler_can_add_workers_when_review_releases_memory(tmp_path):
+    verifier = DockerVerifier(tmp_path, workers=2)
+    finished_first = threading.Event(); barrier = threading.Barrier(2)
+    verifier.concurrency = lambda: 2 if finished_first.is_set() else 1
+    def execute(_, __, unit, cancel):
+        if unit.identity == 'first': finished_first.set()
+        else: barrier.wait(timeout=3)
+        return result(unit)
+    verifier.execute = execute
+    observed = verifier.validate_suite('source', tmp_path,
+        [ValidationUnit(name, name) for name in ('first', 'second', 'third')], threading.Event())
+    assert observed.ok and len(observed.checks) == 3
 
 
 def test_timeout_is_infrastructure_and_does_not_request_a_code_rewrite(tmp_path, monkeypatch):

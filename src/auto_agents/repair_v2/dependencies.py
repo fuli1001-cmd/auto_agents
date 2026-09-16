@@ -1,6 +1,5 @@
 """Closed static Python witnesses; unprovable execution always binds full source."""
 import ast
-import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -132,26 +131,3 @@ def witness(snapshot, unit, runtime):
 def cache_key(snapshot_identity, unit, inputs):
     return digest({'version': 3, 'inputs': inputs,
                    'snapshot': None if inputs['complete'] else snapshot_identity})
-
-
-def execution_fingerprint(root):
-    """Bind opaque checks to every copied input, including Git/ignored files.
-
-    This deliberately includes modification times and modes: filesystem and
-    Git tests can observe them even when the delivered source bytes match.
-    Links are recorded, never traversed. Unsupported entries disable caching.
-    """
-    root = Path(root)
-    info = root.stat()
-    entries = {'.': ['directory', info.st_mode & 0o7777, info.st_mtime_ns]}
-    for current, directories, files in os.walk(root, followlinks=False):
-        for name in sorted([*directories, *files]):
-            path = Path(current) / name
-            info = path.lstat()
-            relative = path.relative_to(root).as_posix()
-            if path.is_symlink(): value = ['link', os.readlink(path)]
-            elif path.is_file(): value = ['file', hashlib.sha256(path.read_bytes()).hexdigest()]
-            elif path.is_dir(): value = ['directory']
-            else: return None
-            entries[relative] = [*value, info.st_mode & 0o7777, info.st_mtime_ns]
-    return digest(entries)
