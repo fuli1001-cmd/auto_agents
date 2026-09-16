@@ -129,3 +129,36 @@ def test_malformed_selection_is_repair_feedback(tmp_path, name, text):
     with pytest.raises(ProtectionError) as error: check()
     assert error.value.code == 'tests_invalid'
     assert name in error.value.findings[0]['reason']
+
+
+@pytest.mark.parametrize('retained,changed', [
+    ('ready() and prepare()', 'prepare() and ready()'),
+    ('ready()', 'prepare() and ready()'),
+    ('True and ready()', 'True and prepare() and ready()'),
+])
+def test_side_effecting_conjunction_changes_cannot_turn_failure_into_pass(tmp_path, retained, changed):
+    source = '''
+def test_order():
+    state = {'ready': False}
+    def ready(): return state['ready']
+    def prepare():
+        state['ready'] = True
+        return True
+    assert PREDICATE
+'''
+    original, current = source.replace('PREDICATE', retained), source.replace('PREDICATE', changed)
+    scope = {}; exec(original, scope)
+    with pytest.raises(AssertionError): scope['test_order']()
+    scope = {}; exec(current, scope); scope['test_order']()
+    with pytest.raises(ProtectionError): audit(tmp_path, original, current)()
+
+
+def test_suffix_strengthening_preserves_nested_conjunction_order(tmp_path):
+    audit(tmp_path, 'def test_value():\n    assert first() and second()\n',
+          'def test_value():\n    assert (first() and second()) and third()\n')()
+
+
+def test_one_strengthened_assertion_cannot_replace_two_evaluations(tmp_path):
+    with pytest.raises(ProtectionError):
+        audit(tmp_path, 'def test_value():\n    assert first()\n    assert first() and second()\n',
+              'def test_value():\n    assert first() and second()\n')()

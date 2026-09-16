@@ -486,7 +486,10 @@ class Controller:
                 if error.code == 'no_progress' and self.state.get('failures'):
                     failure = self.state['failures'][0]
                     nodes = failure.get('failed') or failure.get('missing') or []
-                    location = nodes[0] if nodes else failure.get('unit') or failure.get('path') or failure.get('requirement')
+                    location = nodes[0] if nodes else failure.get('unit') or failure.get('path')
+                    if not location and failure.get('requirement'):
+                        from ..repair_environment_log import sanitize
+                        location = 'independent review: ' + sanitize(str(failure.get('reason') or failure['requirement']))
                     if location:
                         message = 'Acceptance failed at ' + str(location)[:400] + '; ' + message
                 self.checkpoint(status='blocked', blocker={'code': error.code, 'message': message})

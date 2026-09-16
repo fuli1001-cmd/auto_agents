@@ -154,9 +154,11 @@ def _checks(node, domains, bindings=None):
             return ast.Constant(bindings[node.id]) if node.id in bindings else node
     def assertion(expression):
         expression = normalizer.visit(Substitute().visit(copy.deepcopy(expression)))
-        if isinstance(expression, ast.BoolOp) and isinstance(expression.op, ast.And):
-            for part in expression.values: assertion(part)
-        else: checks[ast.unparse(expression)] += 1
+        def conjuncts(value):
+            if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And):
+                return tuple(part for child in value.values for part in conjuncts(child))
+            return (ast.unparse(value),)
+        checks[conjuncts(expression)] += 1
     nodes = list(_local_nodes(node))
     called = {id(child.func) for child in nodes if isinstance(child, ast.Call)}
     for child in nodes:
@@ -169,6 +171,25 @@ def _checks(node, domains, bindings=None):
         if isinstance(child, ast.Attribute) and child.attr in ('skip', 'skipif', 'xfail') and id(child) not in called:
             bypass[ast.unparse(child)] += 1
     return checks, bypass
+
+
+def _missing_checks(original, current):
+    """Each original assertion must run first, in its original short-circuit order.
+
+    Appending checks is strengthening; inserting/reordering them can change
+    state before the retained predicate runs. One new assertion cannot stand
+    in for several original assertions (which may evaluate side effects twice).
+    """
+    remaining, missing = current.copy(), Counter()
+    for check, count in sorted(original.items(), key=lambda item: -len(item[0])):
+        for _ in range(count):
+            matches = [new for new, available in remaining.items()
+                       if available and new[:len(check)] == check]
+            if matches:
+                remaining[min(matches, key=len)] -= 1
+            else:
+                missing[repr(check)] += 1
+    return missing
 
 
 def _changed_checks(original, current):
@@ -196,10 +217,10 @@ def _changed_checks(original, current):
         added_tables = [table['domains'] for names, table in new_tables.items()
                         if not old_variables.intersection(names)]
         new_checks, new_skip = _checks(after, domains)
-        if old_checks - new_checks and added_tables:
+        if _missing_checks(old_checks, new_checks) and added_tables:
             variants = [_checks(after, domains, bindings)[0] for bindings in _additional_bindings(after, added_tables)]
-            new_checks = min(variants, key=lambda checks: sum((old_checks - checks).values()))
-        missing, bypass = old_checks - new_checks, new_skip - old_skip
+            new_checks = min(variants, key=lambda checks: sum(_missing_checks(old_checks, checks).values()))
+        missing, bypass = _missing_checks(old_checks, new_checks), new_skip - old_skip
         if missing or bypass:
             changes.append({'scope': label, 'missing_assertions': dict(missing), 'added_bypass': dict(bypass)})
     # New helpers must not introduce module-wide skipping either.
