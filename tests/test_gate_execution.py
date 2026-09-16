@@ -383,8 +383,17 @@ def test_proof_audit_sample_reexecutes_a_valid_cache_hit(tmp_path: Path) -> None
 def test_auto_result_cache_reuses_when_only_unobserved_source_changes(
     tmp_path: Path,
 ) -> None:
-    if shutil.which("strace") is None:
+    from auto_agents.verification_input_trace import owner_identity
+    if not owner_identity()['metadata']:
+        # The observed-input cache requires a real metadata/trace owner. Run
+        # the same assertions under that production boundary in standalone CI.
+        from test_verification_metadata import execute
+        execute(tmp_path, "import sys\nfrom pathlib import Path\n"
+            + "sys.path.insert(0, " + repr(str(Path(__file__).parent)) + ")\n"
+            + "from test_gate_execution import test_auto_result_cache_reuses_when_only_unobserved_source_changes\n"
+            + "test_auto_result_cache_reuses_when_only_unobserved_source_changes(Path.cwd())\n")
         return
+    assert owner_identity()['trace'] == 1
     project = _project(tmp_path)
     auto_dir = project / ".auto-agents"
     auto_dir.mkdir()
