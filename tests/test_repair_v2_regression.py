@@ -15,7 +15,9 @@ def test_only_unexpected_test_body_failures_supply_counterexamples(phase, xfail,
     report = SimpleNamespace(when=phase, failed=True, passed=False, skipped=False, nodeid='tests/test_x.py::test_x')
     if xfail: report.wasxfail = 'expected failure'
     evidence = Evidence(); evidence.pytest_runtest_logreport(report)
-    hook = evidence.pytest_runtest_makereport(None, SimpleNamespace(when=phase, excinfo=object() if exception else None))
+    def body(): pass
+    excinfo = SimpleNamespace(traceback=[SimpleNamespace(frame=SimpleNamespace(code=SimpleNamespace(raw=body.__code__)))])
+    hook = evidence.pytest_runtest_makereport(SimpleNamespace(obj=body), SimpleNamespace(when=phase, excinfo=excinfo if exception else None))
     next(hook)
     with pytest.raises(StopIteration): hook.send(SimpleNamespace(get_result=lambda: report))
     assert evidence.call_failed == expected
@@ -75,6 +77,25 @@ def bad_cleanup():
 def test_teardown(bad_cleanup): pass
 class TestUnittest(unittest.TestCase):
     def test_body(self): self.assertEqual(1, 2)
+class TestUnittestSetup(unittest.TestCase):
+    def setUp(self): raise RuntimeError('unittest setup')
+    def test_body(self): pass
+class TestUnittestTeardown(unittest.TestCase):
+    def tearDown(self): raise RuntimeError('unittest teardown')
+    def test_body(self): assert True
+class TestUnittestCleanup(unittest.TestCase):
+    def test_body(self):
+        self.addCleanup(self.broken_cleanup)
+        assert True
+    def broken_cleanup(self): raise RuntimeError('unittest cleanup')
+class TestAsyncBody(unittest.IsolatedAsyncioTestCase):
+    async def test_body(self): self.assertEqual(1, 2)
+class TestAsyncSetup(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self): raise RuntimeError('async setup')
+    async def test_body(self): pass
+class TestAsyncTeardown(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self): raise RuntimeError('async teardown')
+    async def test_body(self): assert True
 '''
     (tmp_path / 'test_cases.py').write_text(source)
     script = '''import json,pytest
@@ -89,5 +110,6 @@ Path('evidence.json').write_text(json.dumps({'code':code,'body':e.call_failed,'f
     assert process.returncode == 0, process.stdout + process.stderr
     result = json.loads((tmp_path / 'evidence.json').read_text())
     assert result['code'] == 1
-    assert set(result['body']) == {'test_cases.py::test_body_failure', 'test_cases.py::TestUnittest::test_body'}
+    assert set(result['body']) == {'test_cases.py::test_body_failure', 'test_cases.py::TestUnittest::test_body',
+                                  'test_cases.py::TestAsyncBody::test_body'}
     assert 'test_cases.py::test_unexpected_pass' in result['failed']

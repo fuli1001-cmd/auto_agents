@@ -34,3 +34,8 @@ metadata/trace owner，但测试仍在无 owner 的普通进程中期待完整�
 failed 且不设置 wasxfail。可信驱动现通过 makereport 获取真实 call.excinfo，
 只记录实际测试体异常。真实 pytest 子进程覆盖 strict XPASS、预期失败、普通断言、
 unittest、setup 与 teardown，相关检查共 47 项通过。
+
+独立审查进一步验证 unittest 将 setUp/tearDown 异常也归入 call 阶段。
+驱动现要求真实异常回溯包含收集到的测试函数代码；未知自定义节点不提供反例。
+真实子进程增加同步 setup/teardown/cleanup 和异步 setup/teardown 对照，保留同步、
+异步测试体断言失败的正例；上述相关检查仍全部通过（47 项）。
