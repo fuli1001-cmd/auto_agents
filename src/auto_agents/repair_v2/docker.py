@@ -24,6 +24,32 @@ from .cleanup import labels, reap_containers
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 
 
+def container_mounts():
+    """Observe mounts without exposing container configuration or racing removal."""
+    code, listing = run(['docker', 'ps', '-aq'], timeout=15)
+    if code: raise RepairBlocked('docker_unavailable', listing)
+    identities = listing.split()
+    if not identities: return []
+    command = ['docker', 'inspect', '--type', 'container', '--format', '{{json .Mounts}}']
+    code, data = run([*command, *identities], timeout=15)
+    if code:
+        # Verification containers may finish between ps and inspect. Retry
+        # individually only on this exceptional path, retaining live mounts.
+        rows = []
+        for identity in identities:
+            code, value = run([*command, identity], timeout=15)
+            if code == 1 and value.strip() in {
+                    'Error: No such object: ' + identity,
+                    'Error: No such container: ' + identity,
+                    'Error response from daemon: No such container: ' + identity}:
+                continue
+            if code: raise RepairBlocked('docker_unavailable', value)
+            rows.append(value)
+        data = '\n'.join(rows)
+    return [Path(m['Source']).resolve() for line in data.splitlines() if line.strip()
+            for m in (json.loads(line) or []) if m.get('Source')]
+
+
 def run(command, *, cancel=None, timeout=1800, output=None, env=None, observation=None):
     """Drain continuously, retain a bounded diagnostic tail and reap this group."""
     buffer, truncated, stopped = bytearray(), False, False
@@ -94,13 +120,7 @@ class DockerVerifier:
         require_space(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
         reap_containers(self.root, kind='verification')
-        code, containers = run(['docker', 'ps', '-aq'], timeout=15)
-        if code: raise RepairBlocked('docker_unavailable', containers)
-        mounts = []
-        if containers.strip():
-            code, data = run(['docker', 'inspect', *containers.split()], timeout=15)
-            if code: raise RepairBlocked('docker_unavailable', data)
-            mounts = [Path(m['Source']).resolve() for c in json.loads(data) for m in c.get('Mounts', []) if m.get('Source')]
+        mounts = container_mounts()
         recover_executions(self.root, mounts)
         driver = Path(__file__).with_name('pytest_driver.py').read_text()
         if not self.image:
