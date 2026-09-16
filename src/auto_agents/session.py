@@ -4830,33 +4830,36 @@ class Session:
 
     def _copy_checkpoint_file(self, source: Path, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_symlink():
-            shutil.copy2(source, target, follow_symlinks=False)
-            return
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        blob = (
-            self.project_root
-            / ".auto-agents"
-            / "state"
-            / "checkpoint_blobs"
-            / digest[:2]
-            / digest
-        )
-        if not blob.is_file():
-            blob.parent.mkdir(parents=True, exist_ok=True)
-            temporary = blob.with_suffix(
-                f".{os.getpid()}.{uuid4().hex[:8]}.tmp"
+        symbolic = source.is_symlink()
+        blob = source
+        if not symbolic:
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            blob = (
+                self.project_root / ".auto-agents" / "state"
+                / "checkpoint_blobs" / digest[:2] / digest
             )
-            shutil.copy2(source, temporary)
-            try:
-                os.replace(temporary, blob)
-            finally:
-                if temporary.exists():
-                    temporary.unlink()
+            if not blob.is_file():
+                blob.parent.mkdir(parents=True, exist_ok=True)
+                temporary = blob.with_suffix(f".{os.getpid()}.{uuid4().hex[:8]}.tmp")
+                try:
+                    shutil.copy2(source, temporary)
+                    os.replace(temporary, blob)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        # A previous target can already hard-link a blob or point through a
+        # symlink. Never copy over it: that would mutate retained evidence.
+        temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
         try:
-            os.link(blob, target)
-        except OSError:
-            shutil.copy2(blob, target)
+            if symbolic:
+                shutil.copy2(source, temporary, follow_symlinks=False)
+            else:
+                try:
+                    os.link(blob, temporary)
+                except OSError:
+                    shutil.copy2(blob, temporary)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _reconcile_interrupted_collab_checkpoints(
         self,
