@@ -144,6 +144,54 @@ def test_bad_environment_stops_fix_before_model_and_propagates_to_parent(tmp_pat
     assert coordinator._apply_child_result(parent, handoff).status == "blocked"
 
 
+@pytest.mark.parametrize("verified", [False, True])
+def test_explicit_resume_rechecks_returned_engine_binding_failure(tmp_path, verified):
+    from auto_agents.config import save_session_state
+    root = _make_project(str(tmp_path))
+    orch = Orchestrator(root)
+    coordinator = WorkflowCoordinator(orch)
+    session = Session(orch, mode="collab", coordinator=coordinator)
+    snapshot = coordinator.store.create_root(WorkflowRef("collab", "parent"))
+    original = coordinator.store.prepare_handoff(
+        snapshot, parent=snapshot.root, target="fix", goal="acceptance", reason="engine fix",
+        payload={"issue_seed": {"target_repository": str(tmp_path / "engine")},
+                 "child_session_id": "existing-child"})
+    handoff = coordinator.store.prepare_handoff(
+        snapshot, parent=snapshot.root, target="resume", goal="acceptance", reason="resume",
+        payload={"resume_handoff_id": original.handoff_id})
+    state = SessionState(session_id="parent", mode="collab", status="waiting_child",
+                         workflow_id=snapshot.workflow_id, active_handoff_id=handoff.handoff_id)
+    with patch("auto_agents.repair_client.engine_route", return_value=False):
+        coordinator._drive_handoff(session, state, snapshot)
+    failed_receipt = coordinator.store.handoff_path(handoff.handoff_id).read_bytes()
+    run_path = root / ".auto-agents/state/run_state.json"
+    run_before = run_path.read_bytes()
+
+    def pause_after_child(state):
+        if verified:
+            assert state.status == "executing"
+            state.status = "paused"
+            save_session_state(root, state)
+        return state
+
+    with patch("auto_agents.repair_client.engine_route", return_value=verified), \
+         patch.object(coordinator, "_resume_engine_bound_child", return_value={
+             "status": "completed", "session_id": "existing-child", "changed_paths": []}) as child, \
+         patch.object(session, "_drive_local", side_effect=pause_after_child), \
+         patch.object(orch, "_call_with_failover", side_effect=AssertionError("unexpected provider")):
+        result = session.resume(state.session_id)
+    assert result.status == ("paused" if verified else "blocked")
+    assert child.call_count == int(verified)
+    if verified:
+        assert child.call_args.args[0] == original.payload
+        retry = coordinator.store.load_handoff(Path(result.last_child_result_ref).stem)
+        assert retry.payload == handoff.payload
+        assert retry.handoff_id != handoff.handoff_id
+        assert retry.returned_at
+    assert coordinator.store.handoff_path(handoff.handoff_id).read_bytes() == failed_receipt
+    assert run_path.read_bytes() == run_before
+
+
 def test_same_repository_binding_is_allowed(tmp_path):
     assert repository_binding_error(tmp_path, {"target_repository": str(tmp_path)}) == ""
     assert repository_binding_error(tmp_path, {"issue_seed": {"target_repository": "."}}) == ""

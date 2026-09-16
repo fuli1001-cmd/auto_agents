@@ -378,7 +378,43 @@ class WorkflowCoordinator:
             self.health_runtime.set_phase(state.mode)
         self._ensure_completed_session_commit(session, state)
         snapshot = self.store.load(snapshot.workflow_id)
+        self._resume_blocked_engine_handoff(state, snapshot)
         return self._drive_session(session, state, snapshot, root=True)
+
+    def _resume_blocked_engine_handoff(self, state, snapshot):
+        """Recheck a returned binding failure only at an explicit resume boundary."""
+        if (state.status != "blocked" or state.resolution != "execution_binding_mismatch"
+                or state.active_handoff_id or not state.last_child_result_ref):
+            return
+        reference = Path(state.last_child_result_ref)
+        if reference.resolve() != self.store.handoff_path(reference.stem).resolve():
+            return
+        handoff = self.store.load_handoff(reference.stem)
+        if (handoff.workflow_id != snapshot.workflow_id
+                or handoff.parent != WorkflowRef(state.mode, state.session_id)
+                or not handoff.returned_at or handoff.status != "blocked"
+                or handoff.result.get("resolution") != "execution_binding_mismatch"):
+            return
+        payload = handoff.payload
+        if handoff.target == "resume":
+            original = self.store.load_handoff(str(payload.get("resume_handoff_id", "")))
+            if original.workflow_id != snapshot.workflow_id:
+                return
+            payload = original.payload
+        if self._execution_binding_result(payload).get("resolution") != "verified_engine_repair":
+            return
+        from .repair_control import digest
+        # Keep the failed receipt intact and make preparation crash-idempotent.
+        retry = self.store.prepare_handoff(
+            snapshot, parent=handoff.parent, target=handoff.target, goal=handoff.goal,
+            reason="Verified engine channel restored after execution binding failure",
+            input_ref=handoff.input_ref, input_sha256=handoff.input_sha256,
+            payload=handoff.payload,
+            handoff_id="hf-" + digest([handoff.handoff_id, "engine-binding-recovery"])[:12],
+        )
+        state.active_handoff_id = retry.handoff_id
+        state.status, state.resolution, state.return_phase = "waiting_child", "", ""
+        save_session_state(self.project_root, state)
 
     def resume_active(self):
         snapshot = self.store.active()

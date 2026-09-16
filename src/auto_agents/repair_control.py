@@ -1383,8 +1383,12 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     configured = json.loads(Path(arguments.serve).read_text())
     implementation = Path(configured.get("implementation_root", "/__missing_controller_runtime__"))
-    if configured.get("implementation_root") and (implementation / "src/auto_agents/artifact_store.py").is_file():
+    if configured.get("implementation_root"):
+        # The immutable bootstrap runs as a script. Resolve lazy relative
+        # imports (including failure redaction) against its pinned package.
         sys.path.insert(0, str(implementation / "src"))
+        __package__ = "auto_agents"
+    if configured.get("implementation_root") and (implementation / "src/auto_agents/artifact_store.py").is_file():
         from auto_agents.artifact_runtime import activate, schedule, track
         activate(scope="repair:" + configured["root"])
         track(implementation, "worktree", scope="repair:" + configured["root"],

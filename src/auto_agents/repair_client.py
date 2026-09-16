@@ -127,7 +127,12 @@ def register(lock, args, orchestrator):
     try:
         configured = os.environ.get("AUTO_AGENTS_REPAIR_CONTROL_CONFIG")
         config = json.loads(Path(configured).read_text()) if configured else configure(auto_agents_repo_root())
-        ensure_supervisor(config)
+        # A resumed process belongs to the controller that verified and launched
+        # it. Delivery may already have advanced source_root; trying to upgrade
+        # that busy controller here would discard the recovery registration.
+        # The register RPC still validates the inherited lock and process owner.
+        if not os.environ.get("AUTO_AGENTS_REPAIR_SUBSCRIBER"):
+            ensure_supervisor(config)
         payload = {"project": str(lock.project_root), "token": lock.run_token,
                    "pid": os.getpid(), "ticks": start_ticks(os.getpid()), "command": args.command,
                    "cwd": str(Path.cwd().resolve())}

@@ -626,6 +626,92 @@ def test_foreground_registration_retains_original_cwd(tmp_path, monkeypatch):
     assert call.call_args.args[1]["payload"]["cwd"] == str(tmp_path)
 
 
+def test_resumed_registration_consumes_receipt_without_upgrading_busy_controller(tmp_path, monkeypatch):
+    from auto_agents import repair_client
+    config = configuration(tmp_path)
+    supervisor = Supervisor(config)
+    project = tmp_path / "project"
+    project.mkdir()
+    config_path = tmp_path / "operator.json"
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setenv("AUTO_AGENTS_REPAIR_CONTROL_CONFIG", str(config_path))
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", raising=False)
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_CONTROL_WORKER", raising=False)
+    monkeypatch.delenv("AUTO_AGENTS_REPAIR_ROUTE_PROBE", raising=False)
+    route = {"target_repository": config["source_root"]}
+    with ProjectRunLock(project, environ={}) as lock:
+        subscriber = supervisor.register({"payload": registration(project, lock.run_token)},
+                                         [os.dup(lock.fileno)])["subscriber"]
+        job = supervisor.store.submit(subscriber, {
+            **failure(project), "boundary": {"kind": "engine_route", "route_digest": digest(route)}})
+        supervisor.store.transition(job, "ready", {"status": "already_repaired"})
+        with supervisor.store.connect() as db:
+            db.execute("UPDATE subscribers SET state='resuming' WHERE id=?", (subscriber,))
+        monkeypatch.setenv("AUTO_AGENTS_REPAIR_SUBSCRIBER", subscriber)
+        orch = SimpleNamespace(config=SimpleNamespace(execution=SimpleNamespace(autonomy=SimpleNamespace(mode="max"))))
+        args = SimpleNamespace(command="collab", autonomy=None)
+
+        def dispatch(config, request, fds=()):
+            return supervisor.dispatch({"version": 1, "_peer_pid": os.getpid(), **request},
+                                       [os.dup(fd) for fd in fds])
+
+        try:
+            with patch.object(repair_client, "ensure_supervisor", side_effect=RuntimeError(
+                    "repair supervisor upgrade deferred: the older controller still owns active work")), \
+                 patch.object(repair_client, "rpc", side_effect=dispatch):
+                assert repair_client.register(lock, args, orch)["subscriber"] == subscriber
+                assert repair_client.engine_route(orch, route)
+            assert supervisor.store.job(job)["state"] == "completed"
+            with pytest.raises(RuntimeError, match="registered business process"):
+                supervisor.dispatch({"version": 1, "op": "consume-route", "subscriber": subscriber,
+                                     "route_digest": digest(route), "_peer_pid": -1}, [])
+        finally:
+            for entry in supervisor.registrations.values():
+                for fd in entry["fds"]:
+                    os.close(fd)
+
+
+def test_real_bootstrap_records_failed_resume_without_crashing(tmp_path):
+    from auto_agents import repair_control, repair_environment_log, diagnostic_output
+    import signal
+    config = configuration(tmp_path)
+    engine = make_remote(config)
+    fake_worker_install(config)
+    package = engine / "src/auto_agents"
+    (package / "__init__.py").write_text("")
+    for module in (repair_environment_log, diagnostic_output):
+        (package / Path(module.__file__).name).write_bytes(Path(module.__file__).read_bytes())
+    launch = package / "repair_launch.py"
+    launch.write_text(launch.read_text().replace("{'exit_code':0}",
+        "{'exit_code':3,'error':'resume failed password=private-value'}"))
+    git(engine, "add", "src")
+    git(engine, "commit", "-m", "failed resume transport fixture")
+    repair_control.ensure_supervisor(config)
+    process = rpc(config, {"op": "ping"})
+    project = tmp_path / "project"
+    project.mkdir()
+    try:
+        with ProjectRunLock(project, environ={}) as lock:
+            subscriber = rpc(config, {"op": "register", "payload": registration(project, lock.run_token)},
+                             [lock.fileno])["subscriber"]
+            store = Store(config["root"])
+            job = store.submit(subscriber, failure(project))
+            deadline = time.monotonic() + 10
+            while True:
+                state = next(row for row in store.subscriptions(job) if row["id"] == subscriber)
+                if state["state"] == "blocked":
+                    break
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            error = state["payload"]["repair_failure"]["error"]
+            assert "resume failed" in error and "private-value" not in error
+            assert rpc(config, {"op": "ping"})["pid"] == process["pid"]
+    finally:
+        if repair_control.alive(process["pid"], process["ticks"]):
+            os.kill(process["pid"], signal.SIGTERM)
+        os.waitpid(process["pid"], 0)
+
+
 def test_same_protocol_idle_controller_upgrades_to_new_committed_revision(tmp_path):
     from auto_agents import repair_control
     import signal
