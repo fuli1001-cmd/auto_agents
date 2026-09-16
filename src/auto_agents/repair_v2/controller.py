@@ -482,7 +482,14 @@ class Controller:
                 self.store.event('stopped', phase=self.state['phase'])
                 raise
             except RepairBlocked as error:
-                self.checkpoint(status='blocked', blocker={'code': error.code, 'message': str(error)})
+                message = str(error)
+                if error.code == 'no_progress' and self.state.get('failures'):
+                    failure = self.state['failures'][0]
+                    nodes = failure.get('failed') or failure.get('missing') or []
+                    location = nodes[0] if nodes else failure.get('unit') or failure.get('path') or failure.get('requirement')
+                    if location:
+                        message = 'Acceptance failed at ' + str(location)[:400] + '; ' + message
+                self.checkpoint(status='blocked', blocker={'code': error.code, 'message': message})
                 self.store.event('blocked', **self.state['blocker'])
                 return self.state
             except Exception as error:

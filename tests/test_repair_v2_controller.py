@@ -407,6 +407,7 @@ def test_failed_external_correction_cannot_buy_more_writer_calls(job):
     calls = len(runner.driver.calls)
     final = runner.run()
     assert final['status'] == 'blocked' and final['blocker']['code'] == 'no_progress'
+    assert final['blocker']['message'].startswith('Acceptance failed at value;')
     assert runner.driver.calls[calls:] == [('review', 'reviewer')]
     assert final['attempts'] == blocked['attempts'] and final['replans'] == blocked['replans']
     runner.resume_token = 'third-invocation'
