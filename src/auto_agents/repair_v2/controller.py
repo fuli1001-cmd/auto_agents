@@ -8,6 +8,7 @@ import time
 from .store import digest
 from .types import Cancellation, RepairBlocked, ReviewResult
 from .workspace import source_identity
+from .feedback import assess_progress, diagnose, diagnostic_units, retain_unchecked
 
 
 REVIEW_SCHEMA = {'type': 'object', 'properties': {
@@ -140,7 +141,8 @@ class Controller:
         return json.dumps({'goal': self.request.goal,
             'requirements': [asdict(item) for item in self.request.acceptance],
             'evidence': self.request.evidence,
-            'test_preservation_findings': self.state.get('test_preservation_findings', [])}, ensure_ascii=False)
+            'test_preservation_findings': self.state.get('test_preservation_findings', []),
+            'failure_diagnosis': diagnose(self.state.get('failures', []))}, ensure_ascii=False)
 
     def plan(self, root, *, rediagnose=False):
         self.phase('plan')
@@ -159,6 +161,10 @@ class Controller:
         prompt += ('\nPreserve each original test entry, parameter case and assertion. Conjunctive strengthening '
                    'and literal parameter extensions retaining the old cases are supported. For other test '
                    'refactors, keep the original checks explicit and add separate new cases.')
+        prompt += ('\nGrouped failures share an observed symptom, not necessarily a root cause. '
+                   'Use a representative to distinguish candidate regressions, test/contract conflicts, '
+                   'and environment failures before expanding the change. Tie any claimed conflict to '
+                   'a frozen requirement; do not rewrite expected results merely to obtain a pass.')
         reply = self.agent('plan', prompt, root)
         if not reply.text.strip(): raise RepairBlocked('plan_missing', 'provider returned no implementation plan')
         reference = self.store.artifact('plan', {'text': reply.text, 'request': self.state['request_digest']})
@@ -170,6 +176,8 @@ class Controller:
             'Preserve unrelated work and existing tests. Do not modify Git metadata or weaken verification. '
             'Use small diagnostics only when necessary; the controller runs formal acceptance after this turn. '
             'Prioritize a testable correction for the supplied failures before exploring additional variants. '
+            'Diagnose shared symptoms with their representative nodes first, then check all affected cases. '
+            'Resolve behavior against the frozen requirements while preserving the original assertions. '
             'Use the image-provided python for diagnostics. At the execution deadline the controller may '
             'submit partial edits to formal acceptance, so keep changes coherent as you work. '
             'A previous passing check is not permission to skip a changed requirement. Finish with a concise change summary.\n'
@@ -282,6 +290,10 @@ class Controller:
         if self.state.get('validation') and hasattr(self.verifier, 'remember_timings'):
             self.verifier.remember_timings(self.store.read(self.state['validation'])['checks'])
         units = self.prioritize_failures(self.units(snapshot))
+        if not self._diagnose_candidate(identity, snapshot, units):
+            return False
+        if self.state['phase'] == 'diagnose':
+            self.phase('validate')
         with ThreadPoolExecutor(max_workers=2) as pool:
             validate = getattr(self.verifier, 'validate_suite', self.verifier.validate)
             tests = pool.submit(validate, identity, snapshot, units, Cancellation(self.cancel, tests_cancel))
@@ -357,7 +369,34 @@ class Controller:
         failures = [*validation.failures, *review.findings]
         if not failures: raise RepairBlocked('invalid_validation', 'incomplete acceptance has no actionable failure')
         self.record_failures(failures, identity,
-            passed_tests={node for check in validation.checks if check.get('ok') for node in check.get('passed', [])})
+            passed_tests={node for check in validation.checks if check.get('ok') for node in check.get('passed', [])},
+            review=review)
+        return False
+
+    def _diagnose_candidate(self, identity, snapshot, units):
+        selected = diagnostic_units(self.state.get('failures', []), units)
+        if not selected:
+            return True
+        self.phase('diagnose')
+        result = self.verifier.validate(identity, snapshot, selected, self.cancel)
+        if result.snapshot != identity or source_identity(snapshot) != identity:
+            raise RepairBlocked('snapshot_changed', 'diagnostic evidence belongs to a different source snapshot')
+        self.checkpoint(diagnostic_validation=self.store.artifact('diagnostic-validation', asdict(result)))
+        if result.infrastructure:
+            raise RepairBlocked('verification_infrastructure', '; '.join(
+                str(f.get('reason') or 'diagnostic infrastructure failed') for f in result.failures)
+                or 'diagnostic verification infrastructure failed')
+        if result.cancelled or self.cancel.is_set():
+            raise KeyboardInterrupt()
+        if result.ok:
+            # Diagnostics are early feedback only. The complete mandatory suite,
+            # independent review, regression and boundary checks still follow.
+            return True
+        if not result.failures:
+            raise RepairBlocked('invalid_validation', 'failed diagnostic has no actionable evidence')
+        passed = {node for check in result.checks if check.get('ok') for node in check.get('passed', [])}
+        failures = retain_unchecked(self.state['failures'], result.failures, passed)
+        self.record_failures(failures, identity, passed_tests=passed)
         return False
 
     def prioritize_failures(self, units):
@@ -376,35 +415,50 @@ class Controller:
             return 2
         return sorted(units, key=priority)
 
-    def record_failures(self, failures, identity, *, passed_tests=()):
+    def record_failures(self, failures, identity, *, passed_tests=(), review=None):
         """All concrete candidate failures share the same persistent budget."""
-        def keys(rows):
-            # Traceback paths, elapsed times and wording do not measure progress.
-            values = set()
-            for row in rows:
-                if row.get('failed'):
-                    values.update(('test', n) for n in row['failed'])
-                elif row.get('missing'):
-                    values.update(('missing', n) for n in row['missing'])
-                elif row.get('requirement'):
-                    values.add(('review', row['requirement'], row.get('check', '')))
-                else: values.add(('unit', row.get('unit', row.get('command', row.get('reason', 'unknown')))))
-            return values
-        current = keys(failures)
-        best = {tuple(item) for item in self.state.get('best_failure_keys', [])}
-        progressed = bool(best and current < best)
-        resolved = {tuple(item) for item in self.state.get('resolved_failure_keys', [])}
-        verified = {key for key in best if key[0] in ('test', 'missing') and key[1] in passed_tests}
-        # Newly surfaced findings are not stagnation when every old test
-        # failure has actually passed. Each failure earns this credit once;
-        # an A/B oscillation cannot repeatedly replenish the budget.
-        if best and verified == best and verified - resolved: progressed = True
-        resolved.update(verified)
-        if not best or progressed: best = current
-        self.checkpoint(failures=failures, best_failure_keys=sorted(best),
-                        resolved_failure_keys=sorted(resolved),
-                        stagnant=0 if progressed else self.state['stagnant'] + 1, phase='implement')
-        self.store.event('acceptance_failed', snapshot=identity, failures=failures, progressed=progressed)
+        progress = assess_progress(self.state, failures, identity, passed_tests=passed_tests, review=review)
+        self.checkpoint(failures=failures, best_failure_keys=progress['best_failure_keys'],
+                        resolved_failure_keys=progress['resolved_failure_keys'],
+                        failure_diagnosis=diagnose(failures), progress_policy_version=2,
+                        stagnant=0 if progress['progressed'] else self.state['stagnant'] + 1, phase='implement')
+        self.store.event('acceptance_failed', snapshot=identity, failures=failures,
+                         progressed=progress['progressed'], newly_verified=progress['newly_verified'])
+
+    def _recover_verified_progress(self):
+        """Reinterpret an old stopped receipt once, without inventing new proof."""
+        from pathlib import Path
+        state = self.state
+        if (not state or state.get('status') != 'blocked'
+                or state.get('blocker', {}).get('code') != 'no_progress'
+                or state.get('progress_policy_version', 0) >= 2 or state.get('external_correction')
+                or not self.resume_token or self.resume_token == state.get('resume_token')
+                or not all(state.get(k) for k in ('validation', 'review', 'snapshot', 'snapshot_path'))):
+            return False
+        if state['request_digest'] != digest(self.request.to_dict()):
+            raise RepairBlocked('request_changed', 'progress recovery differs from the frozen repair contract')
+        identity = state['snapshot']
+        validation, saved_review = self.store.read(state['validation']), self.store.read(state['review'])
+        if (validation.get('snapshot') != identity or saved_review.get('snapshot') != identity
+                or validation.get('infrastructure') or validation.get('cancelled')
+                or not saved_review.get('ok') or saved_review.get('findings')
+                or source_identity(Path(state['snapshot_path'])) != identity):
+            return False
+        review = review_result(saved_review['text'], identity, {r.identity for r in self.request.acceptance})
+        passed = {n for c in validation.get('checks', []) if c.get('ok') for n in c.get('passed', [])}
+        progress = assess_progress(state, state['failures'], identity, passed_tests=passed, review=review)
+        if not progress['newly_verified']:
+            return False
+        self.record_failures(state['failures'], identity, passed_tests=passed, review=review)
+        self.checkpoint(status='active', blocker={}, resume_token=self.resume_token)
+        self.store.event('verified_progress_recovered', snapshot=identity,
+                         newly_verified=progress['newly_verified'])
+        return True
+
+    def recover_verified_progress(self):
+        with self.store.locked():
+            self.state = self.store.load()
+            return self._recover_verified_progress()
 
     def run(self):
         with self.store.locked():
@@ -415,6 +469,7 @@ class Controller:
                 'calls': 0, 'failures': [], 'stagnant': 0, 'replans': 0}
             if self.state['request_digest'] != digest(self.request.to_dict()):
                 raise RepairBlocked('request_changed', 'resume request differs from the frozen repair contract')
+            self._recover_verified_progress()
             if self.state['status'] in ('ready', 'complete'):
                 from pathlib import Path
                 saved = self.store.read(self.state['receipt'])
@@ -473,7 +528,7 @@ class Controller:
                         self.checkpoint(plan=reference, phase='audit')
                 while True:
                     if self.cancel.is_set(): raise KeyboardInterrupt()
-                    if self.state['phase'] not in ('audit', 'validate', 'boundary', 'regression'):
+                    if self.state['phase'] not in ('audit', 'diagnose', 'validate', 'boundary', 'regression'):
                         if self.state.get('external_correction'):
                             raise RepairBlocked('no_progress',
                                 'corrected source failed acceptance; implementation budget remains exhausted')

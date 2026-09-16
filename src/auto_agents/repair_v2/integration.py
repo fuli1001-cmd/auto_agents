@@ -142,6 +142,7 @@ def repair_entry(request):
             regression=lambda i, s, coverage, c: verifier.regression(i, s, checkout, accepted.engine_base, coverage, c),
             boundary=lambda identity, source, cancel: _boundaries(verifier, root, identity, source,
                 json.loads((root / 'original-payload.json').read_text()), cancel))
+        controller.recover_verified_progress()
         controller.recover_corrected_source(implementation, pinned['commit'])
         state = controller.run()
         if state['status'] != 'ready':

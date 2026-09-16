@@ -11,6 +11,7 @@ class Evidence:
     def __init__(self):
         self.collected, self.passed, self.failed, self.skipped = [], [], [], []
         self.call_failed = []
+        self.failure_details = []
         self.node_seconds = {}
 
     def pytest_collection_finish(self, session):
@@ -18,7 +19,15 @@ class Evidence:
 
     def pytest_runtest_logreport(self, report):
         self.node_seconds[report.nodeid] = self.node_seconds.get(report.nodeid, 0.0) + getattr(report, 'duration', 0.0)
-        if report.failed: self.failed.append(report.nodeid)
+        if report.failed:
+            self.failed.append(report.nodeid)
+            representation = getattr(report, 'longrepr', '')
+            crash = getattr(representation, 'reprcrash', None)
+            location = getattr(report, 'location', (report.nodeid.split('::', 1)[0],))
+            self.failure_details.append({'nodeid': report.nodeid, 'phase': report.when,
+                'path': str(getattr(crash, 'path', location[0])),
+                'line': getattr(crash, 'lineno', None),
+                'message': str(getattr(crash, 'message', representation))[:2000]})
         if report.skipped or hasattr(report, 'wasxfail'): self.skipped.append(report.nodeid)
         if report.when == 'call' and report.passed and not hasattr(report, 'wasxfail'):
             self.passed.append(report.nodeid)
@@ -55,6 +64,7 @@ def main():
     code = int(pytest.main([*args, '-p', 'no:cacheprovider'], plugins=[evidence]))
     data = {'returncode': code, 'collected': evidence.collected, 'passed': evidence.passed,
             'failed': evidence.failed, 'skipped': evidence.skipped, 'call_failed': evidence.call_failed,
+            'failure_details': evidence.failure_details,
             'node_seconds': evidence.node_seconds}
     Path('/result/pytest.json').write_text(json.dumps(data))
     return code

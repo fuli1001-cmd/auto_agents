@@ -242,6 +242,7 @@ class DockerVerifier:
             'returncode': code, 'collected': sorted(collected), 'passed': sorted(passed),
             'failed': evidence.get('failed', []), 'skipped': evidence.get('skipped', []), 'missing': missing,
             'call_failed': evidence.get('call_failed', []),
+            'failure_details': evidence.get('failure_details', []),
             'node_seconds': evidence.get('node_seconds', {}),
             'cache_hit': False, 'seconds': time.monotonic() - started, 'infrastructure': infrastructure,
             'output': str(base / 'output.log'), 'excerpt': text[-4000:], 'inputs': inputs}
@@ -441,7 +442,8 @@ class DockerVerifier:
         failures = [{'unit': r['unit'], 'command': r['command'],
                      'reason': (r.get('diagnostic') if r['infrastructure'] else '') or r.get('excerpt')
                                or 'verification failed without output (exit ' + str(r.get('returncode')) + ')',
-                     'failed': r['failed'], 'missing': r['missing'], 'infrastructure': r['infrastructure']}
+                     'failed': r['failed'], 'missing': r['missing'], 'infrastructure': r['infrastructure'],
+                     'failure_details': r.get('failure_details', [])}
                     for r in actionable]
         return ValidationResult(not failures and not cancel.is_set(), identity, results, failures,
             cancel.is_set(), any(r['infrastructure'] for r in actionable))

@@ -266,12 +266,14 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
         if progress.get('engine') == 'v2':
             labels = {'plan': '正在统一规划修复', 'implement': '正在连续实施修复',
                       'audit': '正在检查既有测试是否完整保留',
+                      'diagnose': '正在定向复核已知失败，尚未开始完整验收',
                       'validate': '正在集中验收：测试与独立审查并行',
                       'regression': '正在验证修复前后的行为差异',
                       'boundary': '正在验证原会话恢复', 'deliver': '正在交付已验收引擎'}
             if phase == 'check_finished':
                 unit = progress.get('unit', '')
-                stage = ('行为对照：收集' if unit.startswith('behavior-collection:') else
+                stage = ('定向诊断：测试' if unit.startswith('diagnostic:') else
+                         '行为对照：收集' if unit.startswith('behavior-collection:') else
                          '行为对照：测试' if unit.startswith('behavior-baseline:') else '集中验收：测试')
                 message = f"{stage}批次 {progress.get('completed', 0)}/{progress.get('total', 0)} 完成"
                 if progress.get('workers'): message += f"；最多 {progress['workers']} 路并行"
