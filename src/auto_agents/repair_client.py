@@ -265,7 +265,13 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
                       'regression': '正在验证修复前后的行为差异',
                       'boundary': '正在验证原会话恢复', 'deliver': '正在交付已验收引擎'}
             if phase == 'check_finished':
-                return f"集中验收：测试 {progress.get('completed', 0)}/{progress.get('total', 0)} 项完成"
+                unit = progress.get('unit', '')
+                stage = ('行为对照：收集' if unit.startswith('behavior-collection:') else
+                         '行为对照：测试' if unit.startswith('behavior-baseline:') else '集中验收：测试')
+                message = f"{stage}批次 {progress.get('completed', 0)}/{progress.get('total', 0)} 完成"
+                if progress.get('workers'): message += f"；最多 {progress['workers']} 路并行"
+                if progress.get('total_nodes'): message += f"；覆盖 {progress['total_nodes']} 个用例"
+                return message
             label = labels.get(phase, '正在执行统一修复')
             attempt = progress.get('attempt', 0)
             return (f'已提交 {attempt} 次实施结果；' if attempt else '') + label

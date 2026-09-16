@@ -74,3 +74,8 @@ class RepairBlocked(RuntimeError):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+class Cancellation:
+    def __init__(self, parent, local): self.parent, self.local = parent, local
+    def is_set(self): return self.parent.is_set() or self.local.is_set()
