@@ -6,7 +6,7 @@ import threading
 import time
 
 from .store import digest
-from .types import RepairBlocked, ReviewResult
+from .types import Cancellation, RepairBlocked, ReviewResult
 from .workspace import source_identity
 
 
@@ -51,11 +51,6 @@ def review_result(text, snapshot, requirements):
                 or {row['requirement'] for row in coverage} != requirements):
             raise RepairBlocked('review_format', 'approval needs concrete test coverage for every requirement')
     return ReviewResult(result['decision'] == 'APPROVE' and not findings, snapshot, findings, text, coverage)
-
-
-class Cancellation:
-    def __init__(self, parent, local): self.parent, self.local = parent, local
-    def is_set(self): return self.parent.is_set() or self.local.is_set()
 
 
 class Controller:
@@ -271,9 +266,12 @@ class Controller:
         self.phase('validate')
         self.checkpoint(verification_runtime=getattr(self.verifier, 'runtime', ''))
         tests_cancel, review_cancel = threading.Event(), threading.Event()
+        if self.state.get('validation') and hasattr(self.verifier, 'remember_timings'):
+            self.verifier.remember_timings(self.store.read(self.state['validation'])['checks'])
         units = self.prioritize_failures(self.units(snapshot))
         with ThreadPoolExecutor(max_workers=2) as pool:
-            tests = pool.submit(self.verifier.validate, identity, snapshot, units, Cancellation(self.cancel, tests_cancel))
+            validate = getattr(self.verifier, 'validate_suite', self.verifier.validate)
+            tests = pool.submit(validate, identity, snapshot, units, Cancellation(self.cancel, tests_cancel))
             reviewed = pool.submit(self.review, identity, snapshot, Cancellation(self.cancel, review_cancel))
             try:
                 # Observe either side's infrastructure failure immediately;

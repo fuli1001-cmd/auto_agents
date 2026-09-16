@@ -13,9 +13,10 @@ import time
 import uuid
 from contextlib import ExitStack
 
-from .dependencies import cache_key, pytest_parts, witness
+from .dependencies import cache_key, execution_fingerprint, pytest_parts, witness
+from .scheduling import Timings
 from .store import atomic_json, digest
-from .types import RepairBlocked, ValidationResult
+from .types import Cancellation, RepairBlocked, ValidationResult
 from .workspace import source_identity
 from .storage import disposable_source, execution_lease, recover_executions, require_space
 from .cleanup import labels, reap_containers
@@ -134,7 +135,7 @@ class DockerVerifier:
                                'uid': os.getuid(), 'gid': os.getgid(), 'memory': '1g', 'tmpfs': 'exec,4g',
                                'boundary': Path(__file__).with_name('boundary_driver.py').read_text(),
                                'session': Path(__file__).parent.parent.joinpath('session_replay.py').read_text(),
-                               'kernel': os.uname().release, 'policy': 5, 'init': True})
+                               'kernel': os.uname().release, 'policy': 6, 'init': True})
         self.image = identity_text.strip()  # A mutable tag is not a verification input.
 
     def concurrency(self):
@@ -147,17 +148,21 @@ class DockerVerifier:
         if cancel.is_set():
             return {'unit': unit.identity, 'command': unit.command, 'ok': False, 'cancelled': True,
                     'excerpt': 'validation cancelled before dispatch', 'failed': [], 'missing': [], 'infrastructure': False}
+        started = time.monotonic()
         inputs = witness(snapshot, unit, self.runtime)
+        if not inputs['complete'] and not unit.fresh:
+            inputs['execution'] = execution_fingerprint(snapshot)
         key = cache_key(snapshot_id, unit, inputs)
         cache = self.root / 'cache' / (key + '.json')
-        reusable = inputs['complete'] and not unit.fresh
+        reusable = (inputs['complete'] or inputs.get('execution')) and not unit.fresh
         if cache.exists() and reusable:
             try:
                 envelope = json.loads(cache.read_text())
                 result = envelope['result']
                 if (digest(result) == envelope.get('digest') and result.get('ok')
                         and result.get('inputs') == inputs and result.get('command') == unit.command):
-                    return {**result, 'unit': unit.identity, 'cache_hit': True, 'seconds': 0.0}
+                    return {**result, 'unit': unit.identity, 'cache_hit': True, 'seconds': 0.0,
+                            'total_seconds': time.monotonic() - started}
             except (OSError, ValueError, KeyError, TypeError):
                 pass  # A corrupt optimization record never blocks fresh proof.
 
@@ -170,7 +175,8 @@ class DockerVerifier:
         custody = {'clear': True}
         with execution_lease(base), disposable_source(snapshot, source, cleanup=lambda: custody['clear']):
             output.mkdir(exist_ok=True)
-            return self._execute(snapshot_id, snapshot, unit, cancel, key, cache, inputs, identity, base, source, output, custody)
+            result = self._execute(snapshot_id, snapshot, unit, cancel, key, cache, inputs, identity, base, source, output, custody)
+        return {**result, 'total_seconds': time.monotonic() - started}
 
     def _execute(self, snapshot_id, snapshot, unit, cancel, key, cache, inputs, identity, base, source, output, custody):
         if cancel.is_set():
@@ -223,7 +229,7 @@ class DockerVerifier:
         cancelled = execution.get('termination') == 'cancelled'
         timed_out = execution.get('termination') == 'timeout'
         start_error = code in (125, 126, 127) or execution.get('exit_code') in (125, 126, 127)
-        infrastructure = bool(state.get('OOMKilled') or start_error or not state and not cancelled)
+        infrastructure = bool(state.get('OOMKilled') or start_error or timed_out or not state and not cancelled)
         reason = ('container exceeded its memory limit' if state.get('OOMKilled') else
                   'Docker could not start the verification command' if start_error else
                   'verification cancelled by controller' if cancelled else
@@ -238,14 +244,20 @@ class DockerVerifier:
             'returncode': code, 'collected': sorted(collected), 'passed': sorted(passed),
             'failed': evidence.get('failed', []), 'skipped': evidence.get('skipped', []), 'missing': missing,
             'call_failed': evidence.get('call_failed', []),
+            'node_seconds': evidence.get('node_seconds', {}),
             'cache_hit': False, 'seconds': time.monotonic() - started, 'infrastructure': infrastructure,
             'output': str(base / 'output.log'), 'excerpt': text[-4000:], 'inputs': inputs}
-        if result['ok'] and inputs['complete'] and not unit.fresh: atomic_json(cache, {'result': result, 'digest': digest(result)})
+        if result['ok'] and (inputs['complete'] or inputs.get('execution')) and not unit.fresh:
+            try: atomic_json(cache, {'result': result, 'digest': digest(result)})
+            except OSError: pass  # Cache writes are optional; execution evidence is not.
         return result
+
+    def remember_timings(self, checks):
+        timings = Timings(self.root)
+        timings.observe(checks); timings.save()
 
     def suite_units(self, snapshot, request):
         """Collect once after implementation; preserve every actual test node."""
-        import shlex
         from .types import ValidationUnit
         identity = source_identity(snapshot)
         result = self.execute(identity, snapshot, ValidationUnit('suite-collection',
@@ -263,17 +275,17 @@ class DockerVerifier:
             if not file.startswith('tests/') or '..' in Path(file).parts:
                 raise RepairBlocked('verification_collection', 'collection produced an unsafe source path')
             grouped.setdefault(file, []).append(node)
-        units = []
-        for file, nodes in grouped.items():
-            batches = [nodes[i:i + 32] for i in range(0, len(nodes), 32)]
-            for index, batch in enumerate(batches):
-                targets = [file] if len(batches) == 1 else batch
-                units.append(ValidationUnit('suite:' + file + ':' + str(index),
-                    'python -m pytest -q ' + ' '.join(shlex.quote(n) for n in targets),
-                    expected_nodes=tuple(batch), profile='sandbox'))
+        units = Timings(self.root).batches(grouped)
         units.extend(ValidationUnit('required:' + digest(command)[:20], command, profile='sandbox')
                      for command in dict.fromkeys(c for item in request.acceptance for c in item.commands))
         return units
+
+    def validate_suite(self, identity, snapshot, units, cancel):
+        # Discover ordinary failures together instead of consuming one repair
+        # turn per newly encountered batch. Infrastructure still stops dispatch.
+        result = self.validate(identity, snapshot, units, cancel, collect_all=True)
+        self.remember_timings(result.checks)
+        return result
 
     def regression(self, snapshot_id, snapshot, base_repository, base_commit, coverage, cancel):
         """Run current behavioral tests against original production code."""
@@ -299,24 +311,39 @@ class DockerVerifier:
             # executing. Collection/setup errors are never counterexamples.
             grouped = {}
             for node in nodes: grouped.setdefault(node.split('::', 1)[0], []).append(node)
-            units = [ValidationUnit('behavior-baseline:' + file,
-                'python -m pytest -q ' + ' '.join(shlex.quote(n) for n in batch), fresh=True, profile='sandbox')
+            collections = [ValidationUnit('behavior-collection:' + file,
+                'python -m pytest --collect-only -q ' + ' '.join(shlex.quote(n) for n in batch), fresh=True, profile='sandbox')
                 for file, batch in grouped.items()]
-            result = self.validate(identity, baseline, units, cancel, collect_all=True)
+            collected = self.validate(identity, baseline, collections, cancel, collect_all=True)
             if cancel.is_set(): raise KeyboardInterrupt()
-            infrastructure = result.infrastructure or any(
-                check.get('returncode') in (125, 126, 127, 130, 137) for check in result.checks)
-            examples = sorted({node for check in result.checks if check.get('returncode') == 1
+            executable = {}
+            for check in collected.checks:
+                if check['ok']:
+                    for node in check.get('collected', []):
+                        file = node.split('::', 1)[0]
+                        if file not in grouped or not any(node == selected or node.startswith(selected + '[')
+                                or node.startswith(selected + '::') for selected in grouped[file]):
+                            raise RepairBlocked('verification_collection', 'baseline collection escaped reviewed coverage')
+                        executable.setdefault(file, []).append(node)
+            units = Timings(self.root).batches(executable, prefix='behavior-baseline', fresh=True, pack=False)
+            result = self.validate(identity, baseline, units, cancel, collect_all=True) if units and not collected.infrastructure else None
+            if cancel.is_set(): raise KeyboardInterrupt()
+            checks = [*collected.checks, *(result.checks if result else [])]
+            infrastructure = collected.infrastructure or bool(result and result.infrastructure) or any(
+                check.get('returncode') in (125, 126, 127, 130, 137) for check in checks)
+            changed_source = any(check.get('source_unchanged') is False for check in checks)
+            examples = sorted({node for check in (result.checks if result else []) if check.get('returncode') == 1
+                               and check.get('source_unchanged') is True and not check.get('cancelled') and not check.get('timed_out')
                                for node in check.get('call_failed', [])})
-            demonstrated = bool(examples) and not infrastructure
-            detail = next((check for check in result.checks if check.get('call_failed')), None)
-            return {'ok': not infrastructure and (demonstrated or not product_changed),
+            demonstrated = bool(examples) and not infrastructure and not changed_source
+            detail = next((check for check in checks if check.get('call_failed')), None)
+            return {'ok': not infrastructure and not changed_source and (demonstrated or not product_changed),
                     'snapshot': snapshot_id, 'base': base_commit, 'runtime': self.runtime,
                     'product_changed': product_changed, 'demonstrated_regression': demonstrated,
-                    'counterexamples': examples, 'checks': result.checks,
+                    'counterexamples': examples, 'checks': checks,
                     'infrastructure': bool(infrastructure),
                     'output': detail.get('output', '') if detail else '',
-                    'reason': detail.get('excerpt', '') if demonstrated else
+                    'reason': 'Baseline tests modified their source.' if changed_source else detail.get('excerpt', '') if demonstrated else
                         'No executed behavioral counterexample on the original source; collection and setup errors do not establish a regression.'}
 
     def boundary(self, snapshot_id, snapshot, frozen_target, payload, cancel):
@@ -375,24 +402,36 @@ class DockerVerifier:
         results = []
         pending = iter(unique.values())
         workers = self.concurrency()
+        total_nodes = len({node for unit in unique.values() for node in unit.expected_nodes})
+        stopped = threading.Event()
+        execution_cancel = Cancellation(cancel, stopped)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             running = {}
             def dispatch():
                 unit = next(pending, None)
                 if unit is not None:
-                    running[pool.submit(self.execute, identity, snapshot, unit, cancel)] = unit
-            for _ in range(workers):
-                if not cancel.is_set(): dispatch()
-            failed = False
-            while running:
-                done, _ = wait(running, return_when=FIRST_COMPLETED)
-                for future in done:
-                    running.pop(future)
-                    result = future.result(); results.append(result)
-                    failed = failed or not result['ok']
-                    if self.callback: self.callback('check_finished', {**result, 'completed': len(results), 'total': len(unique)})
-                if (collect_all or not failed) and not cancel.is_set():
-                    for _ in done: dispatch()
+                    running[pool.submit(self.execute, identity, snapshot, unit, execution_cancel)] = unit
+            try:
+                for _ in range(workers):
+                    if not execution_cancel.is_set(): dispatch()
+                failed = False
+                while running:
+                    done, _ = wait(running, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        running.pop(future)
+                        result = future.result(); results.append(result)
+                        failed = failed or not result['ok']
+                        if result['infrastructure']: stopped.set()
+                        if self.callback: self.callback('check_finished', {**result, 'completed': len(results),
+                            'total': len(unique), 'workers': workers, 'total_nodes': total_nodes,
+                            'tested_nodes': len({node for check in results for node in check.get('collected', [])})})
+                    if (collect_all or not failed) and not execution_cancel.is_set():
+                        for _ in done: dispatch()
+            except BaseException:
+                # Cancel siblings before the executor waits for them. Otherwise
+                # one raised error could wait for unrelated 30-minute checks.
+                stopped.set()
+                raise
         # Checks already in flight complete and retain their evidence. New
         # expensive copies/containers are not queued after a known failure.
         actionable = [r for r in results if not r['ok'] and (r['infrastructure'] or r.get('failed') or not r.get('cancelled'))]

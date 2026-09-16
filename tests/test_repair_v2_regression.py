@@ -41,12 +41,16 @@ def test_baseline_collection_errors_cannot_mask_or_replace_behavior(tmp_path, co
     def execute(identity, baseline, unit, cancel):
         assert (baseline / 'value.py').read_text() == 'value = 0\n'
         assert (baseline / 'tests/test_portable.py').read_text() == 'def test_value(): assert value == 1\n'
-        calls.append(unit.command)
         portable = 'test_portable' in unit.command
-        node = 'tests/test_portable.py::test_value'
+        node = 'tests/test_portable.py::test_value' if portable else 'tests/test_new_api.py::test_api'
+        if '--collect-only' in unit.command:
+            return dict(unit=unit.identity, command=unit.command, ok=True, returncode=0,
+                        collected=[node], failed=[], missing=[], infrastructure=False, source_unchanged=True)
+        calls.append(unit.command)
         return dict(unit=unit.identity, command=unit.command, ok=False, returncode=code if portable else 2,
                     failed=[node] if portable and code == 1 else [], missing=[], infrastructure=False,
-                    call_failed=[node] if portable and body_fail else [], excerpt='baseline evidence', output='log')
+                    call_failed=[node] if portable and body_fail else [], source_unchanged=True,
+                    excerpt='baseline evidence', output='log')
     verifier.execute = execute
     result = verifier.regression('snapshot', source, source, base,
         [{'nodes': ['tests/test_new_api.py::test_api', 'tests/test_portable.py::test_value']}], threading.Event())
@@ -113,3 +117,32 @@ Path('evidence.json').write_text(json.dumps({'code':code,'body':e.call_failed,'f
     assert set(result['body']) == {'test_cases.py::test_body_failure', 'test_cases.py::TestUnittest::test_body',
                                   'test_cases.py::TestAsyncBody::test_body'}
     assert 'test_cases.py::test_unexpected_pass' in result['failed']
+
+
+@pytest.mark.parametrize('mutated', [False, True])
+def test_baseline_shards_parameter_cases_and_rejects_source_mutation(tmp_path, mutated):
+    source = tmp_path / 'source'; source.mkdir(); (source / 'tests').mkdir()
+    git(source, 'init', '-q'); (source / 'value.py').write_text('value = 0\n')
+    (source / 'tests/test_value.py').write_text('def test_value(): pass\n')
+    git(source, 'add', '.'); git(source, 'commit', '-qm', 'old')
+    base = git(source, 'rev-parse', 'HEAD'); (source / 'value.py').write_text('value = 1\n')
+    git(source, 'add', '.'); git(source, 'commit', '-qm', 'new')
+    nodes = [f'tests/test_value.py::test_value[{i}]' for i in range(75)]
+    executed = []
+    verifier = DockerVerifier(tmp_path / 'verification', workers=2); verifier.root.mkdir()
+    verifier.concurrency = lambda: 2
+    def execute(identity, baseline, unit, cancel):
+        collect = '--collect-only' in unit.command
+        batch = nodes if collect else list(unit.expected_nodes)
+        if not collect: executed.append(batch)
+        return dict(unit=unit.identity, command=unit.command, ok=collect,
+                    returncode=0 if collect else 1, collected=batch, source_unchanged=collect or not mutated,
+                    failed=[] if collect else batch, call_failed=[] if collect else batch,
+                    missing=[], infrastructure=False, excerpt='old behavior fails')
+    verifier.execute = execute
+    observed = verifier.regression('source', source, source, base,
+        [{'nodes': ['tests/test_value.py::test_value']}], threading.Event())
+    assert len(executed) == 3 and all(len(batch) <= 32 for batch in executed)
+    assert sorted(n for batch in executed for n in batch) == sorted(nodes)
+    assert observed['ok'] is (not mutated)
+    assert observed['counterexamples'] == ([] if mutated else sorted(nodes))
