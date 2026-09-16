@@ -430,7 +430,7 @@ def _mandatory_refs(state):
     if missing_requirements:
         raise ownership_error(state, 'owned requirements are absent from retained contract history',
                               missing_requirement_ids=sorted(missing_requirements))
-    if state.parent_handoff_id and not (task_ids or requirement_ids) and not any(
+    if state.parent_handoff_id and tasks and not (task_ids or requirement_ids) and not any(
         not (task.get('workflow_id') or binding.get('plan_workflow_id'))
         or (task.get('workflow_id') or binding.get('plan_workflow_id')) == state.workflow_id
         for task in tasks

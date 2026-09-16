@@ -589,6 +589,8 @@ class RoutedWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_project(tmp)
             _commit_baseline(root)
+            from auto_agents.config import load_task_plan
+            task_ids = [task["task_id"] for task in load_task_plan(root).get("tasks", [])]
             inputs = iter(["Stop the button crash", "y"])
             orchestrator = Orchestrator(
                 root, user_input_fn=lambda _prompt: next(inputs, "")
@@ -610,7 +612,9 @@ class RoutedWorkflowTests(unittest.TestCase):
                             '{"target":"fix","reason":"existing regression",'
                             '"summary":"button crash","issue_seed":'
                             '{"summary":"button crash","expected":"no crash",'
-                            '"actual":"crash"}}\n'
+                            '"actual":"crash"'
+                            + (',"task_id":' + json.dumps(task_ids[0]) if task_ids else "")
+                            + '}}\n'
                         )
                 elif "FIX_DISPOSITION v1" in prompt and "Before modifying files" in prompt:
                     content = (
@@ -664,6 +668,18 @@ class RoutedWorkflowTests(unittest.TestCase):
             )
             handoff = WorkflowStore(root).load_handoff(handoff_id)
             self.assertTrue(handoff.payload["auto_approve"])
+
+    def test_collab_routes_taskless_bug_and_returns_for_goal_verification(self) -> None:
+        from auto_agents.config import load_task_plan, save_task_plan
+        make_project = _make_project
+        def taskless(*args, **kwargs):
+            root = make_project(*args, **kwargs)
+            plan = load_task_plan(root)
+            plan['tasks'] = []
+            save_task_plan(root, plan)
+            return root
+        with patch(__name__ + '._make_project', side_effect=taskless):
+            self.test_collab_routes_bug_through_fix_and_returns_for_goal_verification()
 
     def test_collab_auto_approve_propagates_to_routed_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

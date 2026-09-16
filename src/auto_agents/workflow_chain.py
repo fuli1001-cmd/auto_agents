@@ -834,6 +834,11 @@ class IssueBriefBuilder:
             "source_handoff_id": str(payload.get("source_handoff_id", "")).strip(),
             "updated_at": utc_now(),
         }
+        # Preserve explicit authority for admission and subsequent recovery;
+        # an issue summary must not silently discard the routing scope.
+        for key in ('task_id', 'task_ids', 'requirement_ids'):
+            if key in payload:
+                issue[key] = payload[key]
         json_path = self.root / "issue.json"
         markdown_path = self.root / "issue.md"
         write_json(json_path, issue)
