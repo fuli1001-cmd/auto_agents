@@ -329,7 +329,8 @@ def test_worker_cannot_use_legacy_no_diagnosis_bypass(tmp_path):
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="local verification sandbox not installed")
 @pytest.mark.parametrize("matching", [True, False])
-def test_real_sandbox_replay_consumes_only_the_original_engine_route(tmp_path, matching):
+@pytest.mark.parametrize("returned", [False, True])
+def test_real_sandbox_replay_consumes_only_the_original_engine_route(tmp_path, matching, returned):
     from auto_agents.config import save_session_state
     from auto_agents.models import SessionState
     from auto_agents.self_repair import AutoAgentsSelfRepairRunner, auto_agents_repo_root
@@ -346,6 +347,14 @@ def test_real_sandbox_replay_consumes_only_the_original_engine_route(tmp_path, m
                                    reason="engine repair", payload=request)
     state = _confirm_collab_state(SessionState(session_id="parent", mode="collab", status="waiting_child",
         workflow_id=snapshot.workflow_id, active_handoff_id=handoff.handoff_id, auto_approve=True))
+    if returned:
+        from auto_agents.orchestrator import Orchestrator
+        from auto_agents.workflow_runtime import WorkflowCoordinator
+        coordinator = WorkflowCoordinator(Orchestrator(project))
+        with patch("auto_agents.repair_client.engine_route", return_value=False):
+            state = coordinator._drive_handoff(None, state, snapshot)
+        assert state.status == "blocked"
+        assert Path(state.last_child_result_ref).is_absolute()
     save_session_state(project, state)
     before = (project / ".auto-agents/state/sessions/parent/session_state.json").read_bytes()
     from auto_agents.root_cause import RootCauseCoordinator

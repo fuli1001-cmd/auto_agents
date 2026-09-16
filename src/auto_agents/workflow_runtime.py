@@ -387,10 +387,14 @@ class WorkflowCoordinator:
                 or state.active_handoff_id or not state.last_child_result_ref):
             return
         reference = Path(state.last_child_result_ref)
-        if reference.resolve() != self.store.handoff_path(reference.stem).resolve():
+        # Diagnostic copies and moved projects retain the original absolute
+        # receipt path. Resolve its project-relative identity in this store;
+        # never read the original project to authorize a copied workflow.
+        if reference.parts[-4:] != (".auto-agents", "state", "handoffs", reference.stem + ".json"):
             return
         handoff = self.store.load_handoff(reference.stem)
-        if (handoff.workflow_id != snapshot.workflow_id
+        if (handoff.handoff_id != reference.stem
+                or handoff.workflow_id != snapshot.workflow_id
                 or handoff.parent != WorkflowRef(state.mode, state.session_id)
                 or not handoff.returned_at or handoff.status != "blocked"
                 or handoff.result.get("resolution") != "execution_binding_mismatch"):

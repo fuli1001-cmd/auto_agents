@@ -428,6 +428,44 @@ def test_exhausted_repair_accepts_committed_correction_without_more_implementati
     assert runner.store.read(final['receipt'])['snapshot'] != blocked['snapshot']
 
 
+def test_subscriber_counterexample_accepts_new_committed_correction_without_extra_retry(job):
+    runner = controller(job, Driver(fail=True))
+    runner.run()
+    repo = runner.workspace.source
+    (repo / 'source.py').write_text('value = 1\n')
+    git(repo, 'commit', '-qam', 'First external correction')
+    runner.resume_token = 'first-correction'
+    assert runner.recover_corrected_source(repo, git(repo, 'rev-parse', 'HEAD'))
+    assert runner.run()['status'] == 'ready'
+    # validate_subscriber revokes acceptance and retains the concrete live
+    # counterexample as active/implement, even for an exhausted writer budget.
+    runner.checkpoint(status='active', phase='implement', failures=[{
+        'unit': 'subscriber-boundary', 'reason': 'relocated receipt was not consumed'}])
+    before = runner.store.load()
+    (repo / 'resume.py').write_text('relocated_receipt_supported = True\n')
+    git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'Correct the subscriber counterexample')
+    correction = git(repo, 'rev-parse', 'HEAD')
+    assert not runner.recover_corrected_source(repo, correction)  # Same invocation.
+    runner.resume_token = 'subscriber-correction'
+    assert runner.recover_corrected_source(repo, correction)
+    recovered = runner.store.load()
+    for field in ('attempts', 'calls', 'stagnant', 'replans', 'plan', 'sessions', 'failures'):
+        assert recovered[field] == before[field]
+    assert recovered['phase'] == 'audit'
+    observed = []
+    def boundary(identity, snapshot, cancel):
+        observed.append(identity)
+        return {'ok': (Path(snapshot) / 'resume.py').read_text() == 'relocated_receipt_supported = True\n',
+                'snapshot': identity}
+    runner.boundary = boundary
+    calls = len(runner.driver.calls)
+    final = runner.run()
+    assert final['status'] == 'ready'
+    assert observed == [final['snapshot']]
+    assert runner.driver.calls[calls:] == [('review', 'reviewer')]
+    assert final['attempts'] == before['attempts']
+
+
 def test_exhausted_repair_ignores_same_invocation_and_source_identical_commit(job):
     runner = controller(job, Driver(fail=True))
     runner.resume_token = 'old-invocation'

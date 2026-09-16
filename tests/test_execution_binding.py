@@ -192,6 +192,39 @@ def test_explicit_resume_rechecks_returned_engine_binding_failure(tmp_path, veri
     assert run_path.read_bytes() == run_before
 
 
+@pytest.mark.parametrize("mismatch", ["parent", "workflow", "handoff", "path"])
+def test_relocated_receipt_requires_matching_local_workflow_identity(tmp_path, mismatch):
+    root = _make_project(str(tmp_path))
+    coordinator = WorkflowCoordinator(Orchestrator(root))
+    snapshot = coordinator.store.create_root(WorkflowRef("collab", "parent"))
+    handoff = coordinator.store.prepare_handoff(
+        snapshot, parent=snapshot.root, target="fix", goal="acceptance", reason="engine fix",
+        payload={"target_repository": str(tmp_path / "engine")})
+    coordinator.store.record_result(snapshot, handoff, status="blocked",
+        result={"status": "blocked", "resolution": "execution_binding_mismatch"})
+    coordinator.store.consume_result(snapshot, handoff, operation_id="blocked-receipt")
+    reference = Path('/unmounted/project/.auto-agents/state/handoffs') / (handoff.handoff_id + '.json')
+    state = SessionState(session_id="parent", mode="collab", status="blocked",
+        workflow_id=snapshot.workflow_id, resolution="execution_binding_mismatch",
+        last_child_result_ref=str(reference))
+    if mismatch == "path":
+        state.last_child_result_ref = str(reference.with_suffix('.txt'))
+    else:
+        from auto_agents.io_utils import read_json, write_json
+        path = coordinator.store.handoff_path(handoff.handoff_id)
+        payload = read_json(path)
+        if mismatch == "parent":
+            payload['parent']['native_id'] = 'another-parent'
+        elif mismatch == "workflow":
+            payload['workflow_id'] = 'another-workflow'
+        else:
+            payload['handoff_id'] = 'another-handoff'
+        write_json(path, payload)
+    with patch.object(coordinator, '_execution_binding_result', side_effect=AssertionError('foreign receipt')):
+        coordinator._resume_blocked_engine_handoff(state, snapshot)
+    assert state.status == 'blocked' and not state.active_handoff_id
+
+
 def test_same_repository_binding_is_allowed(tmp_path):
     assert repository_binding_error(tmp_path, {"target_repository": str(tmp_path)}) == ""
     assert repository_binding_error(tmp_path, {"issue_seed": {"target_repository": "."}}) == ""

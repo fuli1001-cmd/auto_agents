@@ -603,9 +603,19 @@ class Controller:
         import subprocess
         with self.store.locked():
             self.state = self.store.load()
-            if (not self.state or self.state['status'] != 'blocked'
-                    or self.state.get('blocker', {}).get('code') != 'no_progress'
-                    or not self.resume_token or self.resume_token == self.state.get('resume_token')):
+            if not self.state:
+                return False
+            exhausted = (self.state['status'] == 'blocked'
+                         and self.state.get('blocker', {}).get('code') == 'no_progress')
+            # Subscriber validation can revoke an externally corrected receipt
+            # after acceptance. Admit a new committed correction on the next
+            # invocation without first forcing a redundant no_progress failure.
+            subscriber_failure = (self.state['status'] == 'active'
+                and self.state.get('phase') == 'implement' and self.state.get('external_correction')
+                and self.state.get('failures')
+                and all(f.get('unit') == 'subscriber-boundary' for f in self.state['failures']))
+            if (not (exhausted or subscriber_failure) or not self.resume_token
+                    or self.resume_token == self.state.get('resume_token')):
                 return False
             if self.state['request_digest'] != digest(self.request.to_dict()):
                 raise RepairBlocked('request_changed', 'correction differs from the frozen repair contract')
