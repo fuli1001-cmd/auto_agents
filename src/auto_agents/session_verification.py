@@ -57,9 +57,17 @@ def preimplementation_exit(state):
             or state.last_child_result_ref or state.persistence_actions):
         return None
     for entry in state.execution_log:
-        if entry.get('attempt', 0) or entry.get('action') in {
+        action = entry.get('action')
+        # These events are emitted by _phase_converse, whose requests are
+        # read-only. Their attempt field counts conversation rounds, not
+        # _record_agent_attempt's implementation calls. Keep the original
+        # history intact, and do not extend this exception to unknown events.
+        if action in {'converse_error', 'internal_action_auto_authorized'}:
+            continue
+        if entry.get('attempt', 0) or action in {
                 'fix', 'receipt_writer_result', 'receipt_verification', 'receipt_completion',
-                'child_returned', 'fix_route_rejected'}:
+                'child_returned', 'fix_route_rejected', 'implementation_attempts_retained',
+                'candidate_superseded'}:
             return None
     if state.status == 'completed':
         if state.resolution != 'not_a_bug':
