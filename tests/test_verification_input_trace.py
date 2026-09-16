@@ -680,7 +680,7 @@ def test_runtime_allocation_rejects_foreign_job_leaves(tmp_path, symlink):
     execute(tmp_path, f'''
 import os
 from pathlib import Path
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, raises
 import auto_agents.gate_execution as gates
 from auto_agents.gates import GateCommandMetadata
 import sys
@@ -696,13 +696,17 @@ def conflict(job, **kwargs):
     else:
         leaf.mkdir(mode=0o700); (leaf/'retained').write_bytes(b'foreign')
     return original(job,**kwargs)
-command='printf must-not-execute'
+marker=root/'must-not-execute'
+command='printf forbidden > '+str(marker)
 with MonkeyPatch.context() as patch:
     patch.setattr(gates,'short_job_runtime_root',conflict)
     with gates.LocalGatePlanExecutor(project,_config(root),{{command:GateCommandMetadata(result_cache_scope='auto')}}) as executor:
-        result=executor.run(command,timeout_seconds=20,adaptive_timeout_enabled=False,idle_timeout_seconds=20)
-assert not result.ok and not result.stdout, result
-assert 'runtime_allocation' in result.stderr and 'socket_byte_budget' in result.stderr
+        with raises(gates.ConfinementPreflightError) as stopped:
+            executor.run(command,timeout_seconds=20,adaptive_timeout_enabled=False,idle_timeout_seconds=20)
+diagnostic=stopped.value.diagnostic
+assert diagnostic['phase']=='runtime_allocation' and diagnostic['socket_byte_budget']==100
+assert diagnostic['command']==command and diagnostic['attempted_location']==str(leaves[0])
+assert not marker.exists(), 'failed admission must not dispatch the command'
 assert (foreign/'retained').read_bytes()==b'foreign'
 assert (leaves[0]/'retained').read_bytes()==b'foreign'
 assert leaves[0].is_symlink()=={symlink!r}

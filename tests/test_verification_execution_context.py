@@ -405,6 +405,15 @@ def _verification_entry_environment_change(tmp_path, monkeypatch, recovery):
 
 def test_prepared_gate_keeps_shared_prefix_readonly(tmp_path, monkeypatch):
 
+    from auto_agents.gate_execution import LocalGatePlanExecutor
+    observed = []
+    execute = LocalGatePlanExecutor.run
+    def observe(executor, *args, **kwargs):
+        result = execute(executor, *args, **kwargs)
+        observed.append({'ok': result.ok, 'stdout': result.stdout, 'stderr': result.stderr})
+        return result
+    monkeypatch.setattr(LocalGatePlanExecutor, 'run', observe)
+
     root, child = project(tmp_path)
     conda, source, provisioned = _environment(tmp_path)
     before, installed_before = _snapshot(source), _snapshot(provisioned)
@@ -425,7 +434,7 @@ def test_prepared_gate_keeps_shared_prefix_readonly(tmp_path, monkeypatch):
                          '-m', 'pytest', '-q', 'test_context.py'])
     ambient = _retain_command(root, child, command, 'cmd:' + command)
     saved, calls, _ = run_session(root, monkeypatch)
-    assert saved.status == 'completed' and calls == ['fix'], json.dumps(saved.to_dict(), indent=2)
+    assert saved.status == 'completed' and calls == ['fix'], json.dumps(observed, indent=2)
     assert _snapshot(source) == before
     assert _snapshot(provisioned) == installed_before
     assert {path: (root / path).read_bytes() for path in ambient} == ambient

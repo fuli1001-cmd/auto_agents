@@ -3843,7 +3843,9 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(
         fresh_verification = any(entry['action'] == 'inventory_migration_verify' and entry['result'] == 'pass'
                                  for entry in result.execution_log[before_log:])
         assert fresh_verification == (resume_index == 0)
-        expected = verification.fingerprint([binding['binding_fingerprint'], retained['receipt']['fingerprint']])
+        expected = verification.fingerprint([
+            binding['binding_fingerprint'], retained['receipt']['fingerprint'],
+            'session-write-boundary-v1', binding.get('proof_execution_context')])
         if resume_index == 0:
             assert contexts and all(identity == expected for identity in contexts)
         else:
