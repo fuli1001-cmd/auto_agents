@@ -20874,7 +20874,10 @@ class Orchestrator:
         for step in self.config.gates.steps:
             bindings.extend(step.operator_input_bindings)
         try:
-            tasks = self._load_tasks_from_plan()
+            # Reading optional operator bindings is not task-execution
+            # admission: a standalone collab/fix can have no task plan yet.
+            tasks = [TaskSpec.from_dict(row) for row in
+                     load_task_plan(self.project_root).get("tasks", [])]
         except (OSError, TypeError, ValueError):
             tasks = []
         for task in tasks:
