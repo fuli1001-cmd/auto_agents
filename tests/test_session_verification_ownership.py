@@ -2996,9 +2996,23 @@ def _supervised_public_resume(tmp_path, monkeypatch, scope, *, recover):
         configure_local_writer, parent_workflow, resume_to_observation, ObservationBoundary,
     )
 
-    # The trusted executor supplies the production owner. Candidate imports
-    # negotiate with that owner; this test never starts a replacement supervisor.
+    # Legacy executors already supply an owner. A standalone V2 container
+    # establishes the real launcher before rerunning this exact case; never
+    # replace an inherited supervisor or emulate its protocol/observations.
     owner = owner_identity()
+    if not owner['metadata']:
+        import os
+        import auto_agents.verification_sandbox as sandbox
+        name = ('test_public_resume_authenticated_history_with_supervised_input_tracing' if recover else
+                'test_public_resume_global_plan_switch_with_supervised_input_tracing')
+        node = str(Path(__file__).resolve()) + '::' + name + '[' + scope + ']'
+        command = [sys.executable, str(Path(sandbox.__file__).resolve()), '--metadata',
+                   json.dumps({'roots': [str(tmp_path), '/tmp'], 'supervisor_checks': True}),
+                   sys.executable, '-m', 'pytest', '-q', '--basetemp', str(tmp_path / 'supervised'), node]
+        result = subprocess.run(command, cwd=tmp_path, text=True, capture_output=True, timeout=240,
+                                env={**os.environ, 'AUTO_AGENTS_VERIFICATION_SANDBOX': '1'})
+        assert result.returncode == 0, result.stdout + result.stderr
+        return
     assert owner['metadata'] == owner['trace'] == 1, owner
     assert shutil.which('strace'), 'the retained tracing acceptance requires strace'
     if recover:

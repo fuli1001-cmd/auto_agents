@@ -211,7 +211,8 @@ def candidate_request(session, state, request):
         raise ownership_error(state, 'bound writer requires its private execution checkout')
     source_head = _git(session.project_root, 'rev-parse', 'HEAD')
     from .verification_sandbox import candidate_writer_boundary
-    with candidate_writer_boundary(session.project_root, state) as boundary:
+    with candidate_writer_boundary(session.project_root, state,
+            control_root=getattr(session, '_custody_control_root', None)) as boundary:
         yield replace(request, resume_session_id='', resume_provider='',
                       prompt_is_continuation=False, prompt_continuation='',
                       writer_boundary=boundary)

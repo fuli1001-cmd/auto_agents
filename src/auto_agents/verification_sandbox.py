@@ -460,17 +460,18 @@ class CandidateWriterBoundary:
     The private /tmp is necessary for the sandbox launcher's mount registry.
     """
 
-    def __init__(self, root, scratch, state):
+    def __init__(self, root, scratch, state, *, control_root=None):
         from .session_verification import ownership_error
         self.root, self.scratch, self.state = root.resolve(), scratch.resolve(), state
         self.shared = Path(state.verification_binding['repository']).resolve()
+        self.control = Path(control_root).resolve() if control_root is not None else self.shared
         if self.root == self.shared or self.shared.is_relative_to(self.root):
             raise ownership_error(state, 'writer confinement requires a private candidate checkout')
         # Custody admission supports both registered external runtimes and
         # retained independent legacy repositories beneath the control tree.
         # Grant writes to that validated checkout, never to its shared parent.
         from .session_source import validate_checkout
-        validate_checkout(self.shared, state, root)
+        validate_checkout(self.control, state, root)
         self.nested = bool(os.environ.get('AUTO_AGENTS_VERIFICATION_SANDBOX'))
         if self.nested and landlock_abi() < 3:
             raise ownership_error(state, 'writer confinement is unavailable', detail='Landlock ABI 3 is required')
@@ -502,7 +503,7 @@ class CandidateWriterBoundary:
         # Writers may stage there; the shared repository remains read-only.
         # /tmp is a fresh mount, not the host's temporary directory. Shared
         # inputs restored below it are explicitly read-only, including metadata.
-        preserve = [self.root, self.scratch, self.shared, Path(__file__).resolve().parents[2]]
+        preserve = [self.root, self.scratch, self.shared, self.control, Path(__file__).resolve().parents[2]]
         preserve.extend(self.read_roots)
         preserve.extend(Path(value) for value in discover_dependency_links(self.root).values())
         executable = shutil.which(argv[0], path=env.get('PATH'))
@@ -587,10 +588,10 @@ class CandidateWriterBoundary:
 
 
 @contextmanager
-def candidate_writer_boundary(root, state):
+def candidate_writer_boundary(root, state, *, control_root=None):
     with tempfile.TemporaryDirectory(prefix='auto-agents-writer-') as temporary:
         try:
-            boundary = CandidateWriterBoundary(Path(root), Path(temporary), state)
+            boundary = CandidateWriterBoundary(Path(root), Path(temporary), state, control_root=control_root)
             boundary.check()
         except (OSError, subprocess.SubprocessError) as error:
             from .session_verification import ownership_error
