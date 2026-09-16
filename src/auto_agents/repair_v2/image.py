@@ -30,6 +30,14 @@ def file_digest(stream):
     return result.hexdigest()
 
 
+def conda_runtime_markers(paths):
+    """Retain selected Conda prefix identities without copying command history."""
+    return {str(Path(prefix) / 'conda-meta/history').lstrip('/'):
+            '# Selected auto-agents verification runtime\n'
+            for prefix in {paths['base'], paths['prefix']}
+            if (Path(prefix) / 'conda-meta/history').is_file()}
+
+
 def tool_image(root, python, driver, *, codex_binary=None):
     # Concurrent jobs share one build context. A completed image is reusable;
     # its unpacked rootfs is always disposable, including after interrupted builds.
@@ -54,6 +62,8 @@ def _tool_image(root, python, driver, *, codex_binary=None):
     stage = root / 'toolchain'
     fs = stage / 'rootfs'
     records, binaries, sources = {}, [], {}
+    conda_markers = conda_runtime_markers(paths)
+    for key, marker in conda_markers.items(): records[key] = [digest(marker), 0o644]
 
     def copy_file(source, *, destination=None):
         source = Path(os.path.normpath(str(source)))
@@ -100,7 +110,7 @@ def _tool_image(root, python, driver, *, codex_binary=None):
                  'sort', 'uniq', 'wc', 'cut', 'tr', 'sleep', 'timeout', 'true', 'false', 'id', 'uname',
                  'which', 'tar', 'gzip', 'xargs', 'diff', 'date', 'ps', 'kill', 'unshare', 'mount',
                  'umount', 'ip', 'ss', 'curl', 'ldd', 'openssl', 'dirname', 'basename', 'printf',
-                 'du', 'df', 'mktemp', 'tee', 'ln', 'rmdir', 'expr', 'rg'):
+                 'du', 'df', 'mktemp', 'tee', 'ln', 'rmdir', 'expr', 'rg', 'strace'):
         source = next((Path(p) / name for p in ('/usr/bin', '/usr/sbin', '/bin', '/sbin')
                        if (Path(p) / name).is_file()), None)
         if source is None and shutil.which(name): source = Path(shutil.which(name))
@@ -191,6 +201,7 @@ def _tool_image(root, python, driver, *, codex_binary=None):
     code, _ = run(['docker', 'image', 'inspect', image], timeout=15)
     if code:
         generated = {
+            **{key: (marker, 0o644) for key, marker in conda_markers.items()},
             'opt/repair/driver.py': (driver, 0o644),
             'etc/passwd': ('root:x:0:0:root:/root:/bin/sh\n'
                 f'repair:x:{os.getuid()}:{os.getgid()}:repair:/home/repair:/bin/sh\n', 0o644),
