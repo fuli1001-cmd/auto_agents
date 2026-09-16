@@ -10,12 +10,15 @@ import pytest
 class Evidence:
     def __init__(self):
         self.collected, self.passed, self.failed, self.skipped = [], [], [], []
+        self.call_failed = []
 
     def pytest_collection_finish(self, session):
         self.collected = [item.nodeid for item in session.items]
 
     def pytest_runtest_logreport(self, report):
         if report.failed: self.failed.append(report.nodeid)
+        if report.when == 'call' and report.failed and not hasattr(report, 'wasxfail'):
+            self.call_failed.append(report.nodeid)
         if report.skipped or hasattr(report, 'wasxfail'): self.skipped.append(report.nodeid)
         if report.when == 'call' and report.passed and not hasattr(report, 'wasxfail'):
             self.passed.append(report.nodeid)
@@ -36,7 +39,7 @@ def main():
     args = json.loads(os.environ['REPAIR_PYTEST_ARGS'])
     code = int(pytest.main([*args, '-p', 'no:cacheprovider'], plugins=[evidence]))
     data = {'returncode': code, 'collected': evidence.collected, 'passed': evidence.passed,
-            'failed': evidence.failed, 'skipped': evidence.skipped}
+            'failed': evidence.failed, 'skipped': evidence.skipped, 'call_failed': evidence.call_failed}
     Path('/result/pytest.json').write_text(json.dumps(data))
     return code
 
