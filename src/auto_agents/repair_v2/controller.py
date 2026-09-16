@@ -185,8 +185,21 @@ class Controller:
 
     def test_findings(self, root):
         from .audit import test_protection_findings
+        from .workspace import git
+        import subprocess
         findings = test_protection_findings(self.workspace.source, self.request.engine_base, root)
         for parent in self.state.get('integration_parents', []):
+            # A lagging upstream is already represented by the frozen base.
+            # Auditing its historical assertions again would reject test changes
+            # that predate this repair. Never use candidate HEAD for this check:
+            # new upstream tests remain protected even after their merge.
+            try:
+                git(root, 'merge-base', '--is-ancestor', parent, self.request.engine_base)
+            except subprocess.CalledProcessError as error:
+                if error.returncode != 1:
+                    raise
+            else:
+                continue
             findings.extend(test_protection_findings(root, parent, root))
         return findings
 

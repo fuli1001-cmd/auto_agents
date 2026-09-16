@@ -64,6 +64,57 @@ def test_success_has_three_calls_one_candidate_and_no_group_state(job):
     assert 'finding_groups' not in state
 
 
+@pytest.mark.parametrize('weaken', [False, True])
+def test_integration_with_lagging_upstream_protects_frozen_base_tests(job, weaken):
+    from dataclasses import replace
+    request, store, workspace = job
+    repo = workspace.source
+    (repo / 'tests').mkdir()
+    test = repo / 'tests/test_value.py'
+    test.write_text('def test_value():\n    assert 1 == 1\n')
+    git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'old upstream tests')
+    upstream = git(repo, 'rev-parse', 'HEAD')
+    test.write_text('def test_value():\n    assert 2 == 2\n')
+    git(repo, 'commit', '-qam', 'test evolution before repair')
+    base = git(repo, 'rev-parse', 'HEAD')
+    runner = controller((replace(request, engine_base=base), store,
+                         Workspace(workspace.root, repo, base)))
+    accepted = runner.run()
+    assert accepted['status'] == 'ready'
+    calls = list(runner.driver.calls)
+    runner.integrate(repo, [base, upstream])
+    if weaken:
+        (runner.workspace.candidate / 'tests/test_value.py').write_text('def test_value():\n    pass\n')
+        assert not runner.audit(runner.workspace.candidate)
+        assert {f['baseline'] for f in runner.state['failures']} == {base}
+    else:
+        assert runner.run()['status'] == 'ready'
+        assert runner.driver.calls == calls
+    assert runner.state['attempts'] == accepted['attempts']
+
+
+@pytest.mark.parametrize('diverged', [False, True])
+def test_integration_still_protects_new_upstream_tests_after_merge(job, diverged):
+    runner = controller(job)
+    assert runner.run()['status'] == 'ready'
+    repo = runner.workspace.source
+    (repo / 'tests').mkdir()
+    (repo / 'tests/test_upstream.py').write_text('def test_upstream():\n    assert 3 == 3\n')
+    git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'new upstream regression')
+    upstream = git(repo, 'rev-parse', 'HEAD')
+    if diverged:
+        git(repo, 'checkout', '--detach', runner.request.engine_base)
+        (repo / 'local.txt').write_text('independent local work\n')
+        git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'diverged local source')
+    local = git(repo, 'rev-parse', 'HEAD')
+    runner.integrate(repo, [local, upstream])
+    root = runner.workspace.candidate
+    (root / 'tests/test_upstream.py').write_text('def test_upstream():\n    pass\n')
+    assert not runner.audit(root)
+    assert any(f['baseline'] == upstream and f['path'] == 'tests/test_upstream.py'
+               for f in runner.state['failures'])
+
+
 def test_bounded_rediagnosis_does_not_reset_on_restart(job):
     runner = controller(job, Driver(fail=True))
     state = runner.run()
