@@ -190,6 +190,77 @@ def test_same_distribution_version_cannot_certify_another_loaded_engine(monkeypa
     assert any('session_verification' in item for item in failure.value.report['mismatches'])
 
 
+@pytest.mark.parametrize('stale_scope', ['module', 'catalog_only'])
+def test_baseline_catalog_under_candidate_filename_cannot_attest_loaded_runtime(stale_scope):
+    # Use the actual incident baseline in a separate interpreter: loading it
+    # in this pytest process would replace exception classes and other tests'
+    # imported globals. The source on disk and Git metadata remain untouched.
+    program = r'''
+import hashlib, json, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root / 'src'))
+from auto_agents import session_verification as verification
+from auto_agents.models import SessionState
+from auto_agents.repair_runtime_identity import observe_engine, RuntimeIdentityError
+head = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'],
+                      check=True, capture_output=True, text=True).stdout.strip()
+path = Path(verification.__file__)
+disk_source = path.read_bytes()
+fresh = observe_engine(root, expected_commit=head)
+name = 'auto_agents.session_verification'
+assert fresh['modules'][name]['functions']['_retained_reference_catalog']['matches_source'] is True
+state = SessionState(session_id='catalog-probe', workflow_id='workflow-probe',
+                     verification_binding={'contract_revision': 'retained'})
+session = SimpleNamespace(project_root=root)
+read_bytes = verification._retained_reference_bytes
+verification._retained_reference_bytes = lambda *args: b'{broken'
+try:
+    verification._retained_reference_catalog(session, state)
+except verification.SessionOwnershipError as error:
+    assert error.diagnostic['verification_ref'] == '.auto-agents/state/requirements_trace.json'
+else:
+    raise AssertionError('current catalog did not retain the structured failure')
+finally:
+    verification._retained_reference_bytes = read_bytes
+baseline = subprocess.run(['git', '-C', str(root), 'show',
+    'c4906fee7becfbda6c06fb96be6df6843d36754a:src/auto_agents/session_verification.py'],
+    check=True, capture_output=True).stdout
+namespace = verification.__dict__ if sys.argv[2] == 'module' else dict(verification.__dict__)
+exec(compile(baseline, str(path), 'exec', dont_inherit=True), namespace)
+if sys.argv[2] == 'catalog_only':
+    verification._retained_reference_catalog = namespace['_retained_reference_catalog']
+try:
+    observe_engine(root, expected_commit=head)
+except RuntimeIdentityError as error:
+    report = error.report
+    assert name + ':_retained_reference_catalog' in report['mismatches'], report
+    module = report['modules'][name]
+    assert module['path'] == module['origin'] == str(path)
+    assert module['source_sha256'] == hashlib.sha256(disk_source).hexdigest()
+    assert module['functions']['_retained_reference_catalog']['matches_source'] is False
+    assert all(module['functions'][function]['matches_source'] is True for function in
+               ('_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory'))
+else:
+    raise AssertionError('baseline catalog was accepted under the candidate filename')
+namespace['_retained_reference_bytes'] = lambda *args: b'{broken'
+try:
+    verification._retained_reference_catalog(session, state)
+except json.JSONDecodeError:
+    pass
+else:
+    raise AssertionError('counterexample did not load the baseline catalog behavior')
+assert path.read_bytes() == disk_source
+print(json.dumps({'stale_catalog_rejected': True, 'scope': sys.argv[2]}))
+'''
+    result = subprocess.run([sys.executable, '-B', '-c', program, str(ENGINE), stale_scope],
+                            capture_output=True, text=True, timeout=30,
+                            env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0', 'PYTHONDONTWRITEBYTECODE': '1'})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.splitlines()[-1]) == {'stale_catalog_rejected': True, 'scope': stale_scope}
+
+
 @pytest.mark.parametrize('path', ['/', '/work', '/work/child', '/result', '../project', '/tmp/home'])
 def test_replay_cannot_mount_evidence_over_its_trusted_runtime(path):
     from auto_agents.repair_v2.docker import replay_project_path

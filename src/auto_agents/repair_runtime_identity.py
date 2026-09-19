@@ -28,7 +28,10 @@ _MODULES = {
     'auto_agents.cli': ('main',),
     'auto_agents.session': ('Session.resume',),
     'auto_agents.session_verification': (
-        '_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory'),
+        '_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory',
+        # Classification also reads the retained catalog. Checking only its
+        # unchanged callers can attest a stale module under the current path.
+        '_retained_reference_catalog'),
     'auto_agents.workflow_runtime': ('WorkflowCoordinator._engine_child_id',
                                    'WorkflowCoordinator._resume_engine_bound_child'),
 }
