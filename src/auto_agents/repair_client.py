@@ -368,7 +368,12 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     boundary = {"kind": "completion"}
     if invocation.get("session_id"):
         root_state = load_session_state(project, invocation["session_id"])
-        invocation.setdefault("workflow_id", root_state.workflow_id)
+        recorded_workflow = str(invocation.get("workflow_id") or "")
+        if recorded_workflow and root_state.workflow_id and recorded_workflow != root_state.workflow_id:
+            raise RuntimeError("repair invocation conflicts with the saved session workflow")
+        # A fresh CLI starts with workflow_id="" before Session creates its
+        # durable workflow. setdefault cannot fill that existing empty value.
+        invocation["workflow_id"] = root_state.workflow_id or recorded_workflow
         session = root_state
         if root_state.active_handoff_id:
             from .workflow_chain import WorkflowStore
