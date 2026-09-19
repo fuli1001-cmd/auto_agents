@@ -25,6 +25,17 @@ from .cleanup import labels, reap_containers
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 
 
+def replay_project_path(payload):
+    """Mount only the disposable copy at the retained logical project path."""
+    path = Path(payload.get('project') or '/target').expanduser()
+    reserved = [Path(value) for value in ('/work', '/result', '/opt', '/usr', '/bin',
+                                        '/lib', '/lib64', '/etc', '/proc', '/sys', '/dev', '/tmp/home')]
+    if (not path.is_absolute() or '..' in path.parts or ',' in str(path)
+            or any(path == value or path in value.parents or value in path.parents for value in reserved)):
+        raise RepairBlocked('replay_project_path', 'retained project path conflicts with the replay runtime')
+    return path
+
+
 def container_mounts():
     """Observe mounts without exposing container configuration or racing removal."""
     code, listing = run(['docker', 'ps', '-aq'], timeout=15)
@@ -135,6 +146,7 @@ class DockerVerifier:
                                'uid': os.getuid(), 'gid': os.getgid(), 'memory': '1g', 'tmpfs': 'exec,4g',
                                'boundary': Path(__file__).with_name('boundary_driver.py').read_text(),
                                'session': Path(__file__).parent.parent.joinpath('session_replay.py').read_text(),
+                               'runtime_identity': Path(__file__).parent.parent.joinpath('repair_runtime_identity.py').read_text(),
                                'kernel': os.uname().release, 'policy': 7, 'init': True})
         self.image = identity_text.strip()  # A mutable tag is not a verification input.
 
@@ -354,6 +366,7 @@ class DockerVerifier:
         base = self.root / 'executions' / identity
         name = 'aav2-' + identity
         target, source, output = base / 'target', base / 'source', base / 'result'
+        project_path = replay_project_path(payload)
         before = evidence_identity(frozen_target)
         custody = {'clear': True}
         with execution_lease(base), disposable_source(snapshot, source, cleanup=lambda: custody['clear']):
@@ -365,18 +378,20 @@ class DockerVerifier:
                 if (target / '.git').exists():
                     git(target, 'repack', '-a', '-d')
                     (target / '.git/objects/info/alternates').unlink(missing_ok=True)
-                atomic_json(output / 'request.json', {**payload, 'commit': git(source, 'rev-parse', 'HEAD')})
+                atomic_json(output / 'request.json', {**payload, 'commit': git(source, 'rev-parse', 'HEAD'),
+                                                     '_replay_project': str(project_path)})
                 command = ['docker', 'run', '--init', '--name', name, *labels(self.root, identity, kind='verification'), '--network', 'none', '--read-only',
                     '--user', f'{os.getuid()}:{os.getgid()}', '--cap-drop', 'ALL',
                     '--security-opt', 'no-new-privileges', '--memory', '1g', '--pids-limit', '512',
-                    '--tmpfs', '/tmp:rw,nosuid,exec,mode=1777,size=4g', '--workdir', '/target',
+                    '--tmpfs', '/tmp:rw,nosuid,exec,mode=1777,size=4g', '--workdir', str(project_path),
                     '-e', 'HOME=/tmp/home', '-e', 'PYTHONDONTWRITEBYTECODE=1',
                     '-e', 'AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1', '-e', 'AUTO_AGENTS_STORAGE_DISABLED=1',
                     '--mount', f'type=bind,src={source},dst=/work,readonly',
-                    '--mount', f'type=bind,src={target},dst=/target',
+                    '--mount', f'type=bind,src={target},dst={project_path}',
                     '--mount', f'type=bind,src={output},dst=/result']
                 for script in (Path(__file__).with_name('boundary_driver.py'),
-                               Path(__file__).parent.parent / 'session_replay.py'):
+                               Path(__file__).parent.parent / 'session_replay.py',
+                               Path(__file__).parent.parent / 'repair_runtime_identity.py'):
                     command += ['--mount', f'type=bind,src={script},dst=/opt/repair/{script.name},readonly']
                 custody['clear'] = False
                 code, text = run([*command, self.image, 'python', '/opt/repair/boundary_driver.py'],

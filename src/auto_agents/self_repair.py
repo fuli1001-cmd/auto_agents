@@ -8062,7 +8062,8 @@ class AutoAgentsSelfRepairRunner:
             if context.get("engine_route"):
                 from .repair_control import digest
                 receipt = target / ".auto-agents/engine-route-probe.json"
-                write_json(receipt, {"route_digest": digest(context["engine_route"])})
+                write_json(receipt, {"route_digest": digest(context["engine_route"]),
+                                     "engine_route": context["engine_route"]})
             arguments = [self._verification_python(), str(Path(__file__).with_name("session_replay.py")),
                          str(engine), str(target), str(context["session_id"]), str(context["command"]).replace("provider-resolve", "fix")]
             if context.get("engine_route"):

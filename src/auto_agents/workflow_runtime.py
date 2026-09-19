@@ -1113,21 +1113,42 @@ class WorkflowCoordinator:
         from .session_verification import SessionOwnershipError
         children = set()
         for source in route_sources(payload):
+            evidence_base = source.get('evidence_base')
+            if evidence_base and Path(evidence_base).expanduser().resolve() != self.project_root:
+                raise SessionOwnershipError('engine return evidence belongs to another repository')
             if source.get('child_session_id'):
                 children.add(str(source['child_session_id']))
             failed = source.get('failed_handoff_id')
             if not failed:
                 continue
-            evidence_base = source.get('evidence_base')
-            if evidence_base and Path(evidence_base).expanduser().resolve() != self.project_root:
-                raise SessionOwnershipError('engine return evidence belongs to another repository')
             try:
                 original = self.store.load_handoff(str(failed))
+                requested = str(failed)
+                wrappers = []
+                visited = set()
+                while original.target == 'resume':
+                    if (original.handoff_id != requested or original.handoff_id in visited
+                            or original.workflow_id != snapshot.workflow_id):
+                        raise SessionOwnershipError('engine return resume chain has conflicting ownership')
+                    visited.add(original.handoff_id)
+                    wrappers.append(original)
+                    resumed = original.payload.get('resume_handoff_id')
+                    if not resumed:
+                        raise SessionOwnershipError('engine return resume handoff has no original handoff')
+                    requested = str(resumed)
+                    original = self.store.load_handoff(requested)
             except (OSError, ValueError) as error:
                 raise SessionOwnershipError('engine return failed handoff is unavailable') from error
-            if (original.workflow_id != snapshot.workflow_id or original.child is None
+            if (original.handoff_id != requested or original.target != 'fix'
+                    or original.workflow_id != snapshot.workflow_id or original.child is None
                     or original.child.kind != 'fix'):
                 raise SessionOwnershipError('engine return failed handoff has conflicting ownership')
+            if (source.get('original_handoff_id', original.handoff_id) != original.handoff_id
+                    or any(wrapper.child is not None and wrapper.child != original.child
+                           for wrapper in wrappers)
+                    or any(wrapper.payload.get('child_session_id', original.child.native_id)
+                           != original.child.native_id for wrapper in [*wrappers, original])):
+                raise SessionOwnershipError('engine return original handoff conflicts with resume evidence')
             try:
                 child = load_session_state(self.project_root, original.child.native_id)
             except (OSError, ValueError) as error:

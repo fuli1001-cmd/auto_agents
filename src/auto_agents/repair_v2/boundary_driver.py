@@ -11,6 +11,17 @@ def emit(payload):
     print(json.dumps(payload, ensure_ascii=False))
 
 
+def requires_child_recovery(route):
+    sources = [route]
+    while sources:
+        source = sources.pop()
+        if source.get('failed_handoff_id') or source.get('child_session_id'):
+            return True
+        sources.extend(source[key] for key in ('issue_seed', 'spec_seed', 'fix_disposition')
+                       if isinstance(source.get(key), dict))
+    return False
+
+
 def main():
     home = Path(os.environ['HOME'])
     home.mkdir(parents=True, exist_ok=True)
@@ -18,9 +29,12 @@ def main():
     request = json.loads(Path('/result/request.json').read_text())
     invocation = request.get('invocation', {})
     sys.path.insert(0, '/work/src')
-    target = Path('/target')
+    target = Path(request.get('_replay_project', '/target'))
     case = request.get('repair_case') or {}
-    if case.get('progress_history'):
+    bound_child = requires_child_recovery(invocation.get('engine_route') or {})
+    if bound_child and not invocation.get('session_id'):
+        raise RuntimeError('bound child recovery requires the retained session entrypoint')
+    if case.get('progress_history') and not bound_child:
         from auto_agents.health_watch import replay_health_events
         items = replay_health_events(case['progress_history'], progress_lease_seconds=60)
         emit({'ok': True, 'status': 'health_trajectory_replayed',
@@ -33,7 +47,9 @@ def main():
                 return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
             marker = target / '.auto-agents/engine-route-probe.json'
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(json.dumps({'route_digest': digest(invocation['engine_route'])}))
+            marker.write_text(json.dumps({'route_digest': digest(invocation['engine_route']),
+                                          'engine_route': invocation['engine_route'],
+                                          'engine_commit': request['commit']}))
             os.environ['AUTO_AGENTS_REPAIR_ROUTE_PROBE'] = str(marker)
         sys.argv = ['session_replay', '/work', str(target), invocation['session_id'],
                     invocation.get('command', 'collab').replace('provider-resolve', 'fix')]

@@ -7,8 +7,10 @@ import subprocess
 
 if __package__:
     from .repair_runtime import RuntimeCompatibilityError, verify_runtime
+    from .repair_runtime_identity import RuntimeIdentityError, observe_engine
 else:
     from repair_runtime import RuntimeCompatibilityError, verify_runtime
+    from repair_runtime_identity import RuntimeIdentityError, observe_engine
 
 
 def main():
@@ -39,6 +41,12 @@ def main():
     from auto_agents.config import load_run_state
     from auto_agents.orchestrator import Orchestrator
     from auto_agents.cli import main as cli_main
+    observation = {'engine_runtime': observe_engine(runtime, expected_commit=result['commit']),
+                   'invocation': subscriber['payload']['repair'].get('invocation', {})}
+    # Keep this evidence in the controller's request directory, not in the
+    # product session or its original structured failure.
+    report = Path(sys.argv[1]).with_suffix('.runtime.json')
+    report.write_text(json.dumps(observation, ensure_ascii=False, sort_keys=True))
     project = Path(subscriber["project"])
     payload = subscriber["payload"]["repair"]
     inherited = int(os.environ["AUTO_AGENTS_RUN_LOCK_FD"])
@@ -62,6 +70,11 @@ if __name__ == "__main__":
         code = main()
     except RuntimeCompatibilityError as error:
         failure = error.to_result()
+        code = 3
+        print(str(error), file=sys.stderr)
+    except RuntimeIdentityError as error:
+        failure = {'ok': False, 'category': 'runtime_identity', 'error': str(error),
+                   'engine_runtime': error.report}
         code = 3
         print(str(error), file=sys.stderr)
     finally:

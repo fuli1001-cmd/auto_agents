@@ -995,8 +995,19 @@ def _retained_reference_catalog(session, state):
     from .requirements import provider_reference_paths
     payloads = []
     for path in ('.auto-agents/state/requirements_trace.json', '.auto-agents/state/provider_references.lock.json'):
-        source = _retained_reference_bytes(session, state, path)
-        payloads.append(json.loads(source) if source is not None else {})
+        try:
+            source = _retained_reference_bytes(session, state, path)
+            payload = json.loads(source) if source is not None else {}
+            field = 'requirements' if path.endswith('requirements_trace.json') else 'references'
+            rows = payload.get(field, [] if field == 'requirements' else {})
+            if (not isinstance(payload, dict)
+                    or not isinstance(rows, list if field == 'requirements' else dict)
+                    or field == 'requirements' and any(not isinstance(row, dict) for row in rows)):
+                raise ValueError('invalid reference catalog structure')
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            raise ownership_error(state, 'retained reference catalog is unreadable: ' + path,
+                                  verification_ref=path) from error
+        payloads.append(payload)
     trace, lock = payloads
     paths = {}
     for row in trace.get('requirements', []):
