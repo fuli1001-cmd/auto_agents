@@ -857,6 +857,13 @@ class WorkflowCoordinator:
         else:
             raise RuntimeError(f"unsupported handoff target: {handoff.target}")
 
+        if result.get('status') == 'completed' and result.get('candidate_ownership') == 'unknown':
+            # A native delegate may finish without returning an owned result.
+            # Preserve that native status at the dispatch API, but do not
+            # consume it as a completed workflow handoff without ownership.
+            result.update(status='blocked', resolution='verification_ownership',
+                          summary=str(result.get('ownership_diagnostic', {}).get('reason')
+                                      or 'child completion has no bound ownership'))
         native_status = str(result.get("status", "failed"))
         discard_child_mutations = bool(result.get("discard_child_mutations", False))
         if discard_child_mutations or (
@@ -875,10 +882,8 @@ class WorkflowCoordinator:
         self.store.consume_result(snapshot, handoff, operation_id=operation_id)
         return self._apply_child_result(parent_state, handoff)
 
-    def _handoff_exit_ownership(self, state, handoff):
-        from .session_verification import (
-            _validate_binding_identity, ownership_error, preimplementation_exit,
-        )
+    def _validated_child_handoff(self, state, handoff):
+        from .session_verification import ownership_error
         original = handoff
         if handoff.target == 'resume':
             try:
@@ -890,6 +895,13 @@ class WorkflowCoordinator:
                 or original.handoff_id != state.parent_handoff_id
                 or original.payload.get('child_session_id', state.session_id) != state.session_id):
             raise ownership_error(state, 'child exit identity conflicts with its handoff')
+        return original
+
+    def _handoff_exit_ownership(self, state, handoff):
+        from .session_verification import (
+            _validate_binding_identity, ownership_error, preimplementation_exit,
+        )
+        self._validated_child_handoff(state, handoff)
         if state.verification_binding:
             _validate_binding_identity(self.orch, state)
         if state.candidate_custody:
@@ -1641,6 +1653,64 @@ class WorkflowCoordinator:
             self.health_runtime.set_phase(parent_state.mode)
         return parent_state
 
+    def _legacy_completed_result(self, state, handoff):
+        """Read a completed legacy commit range; never authorize shared rollback.
+
+        Before private receipts, a persisted completed child and its handoff
+        baseline identified the result already committed in the shared repo.
+        This compatibility result is only for reporting that committed range.
+        It cannot recover missing modern custody or adopt uncommitted files.
+        """
+        if (state.mode != 'fix' or state.status != 'completed' or state.resolution != 'fixed'
+                or state.verification_binding or state.candidate_custody or state.candidate_paths
+                or state.source_descriptor or state.lineage_changed_paths or state.persistence_actions):
+            return None
+        from .session_verification import SessionOwnershipError
+        try:
+            original = self._validated_child_handoff(state, handoff)
+        except SessionOwnershipError:
+            return None
+        try:
+            retained = load_session_state(self.project_root, state.session_id)
+        except (OSError, ValueError):
+            return None
+        # Do not turn a caller's stale/edited view into a completion receipt.
+        for field in ('session_id', 'mode', 'workflow_id', 'parent_handoff_id', 'status', 'resolution',
+                      'authorization_policy', 'goal_execution_environment', 'verification_binding',
+                      'candidate_custody', 'candidate_paths', 'source_descriptor', 'lineage_changed_paths',
+                      'persistence_actions', 'execution_log'):
+            if getattr(retained, field) != getattr(state, field):
+                return None
+        if any(entry.get('action') in {
+                'receipt_writer_result', 'receipt_verification', 'receipt_completion', 'candidate_superseded',
+                'implementation_attempts_retained', 'not_a_bug', 'execution_preflight_blocked',
+                'engine_preflight_recheck'} for entry in retained.execution_log):
+            return None
+        before = str(original.payload.get('head_before', ''))
+        if not before:
+            return None
+        resolved = subprocess.run(['git', 'rev-parse', '--verify', '--end-of-options', before + '^{commit}'],
+                                  cwd=self.project_root, capture_output=True, text=True)
+        if resolved.returncode:
+            return None
+        base, after = resolved.stdout.strip(), head_ref(self.project_root)
+        if not after or base == after:
+            return None
+        ancestor = subprocess.run(['git', 'merge-base', '--is-ancestor', base, after],
+                                  cwd=self.project_root, capture_output=True)
+        if ancestor.returncode:
+            return None
+        commits = _commits_between(self.project_root, base, after)
+        paths = subprocess.run(['git', 'diff', '--name-only', '-z', base, after, '--'],
+                               cwd=self.project_root, capture_output=True, text=True)
+        if not commits or paths.returncode:
+            return None
+        return {'candidate_ownership': 'legacy_committed', 'candidate_delivery': {},
+                'head_before': base, 'head_after': after, 'commit_shas': commits,
+                'changed_paths': sorted(path for path in paths.stdout.split('\0')
+                                        if path and not path.startswith(('.auto-agents/', '.antigravitycli/'))),
+                'rolled_back_paths': []}
+
     def _session_result(self, state: object, handoff: WorkflowHandoff) -> Dict[str, object]:
         from .session_verification import SessionOwnershipError
         before = str(handoff.payload.get("head_before", ""))
@@ -1690,8 +1760,21 @@ class WorkflowCoordinator:
         if ownership == 'none':
             result['rolled_back_paths'] = []
         if ownership_error is not None:
+            legacy = self._legacy_completed_result(state, handoff)
+            if legacy is not None:
+                result.update(legacy)
+                return result
             result['ownership_diagnostic'] = {'reason': str(ownership_error), **ownership_error.diagnostic}
-            if state.status == 'completed':
+            # Native completion and candidate ownership are distinct. A
+            # completion-only, unbound delegate return has no paths, commits,
+            # or delivery to consume, and cannot authorize any rollback.
+            unbound_return = (handoff.child is None and not any((
+                state.workflow_id, state.parent_handoff_id, state.verification_binding,
+                state.candidate_custody, state.candidate_paths, state.lineage_changed_paths,
+                state.source_descriptor, state.persistence_actions, state.execution_log,
+                state.current_attempt, state.active_handoff_id, state.last_child_result_ref,
+            )))
+            if state.status == 'completed' and not unbound_return:
                 result.update(status='blocked', resolution='verification_ownership', summary=str(ownership_error))
         return result
 
