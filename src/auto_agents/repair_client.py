@@ -222,6 +222,8 @@ def _repair_failure_detail(job, subscriber):
     detail = result.get("control_error") or result.get("error")
     if isinstance(detail, str) and detail.startswith('engine source merge requires resolution'):
         return '引擎版本合并存在冲突，请在详细日志所示隔离目录解决并提交后重试；日常工作区未改动'
+    if isinstance(detail, str) and 'workflow repair chain' in detail:
+        return '同一目标的自修复已达到累计上限；候选和失败现场已保留，需先处理剩余阻塞'
     known = {
         "engine workspace has uncommitted changes; commit them before self-repair or integration": "引擎工作区有未提交改动，请先提交，再运行或整合修复",
         "engine workspace branch changed; retained repair is waiting for integration": "引擎工作区已切换分支，修复提交已保留，等待整合到原分支",
@@ -267,6 +269,7 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
             labels = {'plan': '正在统一规划修复', 'implement': '正在连续实施修复',
                       'audit': '正在检查既有测试是否完整保留',
                       'diagnose': '正在定向复核已知失败，尚未开始完整验收',
+                      'boundary_preflight': '正在先行验证原子任务恢复，尚未开始完整验收',
                       'validate': '正在集中验收：测试与独立审查并行',
                       'regression': '正在验证修复前后的行为差异',
                       'boundary': '正在验证原会话恢复', 'deliver': '正在交付已验收引擎'}
@@ -491,8 +494,9 @@ def boundary_event(kind, **details):
         return
     from .self_repair import auto_agents_repo_root
     try:
-        rpc(json.loads(Path(configured).read_text()), {"op": "boundary", "subscriber": subscriber,
+        response = rpc(json.loads(Path(configured).read_text()), {"op": "boundary", "subscriber": subscriber,
             "kind": kind, "details": details, "pid": os.getpid(), "runtime": str(auto_agents_repo_root())})
+        return bool(response.get('accepted'))
     except (OSError, RuntimeError, ValueError):
         pass
 

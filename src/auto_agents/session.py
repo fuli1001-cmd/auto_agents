@@ -1981,6 +1981,23 @@ class Session:
         if binding_error:
             from .repair_client import engine_route
             if engine_route(self.orch, payload):
+                if self._coordinator is not None and state.workflow_id:
+                    snapshot = self._coordinator.store.load(state.workflow_id)
+                    child_id = self._coordinator._engine_child_id(payload, snapshot)
+                    if child_id:
+                        # Consume the verified return through the actual child
+                        # recovery path. Returning to parent diagnosis here used
+                        # to produce another resume wrapper around a stale error.
+                        # Keep the exact approved payload/digest, without adding
+                        # new product authorization or reseeding the child.
+                        handoff = self._coordinator.store.prepare_handoff(
+                            snapshot, parent=WorkflowRef(state.mode, state.session_id),
+                            target='fix', goal=state.goal, reason='Resume the verified engine repair child',
+                            payload=payload)
+                        state.active_handoff_id = handoff.handoff_id
+                        state.status, state.resolution, state.return_phase = 'waiting_child', '', ''
+                        self._save(state)
+                        return state
                 state.status = "executing"
                 state.resolution = ""
                 state.conversation.append({"role": "orchestrator", "content":
@@ -2156,6 +2173,13 @@ class Session:
             prior_receipt = deepcopy(state.candidate_custody.get("receipt"))
             prior_candidate_paths = dict(state.candidate_paths)
             try:
+                recovery = getattr(self, '_engine_recovery_context', None)
+                if recovery and os.environ.get('AUTO_AGENTS_REPAIR_SUBSCRIBER'):
+                    from .repair_client import boundary_event
+                    if not boundary_event('engine_child', **recovery,
+                            binding_fingerprint=state.verification_binding.get('binding_fingerprint')):
+                        raise SessionOwnershipError('repair supervisor did not acknowledge child recovery')
+                    self._engine_recovery_context = None
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
             except SessionOwnershipError as error:
                 restore_guard.cleanup()

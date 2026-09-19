@@ -36,6 +36,7 @@ def main() -> dict[str, object]:
                                for source in route_sources(expected_route))
     frames = []
     boundary_state = {}
+    boundary_kind = ''
     before_child = {}
     classifications = []
 
@@ -52,11 +53,22 @@ def main() -> dict[str, object]:
         pass
 
     def no_provider(*args, **kwargs):
+        nonlocal boundary_kind
+        boundary_kind = 'provider'
         if frames:
             boundary_state.update(frames[-1].to_dict())
         raise NextProviderBoundary()
 
     def before_attempt(state):
+        # Do not spend live provider budget in an offline proof. Continue until
+        # all real preflight/ownership checks before the writer have run.
+        pass
+
+    def before_agent(self, state, label, prompt):
+        nonlocal boundary_kind
+        import re
+        boundary_kind = ('implementation' if state.mode == 'fix' and re.fullmatch(r'fix-\d+', label)
+                         else 'diagnosis')
         boundary_state.update(state.to_dict())
         raise NextProviderBoundary()
 
@@ -107,6 +119,7 @@ def main() -> dict[str, object]:
         with ExitStack() as patches:
             patches.enter_context(patch.object(Orchestrator, '_call_with_failover', no_provider))
             patches.enter_context(patch.object(Session, '_record_agent_attempt', staticmethod(before_attempt)))
+            patches.enter_context(patch.object(Session, '_call_agent', before_agent))
             patches.enter_context(patch.object(WorkflowCoordinator, '_drive_session', observe_drive))
             patches.enter_context(patch.object(repair_client, 'engine_route', observe_route))
             patches.enter_context(patch.object(session_verification, '_session_reference_kind', observe_reference))
@@ -155,17 +168,19 @@ def main() -> dict[str, object]:
                 'goal_execution_environment', 'authorization_policy', 'hard_ceiling'))
             rechecked = any(entry.get('action') == 'engine_preflight_recheck'
                             and entry.get('route_digest') == recovery.get('route_digest')
-                            for entry in after['execution_log'])
+                            for entry in new_events)
             if before_child.get('status') == 'blocked' and recovery.get('previous_failure'):
                 preserved &= all(after.get(key) == before_child.get(key) for key in (
                     'current_attempt', 'attempt_epoch', 'attempts_since_progress', 'max_attempts'))
                 preserved &= bool(rechecked and binding)
                 preserved &= recovery['previous_failure'] in after['execution_log']
             entered = (boundary_state.get('session_id') == child_id
-                       and after['status'] in {'executing', 'conversing'})
+                       and boundary_kind == 'implementation' and after['status'] == 'executing'
+                       and bool(binding))
             completed = (after['status'] == 'completed' and binding
                          and after.get('candidate_custody', {}).get('receipt'))
             recovery.update(preflight_rechecked=rechecked, retained_constraints=bool(preserved),
+                            boundary_kind=boundary_kind,
                             preflight_outcome='passed' if rechecked and not recovery['current_failure'] else 'not_passed',
                             ok=bool(preserved and (entered or completed)
                                     and not recovery.get('identity_error')))

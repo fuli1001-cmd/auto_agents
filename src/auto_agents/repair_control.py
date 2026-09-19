@@ -49,6 +49,19 @@ def workflow_identity(payload):
     return tuple(invocation.get(key, "") for key in ("command", "session_id", "run_id", "workflow_id"))
 
 
+def needs_child_recovery(job):
+    if job.get('result', {}).get('engine') != 'v2':
+        return False
+    pending = [job['payload'].get('invocation', {}).get('engine_route') or {}]
+    while pending:
+        source = pending.pop()
+        if source.get('failed_handoff_id') or source.get('child_session_id'):
+            return True
+        pending.extend(source[k] for k in ('issue_seed', 'spec_seed', 'fix_disposition')
+                       if isinstance(source.get(k), dict))
+    return False
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -780,6 +793,12 @@ class Supervisor:
             if request.get("_peer_pid") != self.registrations[identity]["payload"]["pid"]:
                 raise RuntimeError("repair request must originate from the registered workflow")
             payload = request["payload"]
+            previous = next((s for s in self.store.subscriptions() if s['id'] == identity), None)
+            if previous and previous['state'] == 'resuming' and previous['job']:
+                prior_job = self.store.job(previous['job'])
+                if needs_child_recovery(prior_job) and prior_job['state'] != 'completed':
+                    raise RuntimeError('previous engine repair has not restored its bound child; '
+                                       'a new repair request cannot replace that missing recovery proof')
             # Code/entrypoint come from the trusted installation, never a route.
             payload["engine_root"] = self.config["source_root"]
             if self.config.get('repair_engine') == 'v2': payload['repair_engine'] = 'v2'
@@ -838,6 +857,24 @@ class Supervisor:
                 passed = (details.get("run_id") == row["payload"]["repair"]["invocation"].get("run_id")
                           and details.get("completed_stage") == expected.get("stage")
                           and details.get("fingerprint") != expected.get("fingerprint"))
+            if (expected['kind'] == 'engine_route' and request['kind'] == 'engine_child'
+                    and needs_child_recovery(job)):
+                receipt = self.store.root / 'jobs' / job['id'] / (
+                    f"validate-{row['id']}-g{job['generation']}-result.json")
+                try:
+                    validation = json.loads(receipt.read_text())
+                    proof = json.loads(validation['proof'])
+                    child = proof['observed']['recovery_observation']
+                    passed = bool(validation['ok'] and proof['ok'] and child['ok']
+                        and child.get('preflight_rechecked')
+                        and child.get('boundary_kind') == 'implementation'
+                        and details.get('binding_fingerprint')
+                        and details.get('route_digest') == expected.get('route_digest')
+                        and details.get('session_id') == child.get('child_session_id')
+                        and details.get('workflow_id') == child.get('workflow_id')
+                        and details.get('original_handoff_id') == child.get('original_handoff_id'))
+                except (OSError, ValueError, KeyError, TypeError):
+                    passed = False
             if passed and job["state"] != "completed":
                 self.store.event(job["id"], "live_boundary_passed", {"subscriber": row["id"], "commit": job["result"]["commit"]})
                 if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
@@ -856,7 +893,7 @@ class Supervisor:
             if passed:
                 job = self.store.job(row["job"])
                 self.store.event(job["id"], "engine_route_consumed", {"subscriber": row["id"]})
-                if job["state"] != "completed":
+                if job["state"] != "completed" and not needs_child_recovery(job):
                     if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
                         self.store.enqueue_publish(job["id"])
                     self.store.transition(job["id"], "completed")
@@ -982,6 +1019,10 @@ class Supervisor:
                 completion = self.store.root / "jobs" / row["job"] / ("resume-" + identity + "-result.json")
                 receipt = json.loads(completion.read_text()) if completion.exists() else {}
                 exit_code = receipt.get("exit_code", 3) if completion.exists() else process.returncode
+                job = self.store.job(row['job'])
+                if exit_code == 0 and needs_child_recovery(job) and job['state'] != 'completed':
+                    exit_code = 3
+                    receipt['error'] = 'original child implementation boundary was not observed'
                 with self.store.connect() as db:
                     db.execute("UPDATE subscribers SET state=?,updated=? WHERE id=? AND state!='cancelled'",
                                ("finished" if exit_code == 0 else "blocked", time.time(), identity))

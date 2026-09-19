@@ -13,6 +13,7 @@ from .providers import AgentSandbox, NativeDriver
 from .store import Store, atomic_json, digest
 from .transaction import bind_controller, frozen_request, transaction_lock, transaction_root
 from .types import RepairBlocked
+from .chain import RepairChain
 from .workspace import Workspace, git, source_identity
 
 
@@ -46,6 +47,8 @@ def _boundaries(verifier, root, identity, source, payload, cancel):
         results.append(verifier.boundary(identity, source, case.parent / 'target',
                                          json.loads(case.read_text()), cancel))
     return {'ok': all(r['ok'] for r in results), 'snapshot': identity, 'runtime': verifier.runtime,
+            'infrastructure': any(r.get('infrastructure') for r in results),
+            'reason': '; '.join(r.get('reason', '') for r in results if r.get('infrastructure')),
             'cases': results, 'observed': [r.get('observed', {}) for r in results]}
 
 
@@ -69,10 +72,13 @@ def _components(request, root, accepted, workspace, python):
     from . import images
     images.pin(verifier.image, root)
     images.maintain()
-    sandbox = AgentSandbox(root / 'provider-state', verifier.image)
+    from .diagnostic_evidence import prepare
+    evidence, evidence_context = prepare(root, json.loads((root / 'original-payload.json').read_text()))
+    sandbox = AgentSandbox(root / 'provider-state', verifier.image, evidence=evidence)
     driver = NativeDriver(configured.providers[provider], sandbox,
                           effort=configured.efforts.get('self_repair', 'deep'),
                           review_effort=configured.efforts.get('self_repair_review', 'max'))
+    driver.evidence_context = evidence_context
     return store, verifier, driver
 
 
@@ -87,6 +93,8 @@ def repair_entry(request):
     if job['payload'].get('autonomy') == 'off':
         return {'ok': False, 'engine': 'v2', 'status': 'disabled', 'error': 'autonomous self-repair is disabled'}
     root = transaction_root(config, job['payload'])
+    chain = RepairChain(config, job['payload'], root)
+    chain.admit()
     pinned = _fixed_controller(request, root)
     with transaction_lock(root):
         from ..artifact_runtime import track
@@ -137,6 +145,7 @@ def repair_entry(request):
                               retained=old['source'] if old else None)
         store, verifier, driver = _components(request, root, accepted, workspace, python)
         controller = Controller(accepted, store, workspace, driver, verifier,
+            chain=chain, preflight_boundary=True,
             units=lambda source: verifier.suite_units(source, accepted) if hasattr(verifier, 'suite_units') else acceptance_units(source, accepted), resume_token=f"{job['id']}:{job['generation']}",
             allow_implementation=job['payload'].get('autonomy') == 'max',
             regression=lambda i, s, coverage, c: verifier.regression(i, s, checkout, accepted.engine_base, coverage, c),
@@ -237,7 +246,10 @@ def deliver(request, approved, *, controller=None, _passes=0):
             base = repository.worktree(accepted.engine_base, 'v2-base-' + accepted.engine_base[:20])
             workspace = Workspace(root / 'workspace', base, accepted.engine_base)
             store, verifier, driver = _components(request, root, accepted, workspace, approved['python'])
+            chain = RepairChain(config, job['payload'], root)
+            chain.admit()
             controller = Controller(accepted, store, workspace, driver, verifier,
+                chain=chain, preflight_boundary=True,
                 units=lambda s: verifier.suite_units(s, accepted) if hasattr(verifier, 'suite_units') else acceptance_units(s, accepted), resume_token=f"{job['id']}:{job['generation']}",
             allow_implementation=job['payload'].get('autonomy') == 'max',
                 regression=lambda i, s, coverage, c: verifier.regression(i, s, base, accepted.engine_base, coverage, c),
@@ -282,7 +294,7 @@ def validate_subscriber(request):
             RootCauseCoordinator._copy_diagnostic_tree(Path(subscriber['project']), evidence)
             result = verifier.boundary(approved['v2_receipt']['snapshot'], Path(approved['runtime']), evidence,
                                        subscriber['payload']['repair'], threading.Event())
-            if not result['ok']:
+            if not result['ok'] and not result.get('infrastructure'):
                 from .evidence import dissociate
                 case = root / 'counterexamples' / digest(result.get('observed', {}))
                 case.mkdir(parents=True, exist_ok=True)

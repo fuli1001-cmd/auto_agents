@@ -1243,6 +1243,9 @@ class WorkflowCoordinator:
             state.resolution = state.return_phase = ""
             save_session_state(self.project_root, state)
         self._ensure_handoff_checkpoint(snapshot, original)
+        session._engine_recovery_context = {'route_digest': digest(payload),
+            'session_id': state.session_id, 'workflow_id': state.workflow_id,
+            'original_handoff_id': original.handoff_id}
         state = self._drive_session(session, state, snapshot, root=False)
         result = self._session_result(state, original)
         if state.status in {"failed", "blocked"}:

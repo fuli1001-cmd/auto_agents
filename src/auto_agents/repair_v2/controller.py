@@ -55,13 +55,15 @@ def review_result(text, snapshot, requirements):
 
 
 class Controller:
-    def __init__(self, request, store, workspace, driver, verifier, *, units, max_stagnant=2, max_replans=1, boundary=None, resume_token='', allow_implementation=True, regression=None):
+    def __init__(self, request, store, workspace, driver, verifier, *, units, max_stagnant=2, max_replans=1, boundary=None, resume_token='', allow_implementation=True, regression=None, chain=None, preflight_boundary=False):
         self.request, self.store, self.workspace = request, store, workspace
         self.driver, self.verifier, self.units = driver, verifier, units
         self.max_stagnant, self.max_replans = max_stagnant, max_replans
         self.regression = regression
         self.allow_implementation = allow_implementation
         self.boundary = boundary
+        self.chain = chain
+        self.preflight_boundary = preflight_boundary
         self.resume_token = resume_token
         self.cancel = threading.Event()
         self.state_lock = threading.RLock()
@@ -77,6 +79,8 @@ class Controller:
 
     def agent(self, role, prompt, root, *, schema=None, cancel=None, fallback_prompt=None):
         if self.cancel.is_set(): raise KeyboardInterrupt()
+        if self.chain is not None:
+            self.chain.reserve(role)
         before = source_identity(root)
         with self.state_lock:
             call = self.state['calls'] + 1
@@ -141,6 +145,8 @@ class Controller:
         return json.dumps({'goal': self.request.goal,
             'requirements': [asdict(item) for item in self.request.acceptance],
             'evidence': self.request.evidence,
+            'repair_chain': self.chain.context() if self.chain is not None else None,
+            'read_only_evidence': getattr(self.driver, 'evidence_context', None),
             'test_preservation_findings': self.state.get('test_preservation_findings', []),
             'failure_diagnosis': diagnose(self.state.get('failures', []))}, ensure_ascii=False)
 
@@ -165,6 +171,9 @@ class Controller:
                    'Use a representative to distinguish candidate regressions, test/contract conflicts, '
                    'and environment failures before expanding the change. Tie any claimed conflict to '
                    'a frozen requirement; do not rewrite expected results merely to obtain a pass.')
+        prompt += ('\nRead the read_only_evidence manifest and relevant retained scene files before planning. '
+                   'Keep changes tied to the original user goal and its concrete recovery blocker. '
+                   'Missing evidence is a limitation to report, not permission for general redesign or new product work.')
         reply = self.agent('plan', prompt, root)
         if not reply.text.strip(): raise RepairBlocked('plan_missing', 'provider returned no implementation plan')
         reference = self.store.artifact('plan', {'text': reply.text, 'request': self.state['request_digest']})
@@ -178,6 +187,7 @@ class Controller:
             'Prioritize a testable correction for the supplied failures before exploring additional variants. '
             'Diagnose shared symptoms with their representative nodes first, then check all affected cases. '
             'Resolve behavior against the frozen requirements while preserving the original assertions. '
+            'Use the read-only retained scene files; keep every production change necessary to restore the bound workflow. '
             'Use the image-provided python for diagnostics. At the execution deadline the controller may '
             'submit partial edits to formal acceptance, so keep changes coherent as you work. '
             'A previous passing check is not permission to skip a changed requirement. Finish with a concise change summary.\n'
@@ -239,6 +249,8 @@ class Controller:
                 self.store.event('review_reused', snapshot=identity)
                 return review_result(saved['text'], identity, {r.identity for r in self.request.acceptance})
         prompt = ('Independently review this immutable candidate against every frozen requirement and the original baseline. '
+            'Use the read-only retained scene and original user goal to reject unrelated features, cleanup or redesign. '
+            'Require evidence that the specific blocked child actually re-enters implementation; parent dialogue is insufficient. '
             'Inspect the diff, relevant source and coverage. Do not modify files or run a broad test suite. '
             'Block only demonstrated violations or introduced regressions, with a concrete counterexample and check. '
             'Editorial preferences and unrelated improvements are not blockers. '
@@ -286,6 +298,25 @@ class Controller:
             raise RepairBlocked('snapshot_changed', 'verification snapshot no longer matches its checkpoint')
         self.phase('validate')
         self.checkpoint(verification_runtime=getattr(self.verifier, 'runtime', ''))
+        early_boundary = None
+        if self.preflight_boundary and self.boundary is not None:
+            self.phase('boundary_preflight')
+            observed = self.boundary(identity, snapshot, self.cancel)
+            if self.cancel.is_set(): raise KeyboardInterrupt()
+            if observed.get('snapshot') != identity or source_identity(snapshot) != identity:
+                raise RepairBlocked('snapshot_changed', 'recovery preflight belongs to another snapshot')
+            early_boundary = self.store.artifact('boundary', observed)
+            self.checkpoint(boundary_preflight=early_boundary)
+            if observed.get('infrastructure'):
+                raise RepairBlocked('verification_infrastructure',
+                                    observed.get('reason') or 'recovery verification environment is unavailable')
+            if not observed.get('ok'):
+                failures = [f for f in self.state['failures'] if f.get('unit') != 'original-boundary']
+                failures.append({'unit': 'original-boundary', 'reason': 'retained child recovery still fails',
+                                 'observed': observed.get('observed', observed)})
+                self.record_failures(failures, identity)
+                return False
+            self.phase('validate')
         tests_cancel, review_cancel = threading.Event(), threading.Event()
         if self.state.get('validation') and hasattr(self.verifier, 'remember_timings'):
             self.verifier.remember_timings(self.store.read(self.state['validation'])['checks'])
@@ -349,12 +380,15 @@ class Controller:
                 validation.failures.append({'unit': 'behavior-regression', 'reason': observed.get('reason', 'regression proof missing')})
                 proof = self.store.artifact('validation', asdict(validation))
                 self.checkpoint(validation=proof)
-        boundary = None
-        if validation.ok and review.ok and self.boundary is not None:
+        boundary = early_boundary
+        if validation.ok and review.ok and self.boundary is not None and boundary is None:
             self.phase('boundary')
             observed = self.boundary(identity, snapshot, self.cancel)
             boundary = self.store.artifact('boundary', observed)
             self.checkpoint(boundary=boundary)
+            if observed.get('infrastructure'):
+                raise RepairBlocked('verification_infrastructure',
+                                    observed.get('reason') or 'recovery verification environment is unavailable')
             if not observed.get('ok') or observed.get('snapshot') != identity:
                 validation.ok = False
                 validation.failures.append({'unit': 'original-boundary', 'reason': 'original recovery boundary failed',
@@ -495,6 +529,11 @@ class Controller:
                     'provider_failed', 'provider_configuration', 'docker_unavailable', 'disk_space',
                     'verification_infrastructure', 'upstream_unavailable', 'disk_observation', 'execution_failed',
                     'provider_timeout', 'provider_cleanup_failed'}
+                if self.state.get('blocker', {}).get('code') == 'repair_chain_exhausted' and self.chain is not None:
+                    budget = self.chain.context()
+                    required = ['model_calls', *(['implementations'] if self.state.get('phase') == 'implement' else [])]
+                    retryable = all(budget['used'][key] < budget['limits'][key]
+                                    for key in required)
                 if not ((retryable or old_audit) and self.resume_token and self.resume_token != self.state.get('resume_token')):
                     return self.state
                 if old_audit:
@@ -528,7 +567,7 @@ class Controller:
                         self.checkpoint(plan=reference, phase='audit')
                 while True:
                     if self.cancel.is_set(): raise KeyboardInterrupt()
-                    if self.state['phase'] not in ('audit', 'diagnose', 'validate', 'boundary', 'regression'):
+                    if self.state['phase'] not in ('audit', 'diagnose', 'validate', 'boundary_preflight', 'boundary', 'regression'):
                         if self.state.get('external_correction'):
                             raise RepairBlocked('no_progress',
                                 'corrected source failed acceptance; implementation budget remains exhausted')

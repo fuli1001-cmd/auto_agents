@@ -26,7 +26,8 @@ _MODULES = {
     'auto_agents': (),
     'auto_agents.config': (),
     'auto_agents.cli': ('main',),
-    'auto_agents.session': ('Session.resume',),
+    'auto_agents.session': ('Session.resume', 'Session._prepare_workflow_handoff',
+                            'Session._phase_fix_execute_owned'),
     'auto_agents.session_verification': (
         '_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory',
         # Classification also reads the retained catalog. Checking only its
