@@ -19,7 +19,6 @@ from auto_agents.config import (
 )
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.repair_control import digest
-from auto_agents.repair_runtime_identity import RuntimeIdentityError, observe_engine
 from auto_agents.session_verification import SessionOwnershipError
 from auto_agents.workflow_runtime import WorkflowCoordinator
 from test_engine_child_recovery import parent_workflow
@@ -28,6 +27,21 @@ from test_session_verification_ownership import _retain_contract
 
 
 ENGINE = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def runtime_identity_api():
+    # This API did not exist on the original engine. Its absence belongs to
+    # setup, never to behavioral counterexample evidence. Other tests in this
+    # module must still collect and execute the original recovery behavior.
+    from auto_agents import repair_runtime_identity
+    return repair_runtime_identity
+
+
+@pytest.fixture
+def replay_project_path_api():
+    from auto_agents.repair_v2.docker import replay_project_path
+    return replay_project_path
 
 
 def retained_recovery(tmp_path, *, wrapped=True, failure='valid'):
@@ -84,8 +98,12 @@ def retained_recovery(tmp_path, *, wrapped=True, failure='valid'):
 @pytest.mark.parametrize('failure', ['valid', 'missing_reference', 'missing_proof', 'reference_only',
                                      'bad_lock', 'missing_lock', 'stale_lock', 'invalid_v2'])
 def test_retained_reference_replay_requires_the_bound_child(tmp_path, wrapped, failure):
-    root, child, store, _, original, _, repair, old_failure = retained_recovery(
+    root, child, store, snapshot, original, _, repair, old_failure = retained_recovery(
         tmp_path, wrapped=wrapped, failure=failure)
+    # Exercise the pre-existing recovery API before inspecting any newly added
+    # report fields. The original engine must actually attempt (and fail) to
+    # resolve a retained resume wrapper, not fail to import the test module.
+    assert WorkflowCoordinator(Orchestrator(root))._engine_child_id(repair.payload, snapshot) == child.session_id
     marker = tmp_path / 'probe.json'
     marker.write_text(json.dumps({'route_digest': digest(repair.payload), 'engine_route': repair.payload}))
     before = {key: deepcopy(getattr(child, key)) for key in (
@@ -164,7 +182,8 @@ def test_engine_resume_chain_conflicts_do_not_change_retained_authority(tmp_path
     assert store.load_handoff(original.handoff_id).child.native_id == child.session_id
 
 
-def test_runtime_report_identifies_loaded_code_without_installation_evidence():
+def test_runtime_report_identifies_loaded_code_without_installation_evidence(runtime_identity_api):
+    observe_engine = runtime_identity_api.observe_engine
     report = observe_engine(ENGINE)
     assert report['python'] == sys.executable
     assert report['ok'] is True and report['commit']
@@ -176,7 +195,8 @@ def test_runtime_report_identifies_loaded_code_without_installation_evidence():
 
 
 @pytest.mark.parametrize('mismatch', ['origin', 'loaded_code'])
-def test_same_distribution_version_cannot_certify_another_loaded_engine(monkeypatch, mismatch):
+def test_same_distribution_version_cannot_certify_another_loaded_engine(monkeypatch, mismatch, runtime_identity_api):
+    RuntimeIdentityError, observe_engine = runtime_identity_api.RuntimeIdentityError, runtime_identity_api.observe_engine
     from auto_agents import session_verification
     monkeypatch.setattr('importlib.metadata.version', lambda _: '0.1.0')
     if mismatch == 'origin':
@@ -190,8 +210,45 @@ def test_same_distribution_version_cannot_certify_another_loaded_engine(monkeypa
     assert any('session_verification' in item for item in failure.value.report['mismatches'])
 
 
+@pytest.mark.parametrize('catalog', ['requirements_trace.json', 'provider_references.lock.json'])
+def test_retained_reference_classification_preserves_structured_catalog_failure(tmp_path, monkeypatch, catalog):
+    """Run an existing production entrypoint on both sides of the repair."""
+    from types import SimpleNamespace
+    from auto_agents.models import GateConfig, SessionState
+    from auto_agents import session_verification as verification
+
+    reference = '.auto-agents/state/' + catalog
+    state = SessionState(session_id='e083fa0c2f2f', workflow_id='retained-workflow',
+        parent_handoff_id='hf-11c942e4f7db', verification_binding={
+            'contract_revision': 'retained-revision', 'contract_fingerprint': 'retained-contract',
+            'task_scope': {'task_ids': ['task-owned'], 'requirement_ids': []},
+        })
+    before = deepcopy(state.to_dict())
+    reads = []
+
+    def retained_bytes(session, actual_state, path):
+        assert actual_state is state
+        reads.append(path)
+        return b'{broken' if path == reference else b'{}'
+
+    monkeypatch.setattr(verification, '_retained_reference_bytes', retained_bytes)
+    with pytest.raises(verification.SessionOwnershipError) as rejected:
+        verification._session_reference_kind(SimpleNamespace(project_root=tmp_path), state,
+                                               GateConfig(), REFERENCE)
+    assert reference in reads
+    assert rejected.value.diagnostic['verification_ref'] == reference
+    assert rejected.value.diagnostic['session_id'] == state.session_id
+    assert rejected.value.diagnostic['handoff_id'] == state.parent_handoff_id
+    assert rejected.value.diagnostic['contract_fingerprint'] == 'retained-contract'
+    assert rejected.value.diagnostic['task_scope'] == before['verification_binding']['task_scope']
+    assert rejected.value.diagnostic['retry_fix'] is False
+    assert 'retained reference catalog is unreadable' in str(rejected.value)
+    assert isinstance(rejected.value.__cause__, json.JSONDecodeError)
+    assert state.to_dict() == before
+
+
 @pytest.mark.parametrize('stale_scope', ['module', 'catalog_only'])
-def test_baseline_catalog_under_candidate_filename_cannot_attest_loaded_runtime(stale_scope):
+def test_baseline_catalog_under_candidate_filename_cannot_attest_loaded_runtime(stale_scope, runtime_identity_api):
     # Use the actual incident baseline in a separate interpreter: loading it
     # in this pytest process would replace exception classes and other tests'
     # imported globals. The source on disk and Git metadata remain untouched.
@@ -262,15 +319,15 @@ print(json.dumps({'stale_catalog_rejected': True, 'scope': sys.argv[2]}))
 
 
 @pytest.mark.parametrize('path', ['/', '/work', '/work/child', '/result', '../project', '/tmp/home'])
-def test_replay_cannot_mount_evidence_over_its_trusted_runtime(path):
-    from auto_agents.repair_v2.docker import replay_project_path
+def test_replay_cannot_mount_evidence_over_its_trusted_runtime(path, replay_project_path_api):
+    replay_project_path = replay_project_path_api
     from auto_agents.repair_v2.types import RepairBlocked
     with pytest.raises(RepairBlocked):
         replay_project_path({'project': path})
 
 
-def test_replay_preserves_original_project_identity_instead_of_rewriting_contracts():
-    from auto_agents.repair_v2.docker import replay_project_path
+def test_replay_preserves_original_project_identity_instead_of_rewriting_contracts(replay_project_path_api):
+    replay_project_path = replay_project_path_api
     payload = {'project': '/home/fuli/projects/sdgp', 'invocation': {'engine_route': {
         'issue_seed': {'evidence_base': '/home/fuli/projects/sdgp', 'requirement_ids': ['REQ-275']}}}}
     before = deepcopy(payload)
