@@ -183,3 +183,20 @@ Quick and expanded acceptance still execute their tests and assertions. Ordinary
 nested gates retain their inherited owner and narrowing policy. If a candidate
 changes the supervisor implementation, observations from another selected
 runtime cannot certify that changed implementation.
+
+## Offline recovery sandbox startup
+
+The pinned controller selects the session replay container profile. It permits
+the nested verification sandbox's namespace and metadata supervisor syscalls
+with `seccomp=unconfined`, while retaining the non-root user, dropped capabilities,
+`no-new-privileges`, no network, read-only container root and disposable project
+copy. No host administration capabilities are added. Other boundary replays and
+ordinary test profiles keep their existing restrictions. The replay profile is
+part of the verification runtime digest, so changing it invalidates old proofs.
+
+A structured `verification_confinement` cause remains an infrastructure failure
+even when the session wraps it as `verification_ownership`. Verification stays
+failed and the controller stops before another implementation or replan. On an
+explicit retry it checks the retained candidate again. Genuine ownership and
+test-discovery failures retain their original verdict; error text alone does
+not grant acceptance or mark an assertion failure as an environment problem.
