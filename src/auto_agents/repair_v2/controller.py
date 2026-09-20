@@ -211,8 +211,11 @@ class Controller:
         if self.scope is not None and not self.scope.current():
             raise RepairBlocked('scope_missing', '当前修复缺少有效的目标范围依据，已保留计划。')
         self.phase('implement')
-        prompt = ('Implement the complete repair plan in this private candidate. Resolve cross-module issues together. '
-            'Preserve unrelated work and existing tests. Do not modify Git metadata or weaken verification. '
+        refreshed = bool(self.state.get('source_refreshed'))
+        prompt = (('The retained candidate has been merged with the current engine. Fix ONLY the remaining '
+                   'failures observed on this refreshed source. Do not repeat completed changes from the old plan. '
+                   if refreshed else 'Implement the complete repair plan in this private candidate. Resolve cross-module issues together. ')
+            + 'Preserve unrelated work and existing tests. Do not modify Git metadata or weaken verification. '
             'Use small diagnostics only when necessary; the controller runs formal acceptance after this turn. '
             'Prioritize a testable correction for the supplied failures before exploring additional variants. '
             'Diagnose shared symptoms with their representative nodes first, then check all affected cases. '
@@ -221,7 +224,8 @@ class Controller:
             'Use the image-provided python for diagnostics. At the execution deadline the controller may '
             'submit partial edits to formal acceptance, so keep changes coherent as you work. '
             'A previous passing check is not permission to skip a changed requirement. Finish with a concise change summary.\n'
-            + self.context() + '\nPLAN:\n' + self.store.read(self.state['plan'])['text'])
+            + self.context() + ('\nThe historical plan is retained as evidence; current failures below define the remaining work.'
+                               if refreshed else '\nPLAN:\n' + self.store.read(self.state['plan'])['text']))
         if self.state['failures']:
             prompt += '\nCorrect these current failures without rebuilding unchanged planning history:\n'
             prompt += json.dumps(self.state['failures'], ensure_ascii=False)
@@ -246,14 +250,18 @@ class Controller:
         from .audit import test_protection_findings
         from .workspace import git
         import subprocess
-        findings = test_protection_findings(self.workspace.source, self.request.engine_base, root)
+        # A trusted source update may intentionally change its own tests. Its
+        # tests, not superseded assertions, constrain the retained candidate.
+        baseline = self.state.get('source_refreshed', {}).get('parent') or self.request.engine_base
+        findings = test_protection_findings(root if baseline != self.request.engine_base else self.workspace.source,
+                                            baseline, root)
         for parent in self.state.get('integration_parents', []):
             # A lagging upstream is already represented by the frozen base.
             # Auditing its historical assertions again would reject test changes
             # that predate this repair. Never use candidate HEAD for this check:
             # new upstream tests remain protected even after their merge.
             try:
-                git(root, 'merge-base', '--is-ancestor', parent, self.request.engine_base)
+                git(root, 'merge-base', '--is-ancestor', parent, baseline)
             except subprocess.CalledProcessError as error:
                 if error.returncode != 1:
                     raise
@@ -363,7 +371,11 @@ class Controller:
         early_boundary = None
         if self.preflight_boundary and self.boundary is not None:
             self.phase('boundary_preflight')
-            observed = self.boundary(identity, snapshot, self.cancel)
+            cached = getattr(self, '_refreshed_boundary', None)
+            self._refreshed_boundary = None
+            observed = (cached if cached and cached.get('snapshot') == identity
+                        and getattr(self, '_refreshed_boundary_runtime', '') == getattr(self.verifier, 'runtime', '')
+                        else self.boundary(identity, snapshot, self.cancel))
             if self.cancel.is_set(): raise KeyboardInterrupt()
             if observed.get('snapshot') != identity or source_identity(snapshot) != identity:
                 raise RepairBlocked('snapshot_changed', 'recovery preflight belongs to another snapshot')
@@ -433,17 +445,18 @@ class Controller:
         self.checkpoint(validation=proof)
         self.workspace.collect_snapshots(identity)
         comparison = None
+        comparison_base = self.state.get('source_refreshed', {}).get('parent') or self.request.engine_base
         old_nodes = set()
         suite_ok = validation.ok
         if not suite_ok and differential and not validation.cancelled and not missing:
             from .comparison import matched, verify
-            key = digest([proof, self.request.engine_base, self.state['verification_runtime']])
+            key = digest([proof, comparison_base, self.state['verification_runtime']])
             if self.state.get('comparison_input') == key and self.state.get('comparison'):
                 observed = self.store.read(self.state['comparison'])
             else:
                 self.phase('baseline_comparison')
-                observed = self.verifier.compare_baseline(identity, snapshot, self.workspace.source,
-                    self.request.engine_base, validation, self.cancel)
+                observed = self.verifier.compare_baseline(identity, snapshot, snapshot,
+                    comparison_base, validation, self.cancel)
             comparison = self.store.artifact('comparison', observed)
             self.checkpoint(comparison=comparison, comparison_input=key)
             if observed.get('infrastructure'):
@@ -451,7 +464,7 @@ class Controller:
             if observed.get('classification_incomplete'):
                 raise RepairBlocked('verification_infrastructure',
                     '暂时无法确认这些测试失败是否由本次改动引起，已保留补丁和对比结果，不扩大修复范围。')
-            suite_ok = verify(observed, asdict(validation), base=self.request.engine_base)
+            suite_ok = verify(observed, asdict(validation), base=comparison_base)
             old_nodes = matched(observed, asdict(validation))
         regression = None
         if suite_ok and review.ok and self.regression is not None:
@@ -487,6 +500,7 @@ class Controller:
             self.checkpoint(status='ready', phase='deliver', failures=[],
                 receipt=self.store.artifact('acceptance', {'request': self.state['request_digest'],
                     'snapshot': identity, 'validation': proof, 'comparison': comparison,
+                    'comparison_base': comparison_base,
                     'scope': self.scope.current() if self.scope is not None else None,
                     'integration_parents': self.state.get('integration_parents', []),
                     'review': self.state['review'], 'boundary': boundary, 'regression': regression}))
@@ -665,6 +679,9 @@ class Controller:
             try:
                 root = self.workspace.prepare()
                 self.verifier.prepare()
+                from .source_refresh import probe as probe_refreshed, resolve_conflicts
+                if not self.state.get('source_conflicts'):
+                    probe_refreshed(self)
                 if hasattr(self.driver, 'preflight'): self.driver.preflight(root)
                 if self.scope is not None and self.state.get('plan') and not self.scope.current():
                     from .scope import proposal
@@ -673,13 +690,18 @@ class Controller:
                         self.checkpoint(scope_receipt=self.scope.admit(retained))
                     else:
                         self.plan(root, scope_only=True)
+                while self.state.get('source_conflicts'):
+                    if self.scope is not None and not self.scope.current():
+                        self.plan(root, scope_only=bool(self.state.get('plan')))
+                    resolve_conflicts(self, root)
+                probe_refreshed(self)
                 provider = getattr(getattr(self.driver, 'config', None), 'kind', 'test')
                 if self.state.get('session_provider') not in (None, provider):
                     self.checkpoint(sessions={})
                 self.checkpoint(session_provider=provider)
                 if recover_review:
                     self.recover_cancelled_review(root)
-                if recover_timeout:
+                if recover_timeout and not self.state.get('source_refreshed'):
                     self.recover_timed_out_implementation(root)
                 if not self.state.get('plan'):
                     self.checkpoint(test_preservation_findings=self.test_findings(root))

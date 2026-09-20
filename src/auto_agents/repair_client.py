@@ -275,6 +275,8 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
                       'validate': '正在集中验收：测试与独立审查并行',
                       'regression': '正在验证修复前后的行为差异',
                       'baseline_comparison': '正在确认测试失败是否在修复前就已存在',
+                      'source_conflicts': '正在整合当前引擎版本与保留候选',
+                      'source_recheck': '正在用当前引擎重新检查原阻塞，尚未继续实施',
                       'boundary': '正在验证原会话恢复', 'deliver': '正在交付已验收引擎'}
             if phase == 'check_finished':
                 unit = progress.get('unit', '')

@@ -104,12 +104,21 @@ def repair_entry(request):
         binding = Path(config['root']) / 'jobs' / job['id'] / 'v2-transaction.json'
         atomic_json(binding, {'root': str(root)})
         selected_file = root / 'source-selection.json'
+        first_selection = not selected_file.exists()
         if selected_file.exists():
             selected = json.loads(selected_file.read_text())
         else:
             selected = repository.select_source(job['payload']['base'])
             atomic_json(selected_file, selected)
-        atomic_json(binding.parent / 'source-selection.json', selected)
+        # The transaction's selection is its immutable acceptance baseline.
+        # Each new job generation must separately observe the current engine.
+        current_file = binding.parent / f"source-selection-g{job['generation']}.json"
+        if current_file.exists():
+            current = json.loads(current_file.read_text())
+        else:
+            current = selected if first_selection else repository.select_source(job['payload']['base'])
+            atomic_json(current_file, current)
+        atomic_json(binding.parent / 'source-selection.json', current)
         revision = selected['revision']
         checkout = repository.worktree(revision, 'v2-base-' + revision[:20])
         # Build the host Python environment only from the trusted controller.
@@ -155,7 +164,11 @@ def repair_entry(request):
             boundary=lambda identity, source, cancel: _boundaries(verifier, root, identity, source,
                 json.loads((root / 'original-payload.json').read_text()), cancel))
         controller.recover_verified_progress()
-        controller.recover_corrected_source(implementation, pinned['commit'])
+        corrected = controller.recover_corrected_source(implementation, pinned['commit'])
+        if not corrected:
+            corrected = controller.recover_corrected_source(repository.cache, current['revision'])
+        from .source_refresh import prepare
+        prepare(controller, repository.cache, current['revision'], force_check=corrected)
         state = controller.run()
         if state['status'] != 'ready':
             return {'ok': False, 'engine': 'v2', 'status': 'v2_' + state['status'],

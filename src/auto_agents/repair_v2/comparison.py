@@ -91,8 +91,11 @@ def accepted(store, receipt, base=None):
     validation = store.read(receipt['validation'])
     if validation.get('ok'):
         return True
+    selected = receipt.get('comparison_base', base)
+    if selected != base and selected not in receipt.get('integration_parents', []):
+        return False
     reference = receipt.get('comparison')
-    return bool(reference and verify(store.read(reference), validation, base=base))
+    return bool(reference and verify(store.read(reference), validation, base=selected))
 
 
 def compare(verifier, snapshot_id, snapshot, base_repository, base_commit, validation, cancel):
