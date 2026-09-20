@@ -88,7 +88,12 @@ def test_resume_imports_current_engine_and_preserves_partial_work_without_reimpl
     assert integration.verify_receipt(result)
 
 
-def test_resume_checks_environment_before_any_provider_or_full_suite(repair_request):
+@pytest.mark.parametrize('confinement', [False, True])
+def test_resume_checks_environment_before_any_provider_or_full_suite(repair_request, confinement):
+    from auto_agents.repair_v2.docker import replay_infrastructure_reason
+    reason = replay_infrastructure_reason({'diagnostic': {
+        'failure_kind': 'verification_confinement', 'detail': 'unshare failed: Operation not permitted',
+    }}) if confinement else 'retained environment unavailable'
     root, driver, verifier = stopped_request(repair_request)
     source = Path(repair_request['config']['source_root'])
     (source / 'source.py').write_text('value = 1\n')
@@ -97,9 +102,9 @@ def test_resume_checks_environment_before_any_provider_or_full_suite(repair_requ
     calls = list(driver.calls)
     driver.preflight = lambda *a: pytest.fail('provider was prepared before the recovery environment check')
     verifier.boundary = lambda identity, *a: {'ok': False, 'snapshot': identity, 'infrastructure': True,
-                                            'reason': 'retained environment unavailable'}
+                                            'reason': reason}
     result = execute(request, driver, verifier)
-    assert not result['ok'] and result['error'] == 'retained environment unavailable'
+    assert not result['ok'] and result['error'] == reason
     assert driver.calls == calls and not verifier.calls
     assert Store(root).load()['source_refresh_check_pending']
     driver.preflight = lambda *a: None

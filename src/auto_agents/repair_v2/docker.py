@@ -24,6 +24,34 @@ from .cleanup import labels, reap_containers
 
 
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+# The session verifier creates its own user/mount/PID namespaces and metadata
+# supervisor. Docker's default seccomp profile prevents their startup even for
+# an unprivileged user. Keep capabilities dropped and the remaining boundaries.
+REPLAY_ISOLATION = {
+    'standard': ('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges'),
+    'session': ('--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+                '--security-opt', 'seccomp=unconfined'),
+}
+
+
+def replay_infrastructure_reason(observed):
+    """Keep sandbox startup failures out of candidate implementation feedback."""
+    if observed.get('infrastructure'):
+        return observed.get('error') or '隔离恢复环境无法启动。'
+    failure = observed.get('recovery_observation', {}).get('current_failure') or {}
+    for item in (failure, observed):
+        diagnostic = item.get('diagnostic') or {}
+        if (item.get('failure_kind') == 'verification_confinement'
+                or diagnostic.get('failure_kind') == 'verification_confinement'
+                or item.get('error_type') == 'ConfinementPreflightError'):
+            detail = diagnostic.get('detail') or item.get('result') or item.get('error') or '沙箱启动检查未通过'
+            return '隔离验证环境无法启动，已停止自动代码修复；请检查控制器的容器隔离配置。原因：' + str(detail)
+    detail = str(failure.get('result', ''))
+    if (failure.get('failure_kind') == 'verification_execution_binding'
+            and detail.startswith(('verification conda environment does not exist:',
+                                   'verification interpreter does not exist:'))):
+        return detail
+    return ''
 
 
 def isolation_arguments(profile):
@@ -73,14 +101,23 @@ def container_security(name):
         return {'error': 'container security configuration is unavailable'}
 
 
-def matches_boundary_security(observed, image):
+def matches_boundary_security(observed, image, profile='sandbox'):
     capabilities = {str(value).removeprefix('CAP_') for value in observed.get('cap_add') or []}
+    options = set(observed.get('security_options') or [])
+    if profile == 'sandbox':
+        isolation_matches = (capabilities == {'SYS_ADMIN', 'SYS_PTRACE'}
+                             and not observed.get('cap_drop')
+                             and 'seccomp=unconfined' in options)
+    elif profile in REPLAY_ISOLATION:
+        isolation_matches = (not capabilities and set(observed.get('cap_drop') or []) == {'ALL'}
+                             and bool(options & {'no-new-privileges', 'no-new-privileges=true'})
+                             and ('seccomp=unconfined' in options) == (profile == 'session'))
+    else:
+        return False
     return (observed.get('image') == image and observed.get('network') == 'none'
             and observed.get('readonly_root') is True and observed.get('privileged') is False
             and observed.get('user') == f'{os.getuid()}:{os.getgid()}'
-            and capabilities == {'SYS_ADMIN', 'SYS_PTRACE'}
-            and not observed.get('cap_drop')
-            and 'seccomp=unconfined' in (observed.get('security_options') or []))
+            and isolation_matches)
 
 
 def replay_project_path(payload):
@@ -210,8 +247,8 @@ class DockerVerifier:
                                'verifier': verifier_identity(),
                                'isolation_profiles': {profile: isolation_arguments(profile)
                                                       for profile in ('standard', 'sandbox')},
-                               'boundary_profile': 'sandbox',
-                               'kernel': os.uname().release, 'policy': 7, 'init': True})
+                               'replay_isolation': REPLAY_ISOLATION,
+                               'kernel': os.uname().release, 'policy': 8, 'init': True})
         self.image = identity_text.strip()  # A mutable tag is not a verification input.
 
     def concurrency(self):
@@ -431,8 +468,9 @@ class DockerVerifier:
         target, source, output = base / 'target', base / 'source', base / 'result'
         project_path = replay_project_path(payload)
         before = evidence_identity(frozen_target)
-        verifier = {**verifier_identity(), 'image': self.image, 'profile': 'sandbox',
-                    'isolation_arguments': isolation_arguments('sandbox')}
+        profile = 'session' if payload.get('invocation', {}).get('session_id') else 'standard'
+        verifier = {**verifier_identity(), 'image': self.image, 'profile': profile,
+                    'isolation_arguments': REPLAY_ISOLATION[profile]}
         custody = {'clear': True}
         with execution_lease(base), disposable_source(snapshot, source, cleanup=lambda: custody['clear']):
             output.mkdir(exist_ok=True)
@@ -449,7 +487,7 @@ class DockerVerifier:
                                                      'replay_environments': [item.describe() for item in environments],
                                                      '_replay_project': str(project_path)})
                 command = ['docker', 'run', '--init', '--name', name, *labels(self.root, identity, kind='verification'), '--network', 'none', '--read-only',
-                    '--user', f'{os.getuid()}:{os.getgid()}', *isolation_arguments('sandbox'),
+                    '--user', f'{os.getuid()}:{os.getgid()}', *REPLAY_ISOLATION[profile],
                     '--memory', '1g', '--pids-limit', '512',
                     '--tmpfs', '/tmp:rw,nosuid,exec,mode=1777,size=4g', '--workdir', str(project_path),
                     '-e', 'HOME=/tmp/home', '-e', 'PYTHONDONTWRITEBYTECODE=1',
@@ -478,27 +516,19 @@ class DockerVerifier:
                 result = {'ok': code == 0 and observed.get('ok') is True and before == after,
                           'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
                           'observed': observed, 'output': str(base / 'output.log'), 'returncode': code}
+                result['isolation_profile'] = profile
                 result['environment_inputs'] = [item.describe() for item in environments]
                 result['verifier_runtime'] = {**verifier, 'container_security': security}
-                if result['ok'] and not matches_boundary_security(security, self.image):
+                if result['ok'] and not matches_boundary_security(security, self.image, profile=profile):
                     result.update(ok=False, infrastructure=True,
                                   reason='Actual recovery container differs from the trusted isolation profile')
                 if (result['ok'] and payload.get('invocation', {}).get('session_id')
                         and observed.get('confinement_probe', {}).get('ok') is not True):
                     result.update(ok=False, infrastructure=True,
                                   reason='Trusted recovery driver did not attest confinement')
-                failure = observed.get('recovery_observation', {}).get('current_failure', {})
-                if failure.get('diagnostic', {}).get('failure_kind') == 'verification_confinement':
-                    result.update(ok=False, infrastructure=True, reason=failure.get('result')
-                                  or 'Retained verification confinement is unavailable')
-                if observed.get('infrastructure'):
-                    result.update(infrastructure=True, reason=observed.get('error', '隔离恢复环境无法启动。'))
-                failure = observed.get('recovery_observation', {}).get('current_failure', {})
-                detail = str(failure.get('result', ''))
-                if (failure.get('failure_kind') == 'verification_execution_binding'
-                        and detail.startswith(('verification conda environment does not exist:',
-                                               'verification interpreter does not exist:'))):
-                    result.update(infrastructure=True, reason=detail)
+                infrastructure_reason = replay_infrastructure_reason(observed)
+                if infrastructure_reason:
+                    result.update(ok=False, infrastructure=True, reason=infrastructure_reason)
                 atomic_json(base / 'boundary.json', result)
                 return result
             except EnvironmentUnavailable as error:
