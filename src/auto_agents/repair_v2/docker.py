@@ -147,6 +147,7 @@ class DockerVerifier:
                                'boundary': Path(__file__).with_name('boundary_driver.py').read_text(),
                                'session': Path(__file__).parent.parent.joinpath('session_replay.py').read_text(),
                                'runtime_identity': Path(__file__).parent.parent.joinpath('repair_runtime_identity.py').read_text(),
+                               'replay_environment': Path(__file__).with_name('replay_environment.py').read_text(),
                                'kernel': os.uname().release, 'policy': 7, 'init': True})
         self.image = identity_text.strip()  # A mutable tag is not a verification input.
 
@@ -366,6 +367,7 @@ class DockerVerifier:
         from ..root_cause import RootCauseCoordinator
         from .evidence import identity as evidence_identity
         from .workspace import git
+        from .replay_environment import prepare as prepare_environment, EnvironmentUnavailable
         identity = uuid.uuid4().hex
         base = self.root / 'executions' / identity
         name = 'aav2-' + identity
@@ -382,7 +384,9 @@ class DockerVerifier:
                 if (target / '.git').exists():
                     git(target, 'repack', '-a', '-d')
                     (target / '.git/objects/info/alternates').unlink(missing_ok=True)
+                environments = prepare_environment(self.root / 'replay-environments', frozen_target, payload)
                 atomic_json(output / 'request.json', {**payload, 'commit': git(source, 'rev-parse', 'HEAD'),
+                                                     'replay_environments': [item.describe() for item in environments],
                                                      '_replay_project': str(project_path)})
                 command = ['docker', 'run', '--init', '--name', name, *labels(self.root, identity, kind='verification'), '--network', 'none', '--read-only',
                     '--user', f'{os.getuid()}:{os.getgid()}', '--cap-drop', 'ALL',
@@ -393,6 +397,8 @@ class DockerVerifier:
                     '--mount', f'type=bind,src={source},dst=/work,readonly',
                     '--mount', f'type=bind,src={target},dst={project_path}',
                     '--mount', f'type=bind,src={output},dst=/result']
+                for environment in environments:
+                    command += ['--mount', f'type=bind,src={environment.root},dst={environment.prefix},readonly']
                 for script in (Path(__file__).with_name('boundary_driver.py'),
                                Path(__file__).parent.parent / 'session_replay.py',
                                Path(__file__).parent.parent / 'repair_runtime_identity.py'):
@@ -402,16 +408,27 @@ class DockerVerifier:
                                  cancel=cancel, timeout=self.timeout, output=base / 'output.log')
                 try: observed = json.loads((output / 'boundary.json').read_text())
                 except (OSError, ValueError): observed = {'ok': False, 'error': text[-4000:]}
+                for environment in environments:
+                    environment.verify()
                 after = evidence_identity(frozen_target)
                 result = {'ok': code == 0 and observed.get('ok') is True and before == after,
                           'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
                           'observed': observed, 'output': str(base / 'output.log'), 'returncode': code}
+                result['environment_inputs'] = [item.describe() for item in environments]
+                if observed.get('infrastructure'):
+                    result.update(infrastructure=True, reason=observed.get('error', '隔离恢复环境无法启动。'))
                 failure = observed.get('recovery_observation', {}).get('current_failure', {})
                 detail = str(failure.get('result', ''))
                 if (failure.get('failure_kind') == 'verification_execution_binding'
                         and detail.startswith(('verification conda environment does not exist:',
                                                'verification interpreter does not exist:'))):
                     result.update(infrastructure=True, reason=detail)
+                atomic_json(base / 'boundary.json', result)
+                return result
+            except EnvironmentUnavailable as error:
+                result = {'ok': False, 'infrastructure': True, 'reason': str(error),
+                          'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
+                          'output': str(base / 'output.log')}
                 atomic_json(base / 'boundary.json', result)
                 return result
             finally:
