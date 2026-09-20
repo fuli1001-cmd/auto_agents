@@ -9,7 +9,36 @@ from .store import digest
 from .types import ValidationUnit
 from .workspace import Workspace, source_identity
 
-POLICY = 'no-new-failures-v1'
+POLICY = 'no-new-failures-v2'
+
+
+def failure_message(message):
+    """Remove only generated diagnostic locations and pytest repr identities.
+
+    Keep raw reports, assertion expressions, values, counts and user paths.
+    Number aliases preserve whether repeated observations refer to one object
+    or several objects/directories; replacing everything by '*' would hide that.
+    """
+    paths, objects = {}, {}
+    diagnostic = re.compile(
+        r'(?P<label>(?:Diagnostics|diagnostics|诊断记录|ostics)[:：] )'
+        r'(?P<root>/tmp/auto-agents-session-replay-[a-z0-9_]{8})'
+        r'(?=/target/\.auto-agents/state/sessions/[^/\s]+/logs/diagnostics\.json)')
+    identity = re.compile(r'(?P<label><built-in method \w+ of [\w.]+ object at )'
+                          r'(?P<address>0x[0-9a-fA-F]+)(?=>)')
+    def alias(match, values, key, label):
+        value = match[key]
+        values.setdefault(value, len(values) + 1)
+        return match['label'] + '<' + label + '-' + str(values[value]) + '>'
+    result = []
+    for line in message.splitlines(keepends=True):
+        # A pathname/address used as an asserted value remains significant.
+        if not re.match(r'\s*(?:AssertionError:\s*)?assert\b', line):
+            line = diagnostic.sub(lambda m: alias(m, paths, 'root', 'replay-directory'), line)
+            if re.match(r'\s*\+\s+where\b', line):
+                line = identity.sub(lambda m: alias(m, objects, 'address', 'object'), line)
+        result.append(line)
+    return ''.join(result)
 
 
 def signatures(report):
@@ -36,7 +65,7 @@ def signatures(report):
             if (len(rows) != 1 or rows[0].get('phase') != 'call' or not rows[0].get('message')
                     or len(rows[0]['message']) >= 2000):
                 return None
-            signature = (rows[0]['phase'], rows[0]['message'])
+            signature = (rows[0]['phase'], failure_message(rows[0]['message']))
             if node in result and result[node] != signature:
                 return None
             result[node] = signature

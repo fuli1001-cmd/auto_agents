@@ -385,7 +385,8 @@ def test_run_choice_uses_existing_clarification_and_keeps_original_goal(tmp_path
     apply_run_choice(orch, question['id'])
 
 
-def test_real_pytest_baseline_comparison_preserves_old_failure_and_required_success(tmp_path):
+@pytest.mark.parametrize('volatile', [False, True])
+def test_real_pytest_baseline_comparison_preserves_old_failure_and_required_success(tmp_path, volatile):
     import shlex
     import subprocess
     import sys
@@ -398,6 +399,14 @@ def test_real_pytest_baseline_comparison_preserves_old_failure_and_required_succ
     (repo / 'toy_source.py').write_text('old = 0\nrequired = 0\n')
     (repo / 'tests/test_toy.py').write_text(
         'from toy_source import old, required\ndef test_old(): assert old == 1\ndef test_required(): assert required == 1\n')
+    if volatile:
+        (repo / 'tests/test_toy.py').write_text(
+            'from toy_source import old, required\nfrom tempfile import TemporaryDirectory\n'
+            'def test_old():\n'
+            '    with TemporaryDirectory(prefix="auto-agents-session-replay-", dir="/tmp") as root:\n'
+            '        result = {"old": old, "error": "Diagnostics: " + root + "/target/.auto-agents/state/sessions/child/logs/diagnostics.json"}\n'
+            '        assert result.get("old") == 1, result\n'
+            'def test_required(): assert required == 1\n')
     git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base')
     base = git(repo, 'rev-parse', 'HEAD')
     (repo / 'toy_source.py').write_text('old = 0\nrequired = 1\n')

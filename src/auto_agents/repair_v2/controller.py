@@ -462,8 +462,8 @@ class Controller:
         old_nodes = set()
         suite_ok = validation.ok
         if not suite_ok and differential and not validation.cancelled and not missing:
-            from .comparison import matched, verify
-            key = digest([proof, comparison_base, self.state['verification_runtime']])
+            from .comparison import POLICY, matched, verify
+            key = digest([proof, comparison_base, self.state['verification_runtime'], POLICY])
             if self.state.get('comparison_input') == key and self.state.get('comparison'):
                 observed = self.store.read(self.state['comparison'])
             else:

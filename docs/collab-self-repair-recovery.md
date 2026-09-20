@@ -266,3 +266,12 @@ and the full immutable artifact mounted read-only at
 in review cache identity. An old snapshot or runtime report is not supplied as
 current evidence, and a successful recovery observation does not waive other
 acceptance requirements.
+
+Baseline failure comparison v2 keeps raw reports unchanged. It aliases only
+generated `auto-agents-session-replay-*` diagnostic directory names and CPython
+bound-method addresses in pytest's `where` explanations. Assertion expressions,
+values, counts, error causes, session identities and ordinary paths remain exact.
+Aliases preserve whether repeated observations name the same object or directory.
+Required checks, setup failures, missing collection and incomplete results cannot
+be discharged as old failures. The comparison policy is part of its cache key,
+so a corrected comparison does not reuse an earlier verdict.
