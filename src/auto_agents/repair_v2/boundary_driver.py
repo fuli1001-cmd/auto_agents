@@ -16,6 +16,11 @@ def check_environments(request):
     program = 'import json,sys;print(json.dumps({"prefix":sys.prefix,"version":list(sys.version_info[:3])}))'
     for environment in request.get('replay_environments', []):
         prefix = Path(environment['prefix'])
+        if environment.get('kind') == 'node-dependencies':
+            if prefix.name != 'node_modules' or not prefix.is_dir():
+                raise ReplayEnvironmentUnavailable('隔离恢复中的 Node 验证依赖不可用：' + str(prefix))
+            result.append(environment)
+            continue
         try:
             completed = subprocess.run([str(prefix / 'bin/python'), '-I', '-S', '-c', program],
                                        capture_output=True, text=True, timeout=20)

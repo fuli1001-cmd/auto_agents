@@ -88,12 +88,15 @@ def test_resume_imports_current_engine_and_preserves_partial_work_without_reimpl
     assert integration.verify_receipt(result)
 
 
-@pytest.mark.parametrize('confinement', [False, True])
+@pytest.mark.parametrize('confinement', [False, True, 'vitest'])
 def test_resume_checks_environment_before_any_provider_or_full_suite(repair_request, confinement):
     from auto_agents.repair_v2.docker import replay_infrastructure_reason
     reason = replay_infrastructure_reason({'diagnostic': {
         'failure_kind': 'verification_confinement', 'detail': 'unshare failed: Operation not permitted',
     }}) if confinement else 'retained environment unavailable'
+    if confinement == 'vitest':
+        from test_repair_v2_replay_confinement import missing_vitest
+        reason = replay_infrastructure_reason(missing_vitest())
     root, driver, verifier = stopped_request(repair_request)
     source = Path(repair_request['config']['source_root'])
     (source / 'source.py').write_text('value = 1\n')

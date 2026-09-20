@@ -40,6 +40,15 @@ def replay_infrastructure_reason(observed):
     failure = observed.get('recovery_observation', {}).get('current_failure') or {}
     for item in (failure, observed):
         diagnostic = item.get('diagnostic') or {}
+        # This is the retained launcher's dependency check, not an assertion or
+        # a generic MODULE_NOT_FOUND (which can be a product import defect).
+        if (diagnostic.get('failure_kind') == 'discovery'
+                and diagnostic.get('phase') == 'runner_discovery'
+                and isinstance(diagnostic.get('returncode'), int)
+                and diagnostic['returncode'] != 0
+                and diagnostic.get('stderr_tail', '').strip()
+                == 'workbench Vitest is not installed; run npm install in ./workbench first'):
+            return '隔离验证环境无法找到 Vitest，已停止自动代码修复；请检查项目依赖和控制器的依赖快照。'
         if (item.get('failure_kind') == 'verification_confinement'
                 or diagnostic.get('failure_kind') == 'verification_confinement'
                 or item.get('error_type') == 'ConfinementPreflightError'):
@@ -434,10 +443,18 @@ class DockerVerifier:
                                Path(__file__).parent.parent / 'repair_runtime_identity.py'):
                     command += ['--mount', f'type=bind,src={script},dst=/opt/repair/{script.name},readonly']
                 custody['clear'] = False
+                execution = {}
                 code, text = run([*command, self.image, 'python', '/opt/repair/boundary_driver.py'],
-                                 cancel=cancel, timeout=self.timeout, output=base / 'output.log')
-                try: observed = json.loads((output / 'boundary.json').read_text())
-                except (OSError, ValueError): observed = {'ok': False, 'error': text[-4000:]}
+                                 cancel=cancel, timeout=self.timeout, output=base / 'output.log',
+                                 observation=execution)
+                try:
+                    observed = json.loads((output / 'boundary.json').read_text())
+                    if not isinstance(observed, dict) or not isinstance(observed.get('ok'), bool):
+                        raise ValueError('invalid boundary report')
+                except (OSError, ValueError):
+                    observed = {'ok': False, 'infrastructure': True,
+                                'error': '隔离恢复未产生有效验证结果，已停止自动代码修复。',
+                                'output_tail': text[-4000:]}
                 for environment in environments:
                     environment.verify()
                 after = evidence_identity(frozen_target)
@@ -449,6 +466,11 @@ class DockerVerifier:
                 infrastructure_reason = replay_infrastructure_reason(observed)
                 if infrastructure_reason:
                     result.update(ok=False, infrastructure=True, reason=infrastructure_reason)
+                if execution.get('termination') == 'timeout':
+                    result.update(ok=False, infrastructure=True, timed_out=True,
+                                  reason='隔离恢复验证超时，已停止自动代码修复；保留候选等待重新验证。')
+                if execution.get('termination') == 'cancelled' or cancel.is_set():
+                    result.update(ok=False, cancelled=True)
                 atomic_json(base / 'boundary.json', result)
                 return result
             except EnvironmentUnavailable as error:

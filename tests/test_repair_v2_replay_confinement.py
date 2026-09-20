@@ -20,6 +20,13 @@ def confinement():
                        'detail': 'unshare: unshare failed: Operation not permitted'}}}}
 
 
+def missing_vitest():
+    return {'ok': False, 'recovery_observation': {'current_failure': {
+        'failure_kind': 'verification_ownership', 'result': 'retained Vitest discovery failed',
+        'diagnostic': {'failure_kind': 'discovery', 'phase': 'runner_discovery', 'returncode': 1,
+                       'stderr_tail': 'workbench Vitest is not installed; run npm install in ./workbench first\n'}}}}
+
+
 @pytest.mark.parametrize('session', [False, True])
 @pytest.mark.parametrize('failed_environment', [False, True])
 def test_boundary_uses_controller_profile_and_preserves_failures(tmp_path, monkeypatch, session, failed_environment):
@@ -85,13 +92,15 @@ def test_semantic_failures_and_error_text_are_not_environment_evidence(kind, det
 
 
 @pytest.mark.parametrize('early', [False, True])
-def test_confinement_stops_controller_without_reimplementation_or_replanning(job, early):
+@pytest.mark.parametrize('failure', [confinement, missing_vitest])
+def test_confinement_stops_controller_without_reimplementation_or_replanning(job, early, failure):
     runner = controller(job)
     runner.preflight_boundary = early
     runner.boundary = lambda identity, *a: {
-        'ok': False, 'snapshot': identity, 'observed': confinement(),
-        'infrastructure': True, 'reason': replay_infrastructure_reason(confinement()),
+        'ok': False, 'snapshot': identity, 'observed': failure(),
+        'infrastructure': True, 'reason': replay_infrastructure_reason(failure()),
     }
+    assert '已停止自动代码修复' in replay_infrastructure_reason(failure())
     state = runner.run()
     assert state['status'] == 'blocked'
     assert state['blocker']['code'] == 'verification_infrastructure'
@@ -100,6 +109,17 @@ def test_confinement_stops_controller_without_reimplementation_or_replanning(job
     calls = list(runner.driver.calls)
     assert runner.run()['status'] == 'blocked'
     assert runner.driver.calls == calls
+
+
+@pytest.mark.parametrize('change', [
+    {'phase': 'test_execution'}, {'failure_kind': 'assertion'}, {'returncode': 0},
+    {'stderr_tail': "Error: Cannot find module './product-component'"},
+    {'stderr_tail': 'AssertionError: workbench Vitest is not installed; run npm install in ./workbench first'},
+])
+def test_missing_vitest_classification_requires_discovery_exit_evidence(change):
+    observed = missing_vitest()
+    observed['recovery_observation']['current_failure']['diagnostic'].update(change)
+    assert replay_infrastructure_reason(observed) == ''
 
 
 def test_replay_isolation_changes_invalidate_verification_runtime(tmp_path, monkeypatch):
