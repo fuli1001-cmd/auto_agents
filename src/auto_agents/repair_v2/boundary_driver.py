@@ -4,6 +4,28 @@ import os
 from pathlib import Path
 import runpy
 import sys
+import subprocess
+
+
+class ReplayEnvironmentUnavailable(RuntimeError):
+    pass
+
+
+def check_environments(request):
+    result = []
+    program = 'import json,sys;print(json.dumps({"prefix":sys.prefix,"version":list(sys.version_info[:3])}))'
+    for environment in request.get('replay_environments', []):
+        prefix = Path(environment['prefix'])
+        try:
+            completed = subprocess.run([str(prefix / 'bin/python'), '-I', '-S', '-c', program],
+                                       capture_output=True, text=True, timeout=20)
+            observed = json.loads(completed.stdout)
+            if completed.returncode or Path(observed['prefix']).resolve() != prefix.resolve():
+                raise ValueError('interpreter does not belong to the captured prefix')
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            raise ReplayEnvironmentUnavailable('隔离验证环境中的 Python 无法启动或环境归属不匹配：' + str(prefix)) from error
+        result.append({**environment, 'interpreter': observed})
+    return result
 
 
 def emit(payload):
@@ -27,6 +49,7 @@ def main():
     home.mkdir(parents=True, exist_ok=True)
     (home / '.gitconfig').write_text('[user]\n name = auto-agents verification\n email = verification@localhost\n')
     request = json.loads(Path('/result/request.json').read_text())
+    environment_inputs = check_environments(request)
     invocation = request.get('invocation', {})
     sys.path.insert(0, '/work/src')
     target = Path(request.get('_replay_project', '/target'))
@@ -55,7 +78,9 @@ def main():
                     invocation.get('command', 'collab').replace('provider-resolve', 'fix')]
         # This copy of the harness belongs to the pinned controller, not /work.
         namespace = runpy.run_path('/opt/repair/session_replay.py', run_name='repair_boundary_harness')
-        emit(namespace['main']())
+        observed = namespace['main']()
+        observed['environment_inputs'] = environment_inputs
+        emit(observed)
         return
     if invocation.get('run_id'):
         from auto_agents.config import load_run_state, save_run_state
@@ -94,5 +119,6 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as error:
-        emit({'ok': False, 'error': str(error), 'error_type': type(error).__name__})
+        emit({'ok': False, 'error': str(error), 'error_type': type(error).__name__,
+              'infrastructure': isinstance(error, ReplayEnvironmentUnavailable)})
         raise SystemExit(1)
