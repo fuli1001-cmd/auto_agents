@@ -179,6 +179,7 @@ def execution_checkout(session, state):
     if '_call_with_failover' in previous.__dict__:
         execution._call_with_failover = previous.__dict__['_call_with_failover']
     execution.config = session.config
+    execution._retained_session_configuration = bool(state.verification_binding)
     execution._force_full_verify = previous._force_full_verify
     previous_context = getattr(session, '_execution_binding', None)
     session._custody_control_root = root

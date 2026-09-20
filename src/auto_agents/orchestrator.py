@@ -759,6 +759,12 @@ class Orchestrator:
     def _prepare_project_config_for_supervision(self) -> bool:
         """Migrate and rebase configuration before assigning provider writes."""
 
+        if getattr(self, '_retained_session_configuration', False):
+            # The private execution checkout uses an already loaded effective
+            # configuration and sealed verification contract. Migrating its
+            # historical JSON would rewrite those inputs outside the shared
+            # project's lifecycle lock, and can replace the scoped gate plan.
+            return False
         migrated = migrate_project_config(self.project_root)
         if not migrated:
             return False

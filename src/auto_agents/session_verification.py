@@ -24,6 +24,8 @@ from .io_utils import read_json
 # parameterized generic bases, even when the selected node remains unchanged.
 _PROOF_INVENTORY_VERSION = 6
 _REFERENCE_ROLE_VERSION = 1
+_REFERENCE_CATALOGS = ('.auto-agents/state/requirements_trace.json',
+                       '.auto-agents/state/provider_references.lock.json')
 
 _PYTEST_CONFIG_NAMES = ('pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
                         'pyproject.toml', 'tox.ini', 'setup.cfg')
@@ -568,6 +570,10 @@ def _validate_binding_inventory(session, state):
 def _validate_task_authority(state):
     binding = state.verification_binding
     scope = binding.get('task_scope', {})
+    if scope.get('mode') == 'focused_fix':
+        if scope.get('task_ids') or scope.get('requirement_ids') or not state.fix_verify_command.strip():
+            raise ownership_error(state, 'focused fix must retain an explicit verification command without task adoption')
+        return
     task_ids = set(scope.get('task_ids', []))
     requirement_ids = set(scope.get('requirement_ids', []))
     # A routed fix in a newly initialized, taskless project has no retained
@@ -658,6 +664,8 @@ def _mandatory_refs(state):
     binding = state.verification_binding
     _validate_task_authority(state)
     scope = binding.get('task_scope', {})
+    if scope.get('mode') == 'focused_fix':
+        return set(scope['verification_refs'])
     task_ids, requirement_ids = set(scope.get('task_ids', [])), set(scope.get('requirement_ids', []))
     tasks = binding.get('tasks', [])
     missing = task_ids - {task.get('task_id') for task in tasks}
@@ -682,6 +690,8 @@ def _mandatory_refs(state):
 def _owned_tasks(state):
     binding = state.verification_binding
     scope = binding.get('task_scope', {})
+    if scope.get('mode') == 'focused_fix':
+        return []
     task_ids, requirements = set(scope.get('task_ids', [])), set(scope.get('requirement_ids', []))
     return [task for task in binding.get('tasks', []) if
             task.get('task_id') in task_ids or requirements.intersection(task.get('requirement_ids', []))
@@ -999,7 +1009,7 @@ def _retained_reference_catalog(session, state):
         return cache[key]
     from .requirements import provider_reference_paths
     payloads = []
-    for path in ('.auto-agents/state/requirements_trace.json', '.auto-agents/state/provider_references.lock.json'):
+    for path in _REFERENCE_CATALOGS:
         try:
             source = _retained_reference_bytes(session, state, path)
             payload = json.loads(source) if source is not None else {}
@@ -1014,7 +1024,10 @@ def _retained_reference_catalog(session, state):
                                   verification_ref=path) from error
         payloads.append(payload)
     trace, lock = payloads
-    paths = {}
+    # Catalogs are themselves retained inputs to reference verification. Keep
+    # their exact paths in the reference inventory so sealing checks their
+    # bytes and availability; this grants no executable proof or task scope.
+    paths = dict.fromkeys(_REFERENCE_CATALOGS, False)
     for row in trace.get('requirements', []):
         for path in provider_reference_paths(row):
             paths[path] = paths.get(path, False) or bool(row.get('external_docs_required'))
@@ -1297,10 +1310,9 @@ def _seal_imported_pytest_sources(session, state, gates, revision):
 def _validate_required_node_selection(session, state, commands):
     """Path containment and proof labels cannot attest a deselected node.
 
-    Require an invocation without selection restrictions for every mandatory
-    pytest node. Name/marker expressions depend on collection-time metadata;
-    without that evidence they cannot establish coverage. Keep the retained
-    command intact and report ambiguity instead of stripping its options.
+    Name/marker filters require actual collection evidence from retained source.
+    Keep their command and safety exclusions intact; collection only establishes
+    selection, while the later execution gate still requires passing test bodies.
     """
     refs = sorted(ref for ref in _mandatory_refs(state)
                   if not ref.startswith('cmd:') and '.py::' in ref)
@@ -1317,8 +1329,13 @@ def _validate_required_node_selection(session, state, commands):
         except (ValueError, TypeError):
             raise ownership_error(state, 'retained pytest selection configuration is unreadable',
                                   verification_ref=path)
+    from .execution_recovery import redact_incident_text
     covered = set()
+    rejected = {ref: [] for ref in refs}
+    unparsed = []
     for command in commands:
+        if len(covered) == len(refs):
+            break
         try:
             # Ownership stays bound to the retained command. Execution credit
             # must also account for the environment the public runner inherits.
@@ -1329,10 +1346,12 @@ def _validate_required_node_selection(session, state, commands):
                 cwd = (session.project_root / invocation.cwd).resolve()
                 options = list(invocation.arguments)
                 targets = list(invocation.targets)
+                selected_config = []
                 settings = _pytest_selection_config(session.project_root, cwd, options,
                                                     targets, configurations,
                     source_exists=lambda path: _historical_source(session,
-                        _contract_source_revision(session, state) or 'HEAD', path) is not None)
+                        _contract_source_revision(session, state) or 'HEAD', path) is not None,
+                    selected_config=selected_config)
                 addopts = settings.get('addopts', [])
                 config_args = []
                 for key in ('python_functions', 'python_classes', 'python_files', 'norecursedirs'):
@@ -1344,6 +1363,8 @@ def _validate_required_node_selection(session, state, commands):
                 # later -o values override those defaults during admission too.
                 config_args.extend(shlex.split(addopts) if isinstance(addopts, str) else list(addopts))
                 for ref in refs:
+                    if ref in covered:
+                        continue
                     path, _, node = ref.partition('::')
                     absolute = (session.project_root / path).resolve()
                     for target in targets or ['.']:
@@ -1353,18 +1374,37 @@ def _validate_required_node_selection(session, state, commands):
                                     or node.startswith(target_node + '::')))
                         contains |= (not target_node and not selected.suffix and selected in absolute.parents)
                         selection_args = [*config_args, *options]
-                        if (contains and not _pytest_selection_restricted(selection_args)
-                                and not _pytest_discovery_excludes(selection_args, ref,
-                                                                 directory=absolute != selected,
-                                                                 collection_root=selected,
-                                                                 source_path=absolute)):
+                        if not contains:
+                            continue
+                        restricted = _pytest_selection_restricted(selection_args)
+                        excluded = (None if restricted else _pytest_discovery_excludes(selection_args, ref,
+                            directory=absolute != selected, collection_root=selected, source_path=absolute))
+                        if restricted and not _pytest_selection_restricted(selection_args, allow_expressions=True):
+                            from .pytest_selection import selected_nodes
+                            collected, deselected = selected_nodes(session, state, invocation)
+                            matches = lambda item: item == ref or item.startswith(ref + '[')
+                            restricted = not any(map(matches, collected)) or any(map(matches, deselected))
+                            excluded = restricted
+                        if not restricted and not excluded:
                             covered.add(ref)
-        except ValueError:
+                        elif len(rejected[ref]) < 8:
+                            rejected[ref].append({
+                                'command': redact_incident_text(command)[:2000],
+                                'cwd': invocation.cwd, 'target': target,
+                                'configuration': list(selected_config),
+                                'effective_pytest_args': redact_incident_text(shlex.join(selection_args))[:2000],
+                                'selection_restricted': restricted, 'discovery_excluded': excluded,
+                            })
+        except ValueError as error:
+            if len(unparsed) < 8:
+                unparsed.append({'command': redact_incident_text(command)[:2000],
+                                 'reason': redact_incident_text(str(error))[:1000]})
             continue  # Unparseable commands cannot attest required nodes.
     for ref in refs:
         if ref not in covered:
             raise ownership_error(state, 'required pytest node lacks unfiltered executable evidence: ' + ref,
                                   verification_ref=ref, owners=diagnostic_owners(state, ref),
+                                  selection_rejections=rejected[ref], unparsed_commands=unparsed,
                                   commands=[command for command in commands if command])
 
 
@@ -1514,7 +1554,7 @@ def _pytest_discovery_excludes(args, ref, *, directory, collection_root, source_
     return bool(directory and not any(fnmatch(Path(path).name, pattern) for pattern in patterns))
 
 
-def _pytest_selection_restricted(args):
+def _pytest_selection_restricted(args, *, allow_expressions=False):
     # Fail closed on selectors whose actual coverage requires collection data.
     # Collection, setup-only and introspection modes cannot attest a test body.
     # These remain valid CLI options; a bound child needs independent execution
@@ -1527,9 +1567,10 @@ def _pytest_selection_restricted(args):
                        '--collect-only', '--co', '--stepwise', '--sw',
                        '--setup-only', '--setup-plan', '--fixtures', '--fixtures-per-test',
                        '--funcargs', '--version', '--help', '-h'}
-                or arg.startswith(('-k', '-m'))):
+                or not allow_expressions and arg.startswith(('-k', '-m'))):
             return True
-        if 'addopts=' in arg and _pytest_selection_restricted(shlex.split(arg.partition('addopts=')[2])):
+        if 'addopts=' in arg and _pytest_selection_restricted(
+                shlex.split(arg.partition('addopts=')[2]), allow_expressions=allow_expressions):
             return True
     return False
 
@@ -1759,6 +1800,7 @@ def _task_scope(session, state):
                 raise ownership_error(state, f'original child handoff has conflicting {key}')
         seeds.append(handoff.get('payload', {}))
     task_ids, requirement_ids = set(), set()
+    focused = []
     for seed in seeds:
         seed_tasks, seed_requirements = set(), set()
         for source in route_sources(seed):
@@ -1766,6 +1808,17 @@ def _task_scope(session, state):
             if source.get('task_id'):
                 source_tasks.add(source['task_id'])
             source_requirements = set(source.get('requirement_ids', []))
+            declared = source.get('verification_scope', {})
+            if not isinstance(declared, dict):
+                raise ownership_error(state, 'verification_scope must be an object')
+            # Compatibility with the explicit non-adoption wording emitted by
+            # older routed fixes. Unknown prose grants no scope exception.
+            legacy = ('此关联仅标识依赖，不接管' in str(source.get('retained_task_relation', '')))
+            if declared.get('mode') == 'focused_fix' or legacy:
+                if source_tasks:
+                    raise ownership_error(state, 'focused fix conflicts with explicit task adoption')
+                focused.append(source)
+                source_requirements = set()
             for existing, incoming, field in ((seed_tasks, source_tasks, 'task_ids'),
                                                (seed_requirements, source_requirements, 'requirement_ids')):
                 if existing and incoming and existing != incoming:
@@ -1777,6 +1830,17 @@ def _task_scope(session, state):
                 raise ownership_error(state, f'conflicting issue and handoff {field}',
                                       retained_scope=sorted(existing), conflicting_scope=sorted(incoming))
             existing.update(incoming)
+    if focused:
+        if task_ids or requirement_ids or not state.fix_verify_command.strip():
+            raise ownership_error(state, 'focused fix conflicts with retained task authority or lacks a verification command')
+        invocations = test_invocations(state.fix_verify_command)
+        refs = sorted({ref for invocation in invocations for ref in invocation.repository_targets})
+        if not refs or any(invocation.targets is None for invocation in invocations):
+            raise ownership_error(state, 'focused fix requires identifiable retained verification targets')
+        return {'mode': 'focused_fix', 'task_ids': [], 'requirement_ids': [],
+                'associated_requirement_ids': sorted({key for source in focused
+                                                      for key in source.get('requirement_ids', [])}),
+                'verification_refs': refs}
     return {'task_ids': sorted(task_ids), 'requirement_ids': sorted(requirement_ids)}
 
 
@@ -1784,6 +1848,7 @@ def _foreign_refs(state):
     binding = state.verification_binding
     task_ids = set(binding.get('task_scope', {}).get('task_ids', []))
     requirement_ids = set(binding.get('task_scope', {}).get('requirement_ids', []))
+    focused = binding.get('task_scope', {}).get('mode') == 'focused_fix'
     owned_refs, foreign_refs = set(), set()
     for task in binding.get('tasks', []):
         refs = _task_refs(task)
@@ -1791,7 +1856,7 @@ def _foreign_refs(state):
                  or requirement_ids.intersection(task.get('requirement_ids', [])))
         unresolved = task.get('status') in {'pending', 'in_progress', 'blocked', 'failed'}
         owner = task.get('workflow_id') or binding.get('plan_workflow_id')
-        foreign = bool(owner and owner != state.workflow_id)
+        foreign = focused or bool(owner and owner != state.workflow_id)
         (foreign_refs if unresolved and foreign and not owned else owned_refs).update(refs)
     # An explicit targeted regression remains required, even for an unfinished
     # task. Missing entries must still produce a preflight failure.

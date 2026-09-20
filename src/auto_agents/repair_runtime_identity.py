@@ -26,17 +26,26 @@ _MODULES = {
     'auto_agents': (),
     'auto_agents.config': (),
     'auto_agents.cli': ('main',),
-    'auto_agents.session': ('Session.resume', 'Session._prepare_workflow_handoff',
-                            'Session._phase_fix_execute_owned', 'Session._resume_existing'),
+    'auto_agents.session': ('Session.resume', 'Session._retain_resume_authority',
+                           'Session._phase_fix_execute', 'Session._prepare_workflow_handoff',
+                           'Session._phase_fix_execute_owned', 'Session._resume_existing'),
+    'auto_agents.workflow_chain': ('WorkflowStore.resolve_handoff_chain',),
+    'auto_agents.repair_client': ('engine_route', '_remember_engine_receipt'),
+    'auto_agents.pytest_selection': ('selected_nodes',),
     'auto_agents.scope_decisions': ('choose', 'session_choice', 'resume_session_choice'),
     'auto_agents.repair_v2.scope': ('ScopeGuard.admit', 'ScopeGuard.current'),
     'auto_agents.session_verification': (
         '_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory',
+        '_validate_required_node_selection',
         # Classification also reads the retained catalog. Checking only its
         # unchanged callers can attest a stale module under the current path.
         '_retained_reference_catalog'),
     'auto_agents.workflow_runtime': ('WorkflowCoordinator._engine_child_id',
-                                   'WorkflowCoordinator._resume_engine_bound_child'),
+        'WorkflowCoordinator._resume_engine_bound_child', 'WorkflowCoordinator._drive_handoff',
+        'WorkflowCoordinator._resume_existing_child', 'WorkflowCoordinator._validated_child_handoff',
+        'WorkflowCoordinator._resolved_handoff_chain', 'WorkflowCoordinator._session_result',
+        'WorkflowCoordinator._resume_session_state', 'WorkflowCoordinator._pending_engine_resume',
+        'WorkflowCoordinator._resume_blocked_engine_handoff'),
 }
 
 

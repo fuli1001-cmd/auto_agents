@@ -221,3 +221,34 @@ Timeouts and missing or malformed replay reports also stop implementation as
 verification infrastructure failures; a timeout cannot accept a partial success
 report. Explicit cancellation remains cancellation, and retained candidates can
 be rechecked once the verification environment is available.
+
+## Focused fixes and complete child recovery
+
+An issue may name related requirements without adopting their unfinished tasks.
+Such a route declares `issue_seed.verification_scope = {"mode": "focused_fix"}`
+and retains a concrete verification command. Its requirement IDs are sealed as
+associations; the command's targets are mandatory evidence. Explicit task grants
+or conflicting requirement grants still reject admission. Compatibility accepts
+the older explicit phrase `此关联仅标识依赖，不接管` in `retained_task_relation`;
+unknown prose cannot grant this exception. Issue materialization preserves this
+declaration. Existing regressions and explicit proof prerequisites remain;
+only demonstrably absent, unadopted future obligations are projected out.
+
+Name and marker expressions in pytest configuration do not automatically exclude
+every required test. A private checkout of the retained revision collects the
+unchanged command with its filters and environment. A trusted observer records
+selected and deselected nodes, including parameter instances. Results are reused
+only for the same source revision, command, working directory and environment.
+Collection establishes selection, never successful execution. Setup-only modes,
+missing nodes, deselected nodes and incomplete parameter selection still fail.
+
+Engine return resolves the complete resume chain and requires an accepted receipt
+for its exact route and runtime. It preserves the original child, goal, budgets
+and historical failures, and records a fresh preflight before implementation.
+The same receipt cannot discharge a later failure. Private execution uses the
+loaded effective configuration without migrating its frozen JSON; shared config
+migrations continue to require the project lifecycle lock.
+
+Recovery validation must reach the retained child's implementation boundary (or
+a verified completion), preserving its constraints. A parent diagnostic turn,
+an unchanged old failure or the disappearance of one error is insufficient.

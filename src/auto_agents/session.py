@@ -1692,8 +1692,9 @@ class Session:
             else WorkflowStore(self.project_root)
         )
         try:
-            original = store.load_handoff(resume_handoff_id)
-        except (FileNotFoundError, RuntimeError, ValueError):
+            chain = store.resolve_handoff_chain(resume_handoff_id, workflow_id=state.workflow_id)
+            original = chain[-1]
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError):
             return f"Unknown resume_handoff_id: {resume_handoff_id}."
         if original.workflow_id != state.workflow_id:
             return (
@@ -3453,7 +3454,7 @@ class Session:
                 [
                     PromptBlock("- Never output FIX_DISPOSITION in collab mode; that protocol belongs to the child fix workflow.", kind="output"),
                     "- If an existing-behavior defect is already clear, output one single-line ROUTE_WORKFLOW v1 marker with target='fix', reason, summary, and issue_seed.",
-                    "- When the retained task plan contains tasks, issue_seed must identify its matching existing task_id/task_ids or requirement_ids. Never invent task ownership or adopt another workflow's work. Omit scope IDs only when no task contract exists.",
+                    "- Use issue_seed task_id/task_ids or requirement_ids as task authority only when taking responsibility for those tasks. For a focused existing-behavior fix that does not adopt planned work, set verification_scope={\"mode\":\"focused_fix\"}; requirement_ids then express association only. Retain a concrete targeted verification command. Never invent task ownership or adopt another workflow's work.",
                     "- If a missing capability or requirements, architecture, or persistence change is already clear, output one single-line ROUTE_WORKFLOW v1 marker with target='run', reason, summary, and spec_seed.",
                     "- Otherwise, if the goal is clear enough for more read-only diagnosis, output 'GOAL_CLEAR' on a line by itself at the end.",
                 ]
@@ -3751,7 +3752,7 @@ class Session:
             "3. Ask the user only for a goal choice, credential, rights attestation, unbudgeted external cost, destructive change, irreversible product decision, or an external observation only the user can perform.",
             "   Output NEED_USER_ASSIST v1: {\"decision_class\":\"<allowed class>\",\"question\":\"<plain project-specific question>\"} on one line.",
             "4. For an existing-behavior defect, output one single-line ROUTE_WORKFLOW v1 JSON marker with target='fix', reason, summary, and issue_seed",
-            "- When the retained task plan contains tasks, issue_seed must identify its matching existing task_id/task_ids or requirement_ids. Never invent task ownership or adopt another workflow's work. Omit scope IDs only when no task contract exists.",
+            "- Use issue_seed task_id/task_ids or requirement_ids as task authority only when taking responsibility for those tasks. For a focused existing-behavior fix that does not adopt planned work, set verification_scope={\"mode\":\"focused_fix\"}; requirement_ids then express association only. Retain a concrete targeted verification command. Never invent task ownership or adopt another workflow's work.",
             "5. For missing/new capability or a requirements, architecture, or persistence change, output one single-line ROUTE_WORKFLOW v1 JSON marker with target='run', reason, summary, and spec_seed",
             "6. To retry a previously returned child after its blocker changed, use target='resume' and resume_handoff_id",
             "7. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",

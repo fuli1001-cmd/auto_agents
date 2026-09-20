@@ -297,8 +297,11 @@ except RuntimeIdentityError as error:
     assert module['path'] == module['origin'] == str(path)
     assert module['source_sha256'] == hashlib.sha256(disk_source).hexdigest()
     assert module['functions']['_retained_reference_catalog']['matches_source'] is False
-    assert all(module['functions'][function]['matches_source'] is True for function in
-               ('_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory'))
+    # Whole-module replacement now also changes scoped catalog classification;
+    # replacing only the catalog must leave every other implementation intact.
+    if sys.argv[2] == 'catalog_only':
+        assert all(module['functions'][function]['matches_source'] is True for function in
+                   ('_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory'))
 else:
     raise AssertionError('baseline catalog was accepted under the candidate filename')
 namespace['_retained_reference_bytes'] = lambda *args: b'{broken'
