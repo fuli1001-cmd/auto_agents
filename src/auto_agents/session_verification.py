@@ -1322,7 +1322,10 @@ def _validate_required_node_selection(session, state, commands):
         except (ValueError, TypeError):
             raise ownership_error(state, 'retained pytest selection configuration is unreadable',
                                   verification_ref=path)
+    from .execution_recovery import redact_incident_text
     covered = set()
+    rejected = {ref: [] for ref in refs}
+    unparsed = []
     for command in commands:
         try:
             # Ownership stays bound to the retained command. Execution credit
@@ -1334,10 +1337,12 @@ def _validate_required_node_selection(session, state, commands):
                 cwd = (session.project_root / invocation.cwd).resolve()
                 options = list(invocation.arguments)
                 targets = list(invocation.targets)
+                selected_config = []
                 settings = _pytest_selection_config(session.project_root, cwd, options,
                                                     targets, configurations,
                     source_exists=lambda path: _historical_source(session,
-                        _contract_source_revision(session, state) or 'HEAD', path) is not None)
+                        _contract_source_revision(session, state) or 'HEAD', path) is not None,
+                    selected_config=selected_config)
                 addopts = settings.get('addopts', [])
                 config_args = []
                 for key in ('python_functions', 'python_classes', 'python_files', 'norecursedirs'):
@@ -1358,18 +1363,31 @@ def _validate_required_node_selection(session, state, commands):
                                     or node.startswith(target_node + '::')))
                         contains |= (not target_node and not selected.suffix and selected in absolute.parents)
                         selection_args = [*config_args, *options]
-                        if (contains and not _pytest_selection_restricted(selection_args)
-                                and not _pytest_discovery_excludes(selection_args, ref,
-                                                                 directory=absolute != selected,
-                                                                 collection_root=selected,
-                                                                 source_path=absolute)):
+                        if not contains:
+                            continue
+                        restricted = _pytest_selection_restricted(selection_args)
+                        excluded = (None if restricted else _pytest_discovery_excludes(selection_args, ref,
+                            directory=absolute != selected, collection_root=selected, source_path=absolute))
+                        if not restricted and not excluded:
                             covered.add(ref)
-        except ValueError:
+                        elif len(rejected[ref]) < 8:
+                            rejected[ref].append({
+                                'command': redact_incident_text(command)[:2000],
+                                'cwd': invocation.cwd, 'target': target,
+                                'configuration': list(selected_config),
+                                'effective_pytest_args': redact_incident_text(shlex.join(selection_args))[:2000],
+                                'selection_restricted': restricted, 'discovery_excluded': excluded,
+                            })
+        except ValueError as error:
+            if len(unparsed) < 8:
+                unparsed.append({'command': redact_incident_text(command)[:2000],
+                                 'reason': redact_incident_text(str(error))[:1000]})
             continue  # Unparseable commands cannot attest required nodes.
     for ref in refs:
         if ref not in covered:
             raise ownership_error(state, 'required pytest node lacks unfiltered executable evidence: ' + ref,
                                   verification_ref=ref, owners=diagnostic_owners(state, ref),
+                                  selection_rejections=rejected[ref], unparsed_commands=unparsed,
                                   commands=[command for command in commands if command])
 
 
