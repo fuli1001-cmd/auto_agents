@@ -25,6 +25,18 @@ from .cleanup import labels, reap_containers
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 
 
+def isolation_arguments(profile):
+    if profile == 'sandbox':
+        # Nested verification creates private user/mount/PID namespaces and
+        # supervises metadata with ptrace. No host namespace or device is
+        # exposed; callers still mount only disposable inputs without network.
+        return ['--cap-add', 'SYS_ADMIN', '--cap-add', 'SYS_PTRACE',
+                '--security-opt', 'seccomp=unconfined']
+    if profile == 'standard':
+        return ['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges']
+    raise RepairBlocked('verification_profile', 'unknown validation isolation profile')
+
+
 def replay_project_path(payload):
     """Mount only the disposable copy at the retained logical project path."""
     path = Path(payload.get('project') or '/target').expanduser()
@@ -148,6 +160,9 @@ class DockerVerifier:
                                'session': Path(__file__).parent.parent.joinpath('session_replay.py').read_text(),
                                'runtime_identity': Path(__file__).parent.parent.joinpath('repair_runtime_identity.py').read_text(),
                                'replay_environment': Path(__file__).with_name('replay_environment.py').read_text(),
+                               'isolation_profiles': {profile: isolation_arguments(profile)
+                                                      for profile in ('standard', 'sandbox')},
+                               'boundary_profile': 'sandbox',
                                'kernel': os.uname().release, 'policy': 7, 'init': True})
         self.image = identity_text.strip()  # A mutable tag is not a verification input.
 
@@ -203,13 +218,7 @@ class DockerVerifier:
             '-e', 'PYTHONDONTWRITEBYTECODE=1', '-e', 'PYTHONNOUSERSITE=1', '-e', 'PYTHONPATH=/work/src',
             '-e', 'AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1', '-e', 'AUTO_AGENTS_STORAGE_ROOT=/tmp/storage',
             '-e', 'AUTO_AGENTS_VERIFICATION_ROOT=/tmp/verification', '-e', 'AUTO_AGENTS_WORKER_ROOT=/tmp/workers']
-        if unit.profile == 'sandbox':
-            # No host project, credentials, devices, sockets or host namespaces
-            # are exposed even for tests of the nested sandbox implementation.
-            command += ['--cap-add', 'SYS_ADMIN', '--cap-add', 'SYS_PTRACE', '--security-opt', 'seccomp=unconfined']
-        elif unit.profile == 'standard':
-            command += ['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges']
-        else: raise RepairBlocked('verification_profile', 'unknown validation isolation profile')
+        command += isolation_arguments(unit.profile)
         parts = pytest_parts(unit.command)
         if parts is not None:
             command += ['-e', 'REPAIR_PYTEST_ARGS=' + json.dumps(parts), self.image, 'python', '/opt/repair/driver.py']
@@ -389,8 +398,8 @@ class DockerVerifier:
                                                      'replay_environments': [item.describe() for item in environments],
                                                      '_replay_project': str(project_path)})
                 command = ['docker', 'run', '--init', '--name', name, *labels(self.root, identity, kind='verification'), '--network', 'none', '--read-only',
-                    '--user', f'{os.getuid()}:{os.getgid()}', '--cap-drop', 'ALL',
-                    '--security-opt', 'no-new-privileges', '--memory', '1g', '--pids-limit', '512',
+                    '--user', f'{os.getuid()}:{os.getgid()}', *isolation_arguments('sandbox'),
+                    '--memory', '1g', '--pids-limit', '512',
                     '--tmpfs', '/tmp:rw,nosuid,exec,mode=1777,size=4g', '--workdir', str(project_path),
                     '-e', 'HOME=/tmp/home', '-e', 'PYTHONDONTWRITEBYTECODE=1',
                     '-e', 'AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1', '-e', 'AUTO_AGENTS_STORAGE_DISABLED=1',
@@ -415,6 +424,10 @@ class DockerVerifier:
                           'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
                           'observed': observed, 'output': str(base / 'output.log'), 'returncode': code}
                 result['environment_inputs'] = [item.describe() for item in environments]
+                failure = observed.get('recovery_observation', {}).get('current_failure', {})
+                if failure.get('diagnostic', {}).get('failure_kind') == 'verification_confinement':
+                    result.update(ok=False, infrastructure=True, reason=failure.get('result')
+                                  or 'Retained verification confinement is unavailable')
                 if observed.get('infrastructure'):
                     result.update(infrastructure=True, reason=observed.get('error', '隔离恢复环境无法启动。'))
                 failure = observed.get('recovery_observation', {}).get('current_failure', {})
