@@ -860,7 +860,12 @@ class Supervisor:
                     if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
                         self.store.enqueue_publish(job["id"])
                     self.store.transition(job["id"], "completed")
-            return {"ok": True, "accepted": passed}
+            return {"ok": True, "accepted": passed, "receipt": ({
+                "job": job['id'], "subscriber": row['id'],
+                "route_digest": expected['route_digest'],
+                "commit": job['result'].get('commit', ''),
+                "acceptance": job['result'].get('v2_receipt', {}),
+            } if passed else {})}
         if op == "finish":
             identity = request["subscriber"]
             with self.store.connect() as db:

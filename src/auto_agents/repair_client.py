@@ -19,6 +19,23 @@ class EngineRepairRequired(RuntimeError):
         super().__init__("auto_agents engine self-repair required for explicitly bound engine route: " + json.dumps(payload, ensure_ascii=False))
 
 
+def _remember_engine_receipt(orchestrator, payload, receipt):
+    """Retain authority only after the control channel accepted this exact route."""
+    runtime = Path(__file__).resolve().parents[2]
+    commit = git(runtime, 'rev-parse', 'HEAD')
+    expected = receipt.get('engine_commit') or receipt.get('commit')
+    if expected and expected != commit:
+        return False
+    context = {'route_digest': digest(payload), 'receipt_digest': digest(receipt),
+               'engine_commit': commit, 'runtime_root': str(runtime),
+               'runtime_digest': digest({name: (runtime / 'src/auto_agents' / name).read_text()
+                   for name in ('workflow_chain.py', 'workflow_runtime.py', 'session.py', 'session_verification.py')})}
+    contexts = dict(getattr(orchestrator, '_verified_engine_routes', {}))
+    contexts[context['route_digest']] = context
+    orchestrator._verified_engine_routes = contexts
+    return True
+
+
 def engine_route(orchestrator, payload):
     """Return True only for a verified receipt; otherwise request engine repair."""
     from .execution_binding import repository_binding_error, route_sources
@@ -28,8 +45,12 @@ def engine_route(orchestrator, payload):
         return False
     probe = os.environ.get("AUTO_AGENTS_REPAIR_ROUTE_PROBE")
     if probe:
-        approved = json.loads(Path(probe).read_text())
-        if digest(payload) == approved.get("route_digest"):
+        try:
+            approved = json.loads(Path(probe).read_text())
+        except (OSError, ValueError):
+            return False
+        if (isinstance(approved, dict) and digest(payload) == approved.get("route_digest")
+                and _remember_engine_receipt(orchestrator, payload, approved)):
             orchestrator._repair_route_probe_consumed = approved["route_digest"]
             return True
     if not registration or not enabled():
@@ -51,7 +72,8 @@ def engine_route(orchestrator, payload):
             orchestrator._repair_control_error = str(error)
             return False
         if response.get("accepted"):
-            return True
+            return _remember_engine_receipt(orchestrator, payload,
+                response.get('receipt') or {'subscriber': subscriber, 'route_digest': route_key})
     raise EngineRepairRequired(payload)
 
 

@@ -1686,8 +1686,9 @@ class Session:
             else WorkflowStore(self.project_root)
         )
         try:
-            original = store.load_handoff(resume_handoff_id)
-        except (FileNotFoundError, RuntimeError, ValueError):
+            chain = store.resolve_handoff_chain(resume_handoff_id, workflow_id=state.workflow_id)
+            original = chain[-1]
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError):
             return f"Unknown resume_handoff_id: {resume_handoff_id}."
         if original.workflow_id != state.workflow_id:
             return (

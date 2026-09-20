@@ -21,6 +21,7 @@ WORKFLOW_SCHEMA_VERSION = 1
 HANDOFF_SCHEMA_VERSION = 1
 WORKFLOW_KINDS = {"collab", "fix", "run", "provider_resolve"}
 HANDOFF_TARGETS = {"fix", "run", "resume"}
+MAX_RESUME_DEPTH = 64
 
 
 def utc_now() -> str:
@@ -417,6 +418,65 @@ class WorkflowStore:
         if not isinstance(payload, dict):
             raise FileNotFoundError(f"handoff not found: {handoff_id}")
         return WorkflowHandoff.from_dict(payload)
+
+    def resolve_handoff_chain(self, handoff, *, workflow_id: str):
+        """Read a bounded resume chain without granting or rewriting authority."""
+        from .execution_binding import route_sources
+
+        requested = handoff if isinstance(handoff, str) else handoff.handoff_id
+        current = self.load_handoff(requested) if isinstance(handoff, str) else handoff
+        chain, visited = [], set()
+        while True:
+            if (not requested or current.handoff_id != requested
+                    or requested in visited or current.workflow_id != workflow_id):
+                raise ValueError('resume chain has conflicting handoff or workflow identity')
+            if chain and current.parent != chain[0].parent:
+                raise ValueError('resume chain belongs to another parent session')
+            visited.add(requested)
+            chain.append(current)
+            if current.target != 'resume':
+                if current.target not in {'fix', 'run'}:
+                    raise ValueError('resume chain has no executable original handoff')
+                break
+            if len(chain) > MAX_RESUME_DEPTH:
+                raise ValueError('resume chain exceeds the maximum depth')
+            requested = current.payload.get('resume_handoff_id')
+            if not isinstance(requested, str) or not requested.strip():
+                raise ValueError('resume handoff requires resume_handoff_id')
+            current = self.load_handoff(requested)
+
+        original = chain[-1]
+        child_ids = set()
+        authorities = {}
+        for entry in reversed(chain):
+            if entry.child is not None:
+                if original.child is None or entry.child != original.child:
+                    raise ValueError('resume chain names conflicting children')
+                child_ids.add(entry.child.native_id)
+            for source in route_sources(entry.payload):
+                if 'child_session_id' in source:
+                    child_ids.add(str(source['child_session_id']))
+                values = {key: source[key] for key in (
+                    'authorization_policy', 'goal_execution_environment', 'source_descriptor',
+                    'auto_approve', 'target_repository', 'evidence_base') if key in source}
+                for field, single in (('task_ids', 'task_id'), ('requirement_ids', None)):
+                    if field in source or single and single in source:
+                        items = source.get(field, [])
+                        if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+                            raise ValueError('resume chain has malformed ' + field)
+                        values[field] = sorted(set(items + ([source[single]] if single and single in source else [])))
+                for key, value in values.items():
+                    if key in {'target_repository', 'evidence_base'}:
+                        value = str((self.project_root / Path(str(value)).expanduser()).resolve())
+                    if key in authorities and authorities[key] != value:
+                        raise ValueError('resume chain has conflicting ' + key)
+                    if entry is not original and key not in authorities and key in {
+                            'task_ids', 'requirement_ids', 'target_repository', 'source_descriptor'}:
+                        raise ValueError('resume wrapper cannot introduce ' + key)
+                    authorities[key] = value
+        if len(child_ids) > 1 or '' in child_ids:
+            raise ValueError('resume chain names conflicting child identities')
+        return chain
 
     def save_handoff(self, handoff: WorkflowHandoff) -> None:
         handoff.updated_at = utc_now()

@@ -68,6 +68,20 @@ def main() -> dict[str, object]:
         finally:
             frames.pop()
 
+    parent_phase = Session._phase_collab_loop
+    def observe_parent_phase(self, state):
+        if recovery['required'] and before_child:
+            child = load_session_state(project, before_child['session_id'])
+            if child.status in {'blocked', 'failed'}:
+                # The bound child's failure is the observation. Do not let
+                # the diagnostic create a new parent baseline before the
+                # parent's next provider call. This boundary cannot pass the
+                # child-entry and fresh-preflight checks below.
+                recovery['boundary_kind'] = 'blocked_child_return'
+                boundary_state.update(state.to_dict())
+                raise NextProviderBoundary()
+        return parent_phase(self, state)
+
     route = repair_client.engine_route
     def observe_route(orchestrator, payload):
         accepted = route(orchestrator, payload)
@@ -81,10 +95,11 @@ def main() -> dict[str, object]:
                 snapshot = coordinator.store.load(parent.workflow_id)
                 child_id = coordinator._engine_child_id(payload, snapshot)
                 child = load_session_state(project, child_id)
-                before_child.update(child.to_dict())
+                if not before_child:
+                    before_child.update(child.to_dict())
                 recovery.update(child_session_id=child_id, workflow_id=child.workflow_id,
                                 original_handoff_id=child.parent_handoff_id,
-                                previous_failure=next((entry for entry in reversed(child.execution_log)
+                                previous_failure=next((entry for entry in reversed(before_child['execution_log'])
                                     if entry.get('action') == 'execution_preflight_blocked'), {}))
             except Exception as error:
                 # Observe the error without bypassing the real recovery path.
@@ -108,6 +123,7 @@ def main() -> dict[str, object]:
             patches.enter_context(patch.object(Orchestrator, '_call_with_failover', no_provider))
             patches.enter_context(patch.object(Session, '_record_agent_attempt', staticmethod(before_attempt)))
             patches.enter_context(patch.object(WorkflowCoordinator, '_drive_session', observe_drive))
+            patches.enter_context(patch.object(Session, '_phase_collab_loop', observe_parent_phase))
             patches.enter_context(patch.object(repair_client, 'engine_route', observe_route))
             patches.enter_context(patch.object(session_verification, '_session_reference_kind', observe_reference))
             orchestrator = Orchestrator(project)
@@ -141,7 +157,8 @@ def main() -> dict[str, object]:
             if boundary_state.get('session_id') == child_id:
                 after = boundary_state
             binding = after.get('verification_binding', {})
-            new_events = after['execution_log'][len(before_child['execution_log']):]
+            history_preserved = after['execution_log'][:len(before_child['execution_log'])] == before_child['execution_log']
+            new_events = after['execution_log'][len(before_child['execution_log']):] if history_preserved else []
             recovery.update(child_status=after['status'],
                             boundary_session_id=boundary_state.get('session_id'),
                             contract_revision=binding.get('contract_revision'),
@@ -150,12 +167,19 @@ def main() -> dict[str, object]:
                             reference_decisions=binding.get('required_references', {}),
                             current_failure=next((entry for entry in reversed(new_events)
                                 if entry.get('action') == 'execution_preflight_blocked'), {}))
-            preserved = all(after.get(key) == before_child.get(key) for key in (
+            preserved = history_preserved and all(after.get(key) == before_child.get(key) for key in (
                 'session_id', 'parent_handoff_id', 'workflow_id', 'goal',
                 'goal_execution_environment', 'authorization_policy', 'hard_ceiling'))
-            rechecked = any(entry.get('action') == 'engine_preflight_recheck'
+            rechecks = [entry for entry in new_events if entry.get('action') == 'engine_preflight_recheck'
                             and entry.get('route_digest') == recovery.get('route_digest')
-                            for entry in after['execution_log'])
+                            and entry.get('child_session_id') == child_id
+                            and entry.get('handoff_id') == recovery['original_handoff_id']]
+            rechecked = bool(rechecks)
+            started = [entry for entry in new_events if entry.get('action') == 'engine_preflight_recheck_started'
+                       and entry.get('route_digest') == recovery.get('route_digest')]
+            recovery.update(preflight_started=bool(started), new_preflight_events=[*started, *rechecks],
+                            diagnostic_origin=('fresh' if recovery['current_failure'] else
+                                               'rechecked' if rechecked else 'historical_replay'))
             if before_child.get('status') == 'blocked' and recovery.get('previous_failure'):
                 preserved &= all(after.get(key) == before_child.get(key) for key in (
                     'current_attempt', 'attempt_epoch', 'attempts_since_progress', 'max_attempts'))
