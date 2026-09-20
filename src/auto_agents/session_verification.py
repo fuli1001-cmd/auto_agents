@@ -24,6 +24,8 @@ from .io_utils import read_json
 # parameterized generic bases, even when the selected node remains unchanged.
 _PROOF_INVENTORY_VERSION = 6
 _REFERENCE_ROLE_VERSION = 1
+_REFERENCE_CATALOGS = ('.auto-agents/state/requirements_trace.json',
+                       '.auto-agents/state/provider_references.lock.json')
 
 _PYTEST_CONFIG_NAMES = ('pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
                         'pyproject.toml', 'tox.ini', 'setup.cfg')
@@ -994,7 +996,7 @@ def _retained_reference_catalog(session, state):
         return cache[key]
     from .requirements import provider_reference_paths
     payloads = []
-    for path in ('.auto-agents/state/requirements_trace.json', '.auto-agents/state/provider_references.lock.json'):
+    for path in _REFERENCE_CATALOGS:
         try:
             source = _retained_reference_bytes(session, state, path)
             payload = json.loads(source) if source is not None else {}
@@ -1009,7 +1011,10 @@ def _retained_reference_catalog(session, state):
                                   verification_ref=path) from error
         payloads.append(payload)
     trace, lock = payloads
-    paths = {}
+    # Catalogs are themselves retained inputs to reference verification. Keep
+    # their exact paths in the reference inventory so sealing checks their
+    # bytes and availability; this grants no executable proof or task scope.
+    paths = dict.fromkeys(_REFERENCE_CATALOGS, False)
     for row in trace.get('requirements', []):
         for path in provider_reference_paths(row):
             paths[path] = paths.get(path, False) or bool(row.get('external_docs_required'))
