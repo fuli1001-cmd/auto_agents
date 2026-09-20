@@ -49,7 +49,10 @@ def _boundaries(verifier, root, identity, source, payload, cancel):
     return {'ok': all(r['ok'] for r in results), 'snapshot': identity, 'runtime': verifier.runtime,
             'infrastructure': any(r.get('infrastructure') for r in results),
             'reason': '; '.join(r.get('reason', '') for r in results if r.get('infrastructure')),
-            'cases': results, 'observed': [r.get('observed', {}) for r in results]}
+            'cases': results, 'observed': [
+                {**r.get('observed', {}), **({'verifier_runtime': r['verifier_runtime']}
+                                            if 'verifier_runtime' in r else {})}
+                for r in results]}
 
 
 def _components(request, root, accepted, workspace, python):

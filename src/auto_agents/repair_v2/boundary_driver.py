@@ -8,7 +8,28 @@ import subprocess
 
 
 class ReplayEnvironmentUnavailable(RuntimeError):
-    pass
+    def __init__(self, message, *, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic or {}
+
+
+def check_confinement():
+    """A successful interpreter launch cannot attest namespace confinement."""
+    try:
+        result = subprocess.run([sys.executable, '-I', '/opt/repair/replay_confinement.py'],
+                                capture_output=True, text=True, timeout=60)
+        observed = json.loads(result.stdout.splitlines()[-1])
+        if (not isinstance(observed, dict) or observed.get('phase') != 'replay_confinement'
+                or result.returncode or observed.get('ok') is not True
+                or observed.get('provider_calls') != 0
+                or not isinstance(observed.get('metadata'), dict)
+                or observed['metadata'].get('ok') is not True):
+            raise ReplayEnvironmentUnavailable('原会话恢复所需的验证隔离无法启动。',
+                diagnostic=observed if isinstance(observed, dict) else {})
+        return observed
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as error:
+        raise ReplayEnvironmentUnavailable('原会话恢复所需的隔离能力检查无法完成。',
+                                            diagnostic={'error': str(error)}) from error
 
 
 def check_environments(request):
@@ -57,6 +78,7 @@ def main():
     bound_child = requires_child_recovery(invocation.get('engine_route') or {})
     if bound_child and not invocation.get('session_id'):
         raise RuntimeError('bound child recovery requires the retained session entrypoint')
+    confinement = check_confinement() if invocation.get('session_id') else None
     if case.get('progress_history') and not bound_child:
         from auto_agents.health_watch import replay_health_events
         items = replay_health_events(case['progress_history'], progress_lease_seconds=60)
@@ -80,6 +102,7 @@ def main():
         namespace = runpy.run_path('/opt/repair/session_replay.py', run_name='repair_boundary_harness')
         observed = namespace['main']()
         observed['environment_inputs'] = environment_inputs
+        observed['confinement_probe'] = confinement
         emit(observed)
         return
     if invocation.get('run_id'):
@@ -120,5 +143,6 @@ if __name__ == '__main__':
         main()
     except Exception as error:
         emit({'ok': False, 'error': str(error), 'error_type': type(error).__name__,
-              'infrastructure': isinstance(error, ReplayEnvironmentUnavailable)})
+              'infrastructure': isinstance(error, ReplayEnvironmentUnavailable),
+              'diagnostic': getattr(error, 'diagnostic', {})})
         raise SystemExit(1)

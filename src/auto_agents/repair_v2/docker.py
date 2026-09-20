@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import asdict
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -35,6 +36,51 @@ def isolation_arguments(profile):
     if profile == 'standard':
         return ['--cap-drop', 'ALL', '--security-opt', 'no-new-privileges']
     raise RepairBlocked('verification_profile', 'unknown validation isolation profile')
+
+
+def verifier_identity():
+    """Describe the controller that launches verification, not /work's engine."""
+    from .workspace import git
+    module = Path(__file__).resolve()
+    root = module.parents[3]
+    paths = [module, module.with_name('boundary_driver.py'),
+             module.with_name('replay_confinement.py'),
+             module.parent.parent / 'session_replay.py',
+             module.parent.parent / 'repair_runtime_identity.py',
+             module.parent.parent / 'verification_sandbox.py']
+    return {'root': str(root), 'commit': git(root, 'rev-parse', 'HEAD'),
+            'modules': {str(path.relative_to(root)): {
+                'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in paths}}
+
+
+def container_security(name):
+    # Deliberately exclude environment variables and the container's complete
+    # configuration: only confinement and runtime identity are evidence here.
+    fields = {'image': '.Image', 'user': '.Config.User', 'network': '.HostConfig.NetworkMode',
+              'readonly_root': '.HostConfig.ReadonlyRootfs', 'privileged': '.HostConfig.Privileged',
+              'cap_add': '.HostConfig.CapAdd', 'cap_drop': '.HostConfig.CapDrop',
+              'security_options': '.HostConfig.SecurityOpt', 'apparmor': '.AppArmorProfile'}
+    template = '{' + ','.join(json.dumps(key) + ':{{json ' + value + '}}'
+                              for key, value in fields.items()) + '}'
+    code, output = run(['docker', 'inspect', '--type', 'container', name, '--format', template], timeout=15)
+    try:
+        observed = json.loads(output)
+        if code or not isinstance(observed, dict):
+            raise ValueError('container security configuration was not observed')
+        return observed
+    except ValueError:
+        return {'error': 'container security configuration is unavailable'}
+
+
+def matches_boundary_security(observed, image):
+    capabilities = {str(value).removeprefix('CAP_') for value in observed.get('cap_add') or []}
+    return (observed.get('image') == image and observed.get('network') == 'none'
+            and observed.get('readonly_root') is True and observed.get('privileged') is False
+            and observed.get('user') == f'{os.getuid()}:{os.getgid()}'
+            and capabilities == {'SYS_ADMIN', 'SYS_PTRACE'}
+            and not observed.get('cap_drop')
+            and 'seccomp=unconfined' in (observed.get('security_options') or []))
 
 
 def replay_project_path(payload):
@@ -160,6 +206,8 @@ class DockerVerifier:
                                'session': Path(__file__).parent.parent.joinpath('session_replay.py').read_text(),
                                'runtime_identity': Path(__file__).parent.parent.joinpath('repair_runtime_identity.py').read_text(),
                                'replay_environment': Path(__file__).with_name('replay_environment.py').read_text(),
+                               'confinement_probe': Path(__file__).with_name('replay_confinement.py').read_text(),
+                               'verifier': verifier_identity(),
                                'isolation_profiles': {profile: isolation_arguments(profile)
                                                       for profile in ('standard', 'sandbox')},
                                'boundary_profile': 'sandbox',
@@ -383,6 +431,8 @@ class DockerVerifier:
         target, source, output = base / 'target', base / 'source', base / 'result'
         project_path = replay_project_path(payload)
         before = evidence_identity(frozen_target)
+        verifier = {**verifier_identity(), 'image': self.image, 'profile': 'sandbox',
+                    'isolation_arguments': isolation_arguments('sandbox')}
         custody = {'clear': True}
         with execution_lease(base), disposable_source(snapshot, source, cleanup=lambda: custody['clear']):
             output.mkdir(exist_ok=True)
@@ -395,6 +445,7 @@ class DockerVerifier:
                     (target / '.git/objects/info/alternates').unlink(missing_ok=True)
                 environments = prepare_environment(self.root / 'replay-environments', frozen_target, payload)
                 atomic_json(output / 'request.json', {**payload, 'commit': git(source, 'rev-parse', 'HEAD'),
+                                                     'verifier_runtime': verifier,
                                                      'replay_environments': [item.describe() for item in environments],
                                                      '_replay_project': str(project_path)})
                 command = ['docker', 'run', '--init', '--name', name, *labels(self.root, identity, kind='verification'), '--network', 'none', '--read-only',
@@ -408,13 +459,17 @@ class DockerVerifier:
                     '--mount', f'type=bind,src={output},dst=/result']
                 for environment in environments:
                     command += ['--mount', f'type=bind,src={environment.root},dst={environment.prefix},readonly']
+                command += ['--mount', 'type=bind,src=' + str(Path(__file__).resolve().parents[2])
+                            + ',dst=/opt/repair/controller,readonly']
                 for script in (Path(__file__).with_name('boundary_driver.py'),
+                               Path(__file__).with_name('replay_confinement.py'),
                                Path(__file__).parent.parent / 'session_replay.py',
                                Path(__file__).parent.parent / 'repair_runtime_identity.py'):
                     command += ['--mount', f'type=bind,src={script},dst=/opt/repair/{script.name},readonly']
                 custody['clear'] = False
                 code, text = run([*command, self.image, 'python', '/opt/repair/boundary_driver.py'],
                                  cancel=cancel, timeout=self.timeout, output=base / 'output.log')
+                security = container_security(name)
                 try: observed = json.loads((output / 'boundary.json').read_text())
                 except (OSError, ValueError): observed = {'ok': False, 'error': text[-4000:]}
                 for environment in environments:
@@ -424,6 +479,14 @@ class DockerVerifier:
                           'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
                           'observed': observed, 'output': str(base / 'output.log'), 'returncode': code}
                 result['environment_inputs'] = [item.describe() for item in environments]
+                result['verifier_runtime'] = {**verifier, 'container_security': security}
+                if result['ok'] and not matches_boundary_security(security, self.image):
+                    result.update(ok=False, infrastructure=True,
+                                  reason='Actual recovery container differs from the trusted isolation profile')
+                if (result['ok'] and payload.get('invocation', {}).get('session_id')
+                        and observed.get('confinement_probe', {}).get('ok') is not True):
+                    result.update(ok=False, infrastructure=True,
+                                  reason='Trusted recovery driver did not attest confinement')
                 failure = observed.get('recovery_observation', {}).get('current_failure', {})
                 if failure.get('diagnostic', {}).get('failure_kind') == 'verification_confinement':
                     result.update(ok=False, infrastructure=True, reason=failure.get('result')
@@ -441,6 +504,7 @@ class DockerVerifier:
             except EnvironmentUnavailable as error:
                 result = {'ok': False, 'infrastructure': True, 'reason': str(error),
                           'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
+                          'verifier_runtime': verifier,
                           'output': str(base / 'output.log')}
                 atomic_json(base / 'boundary.json', result)
                 return result
