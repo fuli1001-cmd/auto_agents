@@ -38,6 +38,8 @@ def main() -> dict[str, object]:
     boundary_state = {}
     boundary_kind = ''
     before_child = {}
+    before_parent = {}
+    parent_boundary_state = {}
     classifications = []
 
     classify = session_verification._session_reference_kind
@@ -78,6 +80,8 @@ def main() -> dict[str, object]:
         try:
             return drive(self, session, state, workflow, root=root)
         finally:
+            if state.session_id == before_parent.get('session_id'):
+                parent_boundary_state.update(state.to_dict())
             frames.pop()
 
     parent_phase = Session._phase_collab_loop
@@ -122,6 +126,11 @@ def main() -> dict[str, object]:
     project = Path(target)
     try:
         runtime_report = identity['observe_engine'](engine, expected_commit=approved.get('engine_commit'))
+        from auto_agents.workflow_chain import WorkflowStore
+        initial = load_session_state(project, session_id)
+        root_ref = WorkflowStore(project).load(initial.workflow_id).root if initial.workflow_id else None
+        parent_id = root_ref.native_id if root_ref and root_ref.kind in {'collab', 'fix'} else session_id
+        before_parent.update(load_session_state(project, parent_id).to_dict())
         # Older revisions have no recovery preflight; exercise their real load.
         import auto_agents.cli as cli
         prepare = getattr(cli, "_prepare_explicit_session", None)
@@ -199,6 +208,20 @@ def main() -> dict[str, object]:
                     'current_attempt', 'attempt_epoch', 'attempts_since_progress', 'max_attempts'))
                 preserved &= bool(rechecked and binding)
                 preserved &= recovery['previous_failure'] in after['execution_log']
+            budgets = ('current_attempt', 'attempt_epoch', 'attempts_since_progress', 'max_attempts', 'hard_ceiling')
+            parent_after = parent_boundary_state or load_session_state(project, before_parent['session_id']).to_dict()
+            parent_preserved = bool(before_parent) and all(parent_after.get(key) == before_parent.get(key)
+                for key in (*budgets, 'session_id', 'workflow_id', 'goal', 'goal_execution_environment',
+                            'authorization_policy', 'auto_approve', 'full_verify'))
+            parent_preserved &= (parent_after['execution_log'][:len(before_parent['execution_log'])]
+                                 == before_parent['execution_log'])
+            recovery.update(parent_session_id=before_parent['session_id'],
+                parent_constraints_preserved=parent_preserved, child_constraints_preserved=bool(preserved),
+                parent_budget={'before': {k: before_parent.get(k) for k in budgets},
+                               'after': {k: parent_after.get(k) for k in budgets}},
+                child_budget={'before': {k: before_child.get(k) for k in budgets},
+                              'after': {k: after.get(k) for k in budgets}})
+            preserved &= parent_preserved
             entered = (boundary_state.get('session_id') == child_id
                        and boundary_kind == 'implementation' and after['status'] == 'executing'
                        and bool(binding))

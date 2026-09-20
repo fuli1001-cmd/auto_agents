@@ -291,8 +291,15 @@ class Controller:
 
     def _review(self, identity, snapshot, cancel=None):
         from .scope import changes as changed_hunks
+        from .review_evidence import recovery_evidence
         changes = changed_hunks(snapshot, self.request.engine_base, self.state.get('integration_parents', [])) if self.scope is not None else None
-        inputs = [self.state['request_digest'], identity, self.state.get('verification_runtime'), self.state['failures']]
+        recovery = recovery_evidence(self, identity)
+        if hasattr(self.driver, 'set_review_evidence'):
+            mounted = self.driver.set_review_evidence(
+                self.store.root / recovery['artifact']['path'] if recovery is not None else None)
+            if recovery is not None and mounted:
+                recovery['file'] = '/repair-recovery/boundary.json'
+        inputs = [self.state['request_digest'], identity, self.state.get('verification_runtime'), self.state['failures'], recovery]
         if self.scope is not None: inputs.append(self.scope.current())
         key = digest(inputs)
         if self.state.get('review_input') == key and self.state.get('review'):
@@ -312,6 +319,12 @@ class Controller:
             'Every finding must name one supplied requirement identity. APPROVE requires no findings.\n'
             + self.context() + '\nOriginal baseline: ' + self.request.engine_base
             + '\nPlan context (not acceptance evidence):\n' + self.store.read(self.state['plan'])['text'])
+        if recovery is not None:
+            prompt += ('\nCONTROLLER RECOVERY EVIDENCE (observed on this candidate, not plan prose):\n'
+                       + json.dumps(recovery, ensure_ascii=False)
+                       + '\nCheck these observations against the retained scene and code. They bind the source, '
+                       'scene digest, runtime and original parent/child identities. Passing recovery alone does '
+                       'not establish other requirements; do not infer missing recovery fields from a success flag.')
         from .context import source_context
         prompt += '\nCURRENT SOURCE AND DIFF:\n' + source_context(snapshot, self.request.engine_base)
         prompt += ('\nUse this exact source and diff for review; retrieve additional dependencies only as needed. '

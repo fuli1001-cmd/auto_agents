@@ -75,6 +75,7 @@ class AgentSandbox:
     def __init__(self, root, image, *, kind='codex', evidence=None):
         self.root, self.image, self.kind = Path(root), image, kind
         self.evidence = Path(evidence).resolve() if evidence is not None else None
+        self.recovery_evidence = None
 
     def home(self, role):
         from .storage import require_space
@@ -151,6 +152,8 @@ class AgentSandbox:
                 argv += ['--mount', 'type=bind,src=' + str(root / '.git') + ',dst=' + str(root / '.git') + ',readonly']
             if self.evidence is not None:
                 argv += ['--mount', f'type=bind,src={self.evidence},dst=/repair-evidence,readonly']
+            if role == 'review' and self.recovery_evidence is not None:
+                argv += ['--mount', f'type=bind,src={self.recovery_evidence},dst=/repair-recovery/boundary.json,readonly']
             # Executables are public, read-only tool inputs; no host home is mounted.
             mounts = set()
             selected = {'codex': None, 'claude-code': 'claude', 'copilot-cli': 'copilot', 'antigravity': 'agy'}[self.kind]
@@ -202,6 +205,12 @@ class NativeDriver:
         if not self.binary: raise RepairBlocked('provider_missing', config.binary + ' is unavailable')
         if config.kind not in ('codex', 'claude-code', 'copilot-cli', 'antigravity'):
             raise RepairBlocked('provider_unsupported', 'V2 has no native driver for ' + config.kind)
+
+    def set_review_evidence(self, path):
+        if self.sandbox is None:
+            return False
+        self.sandbox.recovery_evidence = Path(path).resolve() if path is not None else None
+        return path is not None
 
     def identity(self):
         from .store import digest

@@ -252,3 +252,17 @@ migrations continue to require the project lifecycle lock.
 Recovery validation must reach the retained child's implementation boundary (or
 a verified completion), preserving its constraints. A parent diagnostic turn,
 an unchanged old failure or the disappearance of one error is insufficient.
+
+A failed collab parent may have saved an engine route reply before creating an
+active handoff. Resume parses that reply through the normal route parser and
+checks its exact accepted receipt before ordinary epoch accounting. The recovery
+report captures the workflow parent before public resume, then compares both
+parent and child budgets, authorization, goal and history at the child boundary.
+A successful child entry cannot hide a changed parent budget.
+
+Independent review receives the matching controller recovery observation inline
+and the full immutable artifact mounted read-only at
+`/repair-recovery/boundary.json`. Its source, runtime and scene bindings participate
+in review cache identity. An old snapshot or runtime report is not supplied as
+current evidence, and a successful recovery observation does not waive other
+acceptance requirements.

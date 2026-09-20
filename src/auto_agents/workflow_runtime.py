@@ -300,7 +300,7 @@ class WorkflowCoordinator:
                 f"session {session_id} is {state.mode}, not {session.mode}"
             )
         authority_valid = session._retain_resume_authority(state)
-        engine_resume = authority_valid and self._pending_engine_resume(state)
+        engine_resume = authority_valid and self._pending_engine_resume(state, session)
         self._preserve_engine_resume_budget = bool(engine_resume)
         # Retain explicitly requested policies even when missing authority
         # blocks execution. Policy persistence cannot supply that authority.
@@ -386,7 +386,7 @@ class WorkflowCoordinator:
         self._resume_blocked_engine_handoff(state, snapshot)
         return self._drive_session(session, state, snapshot, root=True)
 
-    def _pending_engine_resume(self, state):
+    def _pending_engine_resume(self, state, session=None):
         """Admit a bound engine return before ordinary resume resets budgets."""
         if not state.workflow_id or state.status == 'completed':
             return False
@@ -397,6 +397,27 @@ class WorkflowCoordinator:
                 return False
             parent = load_session_state(self.project_root, snapshot.root.native_id)
         handoff_id = parent.active_handoff_id
+        if not handoff_id and parent.mode == 'collab' and parent.conversation:
+            # Repair can interrupt route dispatch before a handoff is written.
+            # Inspect the exact pending reply before resetting the parent's
+            # epoch; normal dispatch will still enforce the same receipt.
+            from .session import Session
+            parser = session or Session(self.orch, mode=parent.mode)
+            latest = parent.conversation[-1]
+            if (str(latest.get('role', '')).strip().lower() in {'agent', 'assistant'}
+                    and parser._goal_environment_confirmed(parent)):
+                route, error = parser._parse_workflow_route(str(latest.get('content', '')))
+                if not error and route and str(route.get('target', '')).strip() == 'fix':
+                    try:
+                        payload = parser._fix_workflow_payload(route)
+                    except ValueError:
+                        payload = {}
+                    from .execution_binding import repository_binding_error
+                    if payload and repository_binding_error(self.project_root, payload):
+                        child_id = self._engine_child_id(payload, snapshot)
+                        if (child_id and (not state.parent_handoff_id or child_id == state.session_id)
+                                and self._execution_binding_result(payload).get('resolution') == 'verified_engine_repair'):
+                            return True
         if not handoff_id and parent.status == 'blocked' and parent.resolution in {
                 'execution_binding_mismatch', 'verification_ownership', 'verification_execution_binding'}:
             reference = Path(parent.last_child_result_ref)

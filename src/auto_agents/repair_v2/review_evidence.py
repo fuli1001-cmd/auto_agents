@@ -1,0 +1,32 @@
+"""Controller-produced recovery observations supplied to independent review."""
+
+
+def recovery_evidence(controller, identity):
+    reference = controller.state.get('boundary_preflight')
+    if not reference:
+        return None
+    report = controller.store.read(reference)
+    if (report.get('snapshot') != identity
+            or report.get('runtime', '') != controller.state.get('verification_runtime', '')):
+        return None
+    cases = []
+    for case in report.get('cases', [report]):
+        observed = case.get('observed', {})
+        runtime = observed.get('engine_runtime', {})
+        recovery = observed.get('recovery_observation', {})
+        cases.append({
+            'ok': case.get('ok'), 'snapshot': case.get('snapshot'),
+            'target_digest': case.get('target'), 'runtime': case.get('runtime'),
+            'route_consumed': observed.get('route_consumed'),
+            'error': observed.get('error'),
+            'engine_runtime': {key: runtime.get(key) for key in ('ok', 'commit', 'runtime_root', 'mismatches')},
+            'recovery_observation': {key: recovery.get(key) for key in (
+                'workflow_id', 'original_handoff_id', 'child_session_id', 'parent_session_id',
+                'boundary_kind', 'boundary_session_id', 'preflight_started', 'preflight_rechecked',
+                'preflight_outcome', 'new_preflight_events', 'diagnostic_origin',
+                'parent_budget', 'child_budget', 'parent_constraints_preserved',
+                'child_constraints_preserved', 'retained_constraints', 'diagnostic_provider_calls',
+                'task_scope', 'ok')},
+        })
+    return {'artifact': reference, 'ok': report.get('ok'), 'snapshot': identity,
+            'runtime': report.get('runtime'), 'cases': cases}

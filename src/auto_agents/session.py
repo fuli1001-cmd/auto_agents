@@ -1578,13 +1578,8 @@ class Session:
             "NEED_USER_ASSIST, or GOAL_ACHIEVED marker instead."
         )
 
-    def _route_collab_workflow_reply(
-        self,
-        state: SessionState,
-        reply: str,
-    ) -> Tuple[Optional[SessionState], str]:
-        """Normalize and validate every workflow route accepted by collab."""
-
+    def _parse_workflow_route(self, reply):
+        """Read the same saved route before resume accounting and dispatch."""
         route, error = self._parse_protocol_json(
             _ROUTE_WORKFLOW,
             reply,
@@ -1597,6 +1592,32 @@ class Session:
                 version="v1",
                 label="ROUTE_WORKFLOW v1",
             )
+        return route, error
+
+    @staticmethod
+    def _fix_workflow_payload(route):
+        raw = route.get('issue_seed', {})
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError('ROUTE_WORKFLOW v1 issue_seed must be a JSON object.')
+        seed = dict(raw)
+        seed.setdefault('summary', str(route.get('summary', '')))
+        seed.setdefault('reason', str(route.get('reason', '')))
+        payload = {'issue_seed': seed}
+        if 'target_repository' in route:
+            payload['target_repository'] = route['target_repository']
+        if isinstance(route.get('necessity'), dict):
+            payload['necessity'] = route['necessity']
+        return payload
+
+    def _route_collab_workflow_reply(
+        self,
+        state: SessionState,
+        reply: str,
+    ) -> Tuple[Optional[SessionState], str]:
+        """Normalize and validate every workflow route accepted by collab."""
+        route, error = self._parse_workflow_route(reply)
         if error:
             return None, error
         if route is None:
@@ -1644,15 +1665,10 @@ class Session:
                 return None, resume_error
             payload = {"resume_handoff_id": resume_id}
         elif target == "fix":
-            raw_issue_seed = route.get("issue_seed", {})
-            if raw_issue_seed is None:
-                raw_issue_seed = {}
-            if not isinstance(raw_issue_seed, dict):
-                return None, "ROUTE_WORKFLOW v1 issue_seed must be a JSON object."
-            issue_seed = dict(raw_issue_seed)
-            issue_seed.setdefault("summary", str(route.get("summary", "")))
-            issue_seed.setdefault("reason", str(route.get("reason", "")))
-            payload = {"issue_seed": issue_seed}
+            try:
+                payload = self._fix_workflow_payload(route)
+            except ValueError as error:
+                return None, str(error)
         else:
             raw_spec_seed = route.get("spec_seed")
             if not isinstance(raw_spec_seed, dict) or not raw_spec_seed:
