@@ -72,8 +72,9 @@ class AgentSandbox:
     Model endpoints use the configured proxy through Docker's host gateway.
     Verification runs separately without networking or provider credentials.
     """
-    def __init__(self, root, image, *, kind='codex'):
+    def __init__(self, root, image, *, kind='codex', evidence=None):
         self.root, self.image, self.kind = Path(root), image, kind
+        self.evidence = Path(evidence).resolve() if evidence is not None else None
 
     def home(self, role):
         from .storage import require_space
@@ -148,6 +149,8 @@ class AgentSandbox:
                 '-e', 'HOME=/agent-home', '-e', 'PYTHONDONTWRITEBYTECODE=1']
             if (root / '.git').exists():
                 argv += ['--mount', 'type=bind,src=' + str(root / '.git') + ',dst=' + str(root / '.git') + ',readonly']
+            if self.evidence is not None:
+                argv += ['--mount', f'type=bind,src={self.evidence},dst=/repair-evidence,readonly']
             # Executables are public, read-only tool inputs; no host home is mounted.
             mounts = set()
             selected = {'codex': None, 'claude-code': 'claude', 'copilot-cli': 'copilot', 'antigravity': 'agy'}[self.kind]

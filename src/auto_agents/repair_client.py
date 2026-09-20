@@ -244,6 +244,8 @@ def _repair_failure_detail(job, subscriber):
     detail = result.get("control_error") or result.get("error")
     if isinstance(detail, str) and detail.startswith('engine source merge requires resolution'):
         return '引擎版本合并存在冲突，请在详细日志所示隔离目录解决并提交后重试；日常工作区未改动'
+    if isinstance(detail, str) and 'workflow repair chain' in detail:
+        return '同一目标的自修复已达到累计上限；候选和失败现场已保留，需先处理剩余阻塞'
     known = {
         "engine workspace has uncommitted changes; commit them before self-repair or integration": "引擎工作区有未提交改动，请先提交，再运行或整合修复",
         "engine workspace branch changed; retained repair is waiting for integration": "引擎工作区已切换分支，修复提交已保留，等待整合到原分支",
@@ -266,6 +268,8 @@ def _repair_failure_detail(job, subscriber):
 
 def _repair_progress_message(job, subscriber, *, include_imported=True):
     state, workflow = job["state"], subscriber["state"]
+    if state == 'waiting_user' or workflow == 'waiting_user':
+        return '等待你选择下一步；当前不会继续调用模型'
     if workflow == "finished":
         return "原任务已完成"
     if "cancelled" in (state, workflow):
@@ -289,8 +293,12 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
             labels = {'plan': '正在统一规划修复', 'implement': '正在连续实施修复',
                       'audit': '正在检查既有测试是否完整保留',
                       'diagnose': '正在定向复核已知失败，尚未开始完整验收',
+                      'boundary_preflight': '正在先行验证原子任务恢复，尚未开始完整验收',
                       'validate': '正在集中验收：测试与独立审查并行',
                       'regression': '正在验证修复前后的行为差异',
+                      'baseline_comparison': '正在确认测试失败是否在修复前就已存在',
+                      'source_conflicts': '正在整合当前引擎版本与保留候选',
+                      'source_recheck': '正在用当前引擎重新检查原阻塞，尚未继续实施',
                       'boundary': '正在验证原会话恢复', 'deliver': '正在交付已验收引擎'}
             if phase == 'check_finished':
                 unit = progress.get('unit', '')
@@ -414,6 +422,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
         boundary = {"kind": "engine_route", "route_digest": digest(invocation["engine_route"])}
     source = auto_agents_repo_root()
     payload = {"project": str(Path(project).resolve()), "base": git(source, "rev-parse", "HEAD"),
+               "scope_receipt": getattr(orchestrator, '_repair_scope_receipt', None) if isinstance(error, EngineRepairRequired) else None,
                "symptom_key": symptom_key(error, project),
                "fingerprint": decision.fingerprint, "error": redact_incident_text(str(error)),
                "contract": (diagnosis.final.to_dict() if diagnosis else
@@ -427,6 +436,17 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                "provider": getattr(args, "provider", None) or getattr(orchestrator, "_current_provider", None) or getattr(orchestrator.config, "active_provider", None),
                "autonomy": getattr(args, "autonomy", None) or orchestrator.config.execution.autonomy.mode,
                "resume_argv": argv}
+    if diagnosis and getattr(diagnosis.final, 'necessity', None) and not payload['scope_receipt']:
+        from .repair_v2.scope import ScopeGuard, context
+        necessity = diagnosis.final.necessity
+        if necessity.get('decision') == 'skip':
+            from .scope_decisions import resume_original
+            return resume_original(orchestrator, project, None, args, lock, owner=context(project, payload)['owner'])
+        if necessity.get('decision') == 'required':
+            guard = ScopeGuard(Path(registration['config']['root']) / 'scope-inputs' / digest(invocation),
+                               payload, project, source)
+            reference = guard.admit(necessity)
+            payload['scope_receipt'] = guard.store.read(reference)
     # The request marker deliberately is not a valid RootCauseDiagnosis. An
     # old immutable worker that cannot fetch a newer runtime must fail closed,
     # rather than treating diagnosis=None as permission for legacy repair.
@@ -454,6 +474,28 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
             status = response["job"]["state"]
             job = response["job"]["id"]
             subscriber = next(item for item in response["subscribers"] if item["id"] == registration["subscriber"])
+            if response['job'].get('state') == 'skipped' and response['job'].get('result', {}).get('return_goal'):
+                from .scope_decisions import resume_original
+                return resume_original(orchestrator, project, None, args, lock,
+                                       owner=response['job']['result']['return_goal'])
+            pending = subscriber['payload'].get('pending_decision') or {}
+            if subscriber['state'] == 'waiting_user' and pending:
+                from .scope_decisions import Decisions, choose, resume_original
+                question = Decisions(project).read(pending['id'])
+                choice = choose(orchestrator, question)
+                if choice is None:
+                    rpc(registration['config'], {'op': 'detach-decision', 'subscriber': subscriber['id'],
+                                                 'decision': question['id']})
+                    _report_repair_progress(project, '进度已保存。再次运行同一会话即可回答这个问题并继续。')
+                    return 3
+                answered = rpc(registration['config'], {'op': 'answer-decision', 'subscriber': subscriber['id'],
+                    'decision': question['id'], 'decision_version': question['version'], 'answer': choice[0], 'user_text': choice[1]})
+                if answered.get('resume_original'):
+                    return resume_original(orchestrator, project, question['id'], args, lock)
+                if choice[0] == 'keep' and pending.get('source') == 'repair':
+                    _report_repair_progress(project, '已保留原范围。本次执行暂停，修复候选已保存。')
+                    return 3
+                continue
             prefix = f"Self-repair {job[:8]}："
             log_path = f"详细日志：{registration['config']['root']}/jobs/{job}"
             message = _repair_progress_message(response["job"], subscriber, include_imported=False)
@@ -513,8 +555,9 @@ def boundary_event(kind, **details):
         return
     from .self_repair import auto_agents_repo_root
     try:
-        rpc(json.loads(Path(configured).read_text()), {"op": "boundary", "subscriber": subscriber,
+        response = rpc(json.loads(Path(configured).read_text()), {"op": "boundary", "subscriber": subscriber,
             "kind": kind, "details": details, "pid": os.getpid(), "runtime": str(auto_agents_repo_root())})
+        return bool(response.get('accepted'))
     except (OSError, RuntimeError, ValueError):
         pass
 

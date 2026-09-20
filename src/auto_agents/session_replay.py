@@ -36,6 +36,7 @@ def main() -> dict[str, object]:
                                for source in route_sources(expected_route))
     frames = []
     boundary_state = {}
+    boundary_kind = ''
     before_child = {}
     classifications = []
 
@@ -52,11 +53,22 @@ def main() -> dict[str, object]:
         pass
 
     def no_provider(*args, **kwargs):
+        nonlocal boundary_kind
+        boundary_kind = 'provider'
         if frames:
             boundary_state.update(frames[-1].to_dict())
         raise NextProviderBoundary()
 
     def before_attempt(state):
+        # Do not spend live provider budget in an offline proof. Continue until
+        # all real preflight/ownership checks before the writer have run.
+        pass
+
+    def before_agent(self, state, label, prompt):
+        nonlocal boundary_kind
+        import re
+        boundary_kind = ('implementation' if state.mode == 'fix' and re.fullmatch(r'fix-\d+', label)
+                         else 'diagnosis')
         boundary_state.update(state.to_dict())
         raise NextProviderBoundary()
 
@@ -70,6 +82,7 @@ def main() -> dict[str, object]:
 
     parent_phase = Session._phase_collab_loop
     def observe_parent_phase(self, state):
+        nonlocal boundary_kind
         if recovery['required'] and before_child:
             child = load_session_state(project, before_child['session_id'])
             if child.status in {'blocked', 'failed'}:
@@ -77,7 +90,7 @@ def main() -> dict[str, object]:
                 # the diagnostic create a new parent baseline before the
                 # parent's next provider call. This boundary cannot pass the
                 # child-entry and fresh-preflight checks below.
-                recovery['boundary_kind'] = 'blocked_child_return'
+                boundary_kind = 'blocked_child_return'
                 boundary_state.update(state.to_dict())
                 raise NextProviderBoundary()
         return parent_phase(self, state)
@@ -122,6 +135,7 @@ def main() -> dict[str, object]:
         with ExitStack() as patches:
             patches.enter_context(patch.object(Orchestrator, '_call_with_failover', no_provider))
             patches.enter_context(patch.object(Session, '_record_agent_attempt', staticmethod(before_attempt)))
+            patches.enter_context(patch.object(Session, '_call_agent', before_agent))
             patches.enter_context(patch.object(WorkflowCoordinator, '_drive_session', observe_drive))
             patches.enter_context(patch.object(Session, '_phase_collab_loop', observe_parent_phase))
             patches.enter_context(patch.object(repair_client, 'engine_route', observe_route))
@@ -186,10 +200,12 @@ def main() -> dict[str, object]:
                 preserved &= bool(rechecked and binding)
                 preserved &= recovery['previous_failure'] in after['execution_log']
             entered = (boundary_state.get('session_id') == child_id
-                       and after['status'] in {'executing', 'conversing'})
+                       and boundary_kind == 'implementation' and after['status'] == 'executing'
+                       and bool(binding))
             completed = (after['status'] == 'completed' and binding
                          and after.get('candidate_custody', {}).get('receipt'))
             recovery.update(preflight_rechecked=rechecked, retained_constraints=bool(preserved),
+                            boundary_kind=boundary_kind,
                             preflight_outcome='passed' if rechecked and not recovery['current_failure'] else 'not_passed',
                             ok=bool(preserved and (entered or completed)
                                     and not recovery.get('identity_error')))

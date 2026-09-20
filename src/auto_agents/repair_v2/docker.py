@@ -298,6 +298,10 @@ class DockerVerifier:
         self.remember_timings(result.checks)
         return result
 
+    def compare_baseline(self, identity, snapshot, base_repository, base_commit, validation, cancel):
+        from .comparison import compare
+        return compare(self, identity, snapshot, base_repository, base_commit, validation, cancel)
+
     def regression(self, snapshot_id, snapshot, base_repository, base_commit, coverage, cancel):
         """Run current behavioral tests against original production code."""
         from .workspace import Workspace, git
@@ -402,6 +406,12 @@ class DockerVerifier:
                 result = {'ok': code == 0 and observed.get('ok') is True and before == after,
                           'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
                           'observed': observed, 'output': str(base / 'output.log'), 'returncode': code}
+                failure = observed.get('recovery_observation', {}).get('current_failure', {})
+                detail = str(failure.get('result', ''))
+                if (failure.get('failure_kind') == 'verification_execution_binding'
+                        and detail.startswith(('verification conda environment does not exist:',
+                                               'verification interpreter does not exist:'))):
+                    result.update(infrastructure=True, reason=detail)
                 atomic_json(base / 'boundary.json', result)
                 return result
             finally:

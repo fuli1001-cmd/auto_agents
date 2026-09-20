@@ -13,6 +13,7 @@ from .providers import AgentSandbox, NativeDriver
 from .store import Store, atomic_json, digest
 from .transaction import bind_controller, frozen_request, transaction_lock, transaction_root
 from .types import RepairBlocked
+from .chain import RepairChain
 from .workspace import Workspace, git, source_identity
 
 
@@ -46,6 +47,8 @@ def _boundaries(verifier, root, identity, source, payload, cancel):
         results.append(verifier.boundary(identity, source, case.parent / 'target',
                                          json.loads(case.read_text()), cancel))
     return {'ok': all(r['ok'] for r in results), 'snapshot': identity, 'runtime': verifier.runtime,
+            'infrastructure': any(r.get('infrastructure') for r in results),
+            'reason': '; '.join(r.get('reason', '') for r in results if r.get('infrastructure')),
             'cases': results, 'observed': [r.get('observed', {}) for r in results]}
 
 
@@ -69,10 +72,13 @@ def _components(request, root, accepted, workspace, python):
     from . import images
     images.pin(verifier.image, root)
     images.maintain()
-    sandbox = AgentSandbox(root / 'provider-state', verifier.image)
+    from .diagnostic_evidence import prepare
+    evidence, evidence_context = prepare(root, json.loads((root / 'original-payload.json').read_text()))
+    sandbox = AgentSandbox(root / 'provider-state', verifier.image, evidence=evidence)
     driver = NativeDriver(configured.providers[provider], sandbox,
                           effort=configured.efforts.get('self_repair', 'deep'),
                           review_effort=configured.efforts.get('self_repair_review', 'max'))
+    driver.evidence_context = evidence_context
     return store, verifier, driver
 
 
@@ -87,6 +93,8 @@ def repair_entry(request):
     if job['payload'].get('autonomy') == 'off':
         return {'ok': False, 'engine': 'v2', 'status': 'disabled', 'error': 'autonomous self-repair is disabled'}
     root = transaction_root(config, job['payload'])
+    chain = RepairChain(config, job['payload'], root)
+    chain.admit()
     pinned = _fixed_controller(request, root)
     with transaction_lock(root):
         from ..artifact_runtime import track
@@ -96,12 +104,21 @@ def repair_entry(request):
         binding = Path(config['root']) / 'jobs' / job['id'] / 'v2-transaction.json'
         atomic_json(binding, {'root': str(root)})
         selected_file = root / 'source-selection.json'
+        first_selection = not selected_file.exists()
         if selected_file.exists():
             selected = json.loads(selected_file.read_text())
         else:
             selected = repository.select_source(job['payload']['base'])
             atomic_json(selected_file, selected)
-        atomic_json(binding.parent / 'source-selection.json', selected)
+        # The transaction's selection is its immutable acceptance baseline.
+        # Each new job generation must separately observe the current engine.
+        current_file = binding.parent / f"source-selection-g{job['generation']}.json"
+        if current_file.exists():
+            current = json.loads(current_file.read_text())
+        else:
+            current = selected if first_selection else repository.select_source(job['payload']['base'])
+            atomic_json(current_file, current)
+        atomic_json(binding.parent / 'source-selection.json', current)
         revision = selected['revision']
         checkout = repository.worktree(revision, 'v2-base-' + revision[:20])
         # Build the host Python environment only from the trusted controller.
@@ -136,17 +153,27 @@ def repair_entry(request):
         workspace = Workspace(root / 'workspace', checkout, accepted.engine_base,
                               retained=old['source'] if old else None)
         store, verifier, driver = _components(request, root, accepted, workspace, python)
+        from .scope import ScopeGuard
+        scope = ScopeGuard(root, job['payload'], target, checkout)
+        scope.import_receipt(job['payload'].get('scope_receipt'))
         controller = Controller(accepted, store, workspace, driver, verifier,
+            chain=chain, preflight_boundary=True, scope=scope,
             units=lambda source: verifier.suite_units(source, accepted) if hasattr(verifier, 'suite_units') else acceptance_units(source, accepted), resume_token=f"{job['id']}:{job['generation']}",
             allow_implementation=job['payload'].get('autonomy') == 'max',
             regression=lambda i, s, coverage, c: verifier.regression(i, s, checkout, accepted.engine_base, coverage, c),
             boundary=lambda identity, source, cancel: _boundaries(verifier, root, identity, source,
                 json.loads((root / 'original-payload.json').read_text()), cancel))
         controller.recover_verified_progress()
-        controller.recover_corrected_source(implementation, pinned['commit'])
+        corrected = controller.recover_corrected_source(implementation, pinned['commit'])
+        if not corrected:
+            corrected = controller.recover_corrected_source(repository.cache, current['revision'])
+        from .source_refresh import prepare
+        prepare(controller, repository.cache, current['revision'], force_check=corrected)
         state = controller.run()
         if state['status'] != 'ready':
             return {'ok': False, 'engine': 'v2', 'status': 'v2_' + state['status'],
+                    'return_goal': scope.context['owner'] if state['status'] == 'skipped' else None,
+                    'pending_decision': state.get('pending_decision', '') if state['status'] == 'waiting_user' else '',
                     'error': state.get('blocker', {}).get('message', 'repair is not accepted'),
                     'v2_state': str(root / 'state.json'), 'v2_transaction': str(root)}
         approved = _approved(request, root, state, store, python, environment)
@@ -169,11 +196,12 @@ def _approved(request, root, state, store, python, environment):
             'v2_transaction': str(root),
             'v2_receipt': {'request': state['request_digest'], 'snapshot': state['snapshot'],
                            'reference': state['receipt'], 'store': str(root)},
-            'proof': 'V2 mandatory tests, independent review and original-boundary replay passed.',
+            'proof': 'Required behavior, no-new-failures acceptance, independent review and original-boundary replay passed.',
             'engine_full_proof': {'policy': 1, 'commit': commit, 'environment': environment, 'ok': True}}
 
 
 def verify_receipt(approved, *, expected_root=None):
+    from .comparison import accepted as validation_accepted
     marker = approved.get('v2_receipt') or {}
     root = Path(marker.get('store', '/__missing_v2_receipt__'))
     if expected_root is not None and root.resolve() != Path(expected_root).resolve():
@@ -183,10 +211,12 @@ def verify_receipt(approved, *, expected_root=None):
     if revoked.is_file() and marker['reference']['digest'] in json.loads(revoked.read_text()):
         raise RepairBlocked('invalid_acceptance', 'a live recovery counterexample invalidated this receipt')
     receipt = store.read(marker['reference'])
+    if (root / 'scope.json').exists() and not receipt.get('scope'):
+        raise RepairBlocked('invalid_acceptance', 'candidate lacks the current goal scope proof')
     validation, review = store.read(receipt['validation']), store.read(receipt['review'])
     accepted = json.loads((root / 'request.json').read_text())
     if (digest(accepted) != marker['request'] or receipt['request'] != marker['request']
-            or receipt['snapshot'] != marker['snapshot'] or not validation['ok'] or not review['ok']
+            or receipt['snapshot'] != marker['snapshot'] or not validation_accepted(store, receipt, accepted['engine_base']) or not review['ok']
             or review['findings'] or validation['snapshot'] != marker['snapshot']
             or review['snapshot'] != marker['snapshot']
             or source_identity(Path(approved['runtime'])) != marker['snapshot']):
@@ -194,6 +224,13 @@ def verify_receipt(approved, *, expected_root=None):
     requirements = {r['identity'] for r in accepted['acceptance']}
     from .controller import review_result
     verdict = review_result(review['text'], marker['snapshot'], requirements)
+    if receipt.get('scope'):
+        from .scope import POLICY, changes
+        scoped = store.read(receipt['scope'])
+        if scoped.get('policy') != POLICY or scoped.get('proposal', {}).get('decision') != 'required':
+            raise RepairBlocked('invalid_acceptance', 'repair scope receipt is invalid')
+        verdict = review_result(review['text'], marker['snapshot'], requirements,
+                                changes(Path(approved['runtime']), accepted['engine_base'], receipt.get('integration_parents', [])))
     passed = {node for check in validation['checks'] for node in check.get('passed', [])}
     if not verdict.ok or any(not any(p == n or p.startswith(n + '[') or p.startswith(n + '::') for p in passed)
                              for row in verdict.coverage for n in row['nodes']):
@@ -237,7 +274,12 @@ def deliver(request, approved, *, controller=None, _passes=0):
             base = repository.worktree(accepted.engine_base, 'v2-base-' + accepted.engine_base[:20])
             workspace = Workspace(root / 'workspace', base, accepted.engine_base)
             store, verifier, driver = _components(request, root, accepted, workspace, approved['python'])
+            chain = RepairChain(config, job['payload'], root)
+            chain.admit()
+            from .scope import ScopeGuard
             controller = Controller(accepted, store, workspace, driver, verifier,
+                chain=chain, preflight_boundary=True,
+                scope=ScopeGuard(root, job['payload'], root / 'target-evidence', base),
                 units=lambda s: verifier.suite_units(s, accepted) if hasattr(verifier, 'suite_units') else acceptance_units(s, accepted), resume_token=f"{job['id']}:{job['generation']}",
             allow_implementation=job['payload'].get('autonomy') == 'max',
                 regression=lambda i, s, coverage, c: verifier.regression(i, s, base, accepted.engine_base, coverage, c),
@@ -282,7 +324,7 @@ def validate_subscriber(request):
             RootCauseCoordinator._copy_diagnostic_tree(Path(subscriber['project']), evidence)
             result = verifier.boundary(approved['v2_receipt']['snapshot'], Path(approved['runtime']), evidence,
                                        subscriber['payload']['repair'], threading.Event())
-            if not result['ok']:
+            if not result['ok'] and not result.get('infrastructure'):
                 from .evidence import dissociate
                 case = root / 'counterexamples' / digest(result.get('observed', {}))
                 case.mkdir(parents=True, exist_ok=True)

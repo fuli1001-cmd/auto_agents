@@ -18,6 +18,10 @@ from auto_agents.repair_control import Store as ControlStore
 def repair_request(tmp_path):
     source, project, remote = tmp_path / 'engine', tmp_path / 'project', tmp_path / 'remote.git'
     source.mkdir(); project.mkdir()
+    session = project / '.auto-agents/state/sessions/existing-child/session_state.json'
+    session.parent.mkdir(parents=True)
+    session.write_text(json.dumps({'session_id': 'existing-child', 'goal': 'Restore the value to one',
+                                   'last_error': 'value is zero', 'mode': 'fix'}))
     git(source, 'init', '-q', '-b', 'master')
     (source / 'source.py').write_text('value = 0\n')
     (source / 'tests').mkdir()
@@ -46,7 +50,9 @@ class Driver:
     def __init__(self, after=None): self.calls, self.after = [], after
     def run(self, role, prompt, root, **kwargs):
         self.calls.append(role)
-        if role == 'plan': return AgentReply(True, 'Fix value across the complete repair_request.', 'writer')
+        if role == 'plan': return AgentReply(True, 'Fix value across the complete repair_request.\nREPAIR_SCOPE v1: ' + json.dumps({
+            'decision': 'required', 'blocked_step': 'read the value', 'consequence': 'zero blocks the requested value',
+            'evidence_refs': ['source.py'], 'recovery_check': 'value is one'}), 'writer')
         if role == 'implement':
             (Path(root) / 'source.py').write_text('value = 1\n')
             if self.after: self.after(); self.after = None
@@ -54,7 +60,11 @@ class Driver:
         # The frozen IDs come from the repair_request, never from a test-only alias.
         context = json.loads(prompt.split('\n')[1])
         identity = context['requirements'][0]['identity']
+        from auto_agents.repair_v2.scope import changes
+        base = git(root, 'rev-list', '--max-parents=0', 'HEAD')
         return AgentReply(True, json.dumps({'decision': 'APPROVE', 'findings': [],
+            'change_coverage': [{'change': key, 'requirement': identity, 'reason': 'restore the required value',
+                                 'evidence': 'test_value observes value one'} for key in changes(root, base, context.get('preserved_upstream', []))],
             'coverage': [{'requirement': identity, 'nodes': ['tests/test_value.py::test_value']}]}), 'reviewer')
 
 

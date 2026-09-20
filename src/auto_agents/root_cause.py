@@ -92,6 +92,7 @@ class RootCauseReport:
     proposed_fix_scope: List[str] = field(default_factory=list)
     verification_commands: List[str] = field(default_factory=list)
     resume_strategy: str = ""
+    necessity: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
         payload = asdict(self)
@@ -198,6 +199,7 @@ class RootCauseReport:
             raise ValueError("root-cause report requires causal_chain and evidence")
         return cls(
             role=role,
+            necessity=dict(payload.get('necessity') or {}),
             verdict=verdict,
             owner=owner,
             confidence=float(confidence),
@@ -1353,6 +1355,9 @@ class RootCauseCoordinator:
             ),
         }[role]
         schema = {
+            "necessity": {"decision": "required|needs_user|insufficient|skip", "blocked_step": "",
+                          "consequence": "", "evidence_refs": [], "recovery_check": "",
+                          "question": "", "suggestion": ""},
             "schema_version": ROOT_CAUSE_SCHEMA_VERSION,
             "role": role,
             "verdict": (
@@ -1405,6 +1410,11 @@ class RootCauseCoordinator:
                 "invocation_context. An ambient saved run is not the requested session's "
                 "failure unless a durable workflow/handoff relationship proves that binding. "
                 "A session/workflow repair must restore the original session entrypoint.",
+                "Fill necessity in this existing diagnosis: identify the original user's blocked step, "
+                "its inspectable evidence, consequence and recovery check. Reuse valid prior necessity "
+                "evidence; do not create a second diagnosis. Ignore unrelated old defects and improvements "
+                "entirely. Use needs_user only for changes to the authorized user goal or resuming another "
+                "task explicitly stopped by the user, with a simple question and concrete suggestion.",
                 f"Use no more than {self.config.max_dynamic_commands} diagnostic commands; "
                 f"each command must finish within {self.config.command_timeout_seconds} seconds.",
                 "Separate ownership of the visible symptom from ownership of the mechanism "
