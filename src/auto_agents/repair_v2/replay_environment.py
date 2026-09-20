@@ -1,4 +1,4 @@
-"""Private, content-bound Conda inputs for the offline recovery preflight."""
+"""Private, content-bound runtime inputs for the offline recovery preflight."""
 from dataclasses import dataclass
 import hashlib
 import errno
@@ -111,9 +111,10 @@ def prefixes(command, project):
     return result
 
 
-def inventory(root):
+def inventory(root, *, node=False):
     """Canonical internal links can be relocated without reading outside inputs."""
     root = Path(root).resolve()
+    label = 'Node 依赖' if node else 'Conda 环境'
     records, size = {}, 0
     for current, directories, files in os.walk(root, followlinks=False):
         # Activation state may contain credentials. Offline preflight uses the
@@ -123,12 +124,14 @@ def inventory(root):
         for name in [*files, *(n for n in directories if (Path(current) / n).is_symlink())]:
             path = Path(current) / name
             relative = path.relative_to(root).as_posix()
+            if node and (name == '.npmrc' or name == '.env' or name.startswith('.env.')):
+                continue
             if relative == 'conda-meta/state':
                 continue
             if path.is_symlink():
                 resolved = path.resolve()
                 if not resolved.is_relative_to(root):
-                    raise EnvironmentUnavailable('Conda 环境含有指向环境外部的链接，无法生成独立验证副本：' + relative)
+                    raise EnvironmentUnavailable(label + '含有指向环境外部的链接，无法生成独立验证副本：' + relative)
                 records[relative] = ['link', resolved.relative_to(root).as_posix()]
             elif path.is_file():
                 stat = path.stat()
@@ -139,7 +142,7 @@ def inventory(root):
                         value.update(chunk)
                 records[relative] = ['file', value.hexdigest(), stat.st_mode & 0o777]
             else:
-                raise EnvironmentUnavailable('Conda 环境含有不能复制的特殊文件：' + relative)
+                raise EnvironmentUnavailable(label + '含有不能复制的特殊文件：' + relative)
     return records, size
 
 
@@ -149,30 +152,42 @@ class Snapshot:
     source: Path
     root: Path
     identity: str
+    kind: str = 'conda-runtime-prefix'
 
     def describe(self):
+        if self.kind == 'node-dependencies':
+            return {'prefix': str(self.prefix), 'digest': self.identity, 'kind': self.kind,
+                    'credentials_included': False}
         return {'prefix': str(self.prefix), 'digest': self.identity, 'kind': 'conda-runtime-prefix',
                 'activation_state_included': False}
 
     def verify(self):
         if (self.root.is_symlink() or self.prefix.resolve() != self.source
-                or digest(inventory(self.root)[0]) != self.identity or digest(inventory(self.source)[0]) != self.identity):
-            raise EnvironmentUnavailable('验证期间 Conda 环境发生变化，需重新生成隔离环境输入。')
+                or digest(inventory(self.root, node=self.kind == 'node-dependencies')[0]) != self.identity
+                or digest(inventory(self.source, node=self.kind == 'node-dependencies')[0]) != self.identity):
+            label = 'Node 依赖' if self.kind == 'node-dependencies' else 'Conda 环境'
+            raise EnvironmentUnavailable('验证期间 ' + label + '发生变化，需重新生成隔离环境输入。')
 
 
-def capture(cache, prefix):
+def capture(cache, prefix, *, kind='conda-runtime-prefix'):
     cache = Path(cache).resolve()
     source = Path(prefix).resolve()
-    if not (source / 'conda-meta/history').is_file() or not (source / 'bin/python').is_file():
+    node = kind == 'node-dependencies'
+    label = 'Node 依赖' if node else 'Conda 环境'
+    if kind not in {'conda-runtime-prefix', 'node-dependencies'}:
+        raise EnvironmentUnavailable('未知的隔离验证依赖类型。')
+    if node and (Path(prefix).name != 'node_modules' or not source.is_dir()):
+        raise EnvironmentUnavailable('项目中实际的 Node 验证依赖不可用：' + str(prefix))
+    if not node and (not (source / 'conda-meta/history').is_file() or not (source / 'bin/python').is_file()):
         raise EnvironmentUnavailable('项目中实际的 Conda 环境不可用：' + str(prefix))
-    records, size = inventory(source)
+    records, size = inventory(source, node=node)
     identity = digest(records)
     destination = Path(cache) / identity / 'prefix'
     if destination.is_symlink() or destination.parent.is_symlink():
-        raise EnvironmentUnavailable('隔离 Conda 环境的存储路径被替换，不能用于验证。')
+        raise EnvironmentUnavailable('隔离 ' + label + '的存储路径被替换，不能用于验证。')
     if destination.exists():
-        if digest(inventory(destination)[0]) != identity:
-            raise EnvironmentUnavailable('保留的隔离 Conda 环境已被修改，不能用于验收。')
+        if digest(inventory(destination, node=node)[0]) != identity:
+            raise EnvironmentUnavailable('保留的隔离 ' + label + '已被修改，不能用于验收。')
     else:
         require_space(Path(cache), size)
         Path(cache).mkdir(parents=True, exist_ok=True)
@@ -187,26 +202,73 @@ def capture(cache, prefix):
                     path.symlink_to(os.path.relpath(staged / item[1], path.parent))
                 else:
                     shutil.copy2(source / name, path)
-            if inventory(staged)[0] != records or inventory(source)[0] != records:
-                raise EnvironmentUnavailable('复制期间 Conda 环境发生变化，当前副本不能用于验证。')
+            if inventory(staged, node=node)[0] != records or inventory(source, node=node)[0] != records:
+                raise EnvironmentUnavailable('复制期间 ' + label + '发生变化，当前副本不能用于验证。')
             atomic_json(temporary / 'manifest.json', {'digest': identity, 'files': records})
             try:
                 temporary.rename(destination.parent)
             except OSError as error:
                 if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                     raise
-                if destination.is_symlink() or digest(inventory(destination)[0]) != identity:
+                if destination.is_symlink() or digest(inventory(destination, node=node)[0]) != identity:
                     raise EnvironmentUnavailable('并发生成的隔离环境内容不一致。')
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)
-    return Snapshot(Path(prefix), source, destination, identity)
+    return Snapshot(Path(prefix), source, destination, identity, kind)
+
+
+def node_prefixes(target, payload):
+    """Provision declared discovery inputs without adopting their task scope."""
+    from ..gate_execution import dependency_link_paths
+    from ..execution_binding import test_invocations
+    target, project = Path(target), Path(payload['project'])
+    session_id = payload.get('invocation', {}).get('session_id')
+    if not isinstance(session_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', session_id):
+        return []
+    session_path = target / f'.auto-agents/state/sessions/{session_id}/session_state.json'
+    if (not session_path.is_file() or session_path.is_symlink()
+            or not session_path.resolve().is_relative_to(target.resolve())):
+        return []
+    steps, retained_commands = [], commands(target, payload)
+    for relative, field in (('.auto-agents/config.json', 'gates'),
+                            ('.auto-agents/state/task_plan.json', 'plan')):
+        path = target / relative
+        if not path.is_file():
+            continue
+        if path.is_symlink() or not path.resolve().is_relative_to(target.resolve()):
+            raise EnvironmentUnavailable('保留的验证配置离开了冻结现场。')
+        data = json.loads(path.read_text())
+        if field == 'gates':
+            gates = data.get('gates', {})
+            steps.extend(gates.get('steps', []))
+            retained_commands.extend(gates.get('commands', []))
+        else:
+            steps.extend(data.get('verification_steps', []))
+    required = any(step.get('runner') == 'vitest' for step in steps)
+    retained_commands.extend(step['command'] for step in steps if step.get('command'))
+    for command in retained_commands:
+        try:
+            required |= any(invocation.runner == 'vitest' for invocation in test_invocations(command))
+        except ValueError:
+            continue  # The original runner still diagnoses opaque commands.
+    if not required:
+        return []
+    selected = [project / relative for relative in dependency_link_paths(target)
+                if Path(relative).name == 'node_modules' and (project / relative).is_dir()]
+    if not selected:
+        raise EnvironmentUnavailable('保留的 Vitest 预检需要项目中已安装的 node_modules；离线恢复不安装或替换依赖。')
+    if any(',' in str(path) or '\n' in str(path) or '\r' in str(path) for path in selected):
+        raise EnvironmentUnavailable('Node 验证依赖路径不能安全挂载。')
+    return selected
 
 
 def prepare(cache, target, payload):
     project = Path(payload['project'])
     selected = {prefix for command in commands(target, payload) for prefix in prefixes(command, project)}
     try:
-        return [capture(cache, prefix) for prefix in sorted(selected)]
+        nodes = node_prefixes(target, payload)
+        return [*[capture(cache, prefix) for prefix in sorted(selected)],
+                *[capture(Path(cache) / 'node', prefix, kind='node-dependencies') for prefix in nodes]]
     except (OSError, ValueError) as error:
-        raise EnvironmentUnavailable('无法捕获 Conda 验证环境：' + str(error)) from error
+        raise EnvironmentUnavailable('无法捕获保留的验证环境：' + str(error)) from error

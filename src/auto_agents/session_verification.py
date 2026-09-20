@@ -856,7 +856,12 @@ def _retained_vitest_discovery(session, root, revision, invocation):
                 result = subprocess.run(argv, cwd=checkout, env=environment,
                                         capture_output=True, text=True, timeout=30)
             if result.returncode:
-                raise RunnerContextError('discovery', 'retained Vitest discovery failed', invocation.raw)
+                from .execution_recovery import redact_incident_text
+                error = RunnerContextError('discovery', 'retained Vitest discovery failed', invocation.raw)
+                error.diagnostic.update(returncode=result.returncode,
+                    stdout_tail=redact_incident_text(result.stdout)[-2000:],
+                    stderr_tail=redact_incident_text(result.stderr)[-2000:])
+                raise error
             payload = json.loads(Path(report_name).read_text())
             if not isinstance(payload, list):
                 raise RunnerContextError('discovery', 'retained Vitest report is invalid', invocation.raw)
