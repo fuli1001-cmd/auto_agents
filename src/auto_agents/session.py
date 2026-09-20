@@ -2240,7 +2240,19 @@ class Session:
                     from .repair_client import boundary_event
                     if not boundary_event('engine_child', **recovery,
                             binding_fingerprint=state.verification_binding.get('binding_fingerprint')):
-                        raise SessionOwnershipError('repair supervisor did not acknowledge child recovery')
+                        # A rejected control acknowledgement is not a product
+                        # defect or permission to ask the parent model to plan
+                        # more work. Retain this exact nonterminal handoff.
+                        restore_guard.cleanup()
+                        state.status = 'paused'
+                        state.resolution = 'engine_recovery_unacknowledged'
+                        state.resume_phase = 'executing'
+                        message = '恢复控制器尚未确认接管，已暂停原任务，不继续调用模型。'
+                        state.execution_log.append({'action': 'engine_recovery_unacknowledged',
+                            'attempt': state.current_attempt, 'result': message, 'timestamp': self._now()})
+                        self._save(state)
+                        self._print(message)
+                        return state
                     self._engine_recovery_context = None
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
             except SessionOwnershipError as error:

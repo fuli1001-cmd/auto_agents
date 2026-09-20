@@ -24,6 +24,12 @@ HANDOFF_TARGETS = {"fix", "run", "resume"}
 MAX_RESUME_DEPTH = 64
 
 
+class HandoffIdentityError(ValueError):
+    def __init__(self, message, diagnostic):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -475,7 +481,10 @@ class WorkflowStore:
                         raise ValueError('resume wrapper cannot introduce ' + key)
                     authorities[key] = value
         if len(child_ids) > 1 or '' in child_ids:
-            raise ValueError('resume chain names conflicting child identities')
+            bound = original.child.native_id if original.child else ''
+            raise HandoffIdentityError('resume chain names conflicting child identities', {
+                'handoff_id': original.handoff_id, 'session_id': bound,
+                'child_session_ids': ([bound] if bound in child_ids else []) + sorted(child_ids - {bound})})
         return chain
 
     def save_handoff(self, handoff: WorkflowHandoff) -> None:

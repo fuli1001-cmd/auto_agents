@@ -9,7 +9,21 @@ from .store import digest
 from .types import ValidationUnit
 from .workspace import Workspace, source_identity
 
-POLICY = 'no-new-failures-v2'
+POLICY = 'no-new-failures-v3'
+
+# Control-path invariants cannot be waived by reproducing an old failure.
+MANDATORY_FILES = frozenset({
+    'test_repair_recovery_contract.py', 'test_repair_v2_delivery.py', 'test_repair_runtime.py',
+    'test_repair_source_sync.py', 'test_session_replay_recovery.py',
+    'test_session_verification_ownership.py', 'test_session_review_regressions.py',
+    'test_engine_repair_child_resume.py', 'test_repair_chain.py', 'test_goal_scoped_repair.py',
+    'test_repair_scope_recovery.py', 'test_repair_control.py', 'test_engine_child_recovery.py',
+    'test_engine_reference_recovery.py',
+})
+
+
+def mandatory(node):
+    return Path(node.split('::', 1)[0]).name in MANDATORY_FILES
 
 
 def failure_message(message):
@@ -49,6 +63,8 @@ def signatures(report):
         if check.get('ok'):
             continue
         failed = set(check.get('failed', []))
+        if any(mandatory(node) for node in failed):
+            return None
         if (check.get('returncode') != 1 or check.get('source_unchanged') is not True
                 or str(check.get('unit', '')).startswith('required:')
                 or check.get('cancelled') or check.get('timed_out') or check.get('infrastructure')
@@ -121,7 +137,7 @@ def accepted(store, receipt, base=None):
     if validation.get('ok'):
         return True
     selected = receipt.get('comparison_base', base)
-    if selected != base and selected not in receipt.get('integration_parents', []):
+    if selected != base:
         return False
     reference = receipt.get('comparison')
     return bool(reference and verify(store.read(reference), validation, base=selected))
@@ -135,6 +151,8 @@ def compare(verifier, snapshot_id, snapshot, base_repository, base_commit, valid
     failures = {}
     unknown = []
     for check in raw.get('checks', []):
+        if any(mandatory(node) for node in check.get('failed', [])):
+            return proof
         observed = signatures({'checks': [check]})
         if observed is None and not str(check.get('unit', '')).startswith('required:'):
             unknown.append(check)

@@ -130,7 +130,10 @@ def test_remaining_failure_uses_fresh_evidence_not_historical_plan(repair_reques
         assert (Path(snapshot) / 'new_engine.txt').exists()
         sequence.append('boundary')
         return {'ok': (Path(snapshot) / 'source.py').read_text() == 'value = 1\n',
-                'snapshot': identity, 'observed': {'failure': 'CURRENT_REMAINING_FAILURE'}}
+                'snapshot': identity, 'observed': {'failure': 'CURRENT_REMAINING_FAILURE',
+                    'engine_runtime': {'ok': True}, 'recovery_observation': {
+                        'ok': False, 'parent_session_id': repair_request['job']['payload']['invocation']['session_id'],
+                        'child_session_id': 'bound-child'}}}
     verifier.boundary = boundary
     original = driver.run
     def run(role, prompt, *args, **kwargs):
@@ -145,7 +148,7 @@ def test_remaining_failure_uses_fresh_evidence_not_historical_plan(repair_reques
     assert sequence[:2] == ['boundary', 'implement'] and 'plan' not in sequence
 
 
-def test_existing_current_engine_failure_is_not_misclassified_against_obsolete_baseline(repair_request):
+def test_source_refresh_cannot_move_the_original_regression_baseline(repair_request):
     from dataclasses import asdict
     from auto_agents.repair_v2.comparison import POLICY
     from auto_agents.repair_v2.store import digest
@@ -163,8 +166,8 @@ def test_existing_current_engine_failure_is_not_misclassified_against_obsolete_b
         return ValidationResult(**raw)
     verifier.validate = validate
     def compare(identity, snapshot, repository, base, validation, cancel):
-        assert base == current and base != old
-        assert git(repository, 'show', base + ':source.py') == 'value = 1'
+        assert base == old and base != current
+        assert git(repository, 'show', base + ':source.py') == 'value = 0'
         return {'policy': POLICY, 'ok': True, 'snapshot': identity, 'base': base,
                 'validation_digest': digest(asdict(validation)), 'baseline_report': report('baseline'),
                 'unchanged_tests': ['tests/test_old.py::test_old']}
@@ -173,7 +176,11 @@ def test_existing_current_engine_failure_is_not_misclassified_against_obsolete_b
     result = execute(renewed(repair_request), driver, verifier)
     assert result['ok'], result
     assert driver.calls[len(calls):] == ['review']
-    assert integration.verify_receipt(result)['comparison_base'] == current
+    assert integration.verify_receipt(result)['comparison_base'] == old
+
+
+# Preserve the retained node ID while checking the corrected baseline contract.
+test_existing_current_engine_failure_is_not_misclassified_against_obsolete_baseline = test_source_refresh_cannot_move_the_original_regression_baseline
 
 
 def interrupted(job):

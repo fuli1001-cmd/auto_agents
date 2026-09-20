@@ -77,6 +77,46 @@ class RepairBlocked(RuntimeError):
         self.code = code
 
 
+@dataclass(frozen=True)
+class RuntimeArtifact:
+    artifact_id: str
+    path: str
+    commit: str
+    source: str
+    environments: Dict[str, Any]
+    format: str
+    version: int = 1
+
+
+@dataclass(frozen=True)
+class RecoveryContext:
+    request: str
+    invocation: Dict[str, Any]
+    boundary: Dict[str, Any]
+    scope: Dict[str, Any]
+    ledger: str
+    version: int = 1
+
+
+@dataclass(frozen=True)
+class PhaseProof:
+    stage: str
+    inputs: Dict[str, Any]
+    result: Dict[str, Any]
+    policy: int = 1
+
+
+@dataclass(frozen=True)
+class RepairFailure:
+    domain: str
+    code: str
+    owner: str
+    recover_at: str
+    message: str
+    evidence: Dict[str, Any]
+    version: int = 1
+
+
 class Cancellation:
     def __init__(self, parent, local): self.parent, self.local = parent, local
     def is_set(self): return self.parent.is_set() or self.local.is_set()

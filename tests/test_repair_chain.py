@@ -174,13 +174,22 @@ def recovering(tmp_path):
         route = p['invocation']['engine_route']
         p['boundary'] = {'kind': 'engine_route', 'route_digest': digest(route)}
         job = supervisor.store.submit(subscriber, p)
+        transaction = Path(config['root']) / 'v2-transactions' / 'test-transaction'
+        reference = {'path': 'acceptance.json', 'digest': 'accepted'}
+        Store(transaction).save({'status': 'ready', 'phase': 'activation', 'receipt': reference,
+            'recovery_operation': 'original-operation',
+            'recovery_owner': {'job': job, 'generation': 1, 'subscriber': subscriber, 'artifact_id': 'artifact'}})
         supervisor.store.transition(job, 'ready', {'engine': 'v2', 'ok': True, 'runtime': str(tmp_path),
-                                                  'commit': 'verified', 'status': 'repaired'})
+            'commit': 'verified', 'status': 'accepted', 'recovery_protocol': 1,
+            'source_delivery_needed': True, 'engine_full_proof': {'ok': False},
+            'v2_transaction': str(transaction), 'v2_receipt': {'reference': reference},
+            'runtime_artifact': {'artifact_id': 'artifact'}})
         with supervisor.store.connect() as db:
             db.execute("UPDATE subscribers SET state='resuming' WHERE id=?", (subscriber,))
         proof = {'ok': True, 'observed': {'recovery_observation': {'ok': True,
             'child_session_id': 'child', 'workflow_id': 'wf-parent', 'original_handoff_id': 'hf-original',
-            'preflight_rechecked': True, 'boundary_kind': 'implementation'}}}
+            'preflight_rechecked': True, 'boundary_kind': 'implementation', 'binding_fingerprint': 'writer-binding',
+            'activation_binding_fingerprint': 'bound'}}}
         atomic_json(Path(config['root']) / 'jobs' / job / f'validate-{subscriber}-g1-result.json',
                     {'ok': True, 'proof': json.dumps(proof)})
         try: yield supervisor, subscriber, job, p, tmp_path
@@ -203,8 +212,114 @@ def test_receipt_consumption_cannot_complete_or_publish_before_real_child_entry(
     request = {**common, 'op': 'boundary', 'kind': 'engine_child', 'runtime': str(root), 'details': details}
     assert not supervisor.dispatch(request, [])['accepted']
     details['session_id'] = 'child'
+    details['binding_fingerprint'] = 'wrong-binding'
+    assert not supervisor.dispatch(request, [])['accepted']
+    details['binding_fingerprint'] = 'bound'
     assert supervisor.dispatch(request, [])['accepted']
     assert supervisor.store.job(job)['state'] == 'completed'
+
+
+def test_operation_reservation_is_charged_once_even_after_restart(tmp_path):
+    config = {'root': str(tmp_path)}
+    p = payload(tmp_path); root = transaction_root(config, p)
+    first = RepairChain(config, p, root); first.admit()
+    first.reserve('implement', operation='repair:1')
+    restarted = RepairChain(config, p, root); restarted.admit()
+    restarted.reserve('implement', operation='repair:1')
+    assert restarted.context()['used']['model_calls'] == 1
+    assert restarted.context()['used']['implementations'] == 1
+    with pytest.raises(RepairBlocked): restarted.reserve('review', operation='repair:1')
+
+
+def test_registered_process_ack_uses_real_socket_and_transferred_lock(recovering, tmp_path):
+    import subprocess
+    import sys
+    import threading
+    import time
+    from auto_agents.repair_control import rpc
+    supervisor, subscriber, job_id, p, runtime = recovering
+    job = supervisor.store.job(job_id)
+    # Model an already published runtime; this test exercises recovery only.
+    supervisor.store.transition(job_id, 'ready', {**job['result'], 'source_delivery_needed': False})
+    entry = supervisor.registrations[subscriber]
+    request = {'config': supervisor.config, 'payload': entry['payload'], 'subscriber': subscriber,
+        'runtime': str(runtime), 'route_digest': p['boundary']['route_digest']}
+    script = tmp_path / 'registered-child.py'
+    script.write_text('''import json,os,sys
+from auto_agents.repair_control import rpc,start_ticks
+r=json.loads(sys.argv[1]); config=r['config']; owner=r['payload']
+owner.update(pid=os.getpid(),ticks=start_ticks(os.getpid()))
+registered=rpc(config,{'op':'register','payload':owner,
+    'environment':{'AUTO_AGENTS_REPAIR_SUBSCRIBER':r['subscriber']}},[int(sys.argv[2])])
+assert registered['subscriber']==r['subscriber']
+base={'subscriber':r['subscriber']}
+assert rpc(config,{**base,'op':'consume-route','route_digest':r['route_digest']})['accepted']
+details={'route_digest':r['route_digest'],'session_id':'wrong-child','workflow_id':'wf-parent',
+    'original_handoff_id':'hf-original','binding_fingerprint':'bound'}
+message={**base,'op':'boundary','kind':'engine_child','runtime':r['runtime'],'details':details}
+assert not rpc(config,message)['accepted']
+details['session_id']='child'
+assert rpc(config,message)['accepted']
+assert rpc(config,message)['accepted']
+print('registered child acknowledged')
+''')
+    worker = threading.Thread(target=supervisor.serve, daemon=True); worker.start()
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                rpc(supervisor.config, {'op': 'ping'}); break
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(.02)
+        process = subprocess.run([sys.executable, str(script), json.dumps(request), str(entry['fds'][0])],
+            pass_fds=(entry['fds'][0],), capture_output=True, text=True, timeout=20,
+            env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')})
+        assert process.returncode == 0, process.stdout + process.stderr
+        assert 'registered child acknowledged' in process.stdout
+        assert supervisor.store.job(job_id)['state'] == 'completed'
+        assert supervisor.store.job(job_id)['result']['engine_full_proof']['recovered']
+        transaction = Store(job['result']['v2_transaction']).load()
+        assert transaction['status'] == 'complete' and transaction['phase'] == 'recovered'
+    finally:
+        supervisor.halt = True; worker.join(timeout=5)
+    assert not worker.is_alive()
+
+
+def test_durable_ack_recovers_database_projection_without_relaunch(recovering):
+    from auto_agents.repair_v2.integration import acknowledge_recovery
+    supervisor, subscriber, job_id, p, runtime = recovering
+    job = supervisor.store.job(job_id)
+    supervisor.store.transition(job_id, 'ready', {**job['result'], 'source_delivery_needed': False})
+    job = supervisor.store.job(job_id)
+    row = supervisor.store.subscriptions(job_id)[0]
+    acknowledge_recovery(job, row, {'session_id': 'child'})
+    # Model a crash after the checkpoint commit and before the SQL projection.
+    assert supervisor.store.job(job_id)['state'] == 'ready'
+    supervisor.tick()
+    assert supervisor.store.job(job_id)['state'] == 'completed'
+    assert supervisor.store.job(job_id)['result']['engine_full_proof']['recovered']
+    assert supervisor.store.subscriptions(job_id)[0]['payload']['recovery_confirmed'] == {
+        'job': job_id, 'generation': job['generation']}
+    assert not supervisor.workers and not supervisor.resumes and not supervisor.store.due_publish()
+    supervisor.tick()
+    assert not supervisor.workers and not supervisor.resumes
+
+
+def test_legacy_ready_runtime_migrates_before_subscriber_validation(recovering, monkeypatch):
+    supervisor, subscriber, job_id, _, _ = recovering
+    previous_generation = supervisor.store.job(job_id)['generation']
+    result = dict(supervisor.store.job(job_id)['result'])
+    result.pop('recovery_protocol'); result.pop('runtime_artifact')
+    supervisor.store.transition(job_id, 'ready', result)
+    with supervisor.store.connect() as db:
+        db.execute("UPDATE subscribers SET state='waiting' WHERE id=?", (subscriber,))
+    dispatched = []
+    monkeypatch.setattr(supervisor, 'launch_worker', lambda job, operation: dispatched.append((job, operation)))
+    supervisor.tick()
+    assert dispatched == [(job_id, 'repair')]
+    assert supervisor.store.job(job_id)['generation'] == previous_generation + 1
+    assert supervisor.store.subscriptions(job_id)[0]['state'] == 'waiting'
 
 
 def test_successful_exit_without_child_entry_cannot_be_counted_as_recovery(recovering):
@@ -215,6 +330,24 @@ def test_successful_exit_without_child_entry_cannot_be_counted_as_recovery(recov
     assert row['state'] == 'blocked'
     assert 'implementation boundary' in row['payload']['repair_failure']['error']
     assert supervisor.store.job(job)['state'] != 'completed'
+    state = Store(supervisor.store.job(job)['result']['v2_transaction']).load()
+    assert state['status'] == 'blocked' and state['phase'] == 'activation'
+    assert state['receipt']['digest'] == 'accepted'
+
+
+def test_business_failure_after_ack_does_not_revoke_engine_acceptance(recovering):
+    supervisor, subscriber, job_id, payload, runtime = recovering
+    saved = supervisor.store.job(job_id)['result']
+    supervisor.store.transition(job_id, 'ready', {**saved, 'source_delivery_needed': False})
+    supervisor.dispatch({'version': 1, '_peer_pid': os.getpid(), 'subscriber': subscriber,
+        'op': 'boundary', 'kind': 'engine_child', 'runtime': str(runtime), 'details': {
+            'route_digest': payload['boundary']['route_digest'], 'session_id': 'child',
+            'workflow_id': 'wf-parent', 'original_handoff_id': 'hf-original', 'binding_fingerprint': 'bound'}}, [])
+    supervisor.resumes[subscriber] = SimpleNamespace(poll=lambda: 3, returncode=3)
+    supervisor.tick()
+    job = supervisor.store.job(job_id)
+    assert job['state'] == 'completed' and job['result']['engine_full_proof']['recovered']
+    assert Store(job['result']['v2_transaction']).load()['status'] == 'complete'
 
 
 def test_verified_route_prepares_actual_child_reentry_without_parent_diagnosis(tmp_path, monkeypatch):

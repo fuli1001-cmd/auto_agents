@@ -54,6 +54,17 @@ class Store:
     def save(self, state):
         atomic_json(self.root / 'state.json', {'state': state, 'digest': digest(state)})
 
+    def transition(self, state, **updates):
+        """Call under the transaction/checkpoint lock; reject stale writers."""
+        current = self.load()
+        if current and current.get('revision', 0) != state.get('revision', 0):
+            from .types import RepairBlocked
+            raise RepairBlocked('stale_transition', '修复状态已推进，过期进程不能覆盖当前状态')
+        state.update(updates)
+        state['revision'] = state.get('revision', 0) + 1
+        self.save(state)
+        return state
+
     def event(self, kind, **details):
         row = {'at': datetime.now(timezone.utc).isoformat(), 'kind': kind, **details}
         with (self.root / 'events.jsonl').open('a', encoding='utf-8') as stream:

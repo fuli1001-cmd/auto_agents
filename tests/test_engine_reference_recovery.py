@@ -127,7 +127,12 @@ def test_retained_reference_replay_requires_the_bound_child(tmp_path, wrapped, f
     assert observation['original_handoff_id'] == original.handoff_id
     assert observation['previous_failure'] == old_failure
     assert observation['diagnostic_provider_calls'] == 0
-    assert {key: getattr(saved, key) for key in before} == before
+    expected_budget = dict(before)
+    if failure == 'valid':
+        for key in ('current_attempt', 'attempts_since_progress'): expected_budget[key] += 1
+        assert observation['provider_boundary_calls'] == observation['budget_reserved'] == 1
+        assert observation['full_dispatch'] is True
+    assert {key: getattr(saved, key) for key in before} == expected_budget
     assert old_failure in saved.execution_log
     assert (root / 'foreign.py').read_bytes() == product
     assert report['ok'] is (failure == 'valid'), report

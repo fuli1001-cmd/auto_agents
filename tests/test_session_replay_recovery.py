@@ -69,7 +69,8 @@ payload = json.loads(process.stdout.splitlines()[-1])
 state = json.loads((target / ".auto-agents/state/sessions" / child_id / "session_state.json").read_text())
 original = json.loads(Path(protected[-1]).read_text())
 assert state["mode"] == "fix" and state["status"] == "conversing", process.stderr
-assert state["current_attempt"] == 0 and state["verification_binding"] == {}, process.stderr
+assert state["current_attempt"] == original["current_attempt"] == 3, process.stderr
+assert state["verification_binding"] == {}, process.stderr
 assert state["provider_continuations"] == {}
 assert state["fix_verify_command"] == original["fix_verify_command"]
 assert state["goal"] == original["goal"]
@@ -98,6 +99,8 @@ print(json.dumps(payload))
     runner._verification_argv = guarded
     result = runner._session_probe(auto_agents_repo_root())
     assert result.get('route_consumed') is True, result
-    assert result['ok'] is True and result['status'] == 'next_provider_boundary', result
+    assert result['ok'] is False and result['status'] == 'next_provider_boundary', result
+    assert result['recovery_observation']['boundary_kind'] == 'diagnosis'
+    assert result['recovery_observation']['ok'] is False
     assert {str(path): path.read_bytes() for path in protected} == before
     assert load_session_state(root, child.session_id).status == 'failed'

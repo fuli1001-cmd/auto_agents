@@ -130,6 +130,25 @@ def test_verified_engine_repair_resumes_bound_existing_child_once(tmp_path, monk
     assert store.load_handoff(handoff.handoff_id).returned_at
     resume_to_observation(root, monkeypatch, action)
     assert calls == [child.session_id]
+
+
+def test_rejected_recovery_ack_pauses_same_handoff_without_parent_model_calls(tmp_path, monkeypatch):
+    root, child = project(tmp_path)
+    store, _, handoff = parent_workflow(root, child, engine=True)
+    probe = tmp_path / 'verified.json'
+    probe.write_text(json.dumps({'route_digest': digest(handoff.payload)}))
+    monkeypatch.setenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE', str(probe))
+    monkeypatch.setenv('AUTO_AGENTS_REPAIR_SUBSCRIBER', 'subscriber')
+    monkeypatch.setattr('auto_agents.repair_client.boundary_event', lambda *args, **kwargs: False)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', lambda *args, **kwargs: pytest.fail('model called after rejected ACK'))
+    parent = Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
+    saved = load_session_state(root, child.session_id)
+    assert parent.status == 'waiting_child' and parent.active_handoff_id == handoff.handoff_id
+    assert parent.current_attempt == 0
+    assert saved.status == 'paused' and saved.resolution == 'engine_recovery_unacknowledged'
+    assert store.load_handoff(handoff.handoff_id).status == 'paused'
+    assert not store.load_handoff(handoff.handoff_id).returned_at
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
     assert len(list((root / '.auto-agents/state/sessions').iterdir())) == 2
 
 
@@ -362,6 +381,10 @@ def test_resumed_child_delivers_snapshot_matching_retained_provider_semantics(tm
 @pytest.mark.parametrize('mutation', ['stale', 'forged', 'unsupported'])
 def test_snapshot_repair_rejects_stale_or_forged_provenance(tmp_path, monkeypatch, mutation):
     root, child, provenance = snapshot_project(tmp_path)
+    # One bad candidate proves rejection. Repeating the same fixture until
+    # the default execution budget expires does not add provenance coverage.
+    child.max_attempts = child.hard_ceiling = 1
+    save_session_state(root, child)
     store, _, handoff = parent_workflow(root, child, engine=True)
     receipt = tmp_path / 'route-probe.json'
     receipt.write_text(json.dumps({'route_digest': digest(handoff.payload)}))

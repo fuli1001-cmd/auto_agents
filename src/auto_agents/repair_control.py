@@ -362,6 +362,16 @@ class Store:
             rows = db.execute("SELECT * FROM subscribers" + (" WHERE job=?" if job else ""), (job,) if job else ()).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
+    def confirm_subscriber(self, identity, job):
+        with self.connect() as db:
+            row = db.execute('SELECT payload FROM subscribers WHERE id=? AND job=?', (identity, job['id'])).fetchone()
+            if not row: return
+            payload = json.loads(row['payload'])
+            confirmation = {'job': job['id'], 'generation': job['generation']}
+            if payload.get('recovery_confirmed') == confirmation: return
+            payload['recovery_confirmed'] = confirmation
+            db.execute('UPDATE subscribers SET payload=? WHERE id=?', (json.dumps(payload), identity))
+
     def record_subscriber_failure(self, db, subscriber, job, phase, error):
         """Keep the stop reason with its workflow, in the state-change transaction."""
         from .repair_environment_log import sanitize
@@ -887,40 +897,61 @@ class Supervisor:
                         and child.get('preflight_rechecked')
                         and child.get('boundary_kind') == 'implementation'
                         and details.get('binding_fingerprint')
+                        and details.get('binding_fingerprint') == child.get('activation_binding_fingerprint', child.get('binding_fingerprint'))
                         and details.get('route_digest') == expected.get('route_digest')
                         and details.get('session_id') == child.get('child_session_id')
                         and details.get('workflow_id') == child.get('workflow_id')
                         and details.get('original_handoff_id') == child.get('original_handoff_id'))
                 except (OSError, ValueError, KeyError, TypeError):
                     passed = False
-            if passed and job["state"] != "completed":
+            if passed:
+                if job['result'].get('engine') == 'v2' and (job['result'].get('recovery_protocol') != 1
+                                                           or not job['result'].get('v2_transaction')):
+                    raise RuntimeError('legacy recovery must migrate before acknowledgement')
                 if job['result'].get('engine') == 'v2' and job['result'].get('v2_transaction'):
                     root = Path(job['result']['v2_transaction'])
                     if root.parent.resolve() != (self.store.root / 'v2-transactions').resolve():
                         raise RuntimeError('recovery receipt belongs to another repair store')
-                    atomic_json(root / 'live-recovery.json', {'job': job['id'], 'subscriber': row['id'],
-                        'generation': job['generation'], 'boundary': details, 'commit': job['result']['commit']})
-                self.store.event(job["id"], "live_boundary_passed", {"subscriber": row["id"], "commit": job["result"]["commit"]})
-                if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
-                    self.store.enqueue_publish(job["id"])
-                self.store.transition(job["id"], "completed")
+                    if job['result'].get('recovery_protocol') == 1:
+                        from .repair_v2.integration import acknowledge_recovery
+                        acknowledge_recovery(job, row, details)
+                        completed_result = {**job['result'], 'status': 'recovered',
+                            'engine_full_proof': {**job['result']['engine_full_proof'], 'ok': True, 'recovered': True}}
+                        self.store.transition(job['id'], job['state'], completed_result, generation=job['generation'])
+                    else:
+                        raise RuntimeError('legacy recovery must migrate before acknowledgement')
+                if job['state'] != 'completed':
+                    self.store.event(job["id"], "live_boundary_passed", {"subscriber": row["id"], "commit": job["result"]["commit"]})
+                    if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
+                        self.store.enqueue_publish(job["id"])
+                    self.store.transition(job["id"], "completed")
+                self.store.confirm_subscriber(row['id'], job)
             return {"ok": True, "accepted": passed}
         if op == "consume-route":
             row = next((item for item in self.store.subscriptions() if item["id"] == request["subscriber"]), None)
             if not row or row["state"] != "resuming":
                 return {"ok": True, "accepted": False}
             owner = self.registrations.get(row["id"], {}).get("payload", {})
-            if request.get("_peer_pid") != owner.get("pid"):
+            if request.get("_peer_pid") != owner.get("pid") or not alive(owner.get('pid', 0), owner.get('ticks', 0)):
                 raise RuntimeError("route receipt sender is not the registered business process")
             expected = row["payload"]["repair"]["boundary"]
             passed = expected.get("kind") == "engine_route" and expected.get("route_digest") == request.get("route_digest")
             if passed:
                 job = self.store.job(row["job"])
                 self.store.event(job["id"], "engine_route_consumed", {"subscriber": row["id"]})
-                if job["state"] != "completed" and not needs_child_recovery(job):
-                    if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
-                        self.store.enqueue_publish(job["id"])
-                    self.store.transition(job["id"], "completed")
+                if not needs_child_recovery(job):
+                    if job['result'].get('engine') == 'v2':
+                        if job['result'].get('recovery_protocol') != 1:
+                            raise RuntimeError('legacy recovery must migrate before acknowledgement')
+                        from .repair_v2.integration import acknowledge_recovery
+                        acknowledge_recovery(job, row, {'route_digest': expected['route_digest']})
+                        from .repair_v2.recovery import completed_result
+                        self.store.transition(job['id'], job['state'], completed_result(job), generation=job['generation'])
+                    if job['state'] != 'completed':
+                        if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
+                            self.store.enqueue_publish(job["id"])
+                        self.store.transition(job["id"], "completed")
+                    self.store.confirm_subscriber(row['id'], job)
             return {"ok": True, "accepted": passed, "receipt": ({
                 "job": job['id'], "subscriber": row['id'],
                 "route_digest": expected['route_digest'],
@@ -981,6 +1012,28 @@ class Supervisor:
                 self.stop_process(RecoveredProcess({"pid": pid, "ticks": ticks}))
 
     def tick(self):
+        with self.store.connect() as db:
+            ready = [row[0] for row in db.execute("SELECT id FROM jobs WHERE state='ready'")]
+        for identity in ready:
+            job = self.store.job(identity)
+            if job.get('result', {}).get('recovery_protocol') != 1:
+                continue
+            try:
+                from .repair_v2.recovery import completed_result
+                completed = completed_result(job)
+            except (OSError, ValueError, KeyError, TypeError, ImportError) as error:
+                self.store.transition(identity, 'blocked', {**job['result'], 'ok': False,
+                    'status': 'v2_controller_blocked', 'error': '恢复检查点无法读取，已停止自动实施：' + str(error)},
+                    generation=job['generation'])
+                self.store.event(identity, 'recovery_checkpoint_invalid', {'error': str(error)})
+                continue
+            if completed and self.store.transition(identity, 'completed', completed, generation=job['generation']):
+                if completed.get('source_delivery_needed'):
+                    self.store.enqueue_publish(identity)
+                self.store.event(identity, 'recovery_projection_restored', {'generation': job['generation']})
+                from .repair_v2.store import Store as TransactionStore
+                receipt = TransactionStore(completed['v2_transaction']).load()['live_recovery']
+                self.store.confirm_subscriber(receipt['subscriber'], job)
         self.tick_verifications()
         for identity, process in list(self.relays):
             row = next((item for item in self.store.subscriptions() if item["id"] == identity), None)
@@ -998,13 +1051,24 @@ class Supervisor:
             self.drain_worker_children(identity)
             del self.workers[identity]
             result_path = self.store.root / "jobs" / identity / (operation + f"-g{generation}-result.json")
-            result = json.loads(result_path.read_text()) if result_path.exists() else {"ok": False, "error": "repair worker exited without a receipt"}
+            try:
+                result = json.loads(result_path.read_text()) if result_path.exists() else {"ok": False, "error": "repair worker exited without a receipt"}
+                if not isinstance(result, dict): raise ValueError('worker receipt must be an object')
+            except (OSError, ValueError) as error:
+                result = {'ok': False, 'error': '修复工作进程返回了无效回执：' + str(error)}
             if result.get("generation", generation) != generation:
                 result = {"ok": False, "error": "stale worker receipt"}
             if job["state"] == "cancelled" or job["generation"] != generation:
                 continue
             if operation.startswith("validate-"):
                 subscriber_id = operation[len("validate-"):]
+                if result.get('revalidate') and job['result'].get('recovery_protocol') == 1:
+                    with self.store.connect() as db:
+                        db.execute("UPDATE jobs SET state='queued',generation=generation+1 WHERE id=? AND generation=?",
+                                   (identity, generation))
+                        db.execute("UPDATE subscribers SET state='waiting' WHERE id=? AND state='validating'", (subscriber_id,))
+                    self.store.event(identity, 'acceptance_revalidation_queued', {'subscriber': subscriber_id})
+                    continue
                 with self.store.connect() as db:
                     if result.get("ok") and result.get("engine_full_proof"):
                         updated = {**job["result"], "engine_full_proof": result["engine_full_proof"]}
@@ -1014,7 +1078,8 @@ class Supervisor:
                                ("verified" if result.get("ok") else "blocked", time.time(), subscriber_id))
                     if not result.get("ok"):
                         if job['result'].get('engine') == 'v2':
-                            invalid = {**job['result'], 'ok': False, 'status': 'v2_boundary_failed',
+                            invalid = {**job['result'], 'ok': False, 'status': 'v2_recovery_blocked',
+                                       'failure': result.get('failure'),
                                        'error': result.get('error') or result.get('proof', 'subscriber validation failed')}
                             db.execute("UPDATE jobs SET state='blocked',result=? WHERE id=? AND generation=?",
                                        (json.dumps(invalid), identity, generation))
@@ -1071,12 +1136,28 @@ class Supervisor:
                     del self.resumes[identity]
                     continue
                 completion = self.store.root / "jobs" / row["job"] / ("resume-" + identity + "-result.json")
-                receipt = json.loads(completion.read_text()) if completion.exists() else {}
+                try:
+                    receipt = json.loads(completion.read_text()) if completion.exists() else {}
+                    if not isinstance(receipt, dict): raise ValueError('resume receipt must be an object')
+                except (OSError, ValueError):
+                    receipt = {'exit_code': 3, 'error': '原任务进程没有留下有效退出回执，已停止自动实施。'}
                 exit_code = receipt.get("exit_code", 3) if completion.exists() else process.returncode
                 job = self.store.job(row['job'])
-                if exit_code == 0 and needs_child_recovery(job) and job['state'] != 'completed':
+                if exit_code == 0 and (needs_child_recovery(job) or job['result'].get('recovery_protocol') == 1) and job['state'] != 'completed':
                     exit_code = 3
                     receipt['error'] = 'original child implementation boundary was not observed'
+                if (exit_code != 0 and job['state'] not in {'completed', 'cancelled'}
+                        and job['result'].get('recovery_protocol') == 1):
+                    try:
+                        from .repair_v2.integration import record_activation_failure
+                        failure = record_activation_failure(self.config, job, row, receipt)
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+                        failure = {'domain': 'controller', 'code': 'activation_checkpoint_failed',
+                                   'message': '无法保存恢复失败检查点：' + str(error)}
+                    receipt['error'] = failure['message']
+                    self.store.transition(job['id'], 'blocked', {**job['result'], 'ok': False,
+                        'status': 'v2_activation_blocked', 'error': failure['message'], 'failure': failure},
+                        generation=job['generation'])
                 with self.store.connect() as db:
                     db.execute("UPDATE subscribers SET state=?,updated=? WHERE id=? AND state!='cancelled'",
                                ("finished" if exit_code == 0 else "blocked", time.time(), identity))
@@ -1120,6 +1201,17 @@ class Supervisor:
         if not self.workers:
             for row in self.store.subscriptions():
                 if row["state"] == "waiting" and row["job"] and self.store.job(row["job"])["state"] in {"ready", "completed"}:
+                    saved = self.store.job(row['job'])['result']
+                    if saved.get('engine') == 'v2' and (saved.get('recovery_protocol') != 1
+                                                       or not saved.get('runtime_artifact')):
+                        # Upgrade the saved acceptance before subscriber
+                        # validation; a legacy worktree must not cost a failed
+                        # user invocation merely to reach the migration path.
+                        with self.store.connect() as db:
+                            db.execute('UPDATE jobs SET generation=generation+1 WHERE id=?', (row['job'],))
+                        self.store.event(row['job'], 'runtime_migration_required')
+                        self.launch_worker(row['job'], 'repair')
+                        return
                     with self.store.connect() as db:
                         db.execute("UPDATE subscribers SET state='validating' WHERE id=?", (row["id"],))
                     self.launch_worker(row["job"], "validate-" + row["id"])
@@ -1316,8 +1408,20 @@ class Supervisor:
                     raise RuntimeError("verification workspace belongs to a different repository")
                 generation, run_token = 0, registration["payload"]["token"]
             runtime = Path(request["runtime"]).resolve()
+            approved_runtime = False
+            if not job_id:
+                subscriber = next((item for item in self.store.subscriptions()
+                                   if item['id'] == request.get('subscriber')), None)
+                if subscriber and subscriber.get('job'):
+                    approved = self.store.job(subscriber['job']).get('result', {})
+                    if (approved.get('recovery_protocol') == 1 and approved.get('runtime')
+                            and runtime == Path(approved['runtime']).resolve()):
+                        from .repair_v2.integration import verify_receipt
+                        from .repair_v2.transaction import transaction_root
+                        verify_receipt(approved, expected_root=transaction_root(self.config, subscriber['payload']['repair']))
+                        approved_runtime = True
             if not (runtime == Path(self.config["source_root"]).resolve()
-                    or runtime.is_relative_to(self.store.root / "runtimes")):
+                    or runtime.is_relative_to(self.store.root / "runtimes") or approved_runtime):
                 raise RuntimeError("verification executor is not a trusted engine runtime")
             revision = git(runtime, "rev-parse", "HEAD")
             if runtime == Path(self.config["source_root"]).resolve():

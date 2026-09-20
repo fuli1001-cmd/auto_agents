@@ -41,15 +41,93 @@ def _fixed_controller(request, root):
 
 
 def _boundaries(verifier, root, identity, source, payload, cancel):
-    results = [verifier.boundary(identity, source, Path(root) / 'target-evidence', payload, cancel)]
+    results = [_boundary_once(verifier, root, identity, source, Path(root) / 'target-evidence', payload, cancel)]
+    exclusions = _excluded_cases(root)
     for case in sorted((Path(root) / 'counterexamples').glob('*/payload.json')):
         if cancel.is_set(): raise KeyboardInterrupt()
-        results.append(verifier.boundary(identity, source, case.parent / 'target',
-                                         json.loads(case.read_text()), cancel))
+        if case.parent.name in exclusions: continue
+        results.append(_boundary_once(verifier, root, identity, source, case.parent / 'target',
+                                      json.loads(case.read_text()), cancel))
+    from .recovery import classify
+    for result in results:
+        if result.get('ok'): continue
+        failure = classify(result, payload)
+        if failure['domain'] != 'candidate':
+            error = RepairBlocked(failure['code'], failure['message'])
+            error.failure = failure
+            raise error
     return {'ok': all(r['ok'] for r in results), 'snapshot': identity, 'runtime': verifier.runtime,
             'infrastructure': any(r.get('infrastructure') for r in results),
             'reason': '; '.join(r.get('reason', '') for r in results if r.get('infrastructure')),
             'cases': results, 'observed': [r.get('observed', {}) for r in results]}
+
+
+def _boundary_once(verifier, root, identity, source, target, payload, cancel):
+    from .evidence import identity as evidence_identity
+    from .proofs import once
+    anchor_file = Path(root) / 'budget-anchors.json'
+    if anchor_file.exists():
+        payload = {**payload, '_budget_anchors': Store(root).read(json.loads(anchor_file.read_text()))}
+    if not hasattr(verifier, 'boundary_inputs'):
+        return verifier.boundary(identity, source, target, payload, cancel)
+    inputs = {'source': identity, 'commit': git(source, 'rev-parse', 'HEAD'),
+              'format': 'standalone-git-v1', 'runtime': verifier.runtime,
+              'target': evidence_identity(target), 'payload': digest(payload),
+              'environments': verifier.boundary_inputs(target, payload)}
+    return once(Store(root), 'recovery-boundary', inputs,
+                lambda: verifier.boundary(identity, source, target, payload, cancel))
+
+
+def _excluded_cases(root):
+    from .recovery import classify
+    marker = Path(root) / 'artifact-migration.json'
+    if not marker.exists(): return set()
+    result = set()
+    saved = json.loads(marker.read_text())
+    for reference in saved.get('packaging_failures', []):
+        evidence = Store(root).read(reference)
+        if classify(evidence, {}).get('domain') != 'artifact':
+            raise RepairBlocked('invalid_migration', '旧打包故障的迁移依据已改变')
+        result.add(digest(evidence.get('observed', {})))
+    return result
+
+
+def _migrate_artifact_failure(controller):
+    """Retain raw/revoked receipts; only proven packaging failures are superseded."""
+    from .recovery import classify
+    store = controller.store
+    with store.locked():
+        state = store.load()
+        if not state or state.get('runtime_artifact') or not state.get('receipt'):
+            return False
+        failures = state.get('failures', [])
+        if not failures or any(f.get('unit') != 'subscriber-boundary' for f in failures):
+            return False
+        accepted = store.read(state['receipt'])
+        if accepted.get('snapshot') != state.get('snapshot'):
+            return False
+        references, known = [], set()
+        for path in sorted(store.root.glob('subscriber-*.json')):
+            evidence = json.loads(path.read_text())
+            observed = evidence.get('observed', {})
+            runtime = observed.get('engine_runtime', {}) if isinstance(observed, dict) else {}
+            if (evidence.get('snapshot') == state['snapshot'] and not evidence.get('ok')
+                    and 'commit_unavailable' in runtime.get('mismatches', [])
+                    and set(runtime['mismatches']) <= {'commit', 'commit_unavailable'}
+                    and classify(evidence, {})['domain'] == 'artifact'):
+                references.append(store.artifact('packaging-failure', evidence))
+                known.add(digest(observed))
+        cases = {p.parent.name for p in (store.root / 'counterexamples').glob('*/payload.json')}
+        if not references or not cases or not cases <= known:
+            return False
+        if source_identity(controller.workspace.candidate) != state['snapshot']:
+            return False
+        previous = store.artifact('pre-artifact-migration', state)
+        atomic_json(store.root / 'artifact-migration.json', {'version': 1, 'previous': previous,
+                    'revoked_receipt': state['receipt'], 'packaging_failures': references})
+        store.transition(state, status='active', phase='validate', failures=[], blocker={})
+        store.event('artifact_failure_migrated', previous=previous, calls=state['calls'], attempts=state['attempts'])
+        return True
 
 
 def _components(request, root, accepted, workspace, python):
@@ -83,6 +161,30 @@ def _components(request, root, accepted, workspace, python):
 
 
 def repair_entry(request):
+    """Keep delivery/controller exceptions out of candidate implementation."""
+    try:
+        return _repair_entry(request)
+    except Exception as error:
+        root = transaction_root(request['config'], request['job']['payload'])
+        code = getattr(error, 'code', 'recovery_unclassified')
+        if code in {'job_cancelled', 'transaction_busy', 'stale_transition'}:
+            raise
+        with transaction_lock(root):
+            _assert_owner(request)
+            store = Store(root)
+            with store.locked():
+                state = store.load()
+                if state:
+                    domain = 'artifact' if code == 'runtime_artifact_invalid' else 'controller'
+                    from .types import RepairFailure
+                    from .recovery import block
+                    failure = asdict(RepairFailure(domain, code, domain, state.get('phase', 'prepare'),
+                        str(error), {'error_type': type(error).__name__, 'error': str(error)}))
+                    block(store, state, failure, operation='repair:' + request['job']['id'])
+        raise
+
+
+def _repair_entry(request):
     """No candidate runtime executes controller code or installs host dependencies."""
     from ..repair_control import Repository
     from ..repair_worker import engine_environment
@@ -163,14 +265,22 @@ def repair_entry(request):
             regression=lambda i, s, coverage, c: verifier.regression(i, s, checkout, accepted.engine_base, coverage, c),
             boundary=lambda identity, source, cancel: _boundaries(verifier, root, identity, source,
                 json.loads((root / 'original-payload.json').read_text()), cancel))
+        controller.runtime_environments = {'python': python, 'environment': environment}
+        from .budget_recovery import anchors
+        controller.budget_anchors = store.artifact('budget-anchors', anchors(target, accepted.invocation))
+        atomic_json(root / 'budget-anchors.json', controller.budget_anchors)
+        from .recovery import context
+        recovery_context = context(job['payload'], digest(accepted.to_dict()), chain.store.root)
+        recovery_context['scope'] = scope.context
+        controller.recovery_context = store.artifact('recovery-context', recovery_context)
+        atomic_json(root / 'recovery-context.json', recovery_context)
+        _migrate_artifact_failure(controller)
         controller.recover_verified_progress()
-        corrected = controller.recover_corrected_source(implementation, pinned['commit'])
-        if not corrected:
-            corrected = controller.recover_corrected_source(repository.cache, current['revision'])
+        corrected = controller.recover_corrected_source(repository.cache, current['revision'])
         from .source_refresh import prepare
         prepare(controller, repository.cache, current['revision'], force_check=corrected)
         state = controller.run()
-        if state['status'] != 'ready':
+        if state['status'] not in ('ready', 'complete'):
             return {'ok': False, 'engine': 'v2', 'status': 'v2_' + state['status'],
                     'return_goal': scope.context['owner'] if state['status'] == 'skipped' else None,
                     'pending_decision': state.get('pending_decision', '') if state['status'] == 'waiting_user' else '',
@@ -186,10 +296,18 @@ def _approved(request, root, state, store, python, environment):
     commit = git(snapshot, 'rev-parse', 'HEAD')
     repository = Repository(request['config'])
     repository.import_commit(str(snapshot), commit)
-    runtime = repository.worktree(commit, 'v2-approved-' + commit[:24])
+    from .runtime_artifact import build, verify
+    artifact = state.get('runtime_artifact')
+    if not artifact:
+        artifact = build(root, snapshot, state['snapshot'],
+                         {'python': python, 'environment': environment,
+                          'verifier': state.get('verification_runtime', '')})
+    verify(artifact)
+    runtime = Path(artifact['path'])
     if source_identity(runtime) != state['snapshot']:
         raise RepairBlocked('delivery_source_changed', 'approved runtime differs from the accepted snapshot')
-    return {'ok': True, 'status': 'repaired', 'engine': 'v2', 'commit': commit,
+    return {'ok': True, 'status': 'accepted', 'engine': 'v2', 'commit': commit,
+            'runtime_artifact': artifact, 'recovery_protocol': 1,
             'runtime': str(runtime), 'python': python, 'environment': environment,
             'base': json.loads((root / 'request.json').read_text())['engine_base'],
             'source_delivery_needed': True,
@@ -197,10 +315,20 @@ def _approved(request, root, state, store, python, environment):
             'v2_receipt': {'request': state['request_digest'], 'snapshot': state['snapshot'],
                            'reference': state['receipt'], 'store': str(root)},
             'proof': 'Required behavior, no-new-failures acceptance, independent review and original-boundary replay passed.',
-            'engine_full_proof': {'policy': 1, 'commit': commit, 'environment': environment, 'ok': True}}
+            'engine_full_proof': {'policy': 2, 'commit': commit, 'environment': environment,
+                                  'artifact_id': artifact['artifact_id'], 'code_accepted': True,
+                                  'recovered': False, 'ok': False}}
 
 
 def verify_receipt(approved, *, expected_root=None):
+    if approved.get('recovery_protocol') not in (None, 1):
+        raise RepairBlocked('runtime_protocol', '恢复协议版本不受当前控制器支持；需要兼容的控制器后才能继续')
+    from .runtime_artifact import verify
+    if approved.get('runtime_artifact'):
+        verify(approved['runtime_artifact'])
+        if (Path(approved['runtime']).resolve() != Path(approved['runtime_artifact']['path']).resolve()
+                or approved['commit'] != approved['runtime_artifact']['commit']):
+            raise RepairBlocked('runtime_artifact_invalid', '交付路径与产物清单不一致')
     from .comparison import accepted as validation_accepted
     marker = approved.get('v2_receipt') or {}
     root = Path(marker.get('store', '/__missing_v2_receipt__'))
@@ -211,6 +339,16 @@ def verify_receipt(approved, *, expected_root=None):
     if revoked.is_file() and marker['reference']['digest'] in json.loads(revoked.read_text()):
         raise RepairBlocked('invalid_acceptance', 'a live recovery counterexample invalidated this receipt')
     receipt = store.read(marker['reference'])
+    if approved.get('recovery_protocol') == 1:
+        if receipt.get('runtime_artifact') != approved.get('runtime_artifact'):
+            raise RepairBlocked('invalid_acceptance', '验收回执没有绑定当前运行产物')
+        if receipt.get('budget_anchors'):
+            store.read(receipt['budget_anchors'])
+        if not receipt.get('recovery_context'):
+            raise RepairBlocked('invalid_acceptance', '验收回执缺少原任务恢复上下文')
+        context = store.read(receipt['recovery_context'])
+        if context.get('version') != 1 or context.get('request') != marker['request']:
+            raise RepairBlocked('invalid_acceptance', '恢复上下文与验收目标不一致')
     if (root / 'scope.json').exists() and not receipt.get('scope'):
         raise RepairBlocked('invalid_acceptance', 'candidate lacks the current goal scope proof')
     validation, review = store.read(receipt['validation']), store.read(receipt['review'])
@@ -285,6 +423,9 @@ def deliver(request, approved, *, controller=None, _passes=0):
                 regression=lambda i, s, coverage, c: verifier.regression(i, s, base, accepted.engine_base, coverage, c),
                 boundary=lambda i, s, c: _boundaries(verifier, root, i, s,
                     json.loads((root / 'original-payload.json').read_text()), c))
+            controller.runtime_environments = {'python': approved['python'], 'environment': approved['environment']}
+            controller.budget_anchors = json.loads((root / 'budget-anchors.json').read_text())
+            controller.recovery_context = store.artifact('recovery-context', json.loads((root / 'recovery-context.json').read_text()))
         controller.integrate(repository.cache, parents)
         state = controller.run()
         if state['status'] != 'ready':
@@ -304,27 +445,89 @@ def deliver(request, approved, *, controller=None, _passes=0):
 
 
 def validate_subscriber(request):
+    from .recovery import block
+    from .types import RepairFailure
+    try:
+        return _validate_subscriber(request)
+    except Exception as error:
+        code = getattr(error, 'code', 'recovery_unclassified')
+        if code in {'job_cancelled', 'transaction_busy', 'stale_transition'}:
+            raise
+        artifact = code in {'runtime_artifact_invalid', 'delivery_source_changed'}
+        environment = code in {'verification_infrastructure', 'verification_environment_changed',
+                               'docker_unavailable', 'disk_space', 'image_unavailable'}
+        domain = 'artifact' if artifact else 'environment' if environment else 'controller'
+        stage = 'artifact' if artifact else 'subscriber_validation'
+        failure = asdict(RepairFailure(domain, code, domain, stage, str(error),
+                                      {'error_type': type(error).__name__, 'error': str(error),
+                                       'inputs': getattr(error, 'inputs', {})}))
+        root = transaction_root(request['config'], request['subscriber']['payload']['repair'])
+        with transaction_lock(root):
+            _assert_owner(request)
+            store = Store(root)
+            with store.locked():
+                state = store.load()
+                if state:
+                    if code in {'verification_environment_changed', 'image_unavailable'}:
+                        artifact = request['job']['result'].get('runtime_artifact', {})
+                        signature = digest([code, artifact.get('source'), getattr(error, 'controller_source', '')])
+                        previous = state.get('revalidation_signatures', [])
+                        if signature not in previous:
+                            store.transition(state, status='active', phase='validate', blocker={},
+                                revalidation_signatures=[*previous, signature])
+                            store.event('acceptance_revalidation_required', signature=signature, code=code)
+                            return {'ok': False, 'revalidate': True, 'failure': failure,
+                                    'error': '验证环境已变化，保留代码结果并补验受影响的检查。'}
+                    block(store, state, failure, operation='validation:' + request['subscriber']['id'])
+        return {'ok': False, 'failure': failure, 'error': str(error), 'proof': json.dumps(failure)}
+
+
+def _validate_subscriber(request):
     from ..root_cause import RootCauseCoordinator
+    from .recovery import block, classify, context, operation
+    from .runtime_artifact import verify
     config, job, subscriber = request['config'], request['job'], request['subscriber']
     approved = job['result']
     root = transaction_root(config, subscriber['payload']['repair'])
-    _fixed_controller(request, root)
+    pinned = _fixed_controller(request, root)
     with transaction_lock(root):
-        verify_receipt(approved, expected_root=root)
-        verifier = DockerVerifier(Path(config['root']) / 'v2-verification', python=approved['python'])
-        verifier.prepare()
+        _assert_owner(request)
+        acceptance = verify_receipt(approved, expected_root=root)
+        artifact = approved.get('runtime_artifact')
+        if not artifact:
+            raise RepairBlocked('runtime_protocol', '旧运行目录需要迁移为独立产物，不能直接接管任务')
+        verify(artifact)
+        recovery_context = Store(root).read(acceptance['recovery_context'])
+        current_payload = subscriber['payload']['repair']
+        if (recovery_context['invocation'] != current_payload.get('invocation', {})
+                or recovery_context['boundary'] != current_payload.get('boundary', {})):
+            raise RepairBlocked('recovery_context_changed', '当前交接与已验证的原任务不一致，需要重新核对恢复上下文')
+        action = operation(job, subscriber, artifact, recovery_context)
+        verifier = DockerVerifier(Path(config['root']) / 'v2-verification', python=approved['python'],
+                                  image=artifact['environments'].get('image') or None)
+        try:
+            verifier.prepare()
+        except RepairBlocked as error:
+            error.controller_source = pinned['source']
+            raise
         old = Store(root).read(Store(root).read(approved['v2_receipt']['reference'])['validation'])
         if any(check.get('inputs', {}).get('runtime') != verifier.runtime for check in old['checks']):
-            raise RepairBlocked('verification_environment_changed', 'verification environment changed before workflow resume')
+            error = RepairBlocked('verification_environment_changed', '恢复检查与已有验收的验证环境不同，需要补验。')
+            error.inputs = {'accepted': sorted({check.get('inputs', {}).get('runtime', '') for check in old['checks']}),
+                            'observed': verifier.runtime}
+            error.controller_source = pinned['source']
+            raise error
         # Re-read current project state in a fresh private copy. This proves the
         # subscriber still matches; historical boundary success alone is insufficient.
         import tempfile
         with tempfile.TemporaryDirectory(prefix='v2-subscriber-', dir=root) as temporary:
             evidence = Path(temporary) / 'target'
             RootCauseCoordinator._copy_diagnostic_tree(Path(subscriber['project']), evidence)
-            result = verifier.boundary(approved['v2_receipt']['snapshot'], Path(approved['runtime']), evidence,
-                                       subscriber['payload']['repair'], threading.Event())
-            if not result['ok'] and not result.get('infrastructure'):
+            result = _boundary_once(verifier, root, approved['v2_receipt']['snapshot'], Path(approved['runtime']),
+                                    evidence, subscriber['payload']['repair'], threading.Event())
+            _assert_owner(request)
+            failure = classify(result, subscriber['payload']['repair']) if not result['ok'] else None
+            if failure and failure['domain'] == 'candidate':
                 from .evidence import dissociate
                 case = root / 'counterexamples' / digest(result.get('observed', {}))
                 case.mkdir(parents=True, exist_ok=True)
@@ -335,15 +538,72 @@ def validate_subscriber(request):
                 store = Store(root)
                 with store.locked():
                     state = store.load()
-                    state.update(status='active', phase='implement', failures=[{
+                    store.transition(state, status='blocked', phase='implement', failures=[{
                         'unit': 'subscriber-boundary', 'reason': json.dumps(result.get('observed', {}), ensure_ascii=False)}])
-                    store.save(state)
                     revoked = root / 'revocations.json'
                     values = json.loads(revoked.read_text()) if revoked.exists() else []
                     values.append(approved['v2_receipt']['reference']['digest'])
                     atomic_json(revoked, sorted(set(values)))
+            store = Store(root)
+            with store.locked():
+                state = store.load()
+                if failure:
+                    block(store, state, failure, operation=action)
+                else:
+                    store.transition(state, status='ready', phase='activation', blocker={},
+                        recovery_failure=None, recovery_operation=action,
+                        recovery_owner={'job': job['id'], 'generation': job['generation'],
+                                        'subscriber': subscriber['id'], 'context': recovery_context,
+                                        'artifact_id': artifact['artifact_id']})
         atomic_json(root / ('subscriber-' + subscriber['id'] + '.json'), result)
-        return {'ok': result['ok'], 'proof': json.dumps(result), 'engine_full_proof': approved['engine_full_proof']}
+        return {'ok': result['ok'], 'proof': json.dumps(result), 'failure': failure,
+                'error': failure['message'] if failure else '', 'recovery_operation': action,
+                'engine_full_proof': {**approved['engine_full_proof'], 'delivery_verified': bool(result['ok'])}}
+
+
+def acknowledge_recovery(job, subscriber, details):
+    """Only called after Supervisor authenticates the live child and its route."""
+    root = Path(job['result']['v2_transaction'])
+    with transaction_lock(root):
+        store = Store(root)
+        with store.locked():
+            state = store.load()
+            owner = state.get('recovery_owner') or {}
+            if (owner.get('job') != job['id'] or owner.get('generation') != job['generation']
+                    or owner.get('subscriber') != subscriber['id']
+                    or state.get('receipt') != job['result']['v2_receipt']['reference']
+                    or owner.get('artifact_id') != job['result']['runtime_artifact']['artifact_id']):
+                raise RepairBlocked('stale_recovery', '接管确认不属于当前恢复操作')
+            if state['status'] == 'complete':
+                return state['live_recovery']
+            if state.get('phase') != 'activation' or state['status'] != 'ready':
+                raise RepairBlocked('invalid_recovery_phase', '当前阶段不接受接管确认')
+            receipt = {'job': job['id'], 'subscriber': subscriber['id'], 'generation': job['generation'],
+                       'boundary': details, 'commit': job['result']['commit'],
+                       'operation': state['recovery_operation'], 'artifact_id': owner['artifact_id']}
+            store.transition(state, status='complete', phase='recovered', live_recovery=receipt,
+                             revalidation_signatures=[])
+            atomic_json(root / 'live-recovery.json', receipt)
+            return receipt
+
+
+def record_activation_failure(config, job, subscriber, receipt):
+    from .recovery import block, classify
+    root = Path(job['result']['v2_transaction'])
+    if root.parent.resolve() != (Path(config['root']) / 'v2-transactions').resolve():
+        raise RepairBlocked('invalid_acceptance', '启动失败回执不属于当前控制器')
+    failure = classify({'ok': False, 'observed': receipt}, subscriber['payload']['repair'])
+    if failure['domain'] == 'unknown':
+        failure.update(code=receipt.get('code') or 'activation_failed', recover_at='activation',
+                       message=receipt.get('error') or '原任务在确认接管前退出；已保留代码验收，停止自动实施。')
+    with transaction_lock(root):
+        _assert_owner({'config': config, 'job': job})
+        store = Store(root)
+        with store.locked():
+            state = store.load()
+            if state:
+                block(store, state, failure, operation=state.get('recovery_operation', 'activation'))
+    return failure
 
 
 def publish(request):
@@ -358,8 +618,10 @@ def publish(request):
         current = ControlStore(config['root']).job(job['id'])
         if current['state'] != 'completed' or not current['result'].get('ok'):
             raise RepairBlocked('publication_state', 'workflow acceptance must complete before publication')
-        approved = deliver(request, approved)
-        if not approved.get('ok'): return approved
+        from .recovery import completed_result
+        if completed_result(current) is None:
+            raise RepairBlocked('publication_state', '发布需要当前事务保存的真实接管确认')
+        verify_receipt(approved, expected_root=root)
         _assert_owner(request)
         repository = Repository(config)
         remote, fresh = repository.fetch()
@@ -368,6 +630,10 @@ def publish(request):
         contained = subprocess.run(['git', '-C', str(repository.cache), 'merge-base', '--is-ancestor',
                                     approved['commit'], remote], capture_output=True).returncode == 0
         if not contained:
+            fast_forward = subprocess.run(['git', '-C', str(repository.cache), 'merge-base', '--is-ancestor',
+                                           remote, approved['commit']], capture_output=True).returncode == 0
+            if not fast_forward:
+                raise RepairBlocked('publication_diverged', '远端已发生独立变更；原任务继续运行，发布等待单独处理。')
             publication_policy(config)
             repository.push(approved['commit'])
         from . import images

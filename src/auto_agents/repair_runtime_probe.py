@@ -128,8 +128,8 @@ def terminal_repair_status(root):
             if request["op"] == "submit":
                 return {"job": "job"}
             assert request["op"] == "status"
-            return {"job": {"id": "job", "state": job_state, "result": {"error": "probe failure"}},
-                    "subscribers": [{"id": "probe", "state": subscriber_state}], "registered": []}
+            return {"job": {"id": "job", "state": job_state, "payload": {}, "result": {"error": "probe failure"}},
+                    "subscribers": [{"id": "probe", "state": subscriber_state, "payload": {}}], "registered": []}
 
         with contextlib.ExitStack() as patches:
             patches.enter_context(patch("auto_agents.cli._run_command_for_self_repair_resume", return_value=["run"]))

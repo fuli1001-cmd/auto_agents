@@ -16,7 +16,7 @@ from contextlib import ExitStack
 from .dependencies import cache_key, pytest_parts, witness
 from .scheduling import Timings
 from .store import atomic_json, digest
-from .types import Cancellation, RepairBlocked, ValidationResult
+from .types import Cancellation, RepairBlocked, ValidationResult, ValidationUnit
 from .workspace import source_identity
 from .storage import disposable_source, execution_lease, recover_executions, require_space
 from .cleanup import labels, reap_containers
@@ -185,6 +185,7 @@ class DockerVerifier:
                                'session': Path(__file__).parent.parent.joinpath('session_replay.py').read_text(),
                                'runtime_identity': Path(__file__).parent.parent.joinpath('repair_runtime_identity.py').read_text(),
                                'replay_environment': Path(__file__).with_name('replay_environment.py').read_text(),
+                               'budget_recovery': Path(__file__).with_name('budget_recovery.py').read_text(),
                                'replay_isolation': REPLAY_ISOLATION,
                                'kernel': os.uname().release, 'policy': 8, 'init': True})
         self.image = identity_text.strip()  # A mutable tag is not a verification input.
@@ -400,6 +401,23 @@ class DockerVerifier:
                     'reason': 'Baseline tests modified their source.' if changed_source else detail.get('excerpt', '') if demonstrated else
                         'No executed behavioral counterexample on the original source; collection and setup errors do not establish a regression.'}
 
+    def artifact_preflight(self, artifact, cancel):
+        import shlex
+        program = ('import subprocess; from pathlib import Path; '
+                   'assert Path(".git").is_dir(); '
+                   'assert not Path(".git/objects/info/alternates").exists(); '
+                   'assert subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip() == '
+                   + repr(artifact['commit']))
+        result = self.execute(artifact['source'], Path(artifact['path']),
+            ValidationUnit('required:runtime-artifact', 'python -c ' + shlex.quote(program), fresh=True), cancel)
+        return {'ok': result['ok'], 'infrastructure': result.get('infrastructure', False),
+                'cancelled': result.get('cancelled', False), 'reason': result.get('excerpt', ''),
+                'artifact_id': artifact['artifact_id'], 'check': result}
+
+    def boundary_inputs(self, target, payload):
+        from .replay_environment import prepare
+        return [item.describe() for item in prepare(self.root / 'replay-environments', target, payload)]
+
     def boundary(self, snapshot_id, snapshot, frozen_target, payload, cancel):
         """One deterministic, credential-free replay at the original boundary."""
         from ..root_cause import RootCauseCoordinator
@@ -417,6 +435,9 @@ class DockerVerifier:
             output.mkdir(exist_ok=True)
             try:
                 RootCauseCoordinator._copy_diagnostic_tree(Path(frozen_target), target)
+                if payload.get('_budget_anchors'):
+                    from .budget_recovery import reconcile
+                    reconcile(target, payload['_budget_anchors'], payload.get('invocation', {}))
                 # Dissociate diagnostic Git objects before entering Docker;
                 # the real/frozen project is never mounted into the container.
                 if (target / '.git').exists():

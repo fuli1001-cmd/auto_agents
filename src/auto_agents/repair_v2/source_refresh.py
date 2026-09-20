@@ -12,7 +12,7 @@ from .workspace import git, inventory, source_identity
 def prepare(controller, repository, revision, *, force_check=False, locked=False):
     with nullcontext() if locked else controller.store.locked():
         state = controller.store.load()
-        if not state or state['status'] in ('waiting_user', 'skipped', 'complete'):
+        if not state or state['status'] in ('waiting_user', 'skipped'):
             return False
         if state['request_digest'] != digest(controller.request.to_dict()):
             raise RepairBlocked('request_changed', 'source refresh differs from the frozen repair contract')
@@ -117,6 +117,8 @@ def probe(controller):
     controller.phase('source_recheck')
     identity, snapshot = controller.workspace.freeze()
     controller.checkpoint(snapshot=identity, snapshot_path=str(snapshot))
+    from .runtime_artifact import prepare as prepare_artifact
+    snapshot = prepare_artifact(controller, snapshot)
     if controller.boundary is None:
         controller.checkpoint(source_refresh_check_pending=False, phase='audit')
         return

@@ -996,10 +996,11 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
             progress['group_progress'] = {'total': 5 if candidate == 1 else 6, 'completed': 2,
                                           'current': 3, 'group_id': 'recovery', 'title': '任务恢复边界'}
         payload = {"invocation": {"engine_route": {"issue_seed": {"summary": problems[job]}}}}
-        return {"job": {"id": job, "state": state, "payload": {"error": "wrong shared-job symptom"},
+        confirmation = {'recovery_confirmed': {'job': job, 'generation': 1}} if state == 'completed' else {}
+        return {"job": {"id": job, "state": state, 'generation': 1, "payload": {"error": "wrong shared-job symptom"},
                         "result": {"error": "修复环境依赖安装失败"}, "progress": progress,
                         "prior_repair_input": {'source_job': '2cc79b53'} if grouped and job == first else {}},
-                "subscribers": [{"id": "workflow", "state": workflow, "payload": {"repair": payload}}],
+                "subscribers": [{"id": "workflow", "state": workflow, "payload": {"repair": payload, **confirmation}}],
                 "registered": ["workflow"]}
 
     monkeypatch.setattr(repair_client, "rpc", control_rpc)
@@ -1015,9 +1016,9 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
         "Self-repair 223d4c02：第 1 轮：正在执行针对性验证",
         "Self-repair 223d4c02：第 2 轮：正在生成修复代码",
         "Self-repair 223d4c02：第 2 轮：正在执行针对性验证",
-        "Self-repair 223d4c02：修复方案已就绪，正在验证",
+        "Self-repair 223d4c02：代码已验证，正在检查原任务能否恢复",
         "Self-repair 223d4c02：正在恢复原任务",
-        "Self-repair 223d4c02：已通过恢复检查，原任务继续运行",
+        "Self-repair 223d4c02：原任务已确认接管，继续运行",
         f"Self-repair f28ccccd：正在修复：{problems[second]}",
         f"详细日志：{config['root']}/jobs/{second}",
         "Self-repair f28ccccd：修复受阻：修复环境依赖安装失败",
@@ -1107,8 +1108,9 @@ def test_repair_progress_does_not_claim_success_for_another_subscriber():
     from auto_agents.repair_client import _repair_progress_message
 
     job = {"id": "shared", "state": "completed", "result": {}}
-    assert _repair_progress_message(job, {"state": "validating"}) == "修复方案已就绪，正在验证"
-    assert _repair_progress_message(job, {"state": "waiting"}) == "修复方案已就绪，等待验证"
+    assert _repair_progress_message(job, {"state": "validating"}) == "代码已验证，正在检查原任务能否恢复"
+    assert _repair_progress_message(job, {"state": "waiting"}) == "代码已验证，等待当前任务的恢复检查"
+    assert _repair_progress_message(job, {"state": "resuming"}) == "正在恢复原任务"
     assert _repair_progress_message(job, {"state": "blocked"}) == "修复受阻：未返回具体原因，请查看详细日志"
     job["result"] = {"error": "CalledProcessError: long installation command", "environment_diagnostics": {"metadata": "command.json"}}
     assert _repair_progress_message(job, {"state": "blocked"}) == "修复受阻：修复环境准备失败，请查看详细日志中的环境安装记录"

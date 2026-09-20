@@ -41,6 +41,14 @@ def main() -> dict[str, object]:
     before_parent = {}
     parent_boundary_state = {}
     classifications = []
+    binding_checks = []
+    bind_session = session_verification.bind_session
+
+    def observe_binding(session, state, *args, **kwargs):
+        result = bind_session(session, state, *args, **kwargs)
+        binding_checks.append({'session_id': state.session_id,
+                               'fingerprint': state.verification_binding.get('binding_fingerprint')})
+        return result
 
     classify = session_verification._session_reference_kind
     def observe_reference(session, state, gates, ref):
@@ -56,23 +64,26 @@ def main() -> dict[str, object]:
 
     def no_provider(*args, **kwargs):
         nonlocal boundary_kind
-        boundary_kind = 'provider'
+        if not boundary_kind:
+            boundary_kind = 'provider'
+        request = args[1] if len(args) > 1 else kwargs.get('request')
+        recovery['provider_purpose'] = getattr(request, 'purpose', '')
+        if boundary_kind == 'implementation' and recovery['provider_purpose'] != 'fix':
+            boundary_kind = 'diagnosis'
+        recovery['provider_boundary_calls'] = recovery.get('provider_boundary_calls', 0) + 1
         if frames:
             boundary_state.update(frames[-1].to_dict())
         raise NextProviderBoundary()
 
-    def before_attempt(state):
-        # Do not spend live provider budget in an offline proof. Continue until
-        # all real preflight/ownership checks before the writer have run.
-        pass
-
+    call_agent = Session._call_agent
     def before_agent(self, state, label, prompt):
         nonlocal boundary_kind
         import re
         boundary_kind = ('implementation' if state.mode == 'fix' and re.fullmatch(r'fix-\d+', label)
                          else 'diagnosis')
-        boundary_state.update(state.to_dict())
-        raise NextProviderBoundary()
+        if boundary_kind == 'implementation':
+            recovery['activation_binding_fingerprint'] = state.verification_binding.get('binding_fingerprint')
+        return call_agent(self, state, label, prompt)
 
     drive = WorkflowCoordinator._drive_session
     def observe_drive(self, session, state, workflow, *, root):
@@ -143,12 +154,12 @@ def main() -> dict[str, object]:
         retained = load_session_state(project, session_id)
         with ExitStack() as patches:
             patches.enter_context(patch.object(Orchestrator, '_call_with_failover', no_provider))
-            patches.enter_context(patch.object(Session, '_record_agent_attempt', staticmethod(before_attempt)))
             patches.enter_context(patch.object(Session, '_call_agent', before_agent))
             patches.enter_context(patch.object(WorkflowCoordinator, '_drive_session', observe_drive))
             patches.enter_context(patch.object(Session, '_phase_collab_loop', observe_parent_phase))
             patches.enter_context(patch.object(repair_client, 'engine_route', observe_route))
             patches.enter_context(patch.object(session_verification, '_session_reference_kind', observe_reference))
+            patches.enter_context(patch.object(session_verification, 'bind_session', observe_binding))
             orchestrator = Orchestrator(project)
             session = Session(orchestrator, mode=mode, auto_approve=retained.auto_approve)
             coordinator = WorkflowCoordinator(orchestrator, auto_approve=retained.auto_approve)
@@ -197,15 +208,21 @@ def main() -> dict[str, object]:
                             and entry.get('route_digest') == recovery.get('route_digest')
                             and entry.get('child_session_id') == child_id
                             and entry.get('handoff_id') == recovery['original_handoff_id']]
-            rechecked = bool(rechecks)
+            freshly_bound = any(row['session_id'] == child_id and row['fingerprint']
+                                and row['fingerprint'] == binding.get('binding_fingerprint') for row in binding_checks)
+            active_failure = before_child.get('status') == 'blocked' and bool(recovery.get('previous_failure'))
+            rechecked = bool(rechecks) or bool(not active_failure and freshly_bound)
             started = [entry for entry in new_events if entry.get('action') == 'engine_preflight_recheck_started'
                        and entry.get('route_digest') == recovery.get('route_digest')]
             recovery.update(preflight_started=bool(started), new_preflight_events=[*started, *rechecks],
                             diagnostic_origin=('fresh' if recovery['current_failure'] else
                                                'rechecked' if rechecked else 'historical_replay'))
+            preserved &= all(after.get(key) == before_child.get(key) for key in ('attempt_epoch', 'max_attempts'))
+            reservations = recovery.get('provider_boundary_calls', 0) if boundary_kind == 'implementation' else 0
+            preserved &= reservations in (0, 1) and all(
+                after.get(key) == before_child.get(key, 0) + reservations
+                for key in ('current_attempt', 'attempts_since_progress'))
             if before_child.get('status') == 'blocked' and recovery.get('previous_failure'):
-                preserved &= all(after.get(key) == before_child.get(key) for key in (
-                    'current_attempt', 'attempt_epoch', 'attempts_since_progress', 'max_attempts'))
                 preserved &= bool(rechecked and binding)
                 preserved &= recovery['previous_failure'] in after['execution_log']
             budgets = ('current_attempt', 'attempt_epoch', 'attempts_since_progress', 'max_attempts', 'hard_ceiling')
@@ -220,11 +237,13 @@ def main() -> dict[str, object]:
                 parent_budget={'before': {k: before_parent.get(k) for k in budgets},
                                'after': {k: parent_after.get(k) for k in budgets}},
                 child_budget={'before': {k: before_child.get(k) for k in budgets},
-                              'after': {k: after.get(k) for k in budgets}})
+                              'after': {k: after.get(k) for k in budgets}},
+                budget_reserved=after.get('current_attempt', 0) - before_child.get('current_attempt', 0),
+                full_dispatch=True)
             preserved &= parent_preserved
             entered = (boundary_state.get('session_id') == child_id
                        and boundary_kind == 'implementation' and after['status'] == 'executing'
-                       and bool(binding))
+                       and bool(binding) and freshly_bound and reservations == 1)
             completed = (after['status'] == 'completed' and binding
                          and after.get('candidate_custody', {}).get('receipt'))
             recovery.update(preflight_rechecked=rechecked, retained_constraints=bool(preserved),

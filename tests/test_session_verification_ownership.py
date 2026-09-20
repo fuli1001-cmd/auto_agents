@@ -2629,6 +2629,7 @@ def _switch_ambient_binding_plan(root):
 
 
 def _assert_binding_blocked_before_execution(root, monkeypatch, *, parent=False):
+    before_child = load_session_state(root, 'owned-child').to_dict()
     def baseline(*args, **kwargs):
         pytest.fail('Unresolved session authority must block before baseline capture')
     monkeypatch.setattr(Session, '_ensure_baseline', baseline)
@@ -2642,8 +2643,28 @@ def _assert_binding_blocked_before_execution(root, monkeypatch, *, parent=False)
         monkeypatch.setattr(Session, '_phase_collab_loop', parent_boundary)
         def writer(*args):
             pytest.fail('Unresolved session authority must block before the writer')
-        resume_to_observation(root, monkeypatch, writer)
+        # Conflicting parent/child identity now stops the parent directly;
+        # ordinary child rejection may still return to the parent boundary.
+        monkeypatch.setattr(Orchestrator, '_call_with_failover', writer)
+        try:
+            stopped = Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
+        except ObservationBoundary:
+            pass
+        else:
+            assert stopped.status in {'failed', 'blocked'}
+            persisted = load_session_state(root, 'parent')
+            assert persisted.status == 'blocked' and persisted.resolution == 'verification_ownership'
+            assert 'conflicting child identities' in persisted.execution_log[-1]['result']
         saved = load_session_state(root, 'owned-child')
+        if saved.status == 'failed':
+            # Chain validation rejects the parent before selecting a child.
+            assert saved.to_dict() == before_child
+            rejected = load_session_state(root, 'parent')
+            assert rejected.status == 'blocked' and rejected.resolution == 'verification_ownership'
+            diagnostic = rejected.execution_log[-1]['diagnostic']
+            assert diagnostic['session_id'] == saved.session_id and diagnostic['retry_fix'] is False
+            assert len(diagnostic['child_session_ids']) > 1
+            return saved
     else:
         saved, calls, _ = run_session(root, monkeypatch)
         assert calls == []
@@ -2780,7 +2801,7 @@ def test_public_resume_rejects_conflicting_handoff_child_identities(tmp_path, mo
     handoff_bytes = handoff_path.read_bytes()
     saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
     assert saved.verification_binding == retained
-    diagnostic = saved.execution_log[-1]['diagnostic']
+    diagnostic = load_session_state(root, 'parent').execution_log[-1]['diagnostic']
     assert diagnostic['handoff_id'] == handoff.handoff_id
     assert diagnostic['child_session_ids'] == [child.session_id, 'another-child']
     assert handoff_path.read_bytes() == handoff_bytes
@@ -3276,7 +3297,8 @@ def _assert_public_missing_scope_recovery(tmp_path, monkeypatch, shape):
         for _ in range(2):
             saved = _assert_binding_blocked_before_execution(root, monkeypatch, parent=True)
             assert saved.verification_binding == retained
-            diagnostic = saved.execution_log[-1]['diagnostic']
+            diagnostic = (load_session_state(root, 'parent') if shape == 'missing_scope_conflict'
+                          else saved).execution_log[-1]['diagnostic']
             assert diagnostic['handoff_id'] == handoff.handoff_id
             assert diagnostic['contract_fingerprint'] == retained['contract_fingerprint']
             assert diagnostic['retry_fix'] is False

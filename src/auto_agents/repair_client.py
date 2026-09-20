@@ -277,13 +277,15 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
     if "blocked" in (state, workflow):
         return "修复受阻：" + _repair_failure_detail(job, subscriber)
     if workflow == "resuming":
-        return "已通过恢复检查，原任务继续运行" if state == "completed" else "正在恢复原任务"
+        confirmed = subscriber.get('payload', {}).get('recovery_confirmed')
+        return ("原任务已确认接管，继续运行" if confirmed and confirmed == {
+            'job': job.get('id'), 'generation': job.get('generation')} else "正在恢复原任务")
     if workflow == "validating":
-        return "修复方案已就绪，正在验证"
+        return "代码已验证，正在检查原任务能否恢复"
     if workflow == "verified":
         return "验证已通过，等待恢复原任务"
     if state in {"ready", "completed"}:
-        return "修复方案已就绪，等待验证"
+        return "代码已验证，等待当前任务的恢复检查"
     if state == "queued":
         return "等待开始修复"
     if state == "repairing":
@@ -292,6 +294,8 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
         if progress.get('engine') == 'v2':
             labels = {'plan': '正在统一规划修复', 'implement': '正在连续实施修复',
                       'audit': '正在检查既有测试是否完整保留',
+                      'artifact': '正在生成并检查独立运行产物',
+                      'activation': '恢复检查已通过，等待原子任务确认接管',
                       'diagnose': '正在定向复核已知失败，尚未开始完整验收',
                       'boundary_preflight': '正在先行验证原子任务恢复，尚未开始完整验收',
                       'validate': '正在集中验收：测试与独立审查并行',

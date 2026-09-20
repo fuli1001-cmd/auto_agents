@@ -80,8 +80,7 @@ class Controller:
 
     def checkpoint(self, **updates):
         with self.state_lock:
-            self.state.update(updates)
-            self.store.save(self.state)
+            self.store.transition(self.state, **updates)
 
     def phase(self, name):
         self.checkpoint(phase=name)
@@ -89,15 +88,16 @@ class Controller:
 
     def agent(self, role, prompt, root, *, schema=None, cancel=None, fallback_prompt=None):
         if self.cancel.is_set(): raise KeyboardInterrupt()
+        call = self.state['calls'] + 1
         if self.chain is not None:
-            self.chain.reserve(role)
+            self.chain.reserve(role, operation=self.request.identity + ':' + str(call))
         before = source_identity(root)
         with self.state_lock:
-            call = self.state['calls'] + 1
             self.state['calls'] = call
             self.store.save(self.state)
         reference = self.store.artifact('agent-input', {'role': role, 'prompt': prompt, 'source': before})
-        self.checkpoint(active_call={'call': call, 'role': role, 'source': before, 'input': reference})
+        self.checkpoint(active_call={'call': call, 'role': role, 'source': before, 'input': reference},
+                        call_state='dispatched')
         self.store.event('agent_started', role=role, call=call, input=reference)
         started = time.monotonic()
 
@@ -115,6 +115,7 @@ class Controller:
         if role == 'implement': session = session or self.state['sessions'].get('plan', '')
         reply = self.driver.run(role, prompt, root, session=session, schema=schema,
                                 progress=progress, cancel=cancel or self.cancel)
+        self.checkpoint(call_state='finished')
         with self.state_lock:
             if reply.session: self.state['sessions'][role] = reply.session
             self.store.save(self.state)
@@ -379,6 +380,8 @@ class Controller:
         identity, snapshot = self.state['snapshot'], Path(self.state['snapshot_path'])
         if source_identity(snapshot) != identity:
             raise RepairBlocked('snapshot_changed', 'verification snapshot no longer matches its checkpoint')
+        from .runtime_artifact import prepare
+        snapshot = prepare(self, snapshot)
         self.phase('validate')
         self.checkpoint(verification_runtime=getattr(self.verifier, 'runtime', ''))
         early_boundary = None
@@ -458,7 +461,7 @@ class Controller:
         self.checkpoint(validation=proof)
         self.workspace.collect_snapshots(identity)
         comparison = None
-        comparison_base = self.state.get('source_refreshed', {}).get('parent') or self.request.engine_base
+        comparison_base = self.request.engine_base
         old_nodes = set()
         suite_ok = validation.ok
         if not suite_ok and differential and not validation.cancelled and not missing:
@@ -513,6 +516,9 @@ class Controller:
             self.checkpoint(status='ready', phase='deliver', failures=[],
                 receipt=self.store.artifact('acceptance', {'request': self.state['request_digest'],
                     'snapshot': identity, 'validation': proof, 'comparison': comparison,
+                    'runtime_artifact': self.state.get('runtime_artifact'),
+                    'budget_anchors': getattr(self, 'budget_anchors', None),
+                    'recovery_context': getattr(self, 'recovery_context', None),
                     'comparison_base': comparison_base,
                     'scope': self.scope.current() if self.scope is not None else None,
                     'integration_parents': self.state.get('integration_parents', []),
@@ -640,6 +646,10 @@ class Controller:
                 # Only the foreground choice can return this to the business
                 # workflow; restarting a worker must never re-ask a model.
                 return self.state
+            if self.state.get('call_state') == 'dispatched':
+                self.checkpoint(status='blocked', blocker={'code': 'provider_outcome_unknown',
+                    'message': '上次模型调用中断，尚不能确认结果；已保留消耗和候选，停止重复调用。'})
+                return self.state
             self._recover_verified_progress()
             if self.state['status'] in ('ready', 'complete'):
                 from .comparison import accepted
@@ -648,11 +658,14 @@ class Controller:
                 validation, review = self.store.read(saved['validation']), self.store.read(saved['review'])
                 if (saved['request'] != self.state['request_digest']
                         or saved['snapshot'] != self.state['snapshot']
-                        or not accepted(self.store, saved, self.request.engine_base) or not review['ok'] or review['findings']
+                        or not review['ok'] or review['findings']
                         or source_identity(Path(self.state['snapshot_path'])) != saved['snapshot']):
                     raise RepairBlocked('invalid_acceptance', 'saved acceptance or source no longer matches')
                 self.verifier.prepare()
-                if self.state.get('verification_runtime', '') != getattr(self.verifier, 'runtime', ''):
+                if (not saved.get('runtime_artifact')
+                        or saved.get('recovery_context') != getattr(self, 'recovery_context', None)
+                        or not accepted(self.store, saved, self.request.engine_base)
+                        or self.state.get('verification_runtime', '') != getattr(self.verifier, 'runtime', '')):
                     self.checkpoint(status='active', phase='validate')
                 elif self.scope is not None and (not self.scope.current() or saved.get('scope') != self.scope.current()):
                     # Supplement new scope proof on the retained candidate;
@@ -669,7 +682,10 @@ class Controller:
                              and not self.state.get('audit_recovery_version') and self.state.get('plan'))
                 retryable = self.state.get('blocker', {}).get('code') in {
                     'provider_failed', 'provider_configuration', 'docker_unavailable', 'disk_space',
-                    'verification_infrastructure', 'upstream_unavailable', 'disk_observation', 'execution_failed',
+                    'verification_infrastructure', 'upstream_unavailable', 'disk_observation',
+                    'runtime_artifact_invalid',
+                    'verification_environment_changed', 'image_unavailable',
+                    'original_boundary_failed',
                     'provider_timeout', 'provider_cleanup_failed'}
                 if self.state.get('blocker', {}).get('code') == 'repair_chain_exhausted' and self.chain is not None:
                     budget = self.chain.context()
@@ -726,7 +742,7 @@ class Controller:
                         self.checkpoint(plan=reference, phase='audit')
                 while True:
                     if self.cancel.is_set(): raise KeyboardInterrupt()
-                    if self.state['phase'] not in ('audit', 'diagnose', 'validate', 'boundary_preflight', 'boundary', 'regression', 'baseline_comparison'):
+                    if self.state['phase'] not in ('artifact', 'subscriber_validation', 'activation', 'audit', 'diagnose', 'validate', 'boundary_preflight', 'boundary', 'regression', 'baseline_comparison'):
                         if self.state.get('external_correction'):
                             raise RepairBlocked('no_progress',
                                 'corrected source failed acceptance; implementation budget remains exhausted')
@@ -742,7 +758,7 @@ class Controller:
                     if self.validate(): return self.state
             except KeyboardInterrupt:
                 self.cancel.set()
-                self.checkpoint(status='stopped')
+                self.checkpoint(status='stopped', call_state='interrupted')
                 self.store.event('stopped', phase=self.state['phase'])
                 raise
             except RepairBlocked as error:
@@ -766,7 +782,8 @@ class Controller:
                         location = 'independent review: ' + sanitize(str(failure.get('reason') or failure['requirement']))
                     if location:
                         message = 'Acceptance failed at ' + str(location)[:400] + '; ' + message
-                self.checkpoint(status='blocked', blocker={'code': error.code, 'message': message})
+                self.checkpoint(status='blocked', blocker={'code': error.code, 'message': message},
+                                **({'recovery_failure': error.failure} if hasattr(error, 'failure') else {}))
                 self.store.event('blocked', **self.state['blocker'])
                 return self.state
             except Exception as error:

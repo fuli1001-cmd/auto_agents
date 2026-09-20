@@ -226,8 +226,11 @@ def test_mixed_command_execution_preserves_conditional_actions(tmp_path, monkeyp
     assert marker.exists() is executes_action
 
 
-@pytest.mark.parametrize('status', ['paused', 'waiting_user', 'waiting_child'])
-def test_engine_child_nonterminal_receipt_stays_active_until_same_child_finishes(tmp_path, monkeypatch, status):
+@pytest.mark.parametrize('status,renewed_receipt', [
+    pytest.param(status, renewed, id=status if renewed else 'unverified-' + status)
+    for renewed in (True, False) for status in ('paused', 'waiting_user', 'waiting_child')
+])
+def test_engine_child_nonterminal_receipt_stays_active_until_same_child_finishes(tmp_path, monkeypatch, status, renewed_receipt):
     from auto_agents.repair_control import digest
 
     root, child = project(tmp_path)
@@ -269,7 +272,12 @@ def test_engine_child_nonterminal_receipt_stays_active_until_same_child_finishes
     assert pending.result['session_id'] == child.session_id
     assert calls == []
     ready = True
-    monkeypatch.delenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE')
+    if not renewed_receipt:
+        monkeypatch.delenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE')
+        stopped = Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
+        assert stopped.status == 'blocked' and stopped.resolution == 'execution_binding_mismatch'
+        assert visits == [child.session_id] and calls == []
+        return
     with pytest.raises(ObservationBoundary):
         Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
     assert visits == [child.session_id, child.session_id]

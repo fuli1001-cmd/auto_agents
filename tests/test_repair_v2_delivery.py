@@ -207,14 +207,18 @@ def test_new_subscriber_counterexample_revokes_proof_and_resumes_implementation(
     job = {**repair_request['job'], 'result': approved}
     subscriber = {'id': 'subscriber', 'project': job['payload']['project'], 'payload': {'repair': job['payload']}}
     def failure(identity, *args):
-        return {'ok': False, 'snapshot': identity, 'observed': {'error': 'new reproducible recovery failure'}}
+        return {'ok': False, 'snapshot': identity, 'observed': {
+            'engine_runtime': {'ok': True}, 'recovery_observation': {
+                'ok': False, 'parent_session_id': job['payload']['invocation']['session_id'],
+                'child_session_id': 'bound-child', 'current_failure': {'error': 'original preflight failed'}}}}
     verifier.boundary = failure
     with patch.object(integration, 'DockerVerifier', return_value=verifier):
         result = integration.validate_subscriber({**repair_request, 'job': job, 'subscriber': subscriber})
     assert not result['ok']
     root = Path(approved['v2_transaction'])
     state = Store(root).load()
-    assert state['phase'] == 'implement' and state['status'] == 'active'
+    assert state['phase'] == 'implement' and state['status'] == 'blocked'
+    assert state['recovery_failure']['domain'] == 'candidate'
     assert state['plan'] and state['attempts'] == 1
     assert len(list((root / 'counterexamples').glob('*/payload.json'))) == 1
     with pytest.raises(RepairBlocked, match='counterexample'):
@@ -229,13 +233,46 @@ def test_publication_uses_verified_receipt_and_only_updates_configured_remote(re
     store = ControlStore(repair_request['config']['root'])
     store.transition(repair_request['job']['id'], 'completed', approved)
     request = {**repair_request, 'job': store.job(repair_request['job']['id'])}
+    with pytest.raises(RepairBlocked, match='接管确认'):
+        integration.publish(request)
+    confirm_recovery(request, approved, verifier)
     with patch('auto_agents.repair_worker.make_runner', side_effect=AssertionError('legacy publication loaded')):
         result = integration.publish(request)
     assert result['ok'] and result['status'] == 'published'
     assert git(repair_request['config']['remote'], 'rev-parse', 'refs/heads/master') == approved['commit']
 
 
-def test_new_invocation_imports_controller_correction_into_exhausted_candidate(repair_request, monkeypatch):
+def confirm_recovery(request, approved, verifier):
+    job = {**request['job'], 'result': approved}
+    subscriber = {'id': 'publication-owner', 'project': job['payload']['project'], 'payload': {'repair': job['payload']}}
+    with patch.object(integration, 'DockerVerifier', return_value=verifier):
+        assert integration.validate_subscriber({**request, 'job': job, 'subscriber': subscriber})['ok']
+    integration.acknowledge_recovery(job, subscriber, {'session_id': job['payload']['invocation']['session_id']})
+
+
+def test_publication_divergence_never_reopens_implementation(repair_request, tmp_path):
+    driver, verifier = Driver(), Verifier()
+    with patch('auto_agents.repair_worker.engine_environment', return_value=('python', 'fixed-env')), \
+         patch.object(integration, '_components', side_effect=components(driver, verifier)):
+        approved = integration.repair_entry(repair_request)
+    store = ControlStore(repair_request['config']['root'])
+    store.transition(repair_request['job']['id'], 'completed', approved)
+    request = {**repair_request, 'job': store.job(repair_request['job']['id'])}
+    confirm_recovery(request, approved, verifier)
+    upstream = tmp_path / 'upstream'
+    subprocess.run(['git', 'clone', '--quiet', repair_request['config']['remote'], str(upstream)], check=True)
+    (upstream / 'independent.txt').write_text('independent upstream work')
+    git(upstream, 'add', '.'); git(upstream, 'commit', '-qm', 'upstream advance'); git(upstream, 'push', '-q')
+    before = Store(approved['v2_transaction']).load()
+    with pytest.raises(RepairBlocked, match='远端'):
+        integration.publish(request)
+    assert Store(approved['v2_transaction']).load() == before
+    assert driver.calls == ['plan', 'implement', 'review']
+    assert Path(approved['runtime'], 'source.py').read_text() == 'value = 1\n'
+
+
+@pytest.mark.parametrize('correction_target', ['engine', 'controller'])
+def test_new_invocation_separates_engine_and_controller_corrections(repair_request, monkeypatch, correction_target):
     driver, verifier = Driver(), Verifier()
     original = driver.run
     def no_fix(role, *args, **kwargs):
@@ -262,12 +299,23 @@ def test_new_invocation_imports_controller_correction_into_exhausted_candidate(r
     subprocess.run(['git', 'clone', '-q', str(origin), str(corrected)], check=True)
     (corrected / 'source.py').write_text('value = 1\n')
     git(corrected, 'commit', '-qam', 'Correct the exhausted repair')
+    if correction_target == 'engine':
+        source = Path(repair_request['config']['source_root'])
+        git(source, 'fetch', '-q', str(corrected), 'HEAD')
+        git(source, 'merge', '--ff-only', 'FETCH_HEAD')
     renewed = {**repair_request, 'config': {**repair_request['config'], 'implementation_root': str(corrected)},
                'job': public.job(identity)}
     calls = len(driver.calls)
     with patch('auto_agents.repair_worker.engine_environment', return_value=('python', 'fixed-env')), \
          patch.object(integration, '_components', side_effect=components(driver, verifier)):
         accepted = integration.repair_entry(renewed)
+    if correction_target == 'controller':
+        assert not accepted['ok']
+        assert len(driver.calls) == calls
+        after = Store(root).load()
+        assert after['calls'] == before['calls'] and after['attempts'] == before['attempts']
+        assert (Path(repair_request['config']['source_root']) / 'source.py').read_text() == 'value = 0\n'
+        return
     assert accepted['ok'], accepted
     assert driver.calls[calls:] == ['review']
     after = Store(root).load()
@@ -275,3 +323,7 @@ def test_new_invocation_imports_controller_correction_into_exhausted_candidate(r
     assert (Path(repair_request['config']['source_root']) / 'source.py').read_text() == 'value = 1\n'
     assert (Path(project) / 'keep.txt').read_text() == 'original user data'
     assert integration.verify_receipt(accepted)['boundary']
+
+
+# Retained contracts may still select this pre-separation node name.
+test_new_invocation_imports_controller_correction_into_exhausted_candidate = test_new_invocation_separates_engine_and_controller_corrections

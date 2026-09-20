@@ -964,10 +964,22 @@ class WorkflowCoordinator:
         try:
             return self.store.resolve_handoff_chain(handoff, workflow_id=workflow_id)
         except (OSError, ValueError, TypeError, KeyError) as error:
+            diagnostic = {'workflow_id': workflow_id,
+                          'handoff_id': handoff if isinstance(handoff, str) else handoff.handoff_id,
+                          'retry_fix': False, **getattr(error, 'diagnostic', {})}
+            identity = diagnostic.get('session_id', '')
+            if isinstance(identity, str) and identity and all(c.isalnum() or c in '-_' for c in identity):
+                try:
+                    candidate = self.project_root / '.auto-agents/state/sessions' / identity / 'session_state.json'
+                    if not candidate.resolve().is_relative_to(self.project_root.resolve()):
+                        raise ValueError('diagnostic session leaves its project')
+                    retained = load_session_state(self.project_root, diagnostic['session_id'])
+                    if retained.workflow_id == workflow_id and retained.parent_handoff_id == diagnostic['handoff_id']:
+                        diagnostic['contract_fingerprint'] = retained.verification_binding.get('contract_fingerprint', '')
+                except (OSError, ValueError, TypeError, AttributeError, RuntimeError):
+                    pass  # Diagnostic enrichment never grants execution authority.
             raise SessionOwnershipError('original child handoff is unavailable or conflicting: ' + str(error),
-                diagnostic={'workflow_id': workflow_id,
-                            'handoff_id': handoff if isinstance(handoff, str) else handoff.handoff_id,
-                            'retry_fix': False}) from error
+                                        diagnostic=diagnostic) from error
 
     def _validated_child_handoff(self, state, handoff):
         from .session_verification import ownership_error

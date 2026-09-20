@@ -35,6 +35,7 @@ _MODULES = {
     'auto_agents.scope_decisions': ('choose', 'session_choice', 'resume_session_choice'),
     'auto_agents.repair_v2.scope': ('ScopeGuard.admit', 'ScopeGuard.current'),
     'auto_agents.session_verification': (
+        'bind_session',
         '_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory',
         '_validate_required_node_selection',
         # Classification also reads the retained catalog. Checking only its
@@ -64,6 +65,7 @@ def observe_engine(runtime, *, expected_commit=None):
                             capture_output=True, text=True, timeout=30)
     report = {'pid': os.getpid(), 'python': sys.executable, 'python_version': sys.version,
               'runtime_root': str(runtime), 'commit': commit.stdout.strip() if not commit.returncode else '',
+              'git_returncode': commit.returncode, 'git_error': commit.stderr.strip()[:2000],
               'modules': {}, 'mismatches': []}
     if commit.returncode or not report['commit']:
         report['mismatches'].append('commit_unavailable')

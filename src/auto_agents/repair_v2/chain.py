@@ -97,10 +97,14 @@ class RepairChain:
             self.store.save(state)
             return self.totals(state)
 
-    def reserve(self, role):
+    def reserve(self, role, *, operation=None):
         """Charge before dispatch; a crash or cancellation cannot refund a call."""
         with self.locked():
             state = self._load()
+            if operation and operation in state.get('reservations', {}):
+                if state['reservations'][operation] != [self.transaction.name, role]:
+                    raise RepairBlocked('repair_chain_identity', '调用编号已用于另一项修复操作')
+                return
             used = self.totals(state)
             fields = ['model_calls', *(['implementations'] if role == 'implement' else [])]
             for field in fields:
@@ -110,6 +114,8 @@ class RepairChain:
                         'preserve the candidate and diagnose the remaining blocker before granting more work')
             entry = state['transactions'][self.transaction.name]
             for field in fields: entry[field] += 1
+            if operation:
+                state.setdefault('reservations', {})[operation] = [self.transaction.name, role]
             self.store.save(state)
             self.store.event('call_reserved', transaction=self.transaction.name, role=role, totals=self.totals(state))
 

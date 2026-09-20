@@ -480,7 +480,8 @@ def test_exhausted_repair_ignores_same_invocation_and_source_identical_commit(jo
     assert not runner.recover_corrected_source(repo, commit)
     unchanged = runner.store.load()
     assert unchanged.pop('correction_pending', None) is None
-    assert unchanged == blocked
+    assert {k: v for k, v in unchanged.items() if k != 'revision'} == {
+        k: v for k, v in blocked.items() if k != 'revision'}
     calls = len(runner.driver.calls)
     assert runner.run()['status'] == 'blocked'
     assert len(runner.driver.calls) == calls
