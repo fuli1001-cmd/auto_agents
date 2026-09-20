@@ -246,6 +246,8 @@ def _repair_failure_detail(job, subscriber):
 
 def _repair_progress_message(job, subscriber, *, include_imported=True):
     state, workflow = job["state"], subscriber["state"]
+    if state == 'waiting_user' or workflow == 'waiting_user':
+        return '等待你选择下一步；当前不会继续调用模型'
     if workflow == "finished":
         return "原任务已完成"
     if "cancelled" in (state, workflow):
@@ -272,6 +274,7 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
                       'boundary_preflight': '正在先行验证原子任务恢复，尚未开始完整验收',
                       'validate': '正在集中验收：测试与独立审查并行',
                       'regression': '正在验证修复前后的行为差异',
+                      'baseline_comparison': '正在确认测试失败是否在修复前就已存在',
                       'boundary': '正在验证原会话恢复', 'deliver': '正在交付已验收引擎'}
             if phase == 'check_finished':
                 unit = progress.get('unit', '')
@@ -395,6 +398,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
         boundary = {"kind": "engine_route", "route_digest": digest(invocation["engine_route"])}
     source = auto_agents_repo_root()
     payload = {"project": str(Path(project).resolve()), "base": git(source, "rev-parse", "HEAD"),
+               "scope_receipt": getattr(orchestrator, '_repair_scope_receipt', None) if isinstance(error, EngineRepairRequired) else None,
                "symptom_key": symptom_key(error, project),
                "fingerprint": decision.fingerprint, "error": redact_incident_text(str(error)),
                "contract": (diagnosis.final.to_dict() if diagnosis else
@@ -408,6 +412,17 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                "provider": getattr(args, "provider", None) or getattr(orchestrator, "_current_provider", None) or getattr(orchestrator.config, "active_provider", None),
                "autonomy": getattr(args, "autonomy", None) or orchestrator.config.execution.autonomy.mode,
                "resume_argv": argv}
+    if diagnosis and getattr(diagnosis.final, 'necessity', None) and not payload['scope_receipt']:
+        from .repair_v2.scope import ScopeGuard, context
+        necessity = diagnosis.final.necessity
+        if necessity.get('decision') == 'skip':
+            from .scope_decisions import resume_original
+            return resume_original(orchestrator, project, None, args, lock, owner=context(project, payload)['owner'])
+        if necessity.get('decision') == 'required':
+            guard = ScopeGuard(Path(registration['config']['root']) / 'scope-inputs' / digest(invocation),
+                               payload, project, source)
+            reference = guard.admit(necessity)
+            payload['scope_receipt'] = guard.store.read(reference)
     # The request marker deliberately is not a valid RootCauseDiagnosis. An
     # old immutable worker that cannot fetch a newer runtime must fail closed,
     # rather than treating diagnosis=None as permission for legacy repair.
@@ -435,6 +450,28 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
             status = response["job"]["state"]
             job = response["job"]["id"]
             subscriber = next(item for item in response["subscribers"] if item["id"] == registration["subscriber"])
+            if response['job'].get('state') == 'skipped' and response['job'].get('result', {}).get('return_goal'):
+                from .scope_decisions import resume_original
+                return resume_original(orchestrator, project, None, args, lock,
+                                       owner=response['job']['result']['return_goal'])
+            pending = subscriber['payload'].get('pending_decision') or {}
+            if subscriber['state'] == 'waiting_user' and pending:
+                from .scope_decisions import Decisions, choose, resume_original
+                question = Decisions(project).read(pending['id'])
+                choice = choose(orchestrator, question)
+                if choice is None:
+                    rpc(registration['config'], {'op': 'detach-decision', 'subscriber': subscriber['id'],
+                                                 'decision': question['id']})
+                    _report_repair_progress(project, '进度已保存。再次运行同一会话即可回答这个问题并继续。')
+                    return 3
+                answered = rpc(registration['config'], {'op': 'answer-decision', 'subscriber': subscriber['id'],
+                    'decision': question['id'], 'decision_version': question['version'], 'answer': choice[0], 'user_text': choice[1]})
+                if answered.get('resume_original'):
+                    return resume_original(orchestrator, project, question['id'], args, lock)
+                if choice[0] == 'keep' and pending.get('source') == 'repair':
+                    _report_repair_progress(project, '已保留原范围。本次执行暂停，修复候选已保存。')
+                    return 3
+                continue
             prefix = f"Self-repair {job[:8]}："
             log_path = f"详细日志：{registration['config']['root']}/jobs/{job}"
             message = _repair_progress_message(response["job"], subscriber, include_imported=False)

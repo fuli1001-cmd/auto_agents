@@ -36938,6 +36938,10 @@ class Orchestrator:
         state.resume_context.update(runtime_context)
 
     def resume_saved_run(self) -> RunState:
+        from .scope_decisions import resume_run_choice
+        waiting = resume_run_choice(self)
+        if waiting is not None:
+            return waiting
         state = load_run_state(self.project_root)
         context = dict(state.resume_context)
         spec_file = Path(str(context.get("spec_file") or (self.project_root / "spec.md")))

@@ -22,6 +22,32 @@ def intent(payload):
 def transaction_root(config, payload):
     directory = Path(config['root']) / 'v2-transactions'
     expected = directory / digest(intent(payload))
+    scope = _scope_identity(payload)
+    if scope is not None:
+        matches = []
+        for path in directory.glob('*/original-payload.json'):
+            if path.is_symlink() or path.parent.is_symlink():
+                continue
+            original = json.loads(path.read_text())
+            old = _scope_identity(original)
+            if old is None:
+                # Legacy identity is established from its retained scene, not
+                # a paraphrased issue or the current project's ambient run.
+                try:
+                    from .scope import context
+                    old = _context_identity(context(path.parent / 'target-evidence', original))
+                except (OSError, ValueError, KeyError, TypeError, RepairBlocked):
+                    continue
+            pending = not (path.parent / 'live-recovery.json').exists()
+            same_step = (old is not None and old['owner'] == scope['owner'] and old['goal_version'] == scope['goal_version']
+                         and old['blocker'].get('operation') == scope['blocker'].get('operation'))
+            if old == scope or pending and same_step:
+                saved = Store(path.parent).load() or {}
+                if saved.get('status') != 'complete':
+                    matches.append((path.stat().st_mtime_ns, path.parent))
+        if matches:
+            return max(matches, key=lambda row: row[0])[1]
+        return directory / digest({'goal_scope': scope})
     invocation = payload.get('invocation', {})
     if invocation.get('session_id') and invocation.get('workflow_id'):
         legacy_payload = {**payload, 'invocation': {**invocation, 'workflow_id': ''}}
@@ -32,6 +58,37 @@ def transaction_root(config, payload):
         if (legacy.exists() or legacy.is_symlink()) and _matches_legacy_session(legacy, payload):
             return legacy
     return expected
+
+
+def _context_identity(context):
+    if (not isinstance(context, dict) or context.get('policy') != 'goal-scope-v1'
+            or not context.get('owner') or not context.get('goal_version') or not context.get('blocker')):
+        return None
+    return {key: context[key] for key in ('owner', 'goal_version', 'blocker')}
+
+
+def _scope_identity(payload):
+    record = payload.get('scope_receipt') or {}
+    if record.get('proposal', {}).get('decision') != 'required' or not record.get('witnesses'):
+        return None
+    return _context_identity(record.get('context'))
+
+
+def _matches_scope(root, payload):
+    current = _scope_identity(payload)
+    if current is None:
+        return False
+    original = json.loads((Path(root) / 'original-payload.json').read_text())
+    if json.loads((Path(root) / 'intent.json').read_text()).get('digest') != digest(intent(original)):
+        raise RepairBlocked('transaction_identity_unresolved', 'frozen intent no longer matches its original payload')
+    previous = _scope_identity(original)
+    if previous is None:
+        from .scope import context
+        previous = _context_identity(context(Path(root) / 'target-evidence', original))
+    return previous == current or (not (Path(root) / 'live-recovery.json').exists()
+        and previous is not None and previous['owner'] == current['owner']
+        and previous['goal_version'] == current['goal_version']
+        and previous['blocker'].get('operation') == current['blocker'].get('operation'))
 
 
 def _matches_legacy_session(root, payload):
@@ -90,7 +147,7 @@ def frozen_request(root, payload, create):
     expected = digest(intent(payload))
     if marker.exists():
         if (json.loads(marker.read_text()).get('digest') != expected
-                and not _matches_legacy_session(root, payload)):
+                and not _matches_scope(root, payload) and not _matches_legacy_session(root, payload)):
             raise RepairBlocked('request_changed', 'repair intent differs from its frozen contract')
         if not frozen.is_file():
             raise RepairBlocked('incomplete_request', 'frozen repair request is missing')

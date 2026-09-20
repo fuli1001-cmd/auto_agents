@@ -43,7 +43,9 @@ def assess_progress(state, failures, identity, *, passed_tests=(), review=None):
         verified.update(('review', key[1]) for key in best
                         if key[0] == 'review' and key[1] in approved - outstanding)
     fresh = verified - resolved
-    progressed = bool(best and current < best) or bool(fresh)
+    # A smaller list can mean a cancelled shard or discarded irrelevant output.
+    # Only executed checks can establish progress; oscillation earns no credit.
+    progressed = bool(fresh)
     return {'progressed': progressed, 'best_failure_keys': sorted(current if not best or progressed else best),
             'resolved_failure_keys': sorted(resolved | verified), 'newly_verified': sorted(fresh)}
 

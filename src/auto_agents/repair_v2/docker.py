@@ -298,6 +298,10 @@ class DockerVerifier:
         self.remember_timings(result.checks)
         return result
 
+    def compare_baseline(self, identity, snapshot, base_repository, base_commit, validation, cancel):
+        from .comparison import compare
+        return compare(self, identity, snapshot, base_repository, base_commit, validation, cancel)
+
     def regression(self, snapshot_id, snapshot, base_repository, base_commit, coverage, cancel):
         """Run current behavioral tests against original production code."""
         from .workspace import Workspace, git

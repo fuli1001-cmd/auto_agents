@@ -68,6 +68,7 @@ class ReviewResult:
     findings: List[Dict[str, Any]] = field(default_factory=list)
     text: str = ''
     coverage: List[Dict[str, Any]] = field(default_factory=list)
+    change_coverage: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class RepairBlocked(RuntimeError):

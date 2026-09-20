@@ -144,8 +144,11 @@ def repair_entry(request):
         workspace = Workspace(root / 'workspace', checkout, accepted.engine_base,
                               retained=old['source'] if old else None)
         store, verifier, driver = _components(request, root, accepted, workspace, python)
+        from .scope import ScopeGuard
+        scope = ScopeGuard(root, job['payload'], target, checkout)
+        scope.import_receipt(job['payload'].get('scope_receipt'))
         controller = Controller(accepted, store, workspace, driver, verifier,
-            chain=chain, preflight_boundary=True,
+            chain=chain, preflight_boundary=True, scope=scope,
             units=lambda source: verifier.suite_units(source, accepted) if hasattr(verifier, 'suite_units') else acceptance_units(source, accepted), resume_token=f"{job['id']}:{job['generation']}",
             allow_implementation=job['payload'].get('autonomy') == 'max',
             regression=lambda i, s, coverage, c: verifier.regression(i, s, checkout, accepted.engine_base, coverage, c),
@@ -156,6 +159,8 @@ def repair_entry(request):
         state = controller.run()
         if state['status'] != 'ready':
             return {'ok': False, 'engine': 'v2', 'status': 'v2_' + state['status'],
+                    'return_goal': scope.context['owner'] if state['status'] == 'skipped' else None,
+                    'pending_decision': state.get('pending_decision', '') if state['status'] == 'waiting_user' else '',
                     'error': state.get('blocker', {}).get('message', 'repair is not accepted'),
                     'v2_state': str(root / 'state.json'), 'v2_transaction': str(root)}
         approved = _approved(request, root, state, store, python, environment)
@@ -178,11 +183,12 @@ def _approved(request, root, state, store, python, environment):
             'v2_transaction': str(root),
             'v2_receipt': {'request': state['request_digest'], 'snapshot': state['snapshot'],
                            'reference': state['receipt'], 'store': str(root)},
-            'proof': 'V2 mandatory tests, independent review and original-boundary replay passed.',
+            'proof': 'Required behavior, no-new-failures acceptance, independent review and original-boundary replay passed.',
             'engine_full_proof': {'policy': 1, 'commit': commit, 'environment': environment, 'ok': True}}
 
 
 def verify_receipt(approved, *, expected_root=None):
+    from .comparison import accepted as validation_accepted
     marker = approved.get('v2_receipt') or {}
     root = Path(marker.get('store', '/__missing_v2_receipt__'))
     if expected_root is not None and root.resolve() != Path(expected_root).resolve():
@@ -192,10 +198,12 @@ def verify_receipt(approved, *, expected_root=None):
     if revoked.is_file() and marker['reference']['digest'] in json.loads(revoked.read_text()):
         raise RepairBlocked('invalid_acceptance', 'a live recovery counterexample invalidated this receipt')
     receipt = store.read(marker['reference'])
+    if (root / 'scope.json').exists() and not receipt.get('scope'):
+        raise RepairBlocked('invalid_acceptance', 'candidate lacks the current goal scope proof')
     validation, review = store.read(receipt['validation']), store.read(receipt['review'])
     accepted = json.loads((root / 'request.json').read_text())
     if (digest(accepted) != marker['request'] or receipt['request'] != marker['request']
-            or receipt['snapshot'] != marker['snapshot'] or not validation['ok'] or not review['ok']
+            or receipt['snapshot'] != marker['snapshot'] or not validation_accepted(store, receipt, accepted['engine_base']) or not review['ok']
             or review['findings'] or validation['snapshot'] != marker['snapshot']
             or review['snapshot'] != marker['snapshot']
             or source_identity(Path(approved['runtime'])) != marker['snapshot']):
@@ -203,6 +211,13 @@ def verify_receipt(approved, *, expected_root=None):
     requirements = {r['identity'] for r in accepted['acceptance']}
     from .controller import review_result
     verdict = review_result(review['text'], marker['snapshot'], requirements)
+    if receipt.get('scope'):
+        from .scope import POLICY, changes
+        scoped = store.read(receipt['scope'])
+        if scoped.get('policy') != POLICY or scoped.get('proposal', {}).get('decision') != 'required':
+            raise RepairBlocked('invalid_acceptance', 'repair scope receipt is invalid')
+        verdict = review_result(review['text'], marker['snapshot'], requirements,
+                                changes(Path(approved['runtime']), accepted['engine_base'], receipt.get('integration_parents', [])))
     passed = {node for check in validation['checks'] for node in check.get('passed', [])}
     if not verdict.ok or any(not any(p == n or p.startswith(n + '[') or p.startswith(n + '::') for p in passed)
                              for row in verdict.coverage for n in row['nodes']):
@@ -248,8 +263,10 @@ def deliver(request, approved, *, controller=None, _passes=0):
             store, verifier, driver = _components(request, root, accepted, workspace, approved['python'])
             chain = RepairChain(config, job['payload'], root)
             chain.admit()
+            from .scope import ScopeGuard
             controller = Controller(accepted, store, workspace, driver, verifier,
                 chain=chain, preflight_boundary=True,
+                scope=ScopeGuard(root, job['payload'], root / 'target-evidence', base),
                 units=lambda s: verifier.suite_units(s, accepted) if hasattr(verifier, 'suite_units') else acceptance_units(s, accepted), resume_token=f"{job['id']}:{job['generation']}",
             allow_implementation=job['payload'].get('autonomy') == 'max',
                 regression=lambda i, s, coverage, c: verifier.regression(i, s, base, accepted.engine_base, coverage, c),

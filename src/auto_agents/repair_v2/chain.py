@@ -9,7 +9,7 @@ from .transaction import transaction_root
 from .types import RepairBlocked
 
 
-DEFAULT_LIMITS = {'transactions': 3, 'implementations': 12, 'model_calls': 32}
+DEFAULT_LIMITS = {'transactions': None, 'implementations': None, 'model_calls': None}
 
 
 def workflow_key(payload):
@@ -31,7 +31,7 @@ class RepairChain:
         self.store = Store(Path(config['root']) / 'repair-chains' / digest(self.identity))
         self.limits = {**DEFAULT_LIMITS, **self.policy.get('repair_chain_limits', {})}
         if (set(self.limits) != set(DEFAULT_LIMITS)
-                or any(type(v) is not int or v < 1 for v in self.limits.values())):
+                or any(v is not None and (type(v) is not int or v < 1) for v in self.limits.values())):
             raise RepairBlocked('repair_chain_policy', 'repair_chain_limits must contain positive integer limits')
 
     @contextmanager
@@ -78,10 +78,16 @@ class RepairChain:
         with self.locked():
             state = self._load()
             self._history(state)
-            state['limits'] = (self.limits if self.policy.get('repair_chain_limits')
-                               else state.get('limits', self.limits))
+            # Old ledgers saved implicit defaults without provenance. They are
+            # accounting history, not an operator's spending authorization.
+            state['limits'] = (self.limits if 'repair_chain_limits' in self.policy
+                               else state.get('limits', self.limits) if state.get('explicit_limits')
+                               else dict(DEFAULT_LIMITS))
+            state['explicit_limits'] = bool(self.policy.get('repair_chain_limits') or
+                                            state.get('explicit_limits'))
             known = {entry['canonical'] for entry in state['transactions'].values()}
-            if self.transaction.name not in known and len(known) >= state['limits']['transactions']:
+            limit = state['limits']['transactions']
+            if self.transaction.name not in known and limit is not None and len(known) >= limit:
                 self.store.save(state)
                 raise RepairBlocked('repair_chain_exhausted',
                     f"workflow repair chain already has {len(known)} transactions; "
@@ -98,7 +104,7 @@ class RepairChain:
             used = self.totals(state)
             fields = ['model_calls', *(['implementations'] if role == 'implement' else [])]
             for field in fields:
-                if used[field] >= state['limits'][field]:
+                if state['limits'][field] is not None and used[field] >= state['limits'][field]:
                     raise RepairBlocked('repair_chain_exhausted',
                         f"workflow repair chain exhausted {field}: {used[field]}/{state['limits'][field]}; "
                         'preserve the candidate and diagnose the remaining blocker before granting more work')

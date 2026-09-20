@@ -23,7 +23,7 @@ REVIEW_SCHEMA = {'type': 'object', 'properties': {
     'required': ['decision', 'findings', 'coverage'], 'additionalProperties': False}
 
 
-def review_result(text, snapshot, requirements):
+def review_result(text, snapshot, requirements, changes=None):
     """Local envelope handling; a malformed verdict is never approval."""
     value = text.strip()
     if value.startswith('```') and value.endswith('```'):
@@ -36,7 +36,7 @@ def review_result(text, snapshot, requirements):
     if result.get('decision') not in ('APPROVE', 'REJECT') or not isinstance(findings, list):
         raise RepairBlocked('review_format', 'independent review has an invalid result envelope')
     for row in findings:
-        if (not isinstance(row, dict) or row.get('requirement') not in requirements
+        if (not isinstance(row, dict) or row.get('requirement') not in (requirements | ({'repair-scope', 'repair-regression'} if changes is not None else set()))
                 or any(not isinstance(row.get(k), str) or not row[k].strip()
                        for k in ('reason', 'counterexample', 'check'))):
             raise RepairBlocked('review_format', 'blocking findings need a requirement, counterexample and check')
@@ -51,11 +51,20 @@ def review_result(text, snapshot, requirements):
                               for n in row['nodes']) for row in coverage)
                 or {row['requirement'] for row in coverage} != requirements):
             raise RepairBlocked('review_format', 'approval needs concrete test coverage for every requirement')
-    return ReviewResult(result['decision'] == 'APPROVE' and not findings, snapshot, findings, text, coverage)
+    change_coverage = result.get('change_coverage', [])
+    if changes is not None and result['decision'] == 'APPROVE' and not findings:
+        if (not isinstance(change_coverage, list) or len(change_coverage) != len(changes)
+                or any(not isinstance(row, dict) or row.get('change') not in changes
+                       or row.get('requirement') not in requirements | {'repair-regression'}
+                       or not str(row.get('reason', '')).strip()
+                       or not str(row.get('evidence', '')).strip() for row in change_coverage)
+                or {row['change'] for row in change_coverage} != set(changes)):
+            raise RepairBlocked('review_format', 'every changed hunk needs a goal-bound reason and evidence')
+    return ReviewResult(result['decision'] == 'APPROVE' and not findings, snapshot, findings, text, coverage, change_coverage)
 
 
 class Controller:
-    def __init__(self, request, store, workspace, driver, verifier, *, units, max_stagnant=2, max_replans=1, boundary=None, resume_token='', allow_implementation=True, regression=None, chain=None, preflight_boundary=False):
+    def __init__(self, request, store, workspace, driver, verifier, *, units, max_stagnant=2, max_replans=1, boundary=None, resume_token='', allow_implementation=True, regression=None, chain=None, preflight_boundary=False, scope=None):
         self.request, self.store, self.workspace = request, store, workspace
         self.driver, self.verifier, self.units = driver, verifier, units
         self.max_stagnant, self.max_replans = max_stagnant, max_replans
@@ -63,6 +72,7 @@ class Controller:
         self.allow_implementation = allow_implementation
         self.boundary = boundary
         self.chain = chain
+        self.scope = scope
         self.preflight_boundary = preflight_boundary
         self.resume_token = resume_token
         self.cancel = threading.Event()
@@ -143,6 +153,9 @@ class Controller:
 
     def context(self):
         return json.dumps({'goal': self.request.goal,
+            'goal_scope': self.scope.context if self.scope is not None else None,
+            'necessity_receipt': self.scope.current() if self.scope is not None else None,
+            'preserved_upstream': self.state.get('integration_parents', []),
             'requirements': [asdict(item) for item in self.request.acceptance],
             'evidence': self.request.evidence,
             'repair_chain': self.chain.context() if self.chain is not None else None,
@@ -150,7 +163,8 @@ class Controller:
             'test_preservation_findings': self.state.get('test_preservation_findings', []),
             'failure_diagnosis': diagnose(self.state.get('failures', []))}, ensure_ascii=False)
 
-    def plan(self, root, *, rediagnose=False):
+    def plan(self, root, *, rediagnose=False, scope_only=False):
+        previous_phase = self.state.get('phase', 'validate')
         self.phase('plan')
         prompt = ('Produce one implementation plan for the complete repair. Inspect the source and evidence. '
             'Return Markdown with root causes, proposed changes and coverage of each requirement. '
@@ -174,12 +188,28 @@ class Controller:
         prompt += ('\nRead the read_only_evidence manifest and relevant retained scene files before planning. '
                    'Keep changes tied to the original user goal and its concrete recovery blocker. '
                    'Missing evidence is a limitation to report, not permission for general redesign or new product work.')
+        if self.scope is not None:
+            from .scope import INSTRUCTION
+            prompt += ('\n' + INSTRUCTION if not self.scope.current() else
+                       '\nReuse the supplied valid necessity receipt. Do not repeat its diagnosis or reclassify scope.')
+            if scope_only:
+                prompt += '\nReuse this existing plan. Supply only its missing necessity evidence; do not replan:\n' + self.store.read(self.state['plan'])['text']
         reply = self.agent('plan', prompt, root)
         if not reply.text.strip(): raise RepairBlocked('plan_missing', 'provider returned no implementation plan')
-        reference = self.store.artifact('plan', {'text': reply.text, 'request': self.state['request_digest']})
+        if not scope_only:
+            reference = self.store.artifact('plan', {'text': reply.text, 'request': self.state['request_digest']})
+            self.checkpoint(plan=reference)
+        if self.scope is not None:
+            from .scope import proposal
+            self.checkpoint(scope_receipt=self.scope.admit(proposal(reply.text)))
+        if scope_only:
+            self.checkpoint(phase=previous_phase)
+            return
         self.checkpoint(plan=reference, phase='implement')
 
     def implement(self, root):
+        if self.scope is not None and not self.scope.current():
+            raise RepairBlocked('scope_missing', '当前修复缺少有效的目标范围依据，已保留计划。')
         self.phase('implement')
         prompt = ('Implement the complete repair plan in this private candidate. Resolve cross-module issues together. '
             'Preserve unrelated work and existing tests. Do not modify Git metadata or weaken verification. '
@@ -195,7 +225,18 @@ class Controller:
         if self.state['failures']:
             prompt += '\nCorrect these current failures without rebuilding unchanged planning history:\n'
             prompt += json.dumps(self.state['failures'], ensure_ascii=False)
-        self.agent('implement', prompt, root)
+        if self.scope is not None:
+            prompt += ('\nIf continuing requires an unapproved user goal/product change, stop editing and '
+                       'return REPAIR_SCOPE v1 with decision=needs_user, a plain question and a specific suggestion. '
+                       'Ignore unrelated discoveries entirely. Do not implement an expanded goal before its decision.')
+        reply = self.agent('implement', prompt, root)
+        if self.scope is not None:
+            from .scope import proposal, ScopeDecisionRequired
+            decision = proposal(reply.text)
+            if decision and decision.get('decision') == 'needs_user':
+                if not all(isinstance(decision.get(k), str) and decision[k].strip() for k in ('question', 'suggestion')):
+                    raise RepairBlocked('scope_missing', '请说明具体需要改变的目标范围。')
+                raise ScopeDecisionRequired(decision, self.scope.context)
         self.workspace.checkpoint()
         # A completed implementation is durable even if its local audit fails.
         # Restarting at this boundary must not repeat the model turn.
@@ -241,13 +282,16 @@ class Controller:
             return ReviewResult(False, identity, text='Review cancelled after a concrete test failure.')
 
     def _review(self, identity, snapshot, cancel=None):
-        key = digest([self.state['request_digest'], identity,
-                      self.state.get('verification_runtime'), self.state['failures']])
+        from .scope import changes as changed_hunks
+        changes = changed_hunks(snapshot, self.request.engine_base, self.state.get('integration_parents', [])) if self.scope is not None else None
+        inputs = [self.state['request_digest'], identity, self.state.get('verification_runtime'), self.state['failures']]
+        if self.scope is not None: inputs.append(self.scope.current())
+        key = digest(inputs)
         if self.state.get('review_input') == key and self.state.get('review'):
             saved = self.store.read(self.state['review'])
             if saved.get('snapshot') == identity:
                 self.store.event('review_reused', snapshot=identity)
-                return review_result(saved['text'], identity, {r.identity for r in self.request.acceptance})
+                return review_result(saved['text'], identity, {r.identity for r in self.request.acceptance}, changes)
         prompt = ('Independently review this immutable candidate against every frozen requirement and the original baseline. '
             'Use the read-only retained scene and original user goal to reject unrelated features, cleanup or redesign. '
             'Require evidence that the specific blocked child actually re-enters implementation; parent dialogue is insufficient. '
@@ -267,8 +311,26 @@ class Controller:
         if self.state.get('review'):
             prompt += '\nPrevious independent review (recheck the current delta):\n' + json.dumps(
                 self.store.read(self.state['review']), ensure_ascii=False)
-        reply = self.agent('review', prompt, snapshot, schema=REVIEW_SCHEMA, cancel=cancel)
-        try: result = review_result(reply.text, identity, {r.identity for r in self.request.acceptance})
+        schema = REVIEW_SCHEMA
+        if changes is not None:
+            from copy import deepcopy
+            schema = deepcopy(REVIEW_SCHEMA)
+            schema['properties']['change_coverage'] = {'type': 'array', 'items': {'type': 'object',
+                'properties': {k: {'type': 'string'} for k in ('change', 'requirement', 'reason', 'evidence')},
+                'required': ['change', 'requirement', 'reason', 'evidence'], 'additionalProperties': False}}
+            schema['required'].append('change_coverage')
+            prompt += ('\nCover EVERY hunk in change_coverage:[{change,requirement,reason,evidence}]. '
+                       'requirement names a frozen requirement, or repair-regression ONLY for undoing a regression '
+                       'introduced by this candidate (cite the introducing change and failing check). '
+                       'Reject unrelated changes using finding requirement=repair-scope. '
+                       'Ignore unrelated pre-existing problems, do not list them. '
+                       'Recheck the supplied necessity evidence against original_goal; model prose alone is not proof. '
+                       'Preserve independent upstream changes supplied by the controller; do not attribute them '
+                       'to this repair or remove them to narrow the repair scope. '
+                       'Do not run another necessity investigation when the supplied evidence is complete.\n'
+                       + json.dumps(changes, ensure_ascii=False))
+        reply = self.agent('review', prompt, snapshot, schema=schema, cancel=cancel)
+        try: result = review_result(reply.text, identity, {r.identity for r in self.request.acceptance}, changes)
         except RepairBlocked as error:
             if self.state.get('review_format_retries', 0) >= 1: raise
             original = reply.text.strip()
@@ -282,8 +344,8 @@ class Controller:
             self.checkpoint(review_format_retries=1)
             reply = self.agent('review', 'Correct only the result envelope of the previous review; preserve all '
                 'substantive decisions and evidence. Return the requested JSON. Problem: ' + str(error)
-                + '\nOriginal response:\n' + reply.text, snapshot, schema=REVIEW_SCHEMA, cancel=cancel)
-            result = review_result(reply.text, identity, {r.identity for r in self.request.acceptance})
+                + '\nOriginal response:\n' + reply.text, snapshot, schema=schema, cancel=cancel)
+            result = review_result(reply.text, identity, {r.identity for r in self.request.acceptance}, changes)
             if ((result.ok and original['decision'] != 'APPROVE')
                     or digest(result.findings) != digest(original['findings'])):
                 raise RepairBlocked('review_semantics_changed',
@@ -321,20 +383,23 @@ class Controller:
         if self.state.get('validation') and hasattr(self.verifier, 'remember_timings'):
             self.verifier.remember_timings(self.store.read(self.state['validation'])['checks'])
         units = self.prioritize_failures(self.units(snapshot))
-        if not self._diagnose_candidate(identity, snapshot, units):
+        differential = hasattr(self.verifier, 'compare_baseline')
+        if not differential and not self._diagnose_candidate(identity, snapshot, units):
             return False
         if self.state['phase'] == 'diagnose':
             self.phase('validate')
         with ThreadPoolExecutor(max_workers=2) as pool:
             validate = getattr(self.verifier, 'validate_suite', self.verifier.validate)
-            tests = pool.submit(validate, identity, snapshot, units, Cancellation(self.cancel, tests_cancel))
+            tests = pool.submit(self._validate_suite_once, validate, identity, snapshot, units,
+                                Cancellation(self.cancel, tests_cancel))
             reviewed = pool.submit(self.review, identity, snapshot, Cancellation(self.cancel, review_cancel))
             try:
                 # Observe either side's infrastructure failure immediately;
                 # waiting on tests first can leave a failed reviewer unnoticed.
                 for completed in as_completed((tests, reviewed)):
                     result = completed.result()
-                    if completed is tests and not result.ok: review_cancel.set()
+                    if completed is tests and not result.ok and (result.infrastructure or not differential):
+                        review_cancel.set()
                     if completed is reviewed and result.findings: tests_cancel.set()
                 validation, review = tests.result(), reviewed.result()
             except BaseException:
@@ -367,8 +432,29 @@ class Controller:
         proof = self.store.artifact('validation', asdict(validation))
         self.checkpoint(validation=proof)
         self.workspace.collect_snapshots(identity)
+        comparison = None
+        old_nodes = set()
+        suite_ok = validation.ok
+        if not suite_ok and differential and not validation.cancelled and not missing:
+            from .comparison import matched, verify
+            key = digest([proof, self.request.engine_base, self.state['verification_runtime']])
+            if self.state.get('comparison_input') == key and self.state.get('comparison'):
+                observed = self.store.read(self.state['comparison'])
+            else:
+                self.phase('baseline_comparison')
+                observed = self.verifier.compare_baseline(identity, snapshot, self.workspace.source,
+                    self.request.engine_base, validation, self.cancel)
+            comparison = self.store.artifact('comparison', observed)
+            self.checkpoint(comparison=comparison, comparison_input=key)
+            if observed.get('infrastructure'):
+                raise RepairBlocked('verification_infrastructure', '无法完成修复前后的测试对比，请检查验证环境。')
+            if observed.get('classification_incomplete'):
+                raise RepairBlocked('verification_infrastructure',
+                    '暂时无法确认这些测试失败是否由本次改动引起，已保留补丁和对比结果，不扩大修复范围。')
+            suite_ok = verify(observed, asdict(validation), base=self.request.engine_base)
+            old_nodes = matched(observed, asdict(validation))
         regression = None
-        if validation.ok and review.ok and self.regression is not None:
+        if suite_ok and review.ok and self.regression is not None:
             self.phase('regression')
             observed = self.regression(identity, snapshot, review.coverage, self.cancel)
             regression = self.store.artifact('regression', observed)
@@ -376,12 +462,13 @@ class Controller:
             if observed.get('infrastructure'):
                 raise RepairBlocked('verification_infrastructure', observed.get('reason', 'baseline environment failed'))
             if not observed.get('ok') or observed.get('snapshot') != identity:
+                suite_ok = False
                 validation.ok = False
                 validation.failures.append({'unit': 'behavior-regression', 'reason': observed.get('reason', 'regression proof missing')})
                 proof = self.store.artifact('validation', asdict(validation))
                 self.checkpoint(validation=proof)
         boundary = early_boundary
-        if validation.ok and review.ok and self.boundary is not None and boundary is None:
+        if suite_ok and review.ok and self.boundary is not None and boundary is None:
             self.phase('boundary')
             observed = self.boundary(identity, snapshot, self.cancel)
             boundary = self.store.artifact('boundary', observed)
@@ -390,22 +477,41 @@ class Controller:
                 raise RepairBlocked('verification_infrastructure',
                                     observed.get('reason') or 'recovery verification environment is unavailable')
             if not observed.get('ok') or observed.get('snapshot') != identity:
+                suite_ok = False
                 validation.ok = False
                 validation.failures.append({'unit': 'original-boundary', 'reason': 'original recovery boundary failed',
                                             'observed': observed.get('observed', observed)})
                 proof = self.store.artifact('validation', asdict(validation))
                 self.checkpoint(validation=proof)
-        if validation.ok and review.ok:
+        if suite_ok and review.ok:
             self.checkpoint(status='ready', phase='deliver', failures=[],
                 receipt=self.store.artifact('acceptance', {'request': self.state['request_digest'],
-                    'snapshot': identity, 'validation': proof, 'review': self.state['review'], 'boundary': boundary, 'regression': regression}))
+                    'snapshot': identity, 'validation': proof, 'comparison': comparison,
+                    'scope': self.scope.current() if self.scope is not None else None,
+                    'integration_parents': self.state.get('integration_parents', []),
+                    'review': self.state['review'], 'boundary': boundary, 'regression': regression}))
             return True
-        failures = [*validation.failures, *review.findings]
+        from .comparison import relevant_failures
+        failures = [*([] if suite_ok else relevant_failures(validation.failures, old_nodes)), *review.findings]
         if not failures: raise RepairBlocked('invalid_validation', 'incomplete acceptance has no actionable failure')
         self.record_failures(failures, identity,
             passed_tests={node for check in validation.checks if check.get('ok') for node in check.get('passed', [])},
             review=review)
         return False
+
+    def _validate_suite_once(self, validate, identity, snapshot, units, cancel):
+        from .types import ValidationResult
+        key = digest([identity, getattr(self.verifier, 'runtime', ''), [asdict(u) for u in units]])
+        if not any(u.fresh for u in units) and self.state.get('suite_input') == key and self.state.get('suite_result'):
+            saved = self.store.read(self.state['suite_result'])
+            if (not saved.get('cancelled') and not saved.get('infrastructure') and saved.get('checks')
+                    and all(check.get('inputs', {}).get('complete') for check in saved['checks'])):
+                self.store.event('validation_reused', snapshot=identity)
+                return ValidationResult(**saved)
+        result = validate(identity, snapshot, units, cancel)
+        if result.snapshot == identity and not result.cancelled and not result.infrastructure:
+            self.checkpoint(suite_input=key, suite_result=self.store.artifact('suite', asdict(result)))
+        return result
 
     def _diagnose_candidate(self, identity, snapshot, units):
         selected = diagnostic_units(self.state.get('failures', []), units)
@@ -503,18 +609,27 @@ class Controller:
                 'calls': 0, 'failures': [], 'stagnant': 0, 'replans': 0}
             if self.state['request_digest'] != digest(self.request.to_dict()):
                 raise RepairBlocked('request_changed', 'resume request differs from the frozen repair contract')
+            if self.state['status'] == 'waiting_user':
+                # Only the foreground choice can return this to the business
+                # workflow; restarting a worker must never re-ask a model.
+                return self.state
             self._recover_verified_progress()
             if self.state['status'] in ('ready', 'complete'):
+                from .comparison import accepted
                 from pathlib import Path
                 saved = self.store.read(self.state['receipt'])
                 validation, review = self.store.read(saved['validation']), self.store.read(saved['review'])
                 if (saved['request'] != self.state['request_digest']
                         or saved['snapshot'] != self.state['snapshot']
-                        or not validation['ok'] or not review['ok'] or review['findings']
+                        or not accepted(self.store, saved, self.request.engine_base) or not review['ok'] or review['findings']
                         or source_identity(Path(self.state['snapshot_path'])) != saved['snapshot']):
                     raise RepairBlocked('invalid_acceptance', 'saved acceptance or source no longer matches')
                 self.verifier.prepare()
                 if self.state.get('verification_runtime', '') != getattr(self.verifier, 'runtime', ''):
+                    self.checkpoint(status='active', phase='validate')
+                elif self.scope is not None and (not self.scope.current() or saved.get('scope') != self.scope.current()):
+                    # Supplement new scope proof on the retained candidate;
+                    # never repeat the completed implementation on migration.
                     self.checkpoint(status='active', phase='validate')
                 else: return self.state
             # An unchanged failure does not acquire a new recovery allowance on restart.
@@ -532,8 +647,10 @@ class Controller:
                 if self.state.get('blocker', {}).get('code') == 'repair_chain_exhausted' and self.chain is not None:
                     budget = self.chain.context()
                     required = ['model_calls', *(['implementations'] if self.state.get('phase') == 'implement' else [])]
-                    retryable = all(budget['used'][key] < budget['limits'][key]
+                    retryable = all(budget['limits'][key] is None or budget['used'][key] < budget['limits'][key]
                                     for key in required)
+                if self.scope is not None and self.state.get('blocker', {}).get('code') in {'scope_missing', 'scope_evidence'}:
+                    retryable = bool(self.scope.current())
                 if not ((retryable or old_audit) and self.resume_token and self.resume_token != self.state.get('resume_token')):
                     return self.state
                 if old_audit:
@@ -549,6 +666,13 @@ class Controller:
                 root = self.workspace.prepare()
                 self.verifier.prepare()
                 if hasattr(self.driver, 'preflight'): self.driver.preflight(root)
+                if self.scope is not None and self.state.get('plan') and not self.scope.current():
+                    from .scope import proposal
+                    retained = proposal(self.store.read(self.state['plan'])['text'])
+                    if retained is not None:
+                        self.checkpoint(scope_receipt=self.scope.admit(retained))
+                    else:
+                        self.plan(root, scope_only=True)
                 provider = getattr(getattr(self.driver, 'config', None), 'kind', 'test')
                 if self.state.get('session_provider') not in (None, provider):
                     self.checkpoint(sessions={})
@@ -567,7 +691,7 @@ class Controller:
                         self.checkpoint(plan=reference, phase='audit')
                 while True:
                     if self.cancel.is_set(): raise KeyboardInterrupt()
-                    if self.state['phase'] not in ('audit', 'diagnose', 'validate', 'boundary_preflight', 'boundary', 'regression'):
+                    if self.state['phase'] not in ('audit', 'diagnose', 'validate', 'boundary_preflight', 'boundary', 'regression', 'baseline_comparison'):
                         if self.state.get('external_correction'):
                             raise RepairBlocked('no_progress',
                                 'corrected source failed acceptance; implementation budget remains exhausted')
@@ -587,6 +711,16 @@ class Controller:
                 self.store.event('stopped', phase=self.state['phase'])
                 raise
             except RepairBlocked as error:
+                from .scope import ScopeDecisionRequired
+                if error.code == 'scope_skipped':
+                    self.checkpoint(status='skipped', failures=[])
+                    return self.state
+                if isinstance(error, ScopeDecisionRequired):
+                    from ..scope_decisions import Decisions
+                    pending = Decisions(self.scope.payload['project']).create(error.context, error.proposal,
+                                continuation={'kind': 'repair', 'transaction': self.request.identity})
+                    self.checkpoint(status='waiting_user', pending_decision=pending['id'])
+                    return self.state
                 message = str(error)
                 if error.code == 'no_progress' and self.state.get('failures'):
                     failure = self.state['failures'][0]

@@ -237,7 +237,8 @@ def test_failure_oscillation_cannot_keep_renewing_progress_budget(job):
     verifier.validate = oscillate
     state = controller(job, verifier=verifier).run()
     assert state['status'] == 'blocked' and state['blocker']['code'] == 'no_progress'
-    assert state['attempts'] == 6 and state['replans'] == 1
+    # A disappearing failure without an executed passing check is no progress.
+    assert state['attempts'] == 4 and state['replans'] == 1
 
 
 def test_failed_tests_cancel_slow_review_without_cancelling_the_repair(job):

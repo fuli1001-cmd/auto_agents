@@ -228,6 +228,9 @@ class Store:
         inputs = [payload.get('symptom_key') or payload['fingerprint'], contract_identity(payload), payload['base'], payload['environment']]
         if payload.get('repair_engine') == 'v2':
             inputs.extend([payload['project'], workflow_identity(payload)])
+            if payload.get('scope_receipt'):
+                from .repair_v2.transaction import transaction_root
+                inputs = ['goal-scope-v1', transaction_root({'root': str(self.root)}, payload).name]
         key = digest(inputs)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -237,7 +240,7 @@ class Store:
             fresh_invocation = not subscription["job"] and workflow_identity(payload) is not None
             if fresh_invocation:
                 self._retry_previous_invocation(db, subscription, payload)
-            existing = db.execute("SELECT id,state,result FROM jobs WHERE dedup=? AND state!='cancelled' ORDER BY updated DESC LIMIT 1", (key,)).fetchone()
+            existing = db.execute("SELECT id,state,result FROM jobs WHERE dedup=? AND state NOT IN ('cancelled','skipped') ORDER BY updated DESC LIMIT 1", (key,)).fetchone()
             if fresh_invocation and existing and existing["state"] == "blocked":
                 # A different workflow's terminal failure is not the outcome of
                 # this new invocation. Active and successful jobs remain shared.
@@ -731,7 +734,7 @@ class Supervisor:
             lease = json.loads(path.read_text())
             if lease.get("kind") == "resume":
                 subscription = next((row for row in self.store.subscriptions(lease["job"]) if row["id"] == lease["subscriber"]), None)
-                if subscription and subscription["state"] == "resuming":
+                if subscription and subscription["state"] in {"resuming", "waiting_user"}:
                     self.resumes[lease["subscriber"]] = RecoveredProcess(lease)
             elif lease.get("kind") == "worker":
                 job = self.store.job(lease["job"])
@@ -741,7 +744,10 @@ class Supervisor:
                     self.workers[lease["job"]] = (RecoveredProcess(lease), lease["generation"], lease["operation"])
 
     def register(self, request, fds):
-        payload = request["payload"]
+        # Foreground identity, pending choices and repair receipts are owned
+        # by the supervisor, never supplied by a re-registering business process.
+        payload = {key: value for key, value in request['payload'].items()
+                   if key in {'project', 'token', 'pid', 'ticks', 'command', 'cwd'}}
         project = str(Path(payload["project"]).resolve())
         expected = Path(self.config.get("lock_dir", "/tmp/auto-agents-run-locks")) / (hashlib.sha256(project.encode()).hexdigest() + ".lock")
         if not fds:
@@ -757,6 +763,16 @@ class Supervisor:
                 or request.get("_peer_pid", payload["pid"]) != payload["pid"]):
             raise RuntimeError("stale project registration")
         identity = self.store.register(payload)
+        managed = any(process.pid == payload['pid'] for process in self.resumes.values()) or any(
+            process.pid == payload['pid'] for process, _, _ in self.workers.values())
+        if not managed and not request.get('environment', {}).get('AUTO_AGENTS_REPAIR_SUBSCRIBER'):
+            with self.store.connect() as db:
+                row = db.execute('SELECT payload FROM subscribers WHERE id=?', (identity,)).fetchone()
+                saved = json.loads(row['payload'])
+                previous_front = saved.get('foreground', {})
+                if not previous_front or not alive(previous_front.get('pid', 0), previous_front.get('ticks', '')):
+                    saved['foreground'] = {'pid': payload['pid'], 'ticks': payload['ticks']}
+                    db.execute('UPDATE subscribers SET payload=? WHERE id=?', (json.dumps(saved), identity))
         previous = self.registrations.pop(identity, None)
         if previous:
             for fd in previous["fds"]:
@@ -778,6 +794,8 @@ class Supervisor:
         if request.get("version") != VERSION:
             raise RuntimeError("incompatible repair control protocol")
         op = request["op"]
+        if op in {'request-decision', 'decision-status', 'answer-decision', 'detach-decision'}:
+            return self.decision_dispatch(request)
         if op == "ping":
             return {"ok": True, "version": VERSION, "pid": os.getpid(), "ticks": start_ticks(os.getpid()),
                     "implementation_revision": self.config.get("implementation_revision", ""),
@@ -876,6 +894,12 @@ class Supervisor:
                 except (OSError, ValueError, KeyError, TypeError):
                     passed = False
             if passed and job["state"] != "completed":
+                if job['result'].get('engine') == 'v2' and job['result'].get('v2_transaction'):
+                    root = Path(job['result']['v2_transaction'])
+                    if root.parent.resolve() != (self.store.root / 'v2-transactions').resolve():
+                        raise RuntimeError('recovery receipt belongs to another repair store')
+                    atomic_json(root / 'live-recovery.json', {'job': job['id'], 'subscriber': row['id'],
+                        'generation': job['generation'], 'boundary': details, 'commit': job['result']['commit']})
                 self.store.event(job["id"], "live_boundary_passed", {"subscriber": row["id"], "commit": job["result"]["commit"]})
                 if job["result"].get("status") == "repaired" or job['result'].get('source_delivery_needed'):
                     self.store.enqueue_publish(job["id"])
@@ -998,6 +1022,22 @@ class Supervisor:
                         db.execute("UPDATE outbox SET state='published',detail=? WHERE job=?", (result.get("commit", ""), identity))
                 else:
                     self.store.publish_later(identity, permission=result.get("permission", False), detail=result.get("error", "publication failed"))
+            elif result.get('status') == 'v2_skipped':
+                self.store.transition(identity, 'skipped', result, generation=generation)
+                with self.store.connect() as db:
+                    db.execute("UPDATE subscribers SET state='registered' WHERE job=? AND state!='cancelled'", (identity,))
+            elif result.get('pending_decision'):
+                from .scope_decisions import Decisions
+                decision = Decisions(job['payload']['project']).read(result['pending_decision'])
+                if decision['context']['owner']['project'] != str(Path(job['payload']['project']).resolve()):
+                    raise RuntimeError('decision belongs to another project')
+                self.store.transition(identity, 'waiting_user', result, generation=generation)
+                for subscriber in self.store.subscriptions(identity):
+                    data = {**subscriber['payload'], 'pending_decision': {
+                        'id': decision['id'], 'source': 'repair', 'return_state': subscriber['state']}}
+                    with self.store.connect() as db:
+                        db.execute("UPDATE subscribers SET state='waiting_user',payload=? WHERE id=? AND state!='cancelled'",
+                                   (json.dumps(data), subscriber['id']))
             else:
                 self.store.transition(identity, "ready" if result.get("ok") else "blocked", result, generation=generation)
                 if not result.get("ok"):
@@ -1007,6 +1047,12 @@ class Supervisor:
         for row in self.store.subscriptions():
             identity = row["id"]
             process = self.resumes.get(identity)
+            if row['state'] == 'waiting_user' and row['payload'].get('pending_decision'):
+                front = row['payload'].get('foreground', {})
+                if not alive(front.get('pid', 0), front.get('ticks', '')):
+                    row['payload']['pending_decision']['detached'] = True
+                    with self.store.connect() as db:
+                        db.execute('UPDATE subscribers SET payload=? WHERE id=?', (json.dumps(row['payload']), identity))
             if row["state"] == "registered" and not alive(row["payload"]["pid"], row["payload"]["ticks"]):
                 # A crash is not proof of an engine bug or permission to repeat
                 # external effects. Explicitly queued repairs remain resumable.
@@ -1016,6 +1062,9 @@ class Supervisor:
             if row["state"] == "cancelled" and process:
                 self.stop_process(process)
             if process and process.poll() is not None:
+                if row['state'] == 'waiting_user' and row['payload'].get('pending_decision'):
+                    del self.resumes[identity]
+                    continue
                 completion = self.store.root / "jobs" / row["job"] / ("resume-" + identity + "-result.json")
                 receipt = json.loads(completion.read_text()) if completion.exists() else {}
                 exit_code = receipt.get("exit_code", 3) if completion.exists() else process.returncode
@@ -1039,7 +1088,8 @@ class Supervisor:
                 del self.resumes[identity]
             if row["state"] == "verified" and identity not in self.resumes:
                 self.launch_resume(row)
-            if row["state"] in {"finished", "cancelled", "blocked"} and identity not in self.resumes and row["job"] not in self.workers:
+            detached = row['state'] == 'waiting_user' and row['payload'].get('pending_decision', {}).get('detached')
+            if (row["state"] in {"finished", "cancelled", "blocked"} or detached) and identity not in self.resumes and row["job"] not in self.workers:
                 registration = self.registrations.get(identity)
                 if (row["state"] != "cancelled" and registration
                         and registration.get("terminal_status_pending")
@@ -1052,7 +1102,7 @@ class Supervisor:
         with self.store.connect() as db:
             pending = db.execute("SELECT id FROM jobs WHERE state='ready'").fetchall()
             for item in pending:
-                active = db.execute("SELECT 1 FROM subscribers WHERE job=? AND state IN ('waiting','validating','verified','resuming')", (item["id"],)).fetchone()
+                active = db.execute("SELECT 1 FROM subscribers WHERE job=? AND state IN ('waiting','validating','verified','resuming','waiting_user')", (item["id"],)).fetchone()
                 if not active:
                     db.execute("UPDATE jobs SET state='blocked' WHERE id=?", (item["id"],))
         # Network-only publication must not wait behind another model repair.
@@ -1078,6 +1128,10 @@ class Supervisor:
                 row = db.execute("SELECT id FROM jobs WHERE state='queued' ORDER BY updated LIMIT 1").fetchone()
             if row:
                 self.launch_worker(row["id"], "repair")
+
+    def decision_dispatch(self, request):
+        from .repair_decision_control import dispatch
+        return dispatch(self, request)
 
     def fast_publish(self, identity):
         job = self.store.job(identity)

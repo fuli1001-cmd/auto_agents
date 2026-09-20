@@ -452,6 +452,10 @@ class Session:
             return self._resume_existing(existing)
 
     def _resume_existing(self, existing):
+        from .scope_decisions import resume_session_choice
+        existing = resume_session_choice(self, existing)
+        if existing.status == 'waiting_user' and existing.resolution.startswith('scope_decision:'):
+            return existing
         session_id = existing.session_id
         if existing.mode != self.mode:
             raise ValueError(f"session {session_id} is {existing.mode}, not {self.mode}")
@@ -1660,6 +1664,8 @@ class Session:
 
         if "target_repository" in route:
             payload["target_repository"] = route["target_repository"]
+        if isinstance(route.get('necessity'), dict):
+            payload['necessity'] = route['necessity']
 
         return (
             self._prepare_workflow_handoff(
@@ -1978,8 +1984,47 @@ class Session:
         from .execution_binding import repository_binding_error
 
         binding_error = repository_binding_error(self.project_root, payload)
+        from .repair_v2.scope import ScopeGuard, context as scope_context
+        from .repair_v2.types import RepairBlocked
+        necessity = payload.get('necessity') or (payload.get('issue_seed') or payload.get('spec_seed') or {}).get('necessity')
+        if isinstance(necessity, dict) and necessity.get('decision') == 'skip':
+            state.status = 'executing'
+            self._save(state)
+            return state
+        if isinstance(necessity, dict) and necessity.get('decision') == 'needs_user':
+            from .scope_decisions import session_choice
+            invocation = {'session_id': state.session_id, 'workflow_id': state.workflow_id, 'engine_route': payload}
+            incoming = {'project': str(self.project_root), 'invocation': invocation}
+            context = scope_context(self.project_root, incoming)
+            choice = session_choice(self, state, context, necessity,
+                                    {'kind': 'route', 'target': target, 'reason': reason, 'payload': payload})
+            if choice != 'approve':
+                return state
+            # The exact proposed product/resume route now has explicit user
+            # authority. It still passes the ordinary ownership/routing checks.
+            if binding_error:
+                state.conversation.append({'role': 'orchestrator', 'content':
+                    'The user approved only the displayed goal change. Re-evaluate the original goal and '
+                    'route product work through its existing workflow; do not expand engine maintenance.'})
+                self._save(state)
+                return state
         if binding_error:
             from .repair_client import engine_route
+            self.orch._repair_scope_receipt = None
+            if isinstance(necessity, dict):
+                from .self_repair import auto_agents_repo_root
+                incoming = {'project': str(self.project_root), 'invocation': {
+                    'session_id': state.session_id, 'workflow_id': state.workflow_id, 'engine_route': payload}}
+                try:
+                    guard = ScopeGuard(self.project_root / '.auto-agents/state/repair-scope' / state.session_id,
+                                       incoming, self.project_root, auto_agents_repo_root())
+                    reference = guard.admit(necessity)
+                    self.orch._repair_scope_receipt = guard.store.read(reference)
+                except RepairBlocked as error:
+                    state.conversation.append({'role': 'orchestrator', 'content': str(error)})
+                    state.status = 'executing'
+                    self._save(state)
+                    return state
             if engine_route(self.orch, payload):
                 if self._coordinator is not None and state.workflow_id:
                     snapshot = self._coordinator.store.load(state.workflow_id)
@@ -3713,6 +3758,12 @@ class Session:
             "8. Provide a brief diagnostic status update",
             "9. Never implement, fix, commit, or edit target-project code in collab; route every write to fix or run",
             "10. Repository selection, implementation scope, test strategy, safe migration, engine self-repair, commits, and workflow recovery are internal decisions. Never ask the user to choose or authorize them.",
+            "11. Every proposed engine repair must include necessity:{decision:required|needs_user|insufficient|skip, blocked_step, consequence, evidence_refs, recovery_check}. "
+            "Judge this in the current diagnosis and reuse prior valid evidence. Tie it to the original user goal; "
+            "ignore unrelated old problems and suggestions entirely, do not list or route them. "
+            "For an actual change of user goal/new unrequested product requirements or resuming another user-stopped "
+            "task without authorization, use decision=needs_user and add a plain question and specific suggestion. "
+            "Ordinary technical fixes and resuming the current authorized workflow do not need new approval.",
             "",
             "EXECUTION SAFETY RULES (critical — follow strictly):",
             "- Set a timeout for EVERY HTTP request or polling loop (max 60s per request, 5 min total for repeated polling).",
