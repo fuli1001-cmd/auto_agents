@@ -11,7 +11,7 @@ from auto_agents.config import load_session_state, save_session_state
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.session import Session
 from auto_agents.workflow_runtime import WorkflowCoordinator
-from test_multilayer_engine_recovery import incident, replay
+from test_multilayer_engine_recovery import assert_recovery_budget, incident, replay
 from test_engine_reference_recovery import ENGINE
 from auto_agents.repair_control import digest
 
@@ -40,14 +40,11 @@ def test_saved_engine_route_preserves_distinct_parent_and_child_budgets(tmp_path
     assert observation['parent_session_id'] == parent.session_id
     assert observation['parent_constraints_preserved'] and observation['child_constraints_preserved']
     assert observation['boundary_kind'] == 'implementation' and observation['preflight_rechecked']
-    assert observation['diagnostic_provider_calls'] == 0
+    assert_recovery_budget(observation, 1)
     for name, original in [('parent', parent), ('child', child)]:
         budget = observation[name + '_budget']
-        assert budget['before'] == budget['after']
-        assert budget['before']['current_attempt'] == original.current_attempt
-        assert budget['before']['attempt_epoch'] == original.attempt_epoch
-        assert budget['before']['attempts_since_progress'] == original.attempts_since_progress
-        assert budget['before']['hard_ceiling'] == original.hard_ceiling
+        for key in ('current_attempt', 'attempt_epoch', 'attempts_since_progress', 'max_attempts', 'hard_ceiling'):
+            assert budget['before'][key] == getattr(original, key)
     saved = load_session_state(root, parent.session_id)
     assert saved.execution_log[:len(parent.execution_log)] == parent.execution_log
     assert not any(row.get('action') == 'attempt_epoch_started' for row in saved.execution_log[len(parent.execution_log):])

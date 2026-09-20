@@ -69,13 +69,19 @@ def reconcile(project, original, invocation):
         if current[:len(history)] != history:
             raise RepairBlocked('budget_history_conflict', '历史调用记录不完整，不能推定可用次数：' + identity)
         before = {key: state.get(key) for key in FIELDS}
+        # These constraints apply even when no legacy counter reset needs
+        # repair. An idempotent resume is not authority to change allowances
+        # or to move the attempt epoch backwards.
+        if any(state.get(key) != anchor.get(key) for key in ('max_attempts', 'hard_ceiling')):
+            raise RepairBlocked('budget_history_conflict', '预算上限与原记录不一致，已停止自动恢复：' + identity)
+        if int(state.get('attempt_epoch') or 0) < int(anchor.get('attempt_epoch') or 0):
+            raise RepairBlocked('budget_history_conflict', '调用轮次早于原记录，已停止自动恢复：' + identity)
         deficits = any(int(state.get(key) or 0) < int(anchor.get(key) or 0)
                        for key in ('current_attempt', 'attempts_since_progress'))
         if not deficits: continue
-        if (any(state.get(key) != anchor.get(key) for key in ('max_attempts', 'hard_ceiling'))
-                or not all(_control_only(row, invocation.get('engine_route', {})) for row in current[len(history):])):
+        if not all(_control_only(row, invocation.get('engine_route', {})) for row in current[len(history):]):
             raise RepairBlocked('budget_history_conflict', '旧预算存在无法解释的变化，已停止自动恢复：' + identity)
-        for key in ('current_attempt', 'attempts_since_progress', 'attempt_epoch'):
+        for key in ('current_attempt', 'attempts_since_progress'):
             state[key] = max(int(state.get(key) or 0), int(anchor.get(key) or 0))
         state.setdefault('execution_log', []).append({'action': 'budget_history_reconciled',
             'anchor': digest(anchor), 'before': before, 'after': {key: state.get(key) for key in FIELDS}})

@@ -74,6 +74,17 @@ def replay(root, route, tmp_path, *, receipt='matching', session='parent', mode=
     return json.loads(result.stdout.splitlines()[-1])
 
 
+def assert_recovery_budget(observed, reservations):
+    assert observed['full_dispatch']
+    assert observed.get('provider_boundary_calls', 0) == observed['budget_reserved'] == reservations
+    assert observed['diagnostic_provider_calls'] == 0
+    assert observed['parent_budget']['after'] == observed['parent_budget']['before']
+    before = observed['child_budget']['before']
+    assert observed['child_budget']['after'] == {
+        **before, 'current_attempt': before['current_attempt'] + reservations,
+        'attempts_since_progress': before['attempts_since_progress'] + reservations}
+
+
 @pytest.mark.parametrize('entry', ['engine', 'resume', 'returned_resume', 'child'])
 def test_public_multilayer_recovery_rechecks_retained_child(tmp_path, entry):
     root, child, store, _, original, active, route, old = incident(
@@ -90,14 +101,16 @@ def test_public_multilayer_recovery_rechecks_retained_child(tmp_path, entry):
     assert observation['current_failure'] == {} and observation['previous_failure'] == old
     assert observation['boundary_session_id'] == child.session_id
     assert observation['original_handoff_id'] == original.handoff_id
-    assert observation['diagnostic_provider_calls'] == 0
+    assert_recovery_budget(observation, 1)
     assert len(observation['new_preflight_events']) == 2
     assert all(row['timestamp'] > old['timestamp'] for row in observation['new_preflight_events'])
     assert report['engine_runtime']['modules']['auto_agents.workflow_chain']['functions'][
         'WorkflowStore.resolve_handoff_chain']['matches_source'] is True
     for key in ('goal', 'goal_execution_environment', 'authorization_policy', 'parent_handoff_id',
-                'attempt_epoch', 'attempts_since_progress', 'hard_ceiling', 'current_attempt'):
+                'attempt_epoch', 'max_attempts', 'hard_ceiling'):
         assert getattr(saved, key) == before[key]
+    for key in ('current_attempt', 'attempts_since_progress'):
+        assert getattr(saved, key) == before[key] + 1
     parent = load_session_state(root, 'parent')
     assert (parent.attempt_epoch, parent.attempts_since_progress, parent.hard_ceiling) == (10, 1, 25)
     assert saved.execution_log[:len(before['execution_log'])] == before['execution_log']
@@ -126,7 +139,7 @@ def test_multilayer_new_preflight_failure_preserves_shared_work(tmp_path, monkey
     assert observation['diagnostic_origin'] == 'fresh'
     assert observation['preflight_started']
     assert observation['current_failure'] and observation['previous_failure'] == old
-    assert observation['diagnostic_provider_calls'] == 0
+    assert_recovery_budget(observation, 0)
     saved = load_session_state(root, child.session_id)
     result = store.load_handoff(active.handoff_id).result
     assert saved.status == result['status'] == 'blocked'

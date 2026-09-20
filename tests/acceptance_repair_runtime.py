@@ -11,10 +11,10 @@ import threading
 
 import pytest
 
-from auto_agents.repair_v2.budget_recovery import anchors
+from auto_agents.repair_v2.budget_recovery import anchors, session_path
 from auto_agents.repair_v2.docker import DockerVerifier
 from auto_agents.repair_v2.runtime_artifact import build
-from auto_agents.repair_v2.types import ValidationUnit
+from auto_agents.repair_v2.types import RepairBlocked, ValidationUnit
 from auto_agents.repair_v2.workspace import Workspace, git, inventory, overlay
 from auto_agents.root_cause import RootCauseCoordinator
 
@@ -177,6 +177,37 @@ def test_real_launcher_registers_and_reaches_one_native_provider_boundary(runtim
         approved = integration._approved({'config': config, 'job': job}, root, state, store,
                                          sys.executable, verifier.runtime)
         approved['source_delivery_needed'] = False
+        if not legacy_budget_reset and child_status == 'blocked':
+            # A valid receipt must not allow either replay or the real fresh
+            # launcher to bypass budget checks when the counters are intact.
+            parent_path = session_path(product, 'parent')
+            original_parent = parent_path.read_bytes()
+            registered = supervisor.store.subscriptions(job_id)[0]
+            for field, value in [('max_attempts', parent.max_attempts + 1),
+                                 ('hard_ceiling', parent.hard_ceiling + 1), ('attempt_epoch', 0)]:
+                changed = json.loads(original_parent)
+                changed[field] = value
+                atomic_json(parent_path, changed)
+                protected = {session_path(product, name): session_path(product, name).read_bytes()
+                             for name in captured}
+                try:
+                    with pytest.raises(RepairBlocked) as rejected:
+                        verifier.boundary(selected['source'], Path(selected['path']), product,
+                                          {**payload, '_budget_anchors': captured}, threading.Event())
+                    assert rejected.value.code == 'budget_history_conflict'
+                    request_path = tmp_path / ('conflict-' + field + '.json')
+                    atomic_json(request_path, {'subscriber': registered, 'result': approved, 'config': config})
+                    launched = subprocess.run([sys.executable,
+                        str(Path(config['implementation_root']) / 'src/auto_agents/repair_launch.py'), str(request_path)],
+                        env=lock.inherited_environment({**os.environ, 'AUTO_AGENTS_REPAIR_CONTROL_DISABLED': '1'}),
+                        pass_fds=(lock.fileno,), capture_output=True, text=True, timeout=45)
+                    assert launched.returncode == 3, launched.stderr
+                    failure = json.loads(request_path.with_name(request_path.stem + '-result.json').read_text())
+                    assert failure['code'] == 'budget_history_conflict', failure
+                    assert {path: path.read_bytes() for path in protected} == protected
+                    assert not marker.exists()
+                finally:
+                    parent_path.write_bytes(original_parent)
         supervisor.store.transition(job_id, 'ready', approved)
         thread = threading.Thread(target=supervisor.serve, daemon=True); thread.start()
         try:

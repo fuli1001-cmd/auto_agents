@@ -147,21 +147,31 @@ def test_stale_checkpoint_cannot_overwrite_newer_phase(tmp_path):
         store.transition(stale, phase='implement')
 
 
-def test_critical_recovery_failure_cannot_be_waived_as_baseline():
-    node = 'tests/test_repair_runtime.py::test_current_runtime_passes_controller_owned_behavior_checks'
+@pytest.mark.parametrize('node', [
+    'tests/test_repair_runtime.py::test_current_runtime_passes_controller_owned_behavior_checks',
+    'tests/test_parent_recovery_budget.py::test_saved_engine_route_preserves_distinct_parent_and_child_budgets',
+    'tests/test_multilayer_engine_recovery.py::test_public_multilayer_recovery_rechecks_retained_child[engine]',
+    'tests/test_reference_catalog_recovery.py::test_public_engine_recheck_keeps_catalog_and_executable_obligations[valid-requirements_trace.json]',
+])
+def test_critical_recovery_failure_cannot_be_waived_as_baseline(node):
     report = {'checks': [{'ok': False, 'returncode': 1, 'source_unchanged': True,
         'failed': [node], 'call_failed': [node], 'collected': [node],
         'failure_details': [{'nodeid': node, 'phase': 'call', 'message': 'assert loaded == expected'}]}]}
     assert signatures(report) is None
 
 
-def test_budget_migration_restores_only_proved_restart_resets(tmp_path):
-    from auto_agents.repair_v2.budget_recovery import reconcile, session_path
-    from auto_agents.repair_v2.store import atomic_json
-    original = {'session_id': 'parent', 'workflow_id': 'workflow', 'goal': 'original goal',
+@pytest.fixture
+def budget_anchor():
+    return {'session_id': 'parent', 'workflow_id': 'workflow', 'goal': 'original goal',
         'authorization_policy': {}, 'goal_execution_environment': {'mode': 'real'},
         'current_attempt': 2, 'attempt_epoch': 10, 'attempts_since_progress': 1,
         'max_attempts': 10, 'hard_ceiling': 25, 'execution_log': []}
+
+
+def test_budget_migration_restores_only_proved_restart_resets(tmp_path, budget_anchor):
+    from auto_agents.repair_v2.budget_recovery import reconcile, session_path
+    from auto_agents.repair_v2.store import atomic_json
+    original = budget_anchor
     reset = {**original, 'current_attempt': 0, 'attempt_epoch': 16, 'attempts_since_progress': 0,
         'execution_log': [{'action': 'attempt_epoch_started', 'result': 'failed session resumed'}]}
     path = session_path(tmp_path, 'parent'); atomic_json(path, reset)
@@ -176,6 +186,44 @@ def test_budget_migration_restores_only_proved_restart_resets(tmp_path):
     with pytest.raises(RepairBlocked, match='无法解释'):
         reconcile(tmp_path, {'parent': original}, {'session_id': 'parent'})
     assert json.loads(path.read_text()) == reset
+
+
+@pytest.mark.parametrize('counts', [(2, 1), (3, 2), (0, 0)], ids=['unchanged', 'increased', 'reset'])
+@pytest.mark.parametrize('field,value', [('max_attempts', 11), ('max_attempts', 9),
+    ('hard_ceiling', 26), ('hard_ceiling', 24), ('attempt_epoch', 0)])
+def test_budget_conflict_rejects_all_owners_before_any_write(tmp_path, budget_anchor, counts, field, value):
+    from auto_agents.repair_v2.budget_recovery import reconcile, session_path
+    from auto_agents.repair_v2.store import atomic_json
+    # The first owner needs a legitimate migration. A conflict in the second
+    # must prevent that pending write, including when its counts are unchanged.
+    parent = budget_anchor
+    child = {**deepcopy(parent), 'session_id': 'child'}
+    control_event = {'action': 'attempt_epoch_started', 'result': 'failed session resumed'}
+    reset = {**parent, 'current_attempt': 0, 'attempts_since_progress': 0,
+             'attempt_epoch': 16, 'execution_log': [control_event]}
+    changed = {**child, 'current_attempt': counts[0], 'attempts_since_progress': counts[1],
+               field: value, 'execution_log': [control_event]}
+    paths = [session_path(tmp_path, name) for name in ('parent', 'child')]
+    for path, state in zip(paths, (reset, changed)):
+        atomic_json(path, state)
+    before = {path: path.read_bytes() for path in paths}
+    with pytest.raises(RepairBlocked) as rejected:
+        reconcile(tmp_path, {'parent': parent, 'child': child}, {'session_id': 'parent'})
+    assert rejected.value.code == 'budget_history_conflict'
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+@pytest.mark.parametrize('attempts,since,epoch', [(2, 1, 10), (3, 2, 10), (2, 1, 16)])
+def test_budget_without_reset_keeps_valid_history_untouched(tmp_path, budget_anchor, attempts, since, epoch):
+    from auto_agents.repair_v2.budget_recovery import reconcile, session_path
+    from auto_agents.repair_v2.store import atomic_json
+    state = {**budget_anchor, 'current_attempt': attempts,
+             'attempts_since_progress': since, 'attempt_epoch': epoch}
+    path = session_path(tmp_path, 'parent')
+    atomic_json(path, state)
+    before = path.read_bytes()
+    assert reconcile(tmp_path, {'parent': budget_anchor}, {'session_id': 'parent'}) == []
+    assert path.read_bytes() == before
 
 
 def test_packaging_migration_preserves_revocation_and_does_not_implement(repair_request):

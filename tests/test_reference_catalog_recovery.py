@@ -13,7 +13,7 @@ from auto_agents.session_verification import (
     SessionOwnershipError, _session_reference_kind, validate_binding,
 )
 from test_engine_child_recovery import parent_workflow
-from test_multilayer_engine_recovery import replay
+from test_multilayer_engine_recovery import assert_recovery_budget, replay
 from test_reference_exit_regressions import REFERENCE, reference_project
 from test_session_verification_ownership import _binding_fixture, _retain_contract
 
@@ -96,12 +96,15 @@ def test_public_engine_recheck_keeps_catalog_and_executable_obligations(tmp_path
     assert report['route_consumed'] and report['engine_runtime']['ok']
     observed = report['recovery_observation']
     saved = load_session_state(root, child.session_id)
-    assert observed['diagnostic_provider_calls'] == 0
+    reservations = 1 if failure == 'valid' else 0
+    assert_recovery_budget(observed, reservations)
     assert observed['previous_failure'] == old
     assert saved.execution_log[:len(before['execution_log'])] == before['execution_log']
     for key in ('goal', 'goal_execution_environment', 'authorization_policy', 'parent_handoff_id',
-                'current_attempt', 'attempt_epoch', 'attempts_since_progress', 'hard_ceiling'):
+                'attempt_epoch', 'max_attempts', 'hard_ceiling'):
         assert getattr(saved, key) == before[key]
+    for key in ('current_attempt', 'attempts_since_progress'):
+        assert getattr(saved, key) == before[key] + reservations
     if failure == 'valid':
         assert observed['preflight_rechecked'] and observed['boundary_kind'] == 'implementation'
         assert observed['boundary_session_id'] == child.session_id
