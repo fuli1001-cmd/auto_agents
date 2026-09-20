@@ -200,3 +200,24 @@ failed and the controller stops before another implementation or replan. On an
 explicit retry it checks the retained candidate again. Genuine ownership and
 test-discovery failures retain their original verdict; error text alone does
 not grant acceptance or mark an assertion failure as an environment problem.
+
+The controller also snapshots installed project `node_modules` needed by the
+retained Vitest discovery declarations. It mounts private, content-checked copies
+at their original project paths, read-only, alongside captured Conda inputs.
+Selection uses the frozen configuration and lockfile locations; it does not
+resume any task that owns those declarations. Missing dependencies stop replay
+as infrastructure failure, without installing substitutes. External dependency
+links and changes to captured packages invalidate the inputs. Npm configuration
+and `.env` credential files are excluded, and no package scripts run during
+snapshot admission.
+
+Vitest discovery retains bounded, redacted exit evidence. The known missing
+Workbench Vitest launcher failure is classified as infrastructure only with a
+failed discovery exit and its specific diagnostic; generic missing product
+imports and test assertions retain their original failures. The dependency
+snapshot implementation belongs to the pinned controller. Candidate changes to
+that implementation alone cannot supply inputs to the running verifier.
+Timeouts and missing or malformed replay reports also stop implementation as
+verification infrastructure failures; a timeout cannot accept a partial success
+report. Explicit cancellation remains cancellation, and retained candidates can
+be rechecked once the verification environment is available.

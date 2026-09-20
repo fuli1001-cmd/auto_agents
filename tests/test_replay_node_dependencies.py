@@ -41,6 +41,7 @@ def test_replay_captures_installed_packages_at_the_original_path(node_scene, tmp
     assert snapshot.prefix == packages and snapshot.root != packages
     assert snapshot.describe()['kind'] == 'node-dependencies'
     assert snapshot.describe()['credentials_included'] is False
+    assert snapshot.describe()['credential_files_excluded'] is True
     assert (snapshot.root / '.bin/vitest').resolve().is_relative_to(snapshot.root)
     assert (snapshot.root / '.bin/vitest').read_bytes() == (packages / '.bin/vitest').read_bytes()
     assert not (snapshot.root / '.npmrc').exists() and not (snapshot.root / '.env.local').exists()
@@ -69,6 +70,39 @@ def test_node_inputs_follow_frozen_runner_declarations_not_live_config(node_scen
     assert node_prefixes(frozen, payload) == []
 
 
+def test_workbench_dependencies_follow_retained_lockfile(node_scene):
+    project, frozen, packages, payload = node_scene
+    (project / 'workbench').mkdir()
+    packages.rename(project / 'workbench/node_modules')
+    (frozen / 'workbench').mkdir()
+    (frozen / 'workbench/package-lock.json').write_text('{}')
+    assert node_prefixes(frozen, payload) == [project / 'workbench/node_modules']
+    assert node_prefixes(frozen, {**payload, 'invocation': {
+        'session_id': 'child', 'workflow_id': 'different-workflow'}}) == []
+
+
+@pytest.mark.parametrize('external', [True, False])
+def test_node_links_cannot_capture_files_outside_the_project_or_dependency_tree(node_scene, tmp_path, external):
+    project, frozen, packages, payload = node_scene
+    outside = tmp_path / 'outside'; outside.mkdir()
+    (outside / 'secret').write_text('outside input')
+    if external:
+        packages.rename(project / 'saved')
+        packages.symlink_to(outside, target_is_directory=True)
+    else:
+        (packages / 'escape').symlink_to(outside / 'secret')
+    with pytest.raises(EnvironmentUnavailable, match='外部'):
+        prepare(tmp_path / 'cache', frozen, payload)
+
+
+def test_node_capture_excludes_credential_directories(node_scene, tmp_path):
+    _, _, packages, _ = node_scene
+    (packages / '.env.private').mkdir()
+    (packages / '.env.private/token').write_text('private')
+    snapshot = capture(tmp_path / 'cache', packages, kind='node-dependencies')
+    assert not (snapshot.root / '.env.private').exists()
+
+
 def test_missing_node_inputs_fail_closed_without_creating_replacements(node_scene, tmp_path):
     project, frozen, packages, payload = node_scene
     packages.rename(project / 'saved-packages')
@@ -77,12 +111,61 @@ def test_missing_node_inputs_fail_closed_without_creating_replacements(node_scen
     assert not packages.exists() and not (frozen / 'node_modules').exists()
 
 
+def test_existing_node_directory_without_vitest_is_not_a_usable_environment(node_scene, tmp_path):
+    _, frozen, packages, payload = node_scene
+    (packages / 'vitest/package.json').unlink()
+    with pytest.raises(EnvironmentUnavailable, match='缺少 Vitest'):
+        prepare(tmp_path / 'cache', frozen, payload)
+
+
 def test_node_dependency_check_does_not_launch_a_python_or_package_script(node_scene, monkeypatch):
     _, _, packages, _ = node_scene
     monkeypatch.setattr('auto_agents.repair_v2.boundary_driver.subprocess.run',
                         lambda *a, **k: pytest.fail('dependency admission must not execute package scripts'))
     record = {'kind': 'node-dependencies', 'prefix': str(packages), 'digest': 'bound'}
     assert check_environments({'replay_environments': [record]}) == [record]
+
+
+@pytest.mark.parametrize('outcome', ['missing_runner', 'timeout', 'missing_report', 'invalid_report', 'cancelled'])
+def test_controller_mounts_node_snapshot_and_stops_on_missing_runner(node_scene, tmp_path, monkeypatch, outcome):
+    import threading
+    from auto_agents.repair_v2.docker import DockerVerifier
+    from auto_agents.repair_v2.workspace import git, source_identity
+    from test_repair_v2_replay_confinement import missing_vitest
+    project, frozen, packages, payload = node_scene
+    source = tmp_path / 'engine'; source.mkdir(); git(source, 'init', '-q')
+    (source / 'engine.py').write_text('engine = 1\n')
+    git(source, 'add', '.'); git(source, 'commit', '-qm', 'source')
+    snapshot = capture(tmp_path / 'cache', packages, kind='node-dependencies')
+    monkeypatch.setattr('auto_agents.repair_v2.replay_environment.prepare', lambda *a: [snapshot])
+    def run(args, **kwargs):
+        if args[:2] == ['docker', 'run']:
+            assert f'type=bind,src={snapshot.root},dst={packages},readonly' in args
+            assert not any(f'src={packages},' in arg for arg in args)
+            mount = next(arg for arg in args if arg.endswith(',dst=/result'))
+            output = Path(mount.split(',')[1].removeprefix('src='))
+            request = json.loads((output / 'request.json').read_text())
+            assert request['replay_environments'] == [snapshot.describe()]
+            if outcome == 'missing_runner':
+                atomic_json(output / 'boundary.json', missing_vitest())
+            elif outcome == 'timeout':
+                kwargs['observation']['termination'] = 'timeout'
+                atomic_json(output / 'boundary.json', {'ok': True})
+            elif outcome == 'invalid_report':
+                atomic_json(output / 'boundary.json', {'ok': 'true'})
+            elif outcome == 'cancelled':
+                kwargs['observation']['termination'] = 'cancelled'
+                kwargs['cancel'].set()
+        return 0, ''
+    monkeypatch.setattr('auto_agents.repair_v2.docker.run', run)
+    result = DockerVerifier(tmp_path / 'verification', image='pinned').boundary(
+        source_identity(source), source, frozen, payload, threading.Event())
+    assert result['ok'] is False and result['infrastructure'] is True
+    assert '已停止自动代码修复' in result['reason']
+    if outcome == 'timeout': assert result['timed_out'] is True
+    if outcome == 'cancelled': assert result['cancelled'] is True
+    assert not (frozen / 'node_modules').exists()
+    snapshot.verify()
 
 
 def test_vitest_failure_keeps_bounded_redacted_process_evidence(tmp_path, monkeypatch):

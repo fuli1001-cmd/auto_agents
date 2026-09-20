@@ -117,6 +117,9 @@ def inventory(root, *, node=False):
     label = 'Node 依赖' if node else 'Conda 环境'
     records, size = {}, 0
     for current, directories, files in os.walk(root, followlinks=False):
+        if node:
+            directories[:] = [name for name in directories
+                              if name not in ('.npmrc', '.env') and not name.startswith('.env.')]
         # Activation state may contain credentials. Offline preflight uses the
         # actual interpreter/package files, never shell activation or providers.
         if Path(current) == root / 'etc/conda':
@@ -157,7 +160,7 @@ class Snapshot:
     def describe(self):
         if self.kind == 'node-dependencies':
             return {'prefix': str(self.prefix), 'digest': self.identity, 'kind': self.kind,
-                    'credentials_included': False}
+                    'credentials_included': False, 'credential_files_excluded': True}
         return {'prefix': str(self.prefix), 'digest': self.identity, 'kind': 'conda-runtime-prefix',
                 'activation_state_included': False}
 
@@ -230,6 +233,10 @@ def node_prefixes(target, payload):
     if (not session_path.is_file() or session_path.is_symlink()
             or not session_path.resolve().is_relative_to(target.resolve())):
         return []
+        session = json.loads(session_path.read_text())
+    workflow = payload.get('invocation', {}).get('workflow_id')
+    if workflow and session.get('workflow_id') and workflow != session['workflow_id']:
+        return []
     steps, retained_commands = [], commands(target, payload)
     for relative, field in (('.auto-agents/config.json', 'gates'),
                             ('.auto-agents/state/task_plan.json', 'plan')):
@@ -260,6 +267,10 @@ def node_prefixes(target, payload):
         raise EnvironmentUnavailable('保留的 Vitest 预检需要项目中已安装的 node_modules；离线恢复不安装或替换依赖。')
     if any(',' in str(path) or '\n' in str(path) or '\r' in str(path) for path in selected):
         raise EnvironmentUnavailable('Node 验证依赖路径不能安全挂载。')
+    if any(not path.resolve().is_relative_to(project.resolve()) for path in selected):
+        raise EnvironmentUnavailable('Node 验证依赖指向当前项目外部，不能捕获。')
+    if not any((path / 'vitest/package.json').is_file() for path in selected):
+        raise EnvironmentUnavailable('项目的 node_modules 中缺少 Vitest，不能执行离线恢复预检。')
     return selected
 
 
