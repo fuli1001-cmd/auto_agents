@@ -1948,6 +1948,15 @@ product/configuration changes are restored and rejected. Results are saved befor
 evidence review, so resuming review does not repeat generation. Missing evidence or a rejected
 review cannot complete the goal. A stopped older development run remains stopped.
 
+When acceptance uses a private checkout containing delivered fixes, its controller also identifies
+the original runtime source. Existing ignored environment files and runtime data may be loaded
+through temporary service environment variables or supported launch arguments; relative database
+and media paths must retain their original locations. This does not authorize configuration-file
+edits, database initialization or migration. Blocked acceptance shows its reason in the terminal.
+An explicit resume returns to diagnosis with the prior result, evidence and attempt budget intact;
+any newly routed acceptance keeps its evidence in a separate directory and reconciles previous
+external operations before continuing.
+
 If a provider emits a fix-only `FIX_DISPOSITION` while still inside the read-only collab frame,
 auto_agents deterministically normalizes bounded `fix`, `run_iteration`, and `resume_child`
 decisions into the matching workflow handoff instead of asking the user to repair the protocol.

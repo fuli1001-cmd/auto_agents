@@ -265,6 +265,13 @@ class ConsolePresenter:
         with self._lock:
             if self._closed:
                 return
+            notice = (reporter.snapshot.kind, reporter.snapshot.subject, message)
+            # Private and control reporters share one console during a handoff.
+            # Keep both diagnostic logs, but display an identical status once.
+            if (not debug and self.mode != 'debug' and message.startswith(('当前状态：', 'Status:'))
+                    and notice == getattr(self, '_last_notice', None)):
+                return
+            self._last_notice = notice
             self._ensure_started()
             self._last_event = time.monotonic()
             try:
@@ -775,7 +782,23 @@ class Reporter:
         self.snapshot.stage = str(state.status)
         self.snapshot.status = str(state.status)
         if previous_status != self.snapshot.status:
-            self.emit("status", status=_label(self.snapshot.status, self.language))
+            label = _label(self.snapshot.status, self.language)
+            acceptance = getattr(state, 'acceptance_execution', {})
+            reason = ''
+            if state.status == 'blocked' and state.resolution == 'acceptance_blocked':
+                reason = acceptance.get('result', {}).get('summary', '')
+            elif state.status == 'blocked' and state.resolution == 'acceptance_review_rejected':
+                reason = acceptance.get('review', {}).get('reason', '')
+            elif state.status == 'blocked' and state.resolution == 'acceptance_evidence_invalid':
+                reason = ('验收证据缺失或无效，需要重新核验。' if self.language == 'zh' else
+                          'Acceptance evidence is missing or invalid and must be checked again.')
+            elif state.status == 'blocked' and state.resolution == 'acceptance_input_changed':
+                reason = ('验收目标、代码或授权已变化，需要重新诊断。' if self.language == 'zh' else
+                          'Acceptance inputs changed and require a new diagnosis.')
+            if reason:
+                reason = ' '.join(plain_text(str(reason)).split())[:600]
+                label += ('；原因：' if self.language == 'zh' else '; reason: ') + reason
+            self.emit("status", status=label)
         self.event("session.snapshot", {
             "status": state.status, "attempt": state.current_attempt, "goal": state.goal,
         })

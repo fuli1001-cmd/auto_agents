@@ -15,6 +15,30 @@ from .repair_v2.store import digest
 from .session_operation_policy import operation_policy_lines
 
 
+def runtime_context(session):
+    """Use the controller's project identity, never a provider-supplied path."""
+    return {'code_root': str(session.project_root.resolve()),
+            'runtime_source_root': str(Path(getattr(session, '_custody_control_root', session.project_root)).resolve())}
+
+
+def runtime_prompt_lines(session):
+    return [
+        'Runtime context (controller-owned): ' + json.dumps(runtime_context(session), ensure_ascii=False),
+        'Execute product code and load versioned product configuration from code_root. A private Git checkout may omit ignored .env files and runtime data that still exist in runtime_source_root.',
+        'Before declaring a runtime prerequisite missing, inspect the existing runtime configuration and data at runtime_source_root. During acceptance execution, load existing credentials into the service process environment without printing or copying secrets into evidence.',
+        'During acceptance execution, process-local environment variables or supported launch arguments may bind existing databases, media and other runtime paths to their original absolute locations. Resolve relative runtime data paths against their configuration source, not the private code checkout; keep code and versioned product configuration at code_root.',
+        'These temporary launch bindings are permitted runtime setup, not permission to edit configuration files, initialize or migrate a database, change providers, or reset project identities and operation receipts. Use only storage and services authorized for the original goal; diagnose unsupported or incompatible bindings before execution.',
+    ]
+
+
+def resumable_blocker(state):
+    return (state.mode == 'collab' and state.status == 'blocked'
+            and state.resolution in {'acceptance_blocked', 'acceptance_review_rejected',
+                                     'acceptance_evidence_invalid', 'acceptance_input_changed'}
+            and state.acceptance_execution.get('phase') == 'blocked'
+            and not state.active_handoff_id)
+
+
 def is_request(target, payload):
     return target == 'acceptance' or (target == 'run' and
         payload.get('spec_seed', {}).get('scope') == 'existing_behavior_real_acceptance_only')
@@ -35,6 +59,9 @@ def prepare(session, state, payload):
              'session_id': state.session_id, 'revision': head_ref(session.project_root), 'request': seed,
              'prior_evidence_directories': list(dict.fromkeys(prior))}
     state.acceptance_execution = {'inputs': value, 'identity': digest(value), 'phase': 'pending'}
+    if prior:
+        # A recovery must not overwrite the evidence/operation ledger it cites.
+        state.acceptance_execution['evidence_subdir'] = digest(value)
     state.status, state.return_phase, state.resolution = 'executing', '', ''
     state.execution_log.append({'action': 'acceptance_requested', 'result': 'Execute the existing goal without adopting saved development tasks',
                                 'timestamp': session._now()})
@@ -124,6 +151,18 @@ def _call(session, state, purpose, prompt):
             raise ValueError('验收修改了产品或任务配置，已撤销这些改动')
 
 
+def _directory(session, state):
+    directory = session.project_root / '.auto-agents/state/sessions' / state.session_id / 'acceptance'
+    subdir = state.acceptance_execution.get('evidence_subdir', '')
+    if subdir:
+        if not isinstance(subdir, str) or not re.fullmatch(r'[0-9a-f]{64}', subdir):
+            raise ValueError('验收证据目录无效')
+        directory /= subdir
+    if not directory.resolve().is_relative_to(session.project_root.resolve()):
+        raise ValueError('验收证据必须保存在本次工作目录')
+    return directory
+
+
 def drive(session, state):
     saved = state.acceptance_execution
     value = saved['inputs']
@@ -133,16 +172,13 @@ def drive(session, state):
             or value['environment'] != state.goal_execution_environment
             or value['workflow_id'] != state.workflow_id or value['session_id'] != state.session_id):
         state.status, state.resolution = 'blocked', 'acceptance_input_changed'
+        saved['phase'] = 'blocked'
         session._save(state)
         return state
-    directory = session.project_root / '.auto-agents/state/sessions' / state.session_id / 'acceptance'
-    if not directory.resolve().is_relative_to(session.project_root.resolve()):
-        state.status, state.resolution = 'blocked', 'acceptance_evidence_invalid'
-        session._save(state)
-        return state
-    directory.mkdir(parents=True, exist_ok=True)
-    saved['directory'] = str(directory)
     try:
+        directory = _directory(session, state)
+        directory.mkdir(parents=True, exist_ok=True)
+        saved['directory'] = str(directory)
         if saved.get('question'):
             session._handle_collab_assistance(state, '', saved['question'])
             saved.pop('question')
@@ -158,7 +194,8 @@ def drive(session, state):
             prompt = compose_prompt([
                 'Execute acceptance of the existing product for the original user goal below. This is NOT development, planning or a saved run resume.',
                 'Use the current checkout, already containing delivered fixes. Start existing services and operate the actual browser/UI and configured providers as required by the goal.',
-                'Do not implement features, edit product/config/test files, change requirements or .auto-agents control records, migrate storage, install dependencies or resume stopped tasks.',
+                *runtime_prompt_lines(session),
+                'Do not implement features, edit product/config/test files, change requirements or .auto-agents control records, initialize or migrate storage, install dependencies or resume stopped tasks.',
                 'Runtime data and evidence may be written. Respect the original authorization, spending limits and real/simulated environment. No fake media or proxy-only evidence.',
                 *operation_policy_lines(),
                 'Inspect any existing execution ledger, project IDs and runtime evidence before making provider calls; reuse prior results. Never repeat an externally charged operation whose outcome is unknown.',
@@ -233,8 +270,8 @@ def drive(session, state):
 def completed(session, state):
     saved = state.acceptance_execution
     value = saved.get('inputs', {})
-    directory = session.project_root / '.auto-agents/state/sessions' / state.session_id / 'acceptance'
     try:
+        directory = _directory(session, state)
         return (saved.get('phase') == 'completed' and saved.get('identity') == digest(value)
                 and value.get('goal') == state.goal and value.get('workflow_id') == state.workflow_id
                 and value.get('session_id') == state.session_id

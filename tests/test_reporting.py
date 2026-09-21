@@ -432,6 +432,31 @@ def test_user_log_is_concise_but_diagnostics_retain_protocol_and_details(report)
     assert any(protocol == e['message'] for e in events(reporter))
 
 
+@pytest.mark.parametrize('resolution', ['acceptance_blocked', 'acceptance_review_rejected'])
+def test_acceptance_blocker_is_visible_once_across_private_and_control_reporters(tmp_path, resolution):
+    from auto_agents.models import SessionState
+    stream = io.StringIO()
+    control = Reporter(tmp_path / 'control', stream, language='zh')
+    private = Reporter(tmp_path / 'private', stream, language='zh', presenter=control.presenter)
+    reason = ('FastAPI 启动失败：SCHEMA_DATABASE_MISSING' if resolution == 'acceptance_blocked'
+              else '未提供实际播放或抽帧证据')
+    state = SessionState('accept', mode='collab', status='blocked', resolution=resolution,
+        acceptance_execution={'phase': 'blocked', 'result': {'summary': 'Execution claimed success'}, 'review': {'reason': reason}})
+    if resolution == 'acceptance_blocked':
+        state.acceptance_execution['result']['summary'] = reason
+    try:
+        for reporter in (private, control):
+            reporter.bind('collab', state.session_id)
+            reporter.observe_session(state)
+            reporter.observe_session(state)
+            assert reason in (reporter.root / 'user.log').read_text()
+        assert stream.getvalue().count(reason) == 1
+        assert 'Execution claimed success' not in stream.getvalue()
+    finally:
+        private.close()
+        control.close()
+
+
 @pytest.mark.parametrize('bound', [False, True])
 def test_storage_tracking_failure_is_diagnostic_before_and_after_reporter_start(tmp_path, monkeypatch, capsys, bound):
     from auto_agents import artifact_runtime

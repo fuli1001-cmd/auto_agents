@@ -2887,6 +2887,18 @@ class Session:
         reply: str,
         achieved_match: re.Match,
     ) -> Optional[SessionState]:
+        if state.acceptance_execution.get('phase') == 'blocked':
+            reason = '验收尚未通过，必须通过验收执行和独立证据审核后才能完成目标。'
+            result = state.acceptance_execution.get('result', {})
+            state.status = 'blocked'
+            state.resolution = ('acceptance_blocked' if result.get('status') == 'blocked' else
+                                'acceptance_review_rejected' if state.acceptance_execution.get('review') else
+                                'acceptance_evidence_invalid')
+            state.conversation.append({'role': 'orchestrator', 'content': reason})
+            state.execution_log.append({'action': 'acceptance_completion_rejected',
+                                        'result': reason, 'timestamp': self._now()})
+            self._save(state)
+            return state
         display = _GOAL_ACHIEVED.sub("", reply).strip()
         if display:
             self._print(f"\nAgent:\n{display}")
@@ -3773,6 +3785,7 @@ class Session:
             self._print("Invalid selection. Enter a listed number, a session ID, or 'n' for a new session.")
 
     def _build_collab_prompt(self, state: SessionState, feedback: str) -> str:
+        from .session_acceptance import runtime_prompt_lines
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         consolidated = self._consolidate_goal(state)
@@ -3785,6 +3798,7 @@ class Session:
             *self._goal_contexts(state),
             "",
             *self._goal_environment_prompt_lines(state),
+            *runtime_prompt_lines(self),
             "",
             "--- Conversation History ---",
         ]
@@ -3804,6 +3818,13 @@ class Session:
                 "Previous attempt issues:",
                 ContextBlock(feedback, "Previous attempt issues"),
                 "",
+            ])
+
+        if state.acceptance_execution.get('phase') == 'blocked':
+            lines.extend([
+                'The previous acceptance is blocked. Inspect its saved evidence and identify a concrete recovery before routing another acceptance attempt. Do not repeat generation or paid operations during diagnosis; preserve existing project IDs, results, receipts and budgets.',
+                ContextBlock(json.dumps(state.acceptance_execution, ensure_ascii=False),
+                             'Blocked acceptance evidence'),
             ])
 
         lines.extend([

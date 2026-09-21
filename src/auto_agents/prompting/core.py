@@ -144,7 +144,9 @@ def role_rules(purpose: str) -> Tuple[PromptBlock, ...]:
         rules.append(PromptBlock(
             "Execute only the existing user's acceptance scenario, using the required real environment. "
             "You may start existing services, operate the browser and write runtime data/evidence. "
-            "Do not edit product code, tests, configuration, requirements or workflow control state. "
+            "You may load existing runtime configuration into service process environments and bind "
+            "existing runtime data through supported launch settings. Do not edit product code, tests, "
+            "configuration files, requirements or workflow control state, or initialize or migrate storage. "
             "Do not adopt unrelated development tasks. Preserve external-operation receipts and reuse results.", "stage.acceptance"))
     elif purpose in IMPLEMENT:
         rules.append(PromptBlock(

@@ -328,6 +328,7 @@ class WorkflowCoordinator:
         if not authority_valid:
             return state
         resume_state_changed = False
+        from .session_acceptance import resumable_blocker
         if (not engine_resume and state.status != "completed"
                 and not state.candidate_custody.get("receipt")):
             resume_state_changed = session._invalidate_provider_continuations(
@@ -336,6 +337,7 @@ class WorkflowCoordinator:
             )
             if not (
                 state.status == "failed"
+                or resumable_blocker(state)
                 or (
                     state.status == "paused"
                     and state.resolution == "interrupted_by_user"
@@ -784,7 +786,16 @@ class WorkflowCoordinator:
             return state
         session._coordinator = self
         session._coordinator_managed = True
-        if state.status == "failed":
+        from .session_acceptance import resumable_blocker
+        if resumable_blocker(state):
+            # Explicit resume returns to diagnosis with the failed result intact.
+            # Never replay acceptance execution or reset its budget here.
+            state.status, state.resolution, state.resume_phase = 'executing', '', ''
+            state.execution_log.append({'action': 'acceptance_recovery_started',
+                'result': 'Inspect retained acceptance evidence before any new execution',
+                'timestamp': parent_session_now()})
+            save_session_state(self.project_root, state)
+        elif state.status == "failed":
             session._invalidate_provider_continuations(
                 state,
                 reason="failed session started a fresh durable resume boundary",
