@@ -761,8 +761,8 @@ class Orchestrator:
 
         if getattr(self, '_retained_session_configuration', False):
             # The private execution checkout uses an already loaded effective
-            # configuration and sealed verification contract. Migrating its
-            # historical JSON would rewrite those inputs outside the shared
+            # configuration and, when present, a sealed verification contract.
+            # Migrating historical JSON would rewrite inputs outside the shared
             # project's lifecycle lock, and can replace the scoped gate plan.
             return False
         migrated = migrate_project_config(self.project_root)
