@@ -259,6 +259,40 @@ class RootCauseDiagnosis:
     repair_approved: bool
     reason: str
 
+    def scope_necessity(self, target: Path) -> Dict[str, object]:
+        """Bind temporary diagnostic citations to this diagnosis's retained evidence."""
+        necessity = dict(self.final.necessity)
+        refs = necessity.get('evidence_refs')
+        if not isinstance(refs, list):
+            return necessity
+        bound = []
+        retained = None
+        for ref in refs:
+            if isinstance(ref, str) and ref.partition('#')[0] == '.root-cause-evidence.json':
+                from .repair_v2.scope import read_json
+                from .repair_v2.store import atomic_json, digest
+                from .repair_v2.types import RepairBlocked
+                if retained is None:
+                    target = target.resolve()
+                    try:
+                        relative = Path(self.evidence_path).relative_to(target)
+                    except ValueError as error:
+                        raise RepairBlocked('scope_evidence', '诊断依据不属于当前任务。') from error
+                    evidence = read_json(target, relative)
+                    # Run logs are omitted from isolated repair snapshots. Keep
+                    # an immutable copy under state so the scope receipt can be
+                    # revalidated in every worker and after process restart.
+                    retained = Path('.auto-agents/state/repair-scope-evidence') / (digest(evidence) + '.json')
+                    if not (target / retained).resolve().is_relative_to(target):
+                        raise RepairBlocked('scope_evidence', '诊断依据目录不属于当前任务。')
+                    atomic_json(target / retained, evidence)
+                bound.append({'origin': 'target', 'path': retained.as_posix(),
+                              'pointer': ref.partition('#')[2]})
+            else:
+                bound.append(ref)
+        necessity['evidence_refs'] = bound
+        return necessity
+
     def to_dict(self) -> Dict[str, object]:
         return {
             "schema_version": ROOT_CAUSE_SCHEMA_VERSION,
@@ -1422,6 +1456,9 @@ class RootCauseCoordinator:
                 "evidence; do not create a second diagnosis. Ignore unrelated old defects and improvements "
                 "entirely. Use needs_user only for changes to the authorized user goal or resuming another "
                 "task explicitly stopped by the user, with a simple question and concrete suggestion.",
+                "For necessity.evidence_refs use repository-relative paths, or objects with "
+                "origin (target|source) and path. Cite diagnostic sections as "
+                ".root-cause-evidence.json#/section; these are bound to retained evidence before repair.",
                 f"Use no more than {self.config.max_dynamic_commands} diagnostic commands; "
                 f"each command must finish within {self.config.command_timeout_seconds} seconds.",
                 "Separate ownership of the visible symptom from ownership of the mechanism "

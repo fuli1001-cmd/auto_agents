@@ -4950,6 +4950,20 @@ class Orchestrator:
             and "recovery route: rerun from clarify" in lowered
         )
 
+    def _prompt_clarify_user(
+        self, state: RunState, prompt: str, **kwargs: object,
+    ) -> str:
+        # Both health observers read durable state. Presenter input mode alone
+        # does not suspend the progress lease while the terminal waits.
+        previous_status = state.status
+        state.status = "waiting_user"
+        save_run_state(self.project_root, state)
+        try:
+            return self._prompt_user(prompt, **kwargs)
+        finally:
+            state.status = previous_status
+            save_run_state(self.project_root, state)
+
     def _run_interactive_clarify(
         self,
         state: RunState,
@@ -5039,11 +5053,11 @@ class Orchestrator:
                 confirmed_generation = True
                 self.logger.info("Generation automatically confirmed by --auto-approve.", extra={"audience": "user"})
             else:
-                user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
+                user_conf = self._prompt_clarify_user(state, "Confirm generation? (y/n) [y]: ", default="y")
                 if user_conf.strip().lower() not in ("n", "no"):
                     confirmed_generation = True
                 else:
-                    user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
+                    user_reply = self._prompt_clarify_user(state, "Please provide your thoughts: ", multiline=True)
                     _record_clarify_feedback(user_reply)
         else:
             # Resume interrupted conversation: if trailing history entries
@@ -5067,7 +5081,7 @@ class Orchestrator:
                     self.logger.info("\n[Resuming previous conversation]", extra={"audience": "user"})
                     self.logger.info("\nAgent:", extra={"audience": "user"})
                     self.logger.info(replay_msg["content"])
-                    user_reply = self._prompt_user("\nYour reply: ", multiline=True)
+                    user_reply = self._prompt_clarify_user(state, "\nYour reply: ", multiline=True)
                     if user_reply.strip():
                         history.append({"role": "user", "content": user_reply})
                     else:
@@ -5149,12 +5163,12 @@ class Orchestrator:
                         self.logger.info("Generation automatically confirmed by --auto-approve.", extra={"audience": "user"})
                         break
                     else:
-                        user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
+                        user_conf = self._prompt_clarify_user(state, "Confirm generation? (y/n) [y]: ", default="y")
                         if user_conf.strip().lower() not in ("n", "no"):
                             confirmed_generation = True
                             break
                         else:
-                            user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
+                            user_reply = self._prompt_clarify_user(state, "Please provide your thoughts: ", multiline=True)
                             _record_clarify_feedback(user_reply)
                             continue
 
@@ -5167,7 +5181,7 @@ class Orchestrator:
                 self.logger.info("\nAgent:", extra={"audience": "user"})
                 self.logger.info(display_reply, extra={"audience": "user"})
 
-                user_reply = self._prompt_user("\nYour reply: ", multiline=True)
+                user_reply = self._prompt_clarify_user(state, "\nYour reply: ", multiline=True)
 
                 if user_reply.strip():
                     history.append({"role": "user", "content": user_reply})

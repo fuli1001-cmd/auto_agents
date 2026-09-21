@@ -445,3 +445,58 @@ Path(sys.argv[3]).write_text(json.dumps({**vars(evidence), 'returncode': code}))
     compared = compare(verifier, identity, repo, repo, base, current, None)
     assert compared['ok'] and verify(compared, asdict(current), base=base)
     assert current.failures[0]['failed'] == ['tests/test_toy.py::test_old']
+
+
+def test_diagnostic_scope_retains_temporary_json_evidence_after_restart(scene, tmp_path):
+    from auto_agents.root_cause import RootCauseDiagnosis, RootCauseReport
+    project, source, payload, proposal = scene
+    evidence = project / '.auto-agents/runs/run/root-cause/diagnosis/evidence.json'
+    atomic_json(evidence, {'attempt_timeline': [{'outcome': 'health_quiesce'}]})
+    (project / 'spec.md').write_text('the original goal')
+    original_refs = ['target:spec.md:5', 'source:engine.py:1:2',
+                     '.root-cause-evidence.json#/attempt_timeline/0']
+    from test_root_cause import _report
+    report = RootCauseReport.from_dict({**_report(role='investigator', verdict='ROOT_CAUSE'),
+        'necessity': {**proposal, 'evidence_refs': original_refs}}, role='investigator')
+    reviewer = RootCauseReport.from_dict(_report(role='reviewer', verdict='AGREE'), role='reviewer')
+    diagnosis = RootCauseDiagnosis('diagnosis', str(evidence), report, reviewer, report, None, True, '')
+    # Deserialization also covers cached diagnoses with the old citation format.
+    diagnosis = RootCauseDiagnosis.from_dict(diagnosis.to_dict())
+    guard = ScopeGuard(tmp_path / 'scope', payload, project, source)
+    ref = guard.admit(diagnosis.scope_necessity(project))
+    assert diagnosis.final.necessity['evidence_refs'] == original_refs
+    saved = guard.store.read(ref)
+    assert [row['origin'] for row in saved['witnesses']] == ['target', 'source', 'target']
+    assert saved['witnesses'][-1]['pointer'] == '/attempt_timeline/0'
+    restarted = ScopeGuard(tmp_path / 'scope', payload, project, source)
+    assert restarted.current() == ref
+    from auto_agents.root_cause import RootCauseCoordinator
+    frozen = tmp_path / 'frozen'
+    RootCauseCoordinator._copy_diagnostic_tree(project, frozen)
+    assert not (frozen / evidence.relative_to(project)).exists()
+    worker = ScopeGuard(tmp_path / 'worker', payload, frozen, source)
+    assert worker.import_receipt(saved)
+    retained = frozen / saved['witnesses'][-1]['path']
+    atomic_json(retained, {'attempt_timeline': [{'outcome': 'different failure'}]})
+    assert worker.current() is None
+
+
+@pytest.mark.parametrize('ref', ['target:../private', 'source:/etc/passwd',
+                                'target:.env', 'target:.auto-agents/operator/policy.json',
+                                'source:spec.md'])
+def test_qualified_evidence_keeps_path_and_origin_checks(scene, ref):
+    from auto_agents.repair_v2.scope import witnesses
+    project, source, _, _ = scene
+    (project / 'spec.md').write_text('only exists in target')
+    with pytest.raises(RepairBlocked):
+        witnesses([ref], project, source)
+
+
+@pytest.mark.parametrize('pointer', ['/missing', '/items/-1', '/items/01', '/items/2',
+                                    '/items/0/value/missing', '/bad~2escape'])
+def test_diagnostic_json_pointer_rejects_invalid_or_missing_values(scene, pointer):
+    from auto_agents.repair_v2.scope import witnesses
+    project, source, _, _ = scene
+    atomic_json(project / 'evidence.json', {'items': [{'value': 1}]})
+    with pytest.raises(RepairBlocked):
+        witnesses([{'origin': 'target', 'path': 'evidence.json', 'pointer': pointer}], project, source)

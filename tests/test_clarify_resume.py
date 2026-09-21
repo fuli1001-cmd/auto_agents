@@ -1506,3 +1506,67 @@ class ClarifyResumeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_clarify_wait_is_durable_and_does_not_spend_health_lease(tmp_path):
+    from dataclasses import replace
+    from auto_agents.health_watch import RunHealthEvaluator
+    from auto_agents.models import HealthWatchConfig
+    from test_health_watch import _snapshot
+
+    project = tmp_path / 'project'
+    Orchestrator.init_project(project, 'demo', 'mock')
+    orch = Orchestrator(project)
+    state = load_run_state(project)
+    state.status = 'pending'
+    save_run_state(project, state)
+    spec = project / 'spec.md'
+    spec.write_text('Build feature X')
+    evaluator = RunHealthEvaluator(HealthWatchConfig(goal_stall_lease_multiplier=2))
+
+    def observe(at, activity):
+        durable = load_run_state(project)
+        snapshot = replace(_snapshot(int(at), at, activity=activity, stage='clarify'),
+                           run_status=durable.status)
+        return evaluator.evaluate(snapshot, progress_lease_seconds=1200)
+
+    assert observe(0, 'start') is None
+    def user_input(prompt):
+        assert load_run_state(project).status == 'waiting_user'
+        assert observe(130, 'input') is None
+        assert observe(3900, 'input') is None
+        return 'confirmed'
+    orch._user_input_fn = user_input
+    def agent(**kwargs):
+        assert load_run_state(project).status == 'pending'
+        if kwargs['stage_key'] == 'clarify-conv-0':
+            text = 'Please confirm the scope.'
+        elif kwargs['stage_key'].startswith('clarify-conv-'):
+            assert observe(3901, 'reply') is None
+            text = 'READY_TO_GENERATE'
+        else:
+            assert observe(4368, 'drafts') is None
+            text = 'Generated brief'
+        return AgentResult(True, [], Path('.'), summary=text)
+    with patch.object(orch, '_run_agent_with_retries', side_effect=agent):
+        result = orch._run_interactive_clarify(state, spec, auto_approve=True)
+    assert result.stage_summaries['clarify'] == 'Generated brief'
+    # Pausing for input must not disable detection of a later real stall.
+    assert observe(6401, 'stalled').kind == 'goal_stalled'
+
+
+def test_clarify_input_interrupt_restores_status_without_recording_approval(tmp_path):
+    import pytest
+    project = tmp_path / 'project'
+    Orchestrator.init_project(project, 'demo', 'mock')
+    orch = Orchestrator(project)
+    state = load_run_state(project)
+    state.status = 'pending'
+    def interrupted(prompt):
+        assert load_run_state(project).status == 'waiting_user'
+        raise KeyboardInterrupt
+    orch._user_input_fn = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        orch._prompt_clarify_user(state, 'Confirm?')
+    assert load_run_state(project).status == 'pending'
+    assert not load_run_state(project).approved_gates

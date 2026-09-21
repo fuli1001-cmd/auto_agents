@@ -152,7 +152,11 @@ def witnesses(refs, target, source):
     for ref in refs:
         if not isinstance(ref, (str, dict)):
             raise RepairBlocked('scope_evidence', '范围证据路径无效。')
-        selected = ref if isinstance(ref, dict) else {}
+        selected = dict(ref) if isinstance(ref, dict) else {}
+        if isinstance(ref, str):
+            origin, separator, path = ref.partition(':')
+            if separator and origin in {'target', 'source'}:
+                selected = {'origin': origin, 'path': path}
         if isinstance(ref, dict) and (
                 not isinstance(ref.get('path'), str) or not ref['path']
                 or ref.get('origin') not in {'source', 'target'}
@@ -175,11 +179,23 @@ def witnesses(refs, target, source):
             if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(root):
                 pointer = selected.get('pointer', '')
                 if pointer:
-                    # Exact event extraction, not a larger model-input limit.
-                    if kind != 'target' or not re.fullmatch(r'/execution_log/\d+', pointer):
+                    # Extract an exact retained JSON value, including diagnostic
+                    # evidence sections. Never interpret a fragment as a filename.
+                    if (kind != 'target' or not pointer.startswith('/')
+                            or re.search(r'~(?![01])', pointer)):
                         raise RepairBlocked('scope_evidence', '失败事件定位无效。')
                     try:
-                        value = json.loads(path.read_text())['execution_log'][int(pointer.rsplit('/', 1)[1])]
+                        value = json.loads(path.read_text())
+                        for token in pointer[1:].split('/'):
+                            token = token.replace('~1', '/').replace('~0', '~')
+                            if isinstance(value, list):
+                                if not re.fullmatch(r'0|[1-9]\d*', token):
+                                    raise ValueError('invalid array index')
+                                value = value[int(token)]
+                            elif isinstance(value, dict):
+                                value = value[token]
+                            else:
+                                raise ValueError('pointer traverses a scalar')
                     except (ValueError, KeyError, IndexError, TypeError) as error:
                         raise RepairBlocked('scope_evidence', '失败事件不存在。') from error
                     raw = json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
