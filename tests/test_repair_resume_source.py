@@ -305,3 +305,32 @@ def test_committed_interrupted_writer_is_checked_before_another_implementation(j
     calls = list(runner.driver.calls)
     assert runner.run()['status'] == 'ready'
     assert runner.driver.calls[len(calls):] == [('review', '')]
+
+
+def test_current_source_evidence_is_not_read_from_the_historical_baseline(repair_request):
+    root, driver, verifier = stopped_request(repair_request)
+    # Old transactions had a prose plan without the later necessity marker.
+    store = Store(root)
+    state = store.load()
+    plan = store.read(state['plan'])
+    state['plan'] = store.artifact('plan', {**plan, 'text': plan['text'].split('\nREPAIR_SCOPE')[0]})
+    store.save(state)
+    source = Path(repair_request['config']['source_root'])
+    (source / 'source.py').write_text('value = 1\n')
+    (source / 'new_runtime.py').write_text('verified_current_runtime = True\n')
+    git(source, 'add', '.'); git(source, 'commit', '-qm', 'Add the current runtime witness')
+    run = driver.run
+    def fresh_witness(role, *args, **kwargs):
+        reply = run(role, *args, **kwargs)
+        if role == 'plan':
+            reply.text = reply.text.replace('"evidence_refs": ["source.py"]', '"evidence_refs": ["new_runtime.py"]')
+        return reply
+    driver.run = fresh_witness
+    before = list(driver.calls)
+    result = execute(renewed(repair_request), driver, verifier)
+    assert result['ok'], result
+    assert driver.calls[len(before):] == ['plan', 'review']
+    store = Store(root)
+    scope = store.read(store.load()['scope_receipt'])
+    assert scope['witnesses'][0]['path'] == 'new_runtime.py'
+    assert scope['witnesses'][0]['origin'] == 'source'

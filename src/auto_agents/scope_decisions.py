@@ -129,7 +129,7 @@ def choose(orchestrator, request):
 
 def session_choice(session, state, context, proposal, continuation):
     """Persist before displaying; a restart consumes exactly this same choice."""
-    decisions = Decisions(session.project_root)
+    decisions = Decisions(getattr(session, '_custody_control_root', session.project_root))
     request = decisions.create(context, proposal, continuation=continuation)
     state.status = 'waiting_user'
     state.resolution = 'scope_decision:' + request['id']
@@ -322,6 +322,17 @@ def resume_session_choice(session, state):
             return state
         return apply_repair_choice(session.project_root, request['id'])
     choice = session_choice(session, state, request['context'], request, continuation)
+    if choice in {'approve', 'comment'} and continuation.get('kind') == 'proof_review':
+        from .config import load_session_state, save_session_state
+        child = load_session_state(session.project_root, continuation['session_id'])
+        if child.workflow_id != state.workflow_id:
+            raise RuntimeError('proof choice belongs to another workflow')
+        child.status, child.resolution = 'executing', ''
+        save_session_state(session.project_root, child)
+        if child.session_id == state.session_id:
+            return child
+        state.status = 'waiting_child' if state.active_handoff_id else 'executing'
+        session._save(state)
     if choice == 'approve' and continuation.get('kind') == 'route':
         return session._prepare_workflow_handoff(state, target=continuation['target'],
                     reason=continuation['reason'], payload=continuation['payload'])

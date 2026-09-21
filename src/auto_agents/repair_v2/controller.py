@@ -84,7 +84,10 @@ class Controller:
 
     def phase(self, name):
         self.checkpoint(phase=name)
-        self.store.event('phase_started', phase=name, attempt=self.state.get('attempts', 0))
+        total = self.state.get('attempts', 0)
+        usage = self.state.get('invocation_usage', {})
+        current = max(0, total - usage.get('attempts', total)) if usage.get('token') == self.resume_token else 0
+        self.store.event('phase_started', phase=name, attempt=total, invocation_attempts=current)
 
     def agent(self, role, prompt, root, *, schema=None, cancel=None, fallback_prompt=None):
         if self.cancel.is_set(): raise KeyboardInterrupt()
@@ -642,6 +645,9 @@ class Controller:
                 'calls': 0, 'failures': [], 'stagnant': 0, 'replans': 0}
             if self.state['request_digest'] != digest(self.request.to_dict()):
                 raise RepairBlocked('request_changed', 'resume request differs from the frozen repair contract')
+            if self.state.get('invocation_usage', {}).get('token') != self.resume_token:
+                self.checkpoint(invocation_usage={'token': self.resume_token,
+                    'attempts': self.state['attempts'], 'calls': self.state['calls']})
             if self.state['status'] == 'waiting_user':
                 # Only the foreground choice can return this to the business
                 # workflow; restarting a worker must never re-ask a model.

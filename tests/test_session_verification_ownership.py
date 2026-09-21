@@ -2372,7 +2372,7 @@ def test_public_resume_protects_imported_release_regression(tmp_path, monkeypatc
         return Session(orch, mode='fix', auto_approve=True).resume(child.session_id)
     saved = resume()
     assert writers == ['fix']
-    assert saved.verification_binding['proof_inventory_version'] == 6
+    assert saved.verification_binding['proof_inventory_version'] == 7
     assert saved.verification_binding['proof_sources'][helper] == helper_source
     assert saved.verification_binding['proof_source_owners'][helper][0]['task_id'] == 'task-foreign'
     if inherited_options:
@@ -3855,7 +3855,7 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(
         assert result.status == 'completed', result.to_dict()
         assert len(calls) == 1, 'inventory recovery must reuse the frozen candidate'
         binding = result.verification_binding
-        assert binding['proof_inventory_version'] == 6
+        assert binding['proof_inventory_version'] == 7
         for key in ('repository', 'authorization', 'tasks', 'task_scope', 'contract_revision',
                     'original_handoff_id', 'baseline_identity', 'execution_environment'):
             assert binding[key] == authority[key]
@@ -4816,7 +4816,7 @@ def test_public_parser_inventory_upgrade_preserves_previous_custody_bridge(tmp_p
     ambient = _switch_ambient_binding_plan(root)
     saved, calls, _ = run_session(root, monkeypatch)
     assert saved.status == 'completed' and calls == []
-    assert saved.verification_binding['proof_inventory_version'] == 6
+    assert saved.verification_binding['proof_inventory_version'] == 7
     assert saved.verification_binding['binding_fingerprint'] != authority['binding_fingerprint']
     for key in ('authorization', 'tasks', 'task_scope', 'contract_revision', 'original_handoff_id'):
         assert saved.verification_binding[key] == authority[key]

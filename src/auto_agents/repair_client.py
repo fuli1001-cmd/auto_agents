@@ -315,7 +315,9 @@ def _repair_progress_message(job, subscriber, *, include_imported=True):
                 return message
             label = labels.get(phase, '正在执行统一修复')
             attempt = progress.get('attempt', 0)
-            return (f'已提交 {attempt} 次实施结果；' if attempt else '') + label
+            if 'invocation_attempts' in progress:
+                return f"本次提交 {progress['invocation_attempts']} 次实施，历史累计 {attempt} 次；" + label
+            return (f'历史累计已提交 {attempt} 次实施结果；' if attempt else '') + label
         labels = {
             "engine_source_sync": "正在同步本地与远端引擎版本",
             "request_contract_planning": "正在规划验收检查", "request_contract_ready": "验收检查已就绪",

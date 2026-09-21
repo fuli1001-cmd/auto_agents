@@ -175,6 +175,8 @@ def execution_checkout(session, state):
     execution = Orchestrator(destination, agent_output_stream=previous.agent_output_stream,
                              user_input_fn=previous._user_input_fn)
     execution.adapter = previous.adapter
+    if hasattr(previous, '_repair_registration'):
+        execution._repair_registration = previous._repair_registration
     # Instance-installed provider transports are also used by embedders.
     if '_call_with_failover' in previous.__dict__:
         execution._call_with_failover = previous.__dict__['_call_with_failover']
@@ -466,9 +468,11 @@ def verification_identity(session, state, *, scope='final'):
         contracts = {proof['requirement_id']: current for _, proof, current in
                      selected_requirement_contracts(session, state, commands, metadata=plan.metadata)}
         receipt = state.candidate_custody['receipt']
-        return fingerprint(['execution-bound-receipt-v3', scope, contracts, commands, receipt['fingerprint'], receipt['source_revision'],
-            state.verification_binding, state.fix_verify_command, state.full_verify,
-            environment])
+        from .proof_amendments import identities
+        value = ['execution-bound-receipt-v3', scope, contracts, commands, receipt['fingerprint'], receipt['source_revision'],
+                 state.verification_binding, state.fix_verify_command, state.full_verify, environment]
+        amendments = identities(session, state)
+        return fingerprint([*value, {'proof_amendments': amendments}] if amendments else value)
 
 
 def record_verification(session, state, result, *, identity=None):
@@ -497,7 +501,18 @@ def recover_receipt(session, state):
     admit_fresh_materialization(state)
     with session._session_verification_config():
         plan, commands = session._verification_plan_commands()
-        validate_selected_contracts(session, state, commands, metadata=plan.metadata)
+        from .proof_amendments import ProofReviewRequired, ensure
+        try:
+            validate_selected_contracts(session, state, commands, metadata=plan.metadata)
+        except ProofReviewRequired:
+            decision = ensure(session, state)
+            if decision == 'paused':
+                return
+            if decision == 'rejected':
+                session._receipt_retry_feedback = '独立审核拒绝了当前测试修订。保留原验证义务，按审核记录修正候选。'
+                state.status, state.resolution = 'executing', ''
+                return
+            validate_selected_contracts(session, state, commands, metadata=plan.metadata)
         identity = verification_identity(session, state)
     retained = next((entry for entry in reversed(state.execution_log)
         if entry.get('action') == 'receipt_verification' and entry.get('identity') == identity
@@ -524,6 +539,8 @@ def recover_receipt(session, state):
                 entry.get('action') == 'receipt_completion' and entry.get('identity') == identity
                 and entry.get('delivered_revision') == state.candidate_custody['delivered_revision']
                 for entry in state.execution_log):
+            if not session._ack_engine_recovery(state, 'verification', verification_identity=identity):
+                return
             state.status, state.resolution = 'completed', 'fixed'
             session._save(state)
             return

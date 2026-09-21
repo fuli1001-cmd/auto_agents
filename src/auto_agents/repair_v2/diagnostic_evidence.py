@@ -37,6 +37,25 @@ def prepare(root, payload):
     goal = ''
     total = 0
     for prefix, target, request in cases:
+        # A whole session may exceed the diagnostic cap. The current failure
+        # is nevertheless exported as a bounded, source-attributed event view.
+        from .scope import context
+        try:
+            scoped = context(target, request)
+            failure = scoped.get('observation', {}).get('failure') or {}
+            diagnostic = failure.get('diagnostic') or {}
+            compact = {'original_goal': scoped['original_goal'], 'incident': scoped.get('incident'),
+                'failure': {k: failure[k] for k in ('action', 'result', 'failure_kind', 'executed_commands') if k in failure},
+                'diagnostic': {k: diagnostic[k] for k in ('session_id', 'workflow_id', 'handoff_id',
+                    'verification_ref', 'contract_fingerprint', 'task_scope', 'retry_fix') if k in diagnostic}}
+            text = json.dumps(sanitized_json(compact), ensure_ascii=False, indent=2)
+            if len(text.encode()) <= MAX_FILE and total + len(text.encode()) <= MAX_TOTAL:
+                contents[prefix + '/incident.json'] = text
+                total += len(text.encode())
+                if prefix == 'original':
+                    goal = sanitize(scoped['original_goal'])
+        except (OSError, ValueError, KeyError, TypeError, RepairBlocked):
+            pass  # Missing identity remains an admission error, not a guessed event.
         invocation = request.get('invocation', {})
         session_id = str(invocation.get('session_id') or '')
         pending = ['.auto-agents/config.json', '.auto-agents/state/run_state.json',

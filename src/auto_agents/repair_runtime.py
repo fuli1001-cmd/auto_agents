@@ -17,6 +17,7 @@ RUNTIME_CAPABILITIES = {
     "acceptance_planning": 2,
     "terminal_repair_status": 1,
     "verification_protocol": 1,
+    "failure_incident_protocol": 2,
 }
 
 INCOMPATIBLE_RUNTIME = "repair runtime is incompatible; synchronize the engine versions before retrying"

@@ -194,6 +194,8 @@ def _repair_entry(request):
     _assert_owner(request)
     if job['payload'].get('autonomy') == 'off':
         return {'ok': False, 'engine': 'v2', 'status': 'disabled', 'error': 'autonomous self-repair is disabled'}
+    from .incidents import migrate as migrate_incidents
+    migrate_incidents(config, job['payload'])
     root = transaction_root(config, job['payload'])
     chain = RepairChain(config, job['payload'], root)
     chain.admit()
@@ -254,9 +256,28 @@ def _repair_entry(request):
             raise RepairBlocked('target_changed', 'original frozen recovery evidence was modified')
         workspace = Workspace(root / 'workspace', checkout, accepted.engine_base,
                               retained=old['source'] if old else None)
+        from .scope import ScopeGuard, context as goal_context
+        # Repeated observations of one unresolved fault retain its contract
+        # and budget, but the current scene is a separate immutable witness.
+        scope_target = target
+        if (job['payload'].get('scope_receipt') or {}).get('context', {}).get('policy') == 'goal-scope-v2':
+            current_context = goal_context(Path(job['payload']['project']), job['payload'])
+            original_context = goal_context(target, json.loads((root / 'original-payload.json').read_text()))
+            current_incident, original_incident = current_context.get('incident'), original_context.get('incident')
+            if current_incident and original_incident and current_incident['identity'] != original_incident['identity']:
+                raise RepairBlocked('recovery_context_changed', '当前故障已变化，旧事务不能接管新的阻塞。')
+            if current_incident and current_incident != original_incident:
+                case = root / 'counterexamples' / digest(current_incident)
+                if not (case / 'target').exists():
+                    RootCauseCoordinator._copy_diagnostic_tree(Path(job['payload']['project']), case / 'target')
+                    dissociate(case / 'target')
+                    atomic_json(case / 'payload.json', job['payload'])
+                scope_target = case / 'target'
         store, verifier, driver = _components(request, root, accepted, workspace, python)
-        from .scope import ScopeGuard
-        scope = ScopeGuard(root, job['payload'], target, checkout)
+        current_source = repository.worktree(current['revision'], 'v2-scope-' + current['revision'][:20])
+        scope = ScopeGuard(root, job['payload'], scope_target, current_source)
+        from .incidents import record as record_incident
+        record_incident(store, scope.context)
         scope.import_receipt(job['payload'].get('scope_receipt'))
         controller = Controller(accepted, store, workspace, driver, verifier,
             chain=chain, preflight_boundary=True, scope=scope,
@@ -271,7 +292,10 @@ def _repair_entry(request):
         atomic_json(root / 'budget-anchors.json', controller.budget_anchors)
         from .recovery import context
         recovery_context = context(job['payload'], digest(accepted.to_dict()), chain.store.root)
-        recovery_context['scope'] = scope.context
+        recovery_context.update(scope=scope.context,
+            incident_id=accepted.incident_id or (scope.context.get('incident') or {}).get('identity', ''),
+            incident_revision=(scope.context.get('incident') or {}).get('revision', accepted.incident_revision),
+            contract_revision=accepted.contract_revision or digest([accepted.goal, [asdict(a) for a in accepted.acceptance]]))
         controller.recovery_context = store.artifact('recovery-context', recovery_context)
         atomic_json(root / 'recovery-context.json', recovery_context)
         _migrate_artifact_failure(controller)
@@ -307,7 +331,7 @@ def _approved(request, root, state, store, python, environment):
     if source_identity(runtime) != state['snapshot']:
         raise RepairBlocked('delivery_source_changed', 'approved runtime differs from the accepted snapshot')
     return {'ok': True, 'status': 'accepted', 'engine': 'v2', 'commit': commit,
-            'runtime_artifact': artifact, 'recovery_protocol': 1,
+            'runtime_artifact': artifact, 'recovery_protocol': 2,
             'runtime': str(runtime), 'python': python, 'environment': environment,
             'base': json.loads((root / 'request.json').read_text())['engine_base'],
             'source_delivery_needed': True,
@@ -321,7 +345,7 @@ def _approved(request, root, state, store, python, environment):
 
 
 def verify_receipt(approved, *, expected_root=None):
-    if approved.get('recovery_protocol') not in (None, 1):
+    if approved.get('recovery_protocol') not in (None, 1, 2):
         raise RepairBlocked('runtime_protocol', '恢复协议版本不受当前控制器支持；需要兼容的控制器后才能继续')
     from .runtime_artifact import verify
     if approved.get('runtime_artifact'):
@@ -339,7 +363,7 @@ def verify_receipt(approved, *, expected_root=None):
     if revoked.is_file() and marker['reference']['digest'] in json.loads(revoked.read_text()):
         raise RepairBlocked('invalid_acceptance', 'a live recovery counterexample invalidated this receipt')
     receipt = store.read(marker['reference'])
-    if approved.get('recovery_protocol') == 1:
+    if approved.get('recovery_protocol') in (1, 2):
         if receipt.get('runtime_artifact') != approved.get('runtime_artifact'):
             raise RepairBlocked('invalid_acceptance', '验收回执没有绑定当前运行产物')
         if receipt.get('budget_anchors'):
@@ -347,8 +371,12 @@ def verify_receipt(approved, *, expected_root=None):
         if not receipt.get('recovery_context'):
             raise RepairBlocked('invalid_acceptance', '验收回执缺少原任务恢复上下文')
         context = store.read(receipt['recovery_context'])
-        if context.get('version') != 1 or context.get('request') != marker['request']:
+        if context.get('version') != approved['recovery_protocol'] or context.get('request') != marker['request']:
             raise RepairBlocked('invalid_acceptance', '恢复上下文与验收目标不一致')
+        if approved['recovery_protocol'] == 2:
+            incident = context.get('scope', {}).get('incident')
+            if incident and context.get('incident_id') != incident['identity']:
+                raise RepairBlocked('invalid_acceptance', '恢复回执没有绑定对应失败事件')
     if (root / 'scope.json').exists() and not receipt.get('scope'):
         raise RepairBlocked('invalid_acceptance', 'candidate lacks the current goal scope proof')
     validation, review = store.read(receipt['validation']), store.read(receipt['review'])
@@ -365,7 +393,7 @@ def verify_receipt(approved, *, expected_root=None):
     if receipt.get('scope'):
         from .scope import POLICY, changes
         scoped = store.read(receipt['scope'])
-        if scoped.get('policy') != POLICY or scoped.get('proposal', {}).get('decision') != 'required':
+        if scoped.get('policy') not in ({POLICY} if approved.get('recovery_protocol') == 2 else {POLICY, 'goal-scope-v1'}) or scoped.get('proposal', {}).get('decision') != 'required':
             raise RepairBlocked('invalid_acceptance', 'repair scope receipt is invalid')
         verdict = review_result(review['text'], marker['snapshot'], requirements,
                                 changes(Path(approved['runtime']), accepted['engine_base'], receipt.get('integration_parents', [])))
@@ -584,6 +612,11 @@ def acknowledge_recovery(job, subscriber, details):
             store.transition(state, status='complete', phase='recovered', live_recovery=receipt,
                              revalidation_signatures=[])
             atomic_json(root / 'live-recovery.json', receipt)
+            marker = root / 'incident.json'
+            if marker.exists():
+                incident = store.read(json.loads(marker.read_text()))
+                atomic_json(root / 'incident-resolution.json', store.artifact('incidents', {
+                    **incident, 'status': 'resolved', 'recovery': digest(receipt)}))
             return receipt
 
 

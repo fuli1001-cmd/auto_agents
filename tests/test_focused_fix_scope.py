@@ -89,6 +89,24 @@ def test_focused_scope_preserves_existing_regressions_and_explicit_prerequisites
     assert 'future.feature' in {s.proof_id for s in selected.steps}
 
 
+def test_broad_coverage_is_not_authority_to_adopt_future_dependencies(tmp_path):
+    from auto_agents.models import GateConfig
+    from auto_agents.session_verification import _owned_inventory
+    root, child, _, _, _ = focused_scene(tmp_path)
+    session = Session(Orchestrator(root), mode='fix', auto_approve=True)
+    bind_session(session, child)
+    graph = child.verification_binding['proof_graph']['gates']
+    graph['steps'].append(VerificationStep(proof_id='release.all', runner='pytest', targets=['tests'],
+        levels=['release'], depends_on_proofs=['future.feature']).to_dict())
+    required, _ = _owned_inventory(child, GateConfig.from_dict(graph), session)
+    assert 'owned.contract' in required
+    assert 'release.all' not in required and 'future.feature' not in required
+    selected = session_gates(session, child)
+    assert 'future.feature' not in {s.proof_id for s in selected.steps}
+    broad = next(s for s in selected.steps if s.proof_id == 'release.all')
+    assert broad.targets == ['tests'] and broad.depends_on_proofs == []
+
+
 def test_issue_materialization_preserves_association_mode(tmp_path):
     root, child, _, original, _ = focused_scene(tmp_path)
     IssueBriefBuilder(root, child.session_id).materialize(original.payload['issue_seed'])

@@ -85,6 +85,20 @@ def main() -> dict[str, object]:
             recovery['activation_binding_fingerprint'] = state.verification_binding.get('binding_fingerprint')
         return call_agent(self, state, label, prompt)
 
+    acknowledge = getattr(Session, '_ack_engine_recovery', None)
+    def observe_acknowledgement(self, state, stage, **details):
+        nonlocal boundary_kind
+        if (stage == 'verification' and recovery['required']
+                and state.session_id == before_child.get('session_id')
+                and before_child.get('candidate_custody', {}).get('receipt')):
+            boundary_kind = 'verification'
+            boundary_state.update(state.to_dict())
+            recovery.update(verification_identity=details.get('verification_identity'),
+                activation_binding_fingerprint=state.verification_binding.get('binding_fingerprint'),
+                candidate_fingerprint=state.candidate_custody.get('receipt', {}).get('fingerprint'))
+            raise NextProviderBoundary()
+        return acknowledge(self, state, stage, **details)
+
     drive = WorkflowCoordinator._drive_session
     def observe_drive(self, session, state, workflow, *, root):
         frames.append(state)
@@ -125,10 +139,11 @@ def main() -> dict[str, object]:
                 child = load_session_state(project, child_id)
                 if not before_child:
                     before_child.update(child.to_dict())
+                from auto_agents.repair_v2.incidents import latest_failure
+                failure = latest_failure(before_child)
                 recovery.update(child_session_id=child_id, workflow_id=child.workflow_id,
                                 original_handoff_id=child.parent_handoff_id,
-                                previous_failure=next((entry for entry in reversed(before_child['execution_log'])
-                                    if entry.get('action') == 'execution_preflight_blocked'), {}))
+                                previous_failure=failure[1] if failure else {})
             except Exception as error:
                 # Observe the error without bypassing the real recovery path.
                 recovery['identity_error'] = str(error)
@@ -155,6 +170,8 @@ def main() -> dict[str, object]:
         with ExitStack() as patches:
             patches.enter_context(patch.object(Orchestrator, '_call_with_failover', no_provider))
             patches.enter_context(patch.object(Session, '_call_agent', before_agent))
+            if acknowledge is not None:
+                patches.enter_context(patch.object(Session, '_ack_engine_recovery', observe_acknowledgement))
             patches.enter_context(patch.object(WorkflowCoordinator, '_drive_session', observe_drive))
             patches.enter_context(patch.object(Session, '_phase_collab_loop', observe_parent_phase))
             patches.enter_context(patch.object(repair_client, 'engine_route', observe_route))
@@ -210,7 +227,8 @@ def main() -> dict[str, object]:
                             and entry.get('handoff_id') == recovery['original_handoff_id']]
             freshly_bound = any(row['session_id'] == child_id and row['fingerprint']
                                 and row['fingerprint'] == binding.get('binding_fingerprint') for row in binding_checks)
-            active_failure = before_child.get('status') == 'blocked' and bool(recovery.get('previous_failure'))
+            active_failure = (before_child.get('status') == 'blocked'
+                              and recovery.get('previous_failure', {}).get('action') == 'execution_preflight_blocked')
             rechecked = bool(rechecks) or bool(not active_failure and freshly_bound)
             started = [entry for entry in new_events if entry.get('action') == 'engine_preflight_recheck_started'
                        and entry.get('route_digest') == recovery.get('route_digest')]
@@ -222,7 +240,7 @@ def main() -> dict[str, object]:
             preserved &= reservations in (0, 1) and all(
                 after.get(key) == before_child.get(key, 0) + reservations
                 for key in ('current_attempt', 'attempts_since_progress'))
-            if before_child.get('status') == 'blocked' and recovery.get('previous_failure'):
+            if active_failure:
                 preserved &= bool(rechecked and binding)
                 preserved &= recovery['previous_failure'] in after['execution_log']
             budgets = ('current_attempt', 'attempt_epoch', 'attempts_since_progress', 'max_attempts', 'hard_ceiling')
@@ -246,10 +264,16 @@ def main() -> dict[str, object]:
                        and bool(binding) and freshly_bound and reservations == 1)
             completed = (after['status'] == 'completed' and binding
                          and after.get('candidate_custody', {}).get('receipt'))
+            verified = (boundary_kind == 'verification' and recovery.get('verification_identity')
+                        and recovery.get('candidate_fingerprint') == before_child.get('candidate_custody', {}).get('receipt', {}).get('fingerprint')
+                        and any(row.get('action') == 'receipt_verification'
+                                and row.get('verification', {}).get('ok')
+                                and row.get('verification', {}).get('execution_identity') == recovery['verification_identity']
+                                for row in after['execution_log']))
             recovery.update(preflight_rechecked=rechecked, retained_constraints=bool(preserved),
                             boundary_kind=boundary_kind,
                             preflight_outcome='passed' if rechecked and not recovery['current_failure'] else 'not_passed',
-                            ok=bool(preserved and (entered or completed)
+                            ok=bool(preserved and (entered or completed or verified)
                                     and not recovery.get('identity_error')))
         except (OSError, ValueError, KeyError) as error:
             recovery.update(ok=False, error=str(error))

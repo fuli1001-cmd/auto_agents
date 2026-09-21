@@ -23,7 +23,7 @@ class ObservationBoundary(BaseException):
 REAL_PROVIDER_CALL = Orchestrator._call_with_failover
 
 
-def configure_local_writer(root, child, program):
+def configure_local_writer(root, child, program, *, read_only_program=''):
     """Freeze deterministic transport before the retained baseline is captured."""
     from auto_agents.config import load_project_config, save_project_config
     from auto_agents.models import ProviderConfig
@@ -49,7 +49,7 @@ for name in SHARED:
 '''
     binary.write_text('#!' + sys.executable + '\nimport json,sys,subprocess,shutil\nfrom pathlib import Path\n'
         "if '--help' in sys.argv or '--version' in sys.argv:\n    print('local Claude fixture --output-format --permission-mode --dangerously-skip-permissions'); sys.exit(0)\n"
-        'sys.stdin.read()\nSHARED=' + repr([str(root / 'foreign.py'), str(root / '.git/index')]) + '\n'
+        'PROMPT = sys.stdin.read()\n' + read_only_program + '\nSHARED=' + repr([str(root / 'foreign.py'), str(root / '.git/index')]) + '\n'
         + controls + '\n' + program + '\n'
         "print(json.dumps({'type':'result','subtype':'success','result':'Fixed\\nCOMMIT_MESSAGE: Repair owned value'}))\n")
     binary.chmod(0o755)

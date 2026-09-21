@@ -43,10 +43,11 @@ class RepairChain:
 
     @staticmethod
     def totals(state):
-        entries = state['transactions'].values()
+        entries = list(state['transactions'].values())
+        reviews = list(state.get('proof_reviews', {}).values())
         return {'transactions': len({entry['canonical'] for entry in entries}),
                 'implementations': sum(e['implementations'] for e in entries),
-                'model_calls': sum(e['model_calls'] for e in entries)}
+                'model_calls': sum(e['model_calls'] for e in entries) + sum(reviews)}
 
     def _load(self):
         state = self.store.load() or {'version': 1, 'identity': self.identity, 'transactions': {}}
@@ -55,6 +56,13 @@ class RepairChain:
         return state
 
     def _history(self, state):
+        reviews = Path(self.identity['project']) / '.auto-agents/state/proof-reviews'
+        for path in reviews.glob('*/state.json'):
+            saved = Store(path.parent).load() or {}
+            owner = saved.get('owner', {})
+            if all(owner.get(k) == v for k, v in self.identity.items()):
+                counts = state.setdefault('proof_reviews', {})
+                counts[path.parent.name] = max(counts.get(path.parent.name, 0), saved.get('model_calls', 0))
         for file in (Path(self.config['root']) / 'v2-transactions').glob('*/original-payload.json'):
             payload = json.loads(file.read_text())
             if workflow_key(payload) != self.identity:
@@ -118,6 +126,26 @@ class RepairChain:
                 state.setdefault('reservations', {})[operation] = [self.transaction.name, role]
             self.store.save(state)
             self.store.event('call_reserved', transaction=self.transaction.name, role=role, totals=self.totals(state))
+
+    def reserve_review(self, review, number):
+        """Product proof review shares goal consumption, not an engine transaction."""
+        with self.locked():
+            state = self._load()
+            self._history(state)
+            operation = 'proof-review:' + review + ':' + str(number)
+            reservations = state.setdefault('review_reservations', [])
+            if operation in reservations:
+                return
+            limits = (self.limits if 'repair_chain_limits' in self.policy else
+                      state.get('limits', self.limits) if state.get('explicit_limits') else DEFAULT_LIMITS)
+            limit = limits['model_calls']
+            if limit is not None and self.totals(state)['model_calls'] >= limit:
+                raise RepairBlocked('repair_chain_exhausted', '目标的模型调用授权已用尽，已保留待审核候选。')
+            counts = state.setdefault('proof_reviews', {})
+            counts[review] = max(counts.get(review, 0), number)
+            reservations.append(operation)
+            self.store.save(state)
+            self.store.event('proof_review_reserved', review=review, number=number, totals=self.totals(state))
 
     def context(self):
         state = self.store.load()

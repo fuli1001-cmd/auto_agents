@@ -28,16 +28,20 @@ _MODULES = {
     'auto_agents.cli': ('main',),
     'auto_agents.session': ('Session.resume', 'Session._retain_resume_authority',
                            'Session._phase_fix_execute', 'Session._prepare_workflow_handoff',
-                           'Session._phase_fix_execute_owned', 'Session._resume_existing'),
+                           'Session._phase_fix_execute_owned', 'Session._resume_existing',
+                           'Session._ack_engine_recovery', 'Session._complete_verified_fix'),
     'auto_agents.workflow_chain': ('WorkflowStore.resolve_handoff_chain',),
     'auto_agents.repair_client': ('engine_route', '_remember_engine_receipt'),
     'auto_agents.pytest_selection': ('selected_nodes',),
     'auto_agents.scope_decisions': ('choose', 'session_choice', 'resume_session_choice'),
-    'auto_agents.repair_v2.scope': ('ScopeGuard.admit', 'ScopeGuard.current'),
+    'auto_agents.repair_v2.scope': ('context', 'witnesses', 'ScopeGuard.admit', 'ScopeGuard.current'),
+    'auto_agents.repair_v2.incidents': ('resolve_subject', 'latest_failure', 'observation'),
+    'auto_agents.proof_amendments': ('inputs', 'approved', 'ensure'),
     'auto_agents.session_verification': (
         'bind_session',
         '_reference_kind', '_session_reference_kind', '_mandatory_refs', '_owned_inventory',
         '_validate_required_node_selection',
+        'session_gates', '_step_affected',
         # Classification also reads the retained catalog. Checking only its
         # unchanged callers can attest a stale module under the current path.
         '_retained_reference_catalog'),

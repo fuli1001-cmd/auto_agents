@@ -9,7 +9,7 @@ from .store import digest
 from .types import ValidationUnit
 from .workspace import Workspace, source_identity
 
-POLICY = 'no-new-failures-v4'
+POLICY = 'no-new-failures-v5'
 
 # Control-path invariants cannot be waived by reproducing an old failure.
 MANDATORY_FILES = frozenset({
@@ -20,6 +20,7 @@ MANDATORY_FILES = frozenset({
     'test_repair_scope_recovery.py', 'test_repair_control.py', 'test_engine_child_recovery.py',
     'test_engine_reference_recovery.py', 'test_parent_recovery_budget.py',
     'test_multilayer_engine_recovery.py', 'test_reference_catalog_recovery.py',
+    'test_repair_incidents.py', 'test_proof_amendments.py', 'test_proof_selection_pass.py',
 })
 
 

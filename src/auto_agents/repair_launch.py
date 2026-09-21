@@ -30,7 +30,7 @@ def main():
         from auto_agents.repair_v2.integration import verify_receipt
         from auto_agents.repair_v2.transaction import transaction_root
         acceptance = verify_receipt(result, expected_root=transaction_root(request['config'], subscriber['payload']['repair']))
-        if result.get('recovery_protocol') != 1:
+        if result.get('recovery_protocol') not in (1, 2):
             raise RuntimeError('旧运行产物必须迁移并通过恢复检查后再启动')
         from auto_agents.repair_v2.budget_recovery import reconcile as budget_reconcile
         from auto_agents.repair_v2.store import Store

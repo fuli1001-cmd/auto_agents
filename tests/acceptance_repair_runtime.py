@@ -57,6 +57,12 @@ def test_final_artifact_reenters_original_child_with_real_budget_logic(runtime, 
     protected = {p: p.read_bytes() for p in origin.glob('.auto-agents/state/sessions/*/session_state.json')}
     target = temporary / ('scene-' + scene)
     RootCauseCoordinator._copy_diagnostic_tree(origin, target)
+    if scene == 'current':
+        current = json.loads((origin / '.auto-agents/state/sessions/e083fa0c2f2f/session_state.json').read_text())
+        if current.get('candidate_custody', {}).get('receipt'):
+            replay_current_candidate(runtime, origin, target, current)
+            assert {p: p.read_bytes() for p in protected} == protected
+            return
     payload['_budget_anchors'] = anchors(original, payload['invocation'])
     result = verifier.boundary(artifact['source'], Path(artifact['path']), target, payload, threading.Event())
     (temporary / (scene + '-result.json')).write_text(json.dumps(result, ensure_ascii=False, indent=2))
@@ -72,8 +78,59 @@ def test_final_artifact_reenters_original_child_with_real_budget_logic(runtime, 
     assert {p: p.read_bytes() for p in protected} == protected
 
 
-@pytest.mark.parametrize('legacy_budget_reset,child_status', [(False, 'blocked'), (True, 'blocked'), (False, 'failed')])
-def test_real_launcher_registers_and_reaches_one_native_provider_boundary(runtime, tmp_path, legacy_budget_reset, child_status):
+def replay_current_candidate(runtime, origin, target, child):
+    """Keep original logical paths; only runtime registration uses copy inodes."""
+    import subprocess
+    from auto_agents.repair_v2.docker import REPLAY_ISOLATION
+    from auto_agents.repair_v2.replay_environment import prepare
+    temporary, artifact, verifier = runtime
+    original_candidate = Path(child['candidate_custody']['checkout'])
+    protected = {p: (original_candidate / p).read_bytes() for p in child['candidate_paths']
+                 if (original_candidate / p).is_file()}
+    candidate = temporary / 'retained-candidate'
+    RootCauseCoordinator._copy_diagnostic_tree(original_candidate, candidate)
+    for repository in (target, candidate):
+        git(repository, 'repack', '-a', '-d')
+        (repository / '.git/objects/info/alternates').unlink(missing_ok=True)
+    payload = {'project': str(origin), 'invocation': {'session_id': 'edc3e7442947', 'command': 'collab',
+        'engine_route': {'child_session_id': child['session_id'], 'failed_handoff_id': child['parent_handoff_id']}}}
+    environments = prepare(temporary / 'candidate-environments', origin, payload)
+    for environment in environments:
+        relative = environment.prefix.relative_to(origin)
+        link = candidate / relative
+        if not link.exists() and not link.is_symlink():
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(environment.prefix, target_is_directory=True)
+    output = temporary / 'candidate-output'; output.mkdir()
+    (output / 'candidate-request.json').write_text(json.dumps({
+        'project': str(origin), 'parent': 'edc3e7442947', 'child': child['session_id']}))
+    driver = Path(__file__).with_name('retained_candidate_driver.py').resolve()
+    command = ['docker', 'run', '--rm', '--init', '--network', 'none', '--read-only',
+        '--user', f'{os.getuid()}:{os.getgid()}', *REPLAY_ISOLATION['session'],
+        '--memory', '2g', '--pids-limit', '512', '--tmpfs', '/tmp:rw,nosuid,exec,mode=1777,size=8g',
+        '--workdir', str(origin), '-e', 'HOME=/tmp/home', '-e', 'PYTHONDONTWRITEBYTECODE=1',
+        '-e', 'GIT_CONFIG_COUNT=2', '-e', 'GIT_CONFIG_KEY_0=user.name', '-e', 'GIT_CONFIG_VALUE_0=acceptance',
+        '-e', 'GIT_CONFIG_KEY_1=user.email', '-e', 'GIT_CONFIG_VALUE_1=acceptance@localhost',
+        '-e', 'AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1', '-e', 'AUTO_AGENTS_STORAGE_MAINTENANCE=off',
+        '--mount', f'type=bind,src={artifact["path"]},dst=/work,readonly',
+        '--mount', f'type=bind,src={target},dst={origin}',
+        '--mount', f'type=bind,src={candidate},dst={original_candidate}',
+        '--mount', f'type=bind,src={output},dst=/result',
+        '--mount', f'type=bind,src={driver},dst=/driver.py,readonly']
+    for environment in environments:
+        command += ['--mount', f'type=bind,src={environment.root},dst={environment.prefix},readonly']
+    with (output / 'output.log').open('w') as log:
+        result = subprocess.run([*command, verifier.image, 'python', '/driver.py'], stdout=log,
+                                stderr=subprocess.STDOUT, text=True, timeout=1800)
+    assert result.returncode == 0, (output / 'output.log').read_text()[-16000:]
+    observed = json.loads((output / 'candidate-result.json').read_text())
+    assert observed['ok'] and observed['candidate_preserved'] and observed['calls'] == ['proof_review']
+    assert {p: (original_candidate / p).read_bytes() for p in protected} == protected
+
+
+@pytest.mark.parametrize('legacy_budget_reset,child_status,full_cycle', [
+    (False, 'blocked', False), (True, 'blocked', False), (False, 'failed', False), (False, 'blocked', True)])
+def test_real_launcher_registers_and_reaches_one_native_provider_boundary(runtime, tmp_path, legacy_budget_reset, child_status, full_cycle):
     """Only the review/model endpoints are fixtures; launch/ACK are real."""
     import signal
     import subprocess
@@ -99,12 +156,32 @@ def test_real_launcher_registers_and_reaches_one_native_provider_boundary(runtim
     product, child = project(tmp_path / 'product')
     configured = load_project_config(product)
     configured.execution.autonomy.mode = 'guarded'
+    if full_cycle:
+        configured.execution.acceleration.mode = "on"
+        configured.execution.acceleration.collab_read_only_enabled = True
     save_project_config(product, configured)
     git(product, 'rm', '--cached', '--ignore-unmatch', '.conda')
     with (product / '.gitignore').open('a') as handle: handle.write('\n.conda\n')
     git(product, 'add', '.gitignore'); git(product, 'commit', '-qm', 'Keep dependencies outside source snapshots')
     marker = ExecutionMarker(tmp_path / 'provider-entered')
-    configure_local_writer(product, child, marker.source(repr('entered')) + '\nimport time\ntime.sleep(30)')
+    if full_cycle:
+        review = '''
+if '--permission-mode' in sys.argv:
+    if 'Independently review this exact test amendment' in PROMPT:
+        verdict = {'decision': 'approve', 'reason': 'Retains the original value requirement',
+            'change_coverage': [{'path': p, 'reason': 'Value repair and regression'} for p in ['value.py', 'tests/test_owned.py']],
+            'coverage': [{'path': 'tests/test_owned.py', 'requirement': 'original_goal', 'reason': 'Adds a value regression'}]}
+        print(json.dumps({'type': 'result', 'subtype': 'success', 'result': json.dumps(verdict)}))
+        sys.exit(0)
+PARENT_MARKER
+'''.replace('PARENT_MARKER', '\n'.join('    ' + line for line in (
+            marker.source(repr('returned-to-parent')) + '\nimport time\ntime.sleep(30)\nsys.exit(0)').splitlines()))
+        configure_local_writer(product, child, "Path('value.py').write_text('VALUE = 1\\n')\n"
+            "with Path('tests/test_owned.py').open('a') as f:\n"
+            "    f.write('\\ndef test_new_regression():\\n    from value import VALUE\\n    assert VALUE == 1\\n')\n",
+            read_only_program=review)
+    else:
+        configure_local_writer(product, child, marker.source(repr('entered')) + '\nimport time\ntime.sleep(30)')
     child.fix_verify_command = 'conda run -p ./.conda python -m pytest -q tests/test_owned.py::test_owned'
     child.authorization_policy = authorization_policy_for_state(auto_approve=True).to_dict()
     child.status, child.resolution, child.hard_ceiling = child_status, 'verification_ownership', 15
@@ -177,7 +254,7 @@ def test_real_launcher_registers_and_reaches_one_native_provider_boundary(runtim
         approved = integration._approved({'config': config, 'job': job}, root, state, store,
                                          sys.executable, verifier.runtime)
         approved['source_delivery_needed'] = False
-        if not legacy_budget_reset and child_status == 'blocked':
+        if not legacy_budget_reset and child_status == 'blocked' and not full_cycle:
             # A valid receipt must not allow either replay or the real fresh
             # launcher to bypass budget checks when the counters are intact.
             parent_path = session_path(product, 'parent')
@@ -223,8 +300,14 @@ def test_real_launcher_registers_and_reaches_one_native_provider_boundary(runtim
             assert restored.current_attempt == child.current_attempt + 1
             restored_parent = load_session_state(product, 'parent')
             assert (restored_parent.current_attempt, restored_parent.attempt_epoch,
-                    restored_parent.attempts_since_progress) == (2, 16 if legacy_budget_reset else 10, 1)
-            assert marker.read_text() == 'entered'
+                    restored_parent.attempts_since_progress) == (3 if full_cycle else 2,
+                        16 if legacy_budget_reset else 10, 2 if full_cycle else 1)
+            assert marker.read_text() == ('returned-to-parent' if full_cycle else 'entered')
+            if full_cycle:
+                assert restored.status == 'completed' and restored.candidate_custody.get('delivered_revision')
+                assert sum(r.get('action') == 'proof_review_approved' for r in restored.execution_log) == 1
+                verified = [r for r in restored.execution_log if r.get('action') == 'verify']
+                assert verified[-1]['result'] == 'pass' and verified[-1]['executed_commands'] > 0
         finally:
             supervisor.halt = True; thread.join(timeout=5)
             for process in list(supervisor.resumes.values()):

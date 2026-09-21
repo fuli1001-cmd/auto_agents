@@ -25,12 +25,19 @@ def transaction_root(config, payload):
     scope = _scope_identity(payload)
     if scope is not None:
         matches = []
+        from .chain import workflow_key
+        index = Path(config['root']) / 'incident-index' / digest(workflow_key(payload)) / 'state.json'
+        retired = {}
+        if index.exists():
+            retired = Store(index.parent).load().get('transactions', {})
         for path in directory.glob('*/original-payload.json'):
             if path.is_symlink() or path.parent.is_symlink():
                 continue
+            if retired.get(path.parent.name, {}).get('status') in {'resolved', 'superseded'}:
+                continue
             original = json.loads(path.read_text())
             old = _scope_identity(original)
-            if old is None:
+            if old is None or (original.get('scope_receipt') or {}).get('context', {}).get('policy') != 'goal-scope-v2':
                 # Legacy identity is established from its retained scene, not
                 # a paraphrased issue or the current project's ambient run.
                 try:
@@ -38,10 +45,7 @@ def transaction_root(config, payload):
                     old = _context_identity(context(path.parent / 'target-evidence', original))
                 except (OSError, ValueError, KeyError, TypeError, RepairBlocked):
                     continue
-            pending = not (path.parent / 'live-recovery.json').exists()
-            same_step = (old is not None and old['owner'] == scope['owner'] and old['goal_version'] == scope['goal_version']
-                         and old['blocker'].get('operation') == scope['blocker'].get('operation'))
-            if old == scope or pending and same_step:
+            if old == scope:
                 saved = Store(path.parent).load() or {}
                 if saved.get('status') != 'complete':
                     matches.append((path.stat().st_mtime_ns, path.parent))
@@ -61,7 +65,7 @@ def transaction_root(config, payload):
 
 
 def _context_identity(context):
-    if (not isinstance(context, dict) or context.get('policy') != 'goal-scope-v1'
+    if (not isinstance(context, dict) or context.get('policy') not in {'goal-scope-v1', 'goal-scope-v2'}
             or not context.get('owner') or not context.get('goal_version') or not context.get('blocker')):
         return None
     return {key: context[key] for key in ('owner', 'goal_version', 'blocker')}
@@ -82,13 +86,10 @@ def _matches_scope(root, payload):
     if json.loads((Path(root) / 'intent.json').read_text()).get('digest') != digest(intent(original)):
         raise RepairBlocked('transaction_identity_unresolved', 'frozen intent no longer matches its original payload')
     previous = _scope_identity(original)
-    if previous is None:
+    if previous is None or (original.get('scope_receipt') or {}).get('context', {}).get('policy') != 'goal-scope-v2':
         from .scope import context
         previous = _context_identity(context(Path(root) / 'target-evidence', original))
-    return previous == current or (not (Path(root) / 'live-recovery.json').exists()
-        and previous is not None and previous['owner'] == current['owner']
-        and previous['goal_version'] == current['goal_version']
-        and previous['blocker'].get('operation') == current['blocker'].get('operation'))
+    return previous == current
 
 
 def _matches_legacy_session(root, payload):
@@ -153,6 +154,12 @@ def frozen_request(root, payload, create):
             raise RepairBlocked('incomplete_request', 'frozen repair request is missing')
         return RepairRequest.from_dict(json.loads(frozen.read_text()))
     request = create()
+    scoped = (payload.get('scope_receipt') or {}).get('context') or {}
+    if scoped.get('policy') == 'goal-scope-v2' and scoped.get('incident'):
+        from dataclasses import replace
+        incident = scoped['incident']
+        request = replace(request, incident_id=incident['identity'], incident_revision=incident['revision'],
+                          contract_revision=digest([request.goal, [a.__dict__ for a in request.acceptance]]))
     atomic_json(frozen, request.to_dict())
     atomic_json(root / 'original-payload.json', payload)
     atomic_json(marker, {'digest': expected})

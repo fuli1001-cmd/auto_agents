@@ -22,7 +22,7 @@ from .io_utils import read_json
 
 # Re-seal older receipts before reuse: v5 can omit checks inherited through
 # parameterized generic bases, even when the selected node remains unchanged.
-_PROOF_INVENTORY_VERSION = 6
+_PROOF_INVENTORY_VERSION = 7
 _REFERENCE_ROLE_VERSION = 1
 _REFERENCE_CATALOGS = ('.auto-agents/state/requirements_trace.json',
                        '.auto-agents/state/provider_references.lock.json')
@@ -197,8 +197,10 @@ def _bind_session(session, state) -> None:
         elif any(scope.values()) and scope != state.verification_binding['task_scope']:
             raise ownership_error(state, 'retained task authority conflicts with session evidence')
         from .verification_context import proof_context_descriptor
+        inventory_version = _PROOF_INVENTORY_VERSION if scope.get('mode') == 'focused_fix' else min(_PROOF_INVENTORY_VERSION, 6)
         upgrade_inventory = (recover_scope
-                             or state.verification_binding.get('proof_inventory_version', 0) < _PROOF_INVENTORY_VERSION
+                             or state.verification_binding.get('proof_inventory_version', 0) < inventory_version
+                             or 'proof_source_owners' not in state.verification_binding
                              or state.verification_binding.get('reference_role_version', 0) < _REFERENCE_ROLE_VERSION)
         refresh_context = state.verification_binding.get('proof_execution_context') != proof_context_descriptor(session, state)
         rebuild_inventory = state.verification_binding.get('schema_version', 1) < 12 or upgrade_inventory
@@ -447,9 +449,19 @@ def _step_affected(session, state, step):
     changed = set(state.candidate_paths) | set(state.lineage_changed_paths)
     if not changed:
         return False
-    dependencies = StaticDependencyIndex(session.project_root).closure_for_targets(step.get('targets', []))
-    return any(path in dependencies or any(_matches(path, pattern) for pattern in step.get('impact_paths', []))
-               for path in changed)
+    # Explicit impact already proves inclusion. Building a whole import graph
+    # first repeated megabytes of AST parsing for every retained proof.
+    if any(_matches(path, pattern) for path in changed for pattern in step.get('impact_paths', [])):
+        return True
+    memo = getattr(session, '_proof_selection_pass', None)
+    if memo is None:
+        index = StaticDependencyIndex(session.project_root)
+    else:
+        if memo.get('index') is None:
+            memo['index'] = StaticDependencyIndex(session.project_root)
+        index = memo['index']
+    dependencies = index.closure_for_targets(step.get('targets', []))
+    return bool(changed.intersection(dependencies))
 
 
 def _future_foreign_step(session, state, step, excluded):
@@ -464,7 +476,7 @@ def _future_foreign_step(session, state, step, excluded):
     if not targets or (step.get('proof_id') not in excluded
                        and any(target not in excluded for target in targets)):
         return False
-    if _step_affected(session, state, step):
+    if state.verification_binding.get('task_scope', {}).get('mode') != 'focused_fix' and _step_affected(session, state, step):
         return False
     revision = _contract_source_revision(session, state)
     if not revision:
@@ -473,35 +485,46 @@ def _future_foreign_step(session, state, step, excluded):
         parts = target.split('::')
         if len(parts) > 2 or not parts[0].endswith('.py'):
             return False
-        result = subprocess.run(['git', 'show', f'{revision}:{parts[0]}'],
-                                cwd=getattr(session, "_retained_source_root", session.project_root), capture_output=True, text=True)
-        if result.returncode:
+        root = getattr(session, '_retained_source_root', session.project_root)
+        memo = getattr(session, '_proof_selection_pass', None)
+        cache = memo.setdefault('historical', {}) if memo is not None else {}
+        key = (str(root), revision, parts[0])
+        if key not in cache:
+            result = subprocess.run(['git', 'show', f'{revision}:{parts[0]}'], cwd=root, capture_output=True, text=True)
+            record = {'exists': result.returncode == 0, 'parseable': False, 'functions': set(), 'exports': set()}
+            if not result.returncode:
+                try:
+                    tree = ast.parse(result.stdout)
+                    record['parseable'] = True
+                    record['functions'] = {node.name for node in ast.walk(tree)
+                                           if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                    for node in tree.body:
+                        if isinstance(node, (ast.ImportFrom, ast.Import)):
+                            record['exports'].update(alias.asname or alias.name for alias in node.names)
+                        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                            record['exports'].update(name.id
+                                for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                                for name in ast.walk(target) if isinstance(name, ast.Name))
+                except SyntaxError:
+                    pass
+            cache[key] = record
+        record = cache[key]
+        if not record['exists']:
             continue
         if len(parts) == 1:
             return False  # Existing whole-file coverage is regression evidence.
-        try:
-            tree = ast.parse(result.stdout)
-        except SyntaxError:
+        if not record['parseable']:
             return False
         # Parameter IDs are collection-time identities, not Python function
         # names. A retained function is regression evidence even when static
         # inspection cannot establish whether the requested parameter exists.
         function_name = parts[1].split('[', 1)[0]
-        if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
-               for node in ast.walk(tree)):
+        if function_name in record['functions']:
             return False
         # Imported/re-exported tests have no local FunctionDef. Their retained
         # binding is regression evidence; only proven absence permits removal.
-        for node in tree.body:
-            if isinstance(node, (ast.ImportFrom, ast.Import)) and any(
-                    alias.name == '*' or (alias.asname or alias.name) == function_name
-                    for alias in node.names):
-                return False
-            if isinstance(node, (ast.Assign, ast.AnnAssign)) and any(
-                    isinstance(name, ast.Name) and name.id == function_name
-                    for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
-                    for name in ast.walk(target)):
-                return False
+        if function_name in record['exports'] or '*' in record['exports']:
+            return False
     return True
 
 
@@ -736,6 +759,13 @@ def _owned_inventory(state, gates, session=None):
         command_covered = kind in {'command', 'selector'} and (
             _command_covers(state.fix_verify_command, ref)
             or any(_command_covers(command, ref) for command in _legacy_commands(gates)))
+        if (state.verification_binding.get('task_scope', {}).get('mode') == 'focused_fix'
+                and kind == 'selector' and _command_covers(state.fix_verify_command, ref)):
+            # A direct fix command already discharges this selector. A broad
+            # release group is an alternative coverage route, not authority
+            # to adopt all of its unrelated future-task prerequisites.
+            matches = [step for step in matches if step.command or any(
+                target == ref or target.startswith(ref + '[') for target in step.targets)]
         if not matches and kind != 'artifact' and not command_covered:
             raise ownership_error(state, f'required verification reference has no executable proof: {ref}',
                                   verification_ref=ref, owners=diagnostic_owners(state, ref))
@@ -1864,6 +1894,19 @@ def _foreign_refs(state):
 
 
 def session_gates(session, state):
+    """Share parsing only during one read-only selection; never across edits."""
+    previous = getattr(session, '_proof_selection_pass', None)
+    session._proof_selection_pass = {'index': None}
+    try:
+        return _session_gates(session, state)
+    finally:
+        if previous is None:
+            del session._proof_selection_pass
+        else:
+            session._proof_selection_pass = previous
+
+
+def _session_gates(session, state):
     """Project proven foreign pending obligations out of a retained copy only."""
     from .models import GateConfig, VerificationStep
 
@@ -1907,13 +1950,15 @@ def session_gates(session, state):
         if not step.get('proof_id'):
             step['proof_id'] = 'session.legacy.' + fingerprint(step)[:16]
         indexed[step['proof_id']] = step
-    protected = {key for key, step in indexed.items()
-                 if any(_ref_covered(ref, VerificationStep.from_dict(step)) for ref in refs)
-                 or _step_affected(session, state, step)}
+    focused = binding.get('task_scope', {}).get('mode') == 'focused_fix'
+    protected = (set(_owned_inventory(state, GateConfig.from_dict(gates), session)[0]) if focused else
+                 {key for key, step in indexed.items()
+                  if any(_ref_covered(ref, VerificationStep.from_dict(step)) for ref in refs)
+                  or _step_affected(session, state, step)})
     # Existing regression prerequisites remain evidence regardless of task
     # ownership. Only a demonstrably unimplemented foreign selector can be a
     # future ordering edge, and never on a mandatory owned proof.
-    for key, step in indexed.items():
+    for key, step in ([] if focused else indexed.items()):
         if not _future_foreign_step(session, state, step, excluded):
             for dependency in step.get('depends_on_proofs', []):
                 if dependency in indexed and not _future_foreign_step(session, state, indexed[dependency], excluded):
@@ -2090,6 +2135,7 @@ def _validate_selected_contracts(session, state, commands, *, metadata=None):
         if path not in state.candidate_paths:
             continue
         candidate = session.project_root / path
+        current = None
         try:
             current = candidate.read_text()
             preserved = current == source or (
@@ -2102,6 +2148,14 @@ def _validate_selected_contracts(session, state, commands, *, metadata=None):
         except (OSError, SyntaxError, UnicodeError):
             preserved = False
         if not preserved:
+            from .proof_amendments import admissible, approved, required
+            if (source is not None and isinstance(current, str) and path.endswith('.py')
+                    and path not in state.verification_binding.get('proof_control_paths', [])
+                    and path not in state.verification_binding.get('proof_config_paths', [])
+                    and state.candidate_custody.get('receipt') and admissible(source, current)):
+                if approved(session, state, path):
+                    continue
+                raise required(state, path)
             proof_ids = [step['proof_id'] for step in state.verification_binding.get('required_proofs', [])
                          if _ref_covered(path, VerificationStep.from_dict(step))]
             raise ownership_error(state, f'required proof source was removed or changed: {path}',

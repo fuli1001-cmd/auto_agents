@@ -300,6 +300,12 @@ class WorkflowCoordinator:
                 f"session {session_id} is {state.mode}, not {session.mode}"
             )
         authority_valid = session._retain_resume_authority(state)
+        registration = getattr(self.orch, '_repair_registration', None)
+        if authority_valid and registration and state.workflow_id:
+            root = self.store.load(state.workflow_id).root
+            from .repair_v2.incidents import migrate
+            migrate(registration['config'], {'project': str(self.project_root), 'invocation': {
+                'session_id' if root.kind in {'collab', 'fix', 'provider_resolve'} else 'run_id': root.native_id}})
         engine_resume = authority_valid and self._pending_engine_resume(state, session)
         self._preserve_engine_resume_budget = bool(engine_resume)
         # Retain explicitly requested policies even when missing authority
@@ -416,7 +422,8 @@ class WorkflowCoordinator:
                     if payload and repository_binding_error(self.project_root, payload):
                         child_id = self._engine_child_id(payload, snapshot)
                         if (child_id and (not state.parent_handoff_id or child_id == state.session_id)
-                                and self._execution_binding_result(payload).get('resolution') == 'verified_engine_repair'):
+                                and (self._retained_proof_child(payload, snapshot)
+                                     or self._execution_binding_result(payload).get('resolution') == 'verified_engine_repair')):
                             return True
         if not handoff_id and parent.status == 'blocked' and parent.resolution in {
                 'execution_binding_mismatch', 'verification_ownership', 'verification_execution_binding'}:
@@ -430,13 +437,28 @@ class WorkflowCoordinator:
         if handoff.parent != WorkflowRef(parent.mode, parent.session_id):
             return False
         original = self._resolved_handoff_chain(handoff, snapshot.workflow_id)[-1]
+        if original.child and original.child.kind == 'fix':
+            child = load_session_state(self.project_root, original.child.native_id)
+            if child.candidate_custody.get('receipt'):
+                self._validated_child_handoff(child, handoff)
+                return not state.parent_handoff_id or child.session_id == state.session_id
         from .execution_binding import repository_binding_error
         if not repository_binding_error(self.project_root, original.payload):
             return False
-        if self._execution_binding_result(original.payload).get('resolution') != 'verified_engine_repair':
+        if (not self._retained_proof_child(original.payload, snapshot)
+                and self._execution_binding_result(original.payload).get('resolution') != 'verified_engine_repair'):
             return False
         child_id = self._engine_child_id(original.payload, snapshot)
         return bool(child_id and (not state.parent_handoff_id or child_id == state.session_id))
+
+    def _retained_proof_child(self, payload, snapshot):
+        """A current product proof amendment is not an engine repair request."""
+        from .proof_amendments import pending
+        child_id = self._engine_child_id(payload, snapshot)
+        if not child_id:
+            return None
+        child = load_session_state(self.project_root, child_id)
+        return child if pending(child) else None
 
     def _resume_blocked_engine_handoff(self, state, snapshot):
         """Recheck a returned binding failure only at an explicit resume boundary."""
@@ -872,6 +894,18 @@ class WorkflowCoordinator:
             raise SessionOwnershipError('resumed handoff belongs to another parent session')
         binding_payload = chain[-1].payload
         from .repair_control import digest
+        from .execution_binding import repository_binding_error
+        if (repository_binding_error(self.project_root, binding_payload)
+                and self._retained_proof_child(binding_payload, snapshot)):
+            if not handoff.returned_at:
+                self.store.record_result(snapshot, handoff, status='paused', result={
+                    'status': 'paused', 'resolution': 'proof_review_migrated',
+                    'summary': '当前候选需要测试修订审核，继续原产品子流程。'})
+            self.store.consume_result(snapshot, handoff, operation_id='proof-review-' + handoff.handoff_id)
+            parent_state.active_handoff_id = ''
+            parent_session._prepare_workflow_handoff(parent_state, target='fix',
+                reason='继续审核原候选', payload=binding_payload)
+            return None
         if handoff.returned_at:
             context = getattr(self.orch, '_verified_engine_routes', {}).get(digest(binding_payload))
             failure = None

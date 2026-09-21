@@ -59,7 +59,7 @@ def completed_result(job):
     """Recover the SQLite projection after a crash following a durable ACK."""
     from .store import Store
     result = job.get('result') or {}
-    if result.get('recovery_protocol') != 1 or not result.get('v2_transaction'):
+    if result.get('recovery_protocol') not in (1, 2) or not result.get('v2_transaction'):
         return None
     state = Store(result['v2_transaction']).load() or {}
     receipt = state.get('live_recovery') or {}

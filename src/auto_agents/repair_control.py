@@ -895,7 +895,11 @@ class Supervisor:
                     child = proof['observed']['recovery_observation']
                     passed = bool(validation['ok'] and proof['ok'] and child['ok']
                         and child.get('preflight_rechecked')
-                        and child.get('boundary_kind') == 'implementation'
+                        and child.get('boundary_kind') in {'implementation', 'verification'}
+                        and details.get('recovery_stage', 'implementation') == child.get('boundary_kind')
+                        and (child.get('boundary_kind') != 'verification' or (
+                            details.get('verification_identity') and details['verification_identity'] == child.get('verification_identity')
+                            and details.get('candidate_fingerprint') == child.get('candidate_fingerprint')))
                         and details.get('binding_fingerprint')
                         and details.get('binding_fingerprint') == child.get('activation_binding_fingerprint', child.get('binding_fingerprint'))
                         and details.get('route_digest') == expected.get('route_digest')
@@ -905,14 +909,14 @@ class Supervisor:
                 except (OSError, ValueError, KeyError, TypeError):
                     passed = False
             if passed:
-                if job['result'].get('engine') == 'v2' and (job['result'].get('recovery_protocol') != 1
+                if job['result'].get('engine') == 'v2' and (job['result'].get('recovery_protocol') not in (1, 2)
                                                            or not job['result'].get('v2_transaction')):
                     raise RuntimeError('legacy recovery must migrate before acknowledgement')
                 if job['result'].get('engine') == 'v2' and job['result'].get('v2_transaction'):
                     root = Path(job['result']['v2_transaction'])
                     if root.parent.resolve() != (self.store.root / 'v2-transactions').resolve():
                         raise RuntimeError('recovery receipt belongs to another repair store')
-                    if job['result'].get('recovery_protocol') == 1:
+                    if job['result'].get('recovery_protocol') in (1, 2):
                         from .repair_v2.integration import acknowledge_recovery
                         acknowledge_recovery(job, row, details)
                         completed_result = {**job['result'], 'status': 'recovered',
@@ -941,7 +945,7 @@ class Supervisor:
                 self.store.event(job["id"], "engine_route_consumed", {"subscriber": row["id"]})
                 if not needs_child_recovery(job):
                     if job['result'].get('engine') == 'v2':
-                        if job['result'].get('recovery_protocol') != 1:
+                        if job['result'].get('recovery_protocol') not in (1, 2):
                             raise RuntimeError('legacy recovery must migrate before acknowledgement')
                         from .repair_v2.integration import acknowledge_recovery
                         acknowledge_recovery(job, row, {'route_digest': expected['route_digest']})
@@ -1016,7 +1020,7 @@ class Supervisor:
             ready = [row[0] for row in db.execute("SELECT id FROM jobs WHERE state='ready'")]
         for identity in ready:
             job = self.store.job(identity)
-            if job.get('result', {}).get('recovery_protocol') != 1:
+            if job.get('result', {}).get('recovery_protocol') not in (1, 2):
                 continue
             try:
                 from .repair_v2.recovery import completed_result
@@ -1062,7 +1066,7 @@ class Supervisor:
                 continue
             if operation.startswith("validate-"):
                 subscriber_id = operation[len("validate-"):]
-                if result.get('revalidate') and job['result'].get('recovery_protocol') == 1:
+                if result.get('revalidate') and job['result'].get('recovery_protocol') in (1, 2):
                     with self.store.connect() as db:
                         db.execute("UPDATE jobs SET state='queued',generation=generation+1 WHERE id=? AND generation=?",
                                    (identity, generation))
@@ -1143,11 +1147,11 @@ class Supervisor:
                     receipt = {'exit_code': 3, 'error': '原任务进程没有留下有效退出回执，已停止自动实施。'}
                 exit_code = receipt.get("exit_code", 3) if completion.exists() else process.returncode
                 job = self.store.job(row['job'])
-                if exit_code == 0 and (needs_child_recovery(job) or job['result'].get('recovery_protocol') == 1) and job['state'] != 'completed':
+                if exit_code == 0 and (needs_child_recovery(job) or job['result'].get('recovery_protocol') in (1, 2)) and job['state'] != 'completed':
                     exit_code = 3
                     receipt['error'] = 'original child implementation boundary was not observed'
                 if (exit_code != 0 and job['state'] not in {'completed', 'cancelled'}
-                        and job['result'].get('recovery_protocol') == 1):
+                        and job['result'].get('recovery_protocol') in (1, 2)):
                     try:
                         from .repair_v2.integration import record_activation_failure
                         failure = record_activation_failure(self.config, job, row, receipt)
@@ -1202,7 +1206,7 @@ class Supervisor:
             for row in self.store.subscriptions():
                 if row["state"] == "waiting" and row["job"] and self.store.job(row["job"])["state"] in {"ready", "completed"}:
                     saved = self.store.job(row['job'])['result']
-                    if saved.get('engine') == 'v2' and (saved.get('recovery_protocol') != 1
+                    if saved.get('engine') == 'v2' and (saved.get('recovery_protocol') not in (1, 2)
                                                        or not saved.get('runtime_artifact')):
                         # Upgrade the saved acceptance before subscriber
                         # validation; a legacy worktree must not cost a failed
@@ -1414,7 +1418,7 @@ class Supervisor:
                                    if item['id'] == request.get('subscriber')), None)
                 if subscriber and subscriber.get('job'):
                     approved = self.store.job(subscriber['job']).get('result', {})
-                    if (approved.get('recovery_protocol') == 1 and approved.get('runtime')
+                    if (approved.get('recovery_protocol') in (1, 2) and approved.get('runtime')
                             and runtime == Path(approved['runtime']).resolve()):
                         from .repair_v2.integration import verify_receipt
                         from .repair_v2.transaction import transaction_root

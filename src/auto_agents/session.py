@@ -2001,6 +2001,17 @@ class Session:
         from .execution_binding import repository_binding_error
 
         binding_error = repository_binding_error(self.project_root, payload)
+        proof_resume = False
+        if binding_error and self._coordinator is not None and state.workflow_id:
+            snapshot = self._coordinator.store.load(state.workflow_id)
+            child = self._coordinator._retained_proof_child(payload, snapshot)
+            if child is not None:
+                # Preserve the original engine request as history. The new
+                # continuation owns only the retained product candidate.
+                target, reason = 'resume', '独立审核现有候选的测试修订并继续验证'
+                payload = {'resume_handoff_id': child.parent_handoff_id}
+                binding_error = ''
+                proof_resume = True
         from .repair_v2.scope import ScopeGuard, context as scope_context
         from .repair_v2.types import RepairBlocked
         necessity = payload.get('necessity') or (payload.get('issue_seed') or payload.get('spec_seed') or {}).get('necessity')
@@ -2153,11 +2164,12 @@ class Session:
                 "timestamp": self._now(),
             }
         )
-        self._begin_attempt_epoch(
-            state,
-            reason=f"workflow routed to {target}",
-            reset_stall=False,
-        )
+        if not proof_resume:
+            self._begin_attempt_epoch(
+                state,
+                reason=f"workflow routed to {target}",
+                reset_stall=False,
+            )
         self._save(state)
         return state
 
@@ -2186,7 +2198,7 @@ class Session:
             bind_session(self, state)
             with execution_checkout(self, state):
                 if (state.candidate_custody.get("receipt")
-                        and state.status in {"completed", "failed", "blocked"}):
+                        and state.status in {"completed", "failed", "blocked", "waiting_user", "paused"}):
                     return state
                 return self._phase_fix_execute_owned(state)
         except SessionOwnershipError as error:
@@ -2235,25 +2247,9 @@ class Session:
             prior_receipt = deepcopy(state.candidate_custody.get("receipt"))
             prior_candidate_paths = dict(state.candidate_paths)
             try:
-                recovery = getattr(self, '_engine_recovery_context', None)
-                if recovery and os.environ.get('AUTO_AGENTS_REPAIR_SUBSCRIBER'):
-                    from .repair_client import boundary_event
-                    if not boundary_event('engine_child', **recovery,
-                            binding_fingerprint=state.verification_binding.get('binding_fingerprint')):
-                        # A rejected control acknowledgement is not a product
-                        # defect or permission to ask the parent model to plan
-                        # more work. Retain this exact nonterminal handoff.
-                        restore_guard.cleanup()
-                        state.status = 'paused'
-                        state.resolution = 'engine_recovery_unacknowledged'
-                        state.resume_phase = 'executing'
-                        message = '恢复控制器尚未确认接管，已暂停原任务，不继续调用模型。'
-                        state.execution_log.append({'action': 'engine_recovery_unacknowledged',
-                            'attempt': state.current_attempt, 'result': message, 'timestamp': self._now()})
-                        self._save(state)
-                        self._print(message)
-                        return state
-                    self._engine_recovery_context = None
+                if not self._ack_engine_recovery(state, 'implementation'):
+                    restore_guard.cleanup()
+                    return state
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
             except SessionOwnershipError as error:
                 restore_guard.cleanup()
@@ -2420,6 +2416,17 @@ class Session:
             from .session_candidate import verification_identity
             identity = verification_identity(self, state) if state.candidate_custody.get('receipt') else None
             verify = self._run_verify()
+            if verify.get('failure_kind') == 'proof_review_required':
+                from .proof_amendments import ensure
+                decision = ensure(self, state)
+                if decision == 'paused':
+                    return state
+                if decision == 'approved':
+                    state.verification_diagnostics = {}
+                    verify = self._run_verify()
+                else:
+                    verify = {**verify, 'retry_fix': True, 'failure_kind': 'proof_review_rejected',
+                              'reason': '独立审核拒绝测试修订，请依据原需求和审核记录修正候选。'}
             verify_reason = "" if verify["ok"] else str(verify["reason"])
             self._append_verification_log(state, "verify", verify)
             from .session_candidate import record_verification
@@ -2458,6 +2465,25 @@ class Session:
         self._print("Fix session stopped (no further progress). Session marked as failed.")
         return state
 
+    def _ack_engine_recovery(self, state, stage, *, verification_identity=''):
+        recovery = getattr(self, '_engine_recovery_context', None)
+        if not recovery or not os.environ.get('AUTO_AGENTS_REPAIR_SUBSCRIBER'):
+            return True
+        from .repair_client import boundary_event
+        if boundary_event('engine_child', **recovery, recovery_stage=stage,
+                binding_fingerprint=state.verification_binding.get('binding_fingerprint'),
+                candidate_fingerprint=state.candidate_custody.get('receipt', {}).get('fingerprint', ''),
+                verification_identity=verification_identity):
+            self._engine_recovery_context = None
+            return True
+        state.status, state.resolution, state.resume_phase = 'paused', 'engine_recovery_unacknowledged', 'executing'
+        message = '恢复控制器尚未确认接管，已暂停原任务，不继续调用模型。'
+        state.execution_log.append({'action': state.resolution, 'attempt': state.current_attempt,
+                                    'result': message, 'timestamp': self._now()})
+        self._save(state)
+        self._print(message)
+        return False
+
     def _complete_verified_fix(self, state, verify, reply, *, identity=None):
         if state.candidate_custody.get('receipt'):
             from .session_candidate import verification_identity
@@ -2470,6 +2496,8 @@ class Session:
                     raise ownership_error(state, 'verification inputs changed before completion',
                                           execution_identity=verify.get('execution_identity'),
                                           current_identity=current_identity)
+        if not self._ack_engine_recovery(state, 'verification', verification_identity=identity or ''):
+            return state
         self._print("Verification passed!")
         self._run_session_persistence_action(state)
         state.status, state.resolution = 'completed', 'fixed'
@@ -4093,6 +4121,9 @@ class Session:
     def _verification_plan_commands(self, scope="final"):
         with self._session_verification_config():
             plan = self._session_gate_plan(scope)
+            if self.mode == 'fix' and self._current_state.candidate_custody.get('receipt'):
+                from .proof_amendments import augment_plan
+                plan = augment_plan(self, self._current_state, plan)
             commands = self._logical_gate_commands(plan)
             state = self._current_state
             if self.mode == "fix" and state.fix_verify_command:
@@ -4128,7 +4159,7 @@ class Session:
                 return result
         except SessionOwnershipError as error:
             return {"ok": False, "reason": str(error), "retry_fix": False,
-                    "failure_kind": "verification_ownership", "executed_commands": 0,
+                    "failure_kind": error.diagnostic.get('failure_kind', 'verification_ownership'), "executed_commands": 0,
                     "diagnostic": error.diagnostic,
                     **({'execution_identity': execution_identity} if execution_identity is not None else {})}
         finally:
@@ -4164,8 +4195,11 @@ class Session:
         if state.verification_binding.get("authorization") != state.authorization_policy:
             raise SessionOwnershipError("session authorization changed since contract binding")
         ambient = self.config.gates
-        self.config.gates = session_gates(self, state)
         try:
+            self.config.gates = session_gates(self, state)
+            if state.candidate_custody.get('receipt'):
+                from .proof_amendments import covered_gates
+                self.config.gates = covered_gates(self, state, self.config.gates)
             yield
         finally:
             self.config.gates = ambient
@@ -4605,6 +4639,14 @@ class Session:
             record_gate(gate)
             self.orch._classify_reported_infrastructure_failures(gate)
             extraction = extract_failure_info(gate)
+            from .proof_amendments import execution_evidence
+            if any(not result.ok and result.command in getattr(self, '_amendment_commands', {})
+                   for result in gate.commands):
+                return outcome(False, '审核涉及的测试执行失败，必须修正当前候选。',
+                               retry_fix=extraction.comparable, failure_kind='owned_verification_failed')
+            if gate.ok and not execution_evidence(self, gate):
+                return outcome(False, '审核涉及的测试没有全部提供实际通过记录；不能交付当前候选。',
+                               retry_fix=False, failure_kind='proof_execution_incomplete')
             required = set(state.verification_binding.get('required_proof_ids', []))
             failed_owned = [result.command for result in gate.commands if not result.ok
                             and (required.intersection(getattr(metadata.get(result.command), 'proof_ids', []))

@@ -18,6 +18,18 @@ def control_protocol(root):
     assert VERSION == 1, "unsupported repair control protocol"
 
 
+def failure_incident_protocol(root):
+    from auto_agents.repair_v2.incidents import latest_failure
+    from auto_agents.repair_v2.scope import POLICY
+    from auto_agents.repair_v2.types import RecoveryContext
+    assert POLICY == 'goal-scope-v2' and RecoveryContext('', {}, {}, {}, '').version == 2
+    events = [{'action': 'execution_preflight_blocked', 'result': 'old'},
+              {'action': 'engine_preflight_recheck'},
+              {'action': 'verify', 'result': 'current', 'failure_kind': 'verification_ownership'}]
+    assert latest_failure({'execution_log': events})[1]['result'] == 'current'
+    assert latest_failure({'execution_log': events[:2]}) is None
+
+
 def verification_protocol(root):
     from auto_agents.repair_validation_protocol import VERSION, controller_runtime
     from auto_agents.repair_capability_checks import production_capabilities
@@ -156,7 +168,8 @@ def main():
                      "AUTO_AGENTS_WORKER_ROOT", "AUTO_AGENTS_CLUSTER_HOME"):
             os.environ[name] = str(root / name.lower())
         os.environ.update(AUTO_AGENTS_REPAIR_CONTROL_DISABLED="1", AUTO_AGENTS_STORAGE_MAINTENANCE="off")
-        for check in (control_protocol, progress_supervision, acceptance_planning, terminal_repair_status, verification_protocol):
+        for check in (control_protocol, progress_supervision, acceptance_planning, terminal_repair_status, verification_protocol,
+                      failure_incident_protocol):
             try:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     check(root)

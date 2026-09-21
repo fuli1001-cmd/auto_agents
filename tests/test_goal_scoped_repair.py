@@ -69,7 +69,7 @@ def test_scope_identity_survives_rewording_provider_and_restart(scene, tmp_path)
     config = {'root': str(tmp_path / 'control')}
     root = transaction_root(config, payload)
     request = RepairRequest('same', 'base', 'video', (Acceptance('video', 'video works'),), 'codex')
-    frozen_request(root, payload, lambda: request)
+    request = frozen_request(root, payload, lambda: request)
     Store(root).save({'status': 'blocked', 'calls': 4, 'attempts': 1})
     changed = {**payload, 'fingerprint': 'new words', 'provider': 'another', 'base': 'new-base'}
     assert transaction_root(config, changed) == root

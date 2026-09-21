@@ -19,9 +19,16 @@ class RepairRequest:
     provider: str
     invocation: Dict[str, Any] = field(default_factory=dict)
     evidence: tuple = ()
+    incident_id: str = ''
+    incident_revision: int = 1
+    contract_revision: str = ''
 
     def to_dict(self):
-        return asdict(self)
+        value = asdict(self)
+        if not self.incident_id:
+            for key in ('incident_id', 'incident_revision', 'contract_revision'):
+                value.pop(key)
+        return value
 
     @classmethod
     def from_dict(cls, value):
@@ -95,6 +102,44 @@ class RecoveryContext:
     boundary: Dict[str, Any]
     scope: Dict[str, Any]
     ledger: str
+    version: int = 2
+    incident_id: str = ''
+    incident_revision: int = 1
+    contract_revision: str = ''
+
+
+@dataclass(frozen=True)
+class FailureIncident:
+    identity: str
+    owner: Dict[str, Any]
+    phase: str
+    code: str
+    check: str
+    event: Dict[str, Any]
+    candidate: str = ''
+    status: str = 'open'
+    revision: int = 1
+    version: int = 1
+    domain: str = 'unknown'
+
+
+@dataclass(frozen=True)
+class EvidenceRef:
+    origin: str
+    snapshot: str
+    path: str
+    sha256: str
+    pointer: str = ''
+    version: int = 1
+
+
+@dataclass(frozen=True)
+class ProofAmendmentReceipt:
+    policy: str
+    inputs: str
+    decision: str
+    changes: Dict[str, Any]
+    verdict: Dict[str, Any]
     version: int = 1
 
 
