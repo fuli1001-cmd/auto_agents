@@ -1897,6 +1897,12 @@ engine self-repair, tests, commits, and workflow recovery are resolved automatic
 exceptions such as frontend prototype selection and production persistence protections remain
 manual or prohibited.
 
+Collab's default retry and polling limits apply to operations issued by the diagnostic/acceptance
+agent. They do not impose a new configuration ceiling on the product's internal generation,
+content-correction or background-job policies. Explicit user limits on product calls or spending
+still apply. Agent-generated route constraints remain derived context and cannot create user
+restrictions; a configured retry ceiling must not be reported as retries already consumed.
+
 Before the first implementation route, collab records whether the requested outcome is real or
 simulated. An explicit goal is classified without another prompt; an ambiguous goal receives one
 plain-language, project-specific choice generated from the current project rather than a fixed

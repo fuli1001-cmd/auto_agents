@@ -10,8 +10,9 @@ import re
 import shutil
 
 from .git_ops import head_ref
-from .prompting.core import compose_prompt
+from .prompting.core import ContextBlock, compose_prompt
 from .repair_v2.store import digest
+from .session_operation_policy import operation_policy_lines
 
 
 def is_request(target, payload):
@@ -159,13 +160,17 @@ def drive(session, state):
                 'Use the current checkout, already containing delivered fixes. Start existing services and operate the actual browser/UI and configured providers as required by the goal.',
                 'Do not implement features, edit product/config/test files, change requirements or .auto-agents control records, migrate storage, install dependencies or resume stopped tasks.',
                 'Runtime data and evidence may be written. Respect the original authorization, spending limits and real/simulated environment. No fake media or proxy-only evidence.',
+                *operation_policy_lines(),
                 'Inspect any existing execution ledger, project IDs and runtime evidence before making provider calls; reuse prior results. Never repeat an externally charged operation whose outcome is unknown.',
                 'This execution was interrupted; reconcile prior outcomes before any new external operation.' if interrupted else '',
                 'On a defect or missing prerequisite, return blocked with evidence; do not start implementation or broaden the goal.',
                 'For a decision only the user can make, return needs_user with decision_class (goal_choice, credential, rights_attestation, unbudgeted_external_cost, destructive_change, irreversible_product_decision, or external_observation) and a short plain-language question and recommendation, without internal IDs, paths or implementation jargon.',
                 'Return JSON {"status":"passed|blocked|needs_user","summary":"...","evidence":["relative path"],"question":"..."}. Passed requires all original obligations, with actual browser/media evidence where required.',
                 'Copy evidence into ' + str(directory) + '; paths in evidence are relative to that directory. Record operations and their outcomes there as they happen.',
-                json.dumps(value, ensure_ascii=False),
+                *session._goal_contexts(state),
+                ContextBlock(json.dumps(value, ensure_ascii=False),
+                             'Derived acceptance plan and runtime context; route constraints are agent-generated',
+                             'acceptance_plan'),
             ], purpose='acceptance_execute')
             result = _json(_call(session, state, 'acceptance-execute', prompt))
             if result.get('status') not in ('passed', 'blocked', 'needs_user') or not isinstance(result.get('summary'), str):
@@ -196,8 +201,11 @@ def drive(session, state):
                     'Independently check whether the original goal was actually demonstrated by the supplied evidence. Inspect the evidence files; do not merely trust the executor summary.',
                     'Do not execute generation, change files, restore other tasks or repeat paid operations. Browser/media goals require actual observable content evidence, not just status, metadata or file existence.',
                     'Return JSON {"approved":true|false,"reason":"..."}. Approve only when every original obligation is proved; missing or ambiguous proof must be rejected.',
+                    *operation_policy_lines(),
                     'Evidence directory: ' + str(directory),
-                    json.dumps({'inputs': value, 'result': saved['result'], 'evidence': evidence}, ensure_ascii=False),
+                    *session._goal_contexts(state),
+                    ContextBlock(json.dumps({'inputs': value, 'result': saved['result'], 'evidence': evidence}, ensure_ascii=False),
+                                 'Derived acceptance plan and observed evidence', 'acceptance_review_evidence'),
                 ], purpose='acceptance_review')
                 saved['review'] = _json(_call(session, state, 'acceptance-review', prompt))
                 session._save(state)

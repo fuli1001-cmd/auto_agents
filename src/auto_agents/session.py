@@ -82,6 +82,7 @@ from .session_verification import (
     validate_selected_contracts, session_gates, validate_binding, validate_plan, ownership_error,
 )
 from .provider_contract import provider_policy_prompt_lines
+from .session_operation_policy import operation_policy_lines
 from .prompting import (ContextBlock, PromptBlock, append_context, compose_prompt,
                         instruction_fingerprint, policy_fingerprint)
 from .requirements import (
@@ -3835,10 +3836,8 @@ class Session:
             "task without authorization, use decision=needs_user and add a plain question and specific suggestion. "
             "Ordinary technical fixes and resuming the current authorized workflow do not need new approval.",
             "",
-            "EXECUTION SAFETY RULES (critical — follow strictly):",
-            "- Set a timeout for EVERY HTTP request or polling loop (max 60s per request, 5 min total for repeated polling).",
+            *operation_policy_lines(),
             "- If a subprocess or external command fails, report the failure immediately — do NOT retry indefinitely.",
-            "- Use bounded retries: max 3 retries for any single operation, then stop and report the error.",
             "- Do NOT start infinite watch/poll/retry loops. Always use explicit exit conditions.",
             "- Prefer small incremental steps: start a service, verify it works, then proceed to the next step.",
             "- If you start background servers, verify they are healthy (e.g., curl health-check) before using them.",
