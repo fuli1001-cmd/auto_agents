@@ -301,6 +301,47 @@ def execution_evidence(session, gate):
     return True
 
 
+def _verdict(text, value):
+    """Validate required coverage while allowing explanations of related delta paths."""
+    if not isinstance(text, str):
+        raise ValueError('审核回答必须是文本')
+    text = text.strip()
+    if text.startswith('```'):
+        text = '\n'.join(text.splitlines()[1:-1])
+    verdict = json.loads(text)
+    if not isinstance(verdict, dict):
+        raise ValueError('审核结果必须是 JSON 对象')
+    decision = verdict.get('decision')
+    if (decision not in ('approve', 'reject', 'needs_user')
+            or not isinstance(verdict.get('reason'), str) or not verdict['reason'].strip()):
+        raise ValueError('缺少有效的审核决定或原因')
+    coverage = verdict.get('coverage') or []
+    if not isinstance(coverage, list) or any(not isinstance(r, dict) for r in coverage):
+        raise ValueError('测试覆盖说明必须是对象列表')
+    if decision == 'needs_user' and any(not isinstance(verdict.get(k), str) or not verdict[k].strip()
+                                      for k in ('question', 'suggestion')):
+        raise ValueError('缺少供用户选择的问题或建议')
+    if decision == 'approve':
+        requirements = {'original_goal'} | {r for task in value['requirements'] for r in task.get('requirement_ids', [])}
+        for row in coverage:
+            if not isinstance(row.get('path'), str) or row['path'] not in value['delta']:
+                raise ValueError('测试覆盖说明包含候选改动之外的文件')
+            if not isinstance(row.get('requirement'), str) or row['requirement'] not in requirements:
+                raise ValueError('测试覆盖说明引用了未绑定的需求：' + row['path'])
+            if not isinstance(row.get('reason'), str) or not row['reason'].strip():
+                raise ValueError('测试覆盖说明缺少原因：' + row['path'])
+        missing = set(value['changes']) - {r['path'] for r in coverage}
+        if missing:
+            raise ValueError('测试覆盖说明缺少文件：' + ', '.join(sorted(missing)))
+        delta_coverage = verdict.get('change_coverage') or []
+        if (not isinstance(delta_coverage, list)
+                or any(not isinstance(r, dict) or not isinstance(r.get('path'), str)
+                       or not isinstance(r.get('reason'), str) or not r['reason'].strip() for r in delta_coverage)
+                or {r['path'] for r in delta_coverage} != set(value['delta'])):
+            raise ValueError('全部改动的覆盖说明不完整或包含无关文件')
+    return verdict
+
+
 def ensure(session, state):
     """Return approved/rejected/paused; reserve before a fresh independent call."""
     from .models import AgentRequest
@@ -323,10 +364,17 @@ def ensure(session, state):
             session._save(state)
             return 'paused'
         if saved.get('status') == 'invalid':
-            # A known invalid reply may be retried on explicit continuation;
-            # an unknown in-flight outcome above must never be redispatched.
-            store.transition(saved, status='pending', reply=None)
-        session._print('正在独立审核测试修订；保留现有候选。')
+            # Revalidate the retained reply first: a corrected validator must
+            # not charge for another review of identical, sealed inputs.
+            try:
+                _verdict(store.read(saved['reply'])['text'], value)
+            except (ValueError, TypeError, KeyError):
+                # A genuinely invalid reply may be retried on continuation.
+                store.transition(saved, status='pending', reply=None)
+            else:
+                store.transition(saved, status='received', error=None)
+        session._print('正在复用已保存的审核回答；保留现有候选。' if saved.get('reply')
+                       else '正在独立审核测试修订；保留现有候选。')
         if not saved.get('reply'):
             registration = getattr(session.orch, '_repair_registration', None)
             if registration:
@@ -350,6 +398,8 @@ def ensure(session, state):
                     'requirements. Do not edit files, run product code, or contact content providers. Inspect the entire '
                     'delta. Approve only if all revised expectations are justified by existing requirements and the '
                     'original obligations remain covered. Reject weakened assertions or changes merely to pass. '
+                    'coverage must explain every path in changes using a bound requirement; it may also explain '
+                    'other paths in delta, but no paths outside delta. change_coverage must explain every path in delta. '
                     'Return JSON {"decision":"approve|reject|needs_user", "reason":"...", '
                     '"coverage":[{"path":"...", "requirement":"original_goal or bound requirement ID", "reason":"..."}], '
                     '"change_coverage":[{"path":"every path in delta", "reason":"why necessary for the original goal"}], '
@@ -381,35 +431,13 @@ def ensure(session, state):
         # and every review input before making its reply effective.
         if inputs(session, state) != value:
             raise ownership_error(state, '审核期间候选或证明输入发生变化。')
-        text = store.read(saved['reply'])['text'].strip()
-        if text.startswith('```'):
-            text = '\n'.join(text.splitlines()[1:-1])
         try:
-            verdict = json.loads(text)
+            verdict = _verdict(store.read(saved['reply'])['text'], value)
             decision = verdict['decision']
-            if (decision not in {'approve', 'reject', 'needs_user'}
-                    or not isinstance(verdict.get('reason'), str) or not verdict['reason'].strip()):
-                raise ValueError('missing decision')
-            coverage = verdict.get('coverage') or []
-            if not isinstance(coverage, list) or any(not isinstance(r, dict) for r in coverage):
-                raise ValueError('invalid amendment coverage')
-            if decision == 'needs_user' and any(not isinstance(verdict.get(k), str) or not verdict[k].strip()
-                                              for k in ('question', 'suggestion')):
-                raise ValueError('missing user-facing choice')
-            requirements = {'original_goal'} | {r for task in value['requirements'] for r in task.get('requirement_ids', [])}
-            if decision == 'approve' and ({r['path'] for r in coverage if r.get('requirement') in requirements and r.get('reason')}
-                                         != set(value['changes'])):
-                raise ValueError('incomplete amendment coverage')
-            delta_coverage = verdict.get('change_coverage') or []
-            if decision == 'approve' and (not isinstance(delta_coverage, list)
-                    or any(not isinstance(r, dict) or not isinstance(r.get('reason'), str) or not r['reason'].strip()
-                           for r in delta_coverage)
-                    or {r.get('path') for r in delta_coverage} != set(value['delta'])):
-                raise ValueError('incomplete product change coverage')
         except (ValueError, TypeError, KeyError) as error:
-            store.transition(saved, status='invalid')
+            store.transition(saved, status='invalid', error=str(error))
             state.status, state.resolution, state.resume_phase = 'paused', 'proof_review_invalid', 'executing'
-            session._print('审核结果格式不完整，已保留候选；继续时仅重试审核，不重新实施。')
+            session._print('审核结果校验未通过：' + str(error) + '。已保留候选；继续时先重新校验已保存的回答。')
             session._save(state)
             return 'paused'
         if decision == 'needs_user':
@@ -429,7 +457,7 @@ def ensure(session, state):
         from .repair_v2.types import ProofAmendmentReceipt
         receipt = store.artifact('amendment', asdict(ProofAmendmentReceipt(
             POLICY, digest(value), decision, value['changes'], verdict)))
-        store.transition(saved, status='approved' if decision == 'approve' else 'rejected', receipt=receipt)
+        store.transition(saved, status='approved' if decision == 'approve' else 'rejected', receipt=receipt, error=None)
         state.execution_log.append({'action': 'proof_review_approved' if decision == 'approve' else 'proof_review_rejected',
                                     'review': digest(value), 'receipt': receipt, 'candidate': value['candidate'],
                                     'result': verdict['reason']})

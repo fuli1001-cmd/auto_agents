@@ -1,0 +1,33 @@
+{
+  "decision": "approve",
+  "reason": "The complete two-path delta is justified. The new digest matches the APIMart reference already present at the frozen contract revision; it does not refresh that reference or expand capabilities. Replacing the omitted-FPS rejection with an explicit unsupported FPS request follows original success criterion 6. Added tests verify valid serialized submissions, unchanged limits, and rejection before transport on digest mismatch. Static review only; no product code or provider calls were executed.",
+  "coverage": [
+    {
+      "path": "config/video_provider_capability_snapshots.json",
+      "requirement": "original_goal",
+      "reason": "Corrects a stale consumer digest that blocks configured-provider submission while preserving capability limits, expiry, and validation."
+    },
+    {
+      "path": "tests/test_provider_capability_snapshot.py",
+      "requirement": "original_goal",
+      "reason": "Covers submission without a fixed FPS, retains explicit unsupported-FPS rejection, and adds wire-payload, duration, resolution, digest, and call-count checks. Other existing assertions remain."
+    },
+    {
+      "path": "tests/test_provider_capability_snapshot.py",
+      "requirement": "REQ-275",
+      "reason": "Uses the actual client serialization and prebilling validator with fake transport and existing local references. These checks supplement, but do not establish, the required system-boundary safety and recovery proofs."
+    }
+  ],
+  "change_coverage": [
+    {
+      "path": "config/video_provider_capability_snapshots.json",
+      "reason": "Synchronizes the consumer with the already-frozen reference so the original real-provider workflow can pass legitimate capability validation."
+    },
+    {
+      "path": "tests/test_provider_capability_snapshot.py",
+      "reason": "Corrects an expectation inconsistent with the approved no-fixed-FPS goal and verifies that digest synchronization preserves prebilling protections."
+    }
+  ],
+  "question": "",
+  "suggestion": "Accept this narrow amendment. Keep REQ-274/REQ-275 system-boundary proofs and the original browser, real-video playback, story, and audio/subtitle acceptance checks as separate completion obligations."
+}

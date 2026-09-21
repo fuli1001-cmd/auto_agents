@@ -15,6 +15,106 @@ from test_session_verification_ownership import project
 BEFORE = 'import unittest\nclass Tests(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(1, 1)\n'
 
 
+@pytest.fixture
+def retained_review(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from auto_agents import proof_amendments as review
+    from auto_agents.repair_v2.store import digest
+    verdict = json.loads((Path(__file__).parent / 'fixtures/proof_review_related_config.json').read_text())
+    value = {'owner': {'subject': 'session:original'}, 'candidate': 'sealed-candidate',
+             'changes': {'tests/test_provider_capability_snapshot.py': {}},
+             'delta': {row['path']: {} for row in verdict['change_coverage']},
+             'requirements': [{'requirement_ids': ['REQ-275']}]}
+    monkeypatch.setattr(review, 'inputs', lambda *args: value)
+    messages, calls = [], []
+    def provider(request):
+        calls.append(request.purpose)
+        return AgentResult(True, [], request.output_path, summary=json.dumps(verdict))
+    session = SimpleNamespace(project_root=tmp_path, _save=lambda state: None, _print=messages.append,
+        orch=SimpleNamespace(config=SimpleNamespace(efforts={}), _call_with_failover=provider))
+    state = SimpleNamespace(proof_review={}, workflow_id='', session_id='child',
+                            execution_log=[], status='paused', resolution='proof_review_invalid', resume_phase='executing')
+    store = review._store(session, value)
+    saved = {'status': 'invalid', 'inputs': digest(value), 'owner': value['owner'], 'model_calls': 1,
+             'reply': store.artifact('reply', {'text': json.dumps(verdict)}), 'error': 'incomplete amendment coverage'}
+    store.save(saved)
+    return SimpleNamespace(session=session, state=state, store=store, value=value,
+                           verdict=verdict, messages=messages, calls=calls)
+
+
+def test_real_reply_previously_invalid_is_reused_without_model_call(retained_review):
+    from auto_agents import proof_amendments as review
+    r = retained_review
+    old_reply = r.store.load()['reply']
+    assert review.ensure(r.session, r.state) == 'approved'
+    saved = r.store.load()
+    assert saved['reply'] == old_reply and saved['model_calls'] == 1 and saved['error'] is None
+    assert r.store.read(saved['receipt'])['decision'] == 'approve'
+    assert r.calls == []
+    assert any('复用已保存的审核回答' in message for message in r.messages)
+    assert review.ensure(r.session, r.state) == 'approved'
+    assert r.calls == []
+
+
+@pytest.mark.parametrize('defect,message', [
+    ('missing_test', '测试覆盖说明缺少文件'),
+    ('foreign_path', '候选改动之外'),
+    ('unknown_requirement', '未绑定的需求'),
+    ('empty_reason', '缺少原因'),
+    ('missing_product', '全部改动'),
+    ('malformed_path', '候选改动之外'),
+    ('malformed_requirement', '未绑定的需求'),
+    ('malformed_product', '全部改动'),
+])
+def test_invalid_coverage_remains_blocked_with_persisted_reason(retained_review, defect, message):
+    from auto_agents import proof_amendments as review
+    r = retained_review
+    if defect == 'missing_test':
+        r.verdict['coverage'] = r.verdict['coverage'][:1]
+    elif defect == 'foreign_path':
+        r.verdict['coverage'][0]['path'] = 'unrelated.py'
+    elif defect == 'unknown_requirement':
+        r.verdict['coverage'][0]['requirement'] = 'REQ-unapproved'
+    elif defect == 'empty_reason':
+        r.verdict['coverage'][0]['reason'] = '  '
+    elif defect == 'missing_product':
+        r.verdict['change_coverage'].pop()
+    elif defect == 'malformed_path':
+        r.verdict['coverage'][0]['path'] = []
+    elif defect == 'malformed_requirement':
+        r.verdict['coverage'][0]['requirement'] = []
+    else:
+        r.verdict['change_coverage'][0]['path'] = []
+    saved = r.store.load()
+    saved.update(status='received', reply=r.store.artifact('reply', {'text': json.dumps(r.verdict)}))
+    r.store.save(saved)
+    assert review.ensure(r.session, r.state) == 'paused'
+    saved = r.store.load()
+    assert saved['status'] == 'invalid' and message in saved['error']
+    assert r.state.resolution == 'proof_review_invalid'
+    assert any(message in m for m in r.messages)
+    assert not saved.get('receipt') and r.calls == []
+
+
+def test_genuinely_invalid_reply_can_retry_review_without_implementation(retained_review):
+    from auto_agents import proof_amendments as review
+    r = retained_review
+    saved = r.store.load()
+    saved['reply'] = r.store.artifact('reply', {'text': 'invalid JSON'})
+    r.store.save(saved)
+    assert review.ensure(r.session, r.state) == 'approved'
+    assert r.calls == ['proof_review'] and r.store.load()['model_calls'] == 2
+
+
+def test_changed_inputs_cannot_reuse_previous_approval(retained_review):
+    from auto_agents import proof_amendments as review
+    r = retained_review
+    assert review.ensure(r.session, r.state) == 'approved'
+    r.value['candidate'] = 'different-candidate'
+    assert review.ensure(r.session, r.state) == 'approved'
+    assert r.calls == ['proof_review']
+
+
 def test_unittest_addition_and_requirement_revision_can_be_reviewed():
     assert admissible(BEFORE, BEFORE + '    def test_added(self) -> None:\n        self.assertTrue(True)\n')
     assert admissible(BEFORE, BEFORE.replace('assertEqual(1, 1)', 'assertEqual(2, 2)'))
@@ -82,7 +182,7 @@ def test_reviewed_coverage_maps_changes_without_bypassing_release_policy(tmp_pat
     assert [s.proof_id for s in config.steps] == ['release.all']
 
 
-@pytest.mark.parametrize('interrupt', ['', 'received', 'approved'])
+@pytest.mark.parametrize('interrupt', ['', 'received', 'approved', 'invalid'])
 def test_real_candidate_review_verification_delivery_and_restart(tmp_path, monkeypatch, interrupt):
     root, child = project(tmp_path)
     configure_local_writer(root, child, """
@@ -100,7 +200,7 @@ with Path('tests/test_owned.py').open('a') as f:
                 'decision': 'approve', 'reason': 'New regression preserves the original value requirement',
                 'change_coverage': [{'path': p, 'reason': 'Required candidate repair'} for p in value['delta']],
                 'coverage': [{'path': path, 'requirement': 'original_goal', 'reason': 'Verifies the requested value'}
-                             for path in value['changes']]}))
+                             for path in value['delta']]}))
         return REAL_PROVIDER_CALL(self, request)
     monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
     if interrupt:
@@ -109,7 +209,8 @@ with Path('tests/test_owned.py').open('a') as f:
         interrupted = []
         def crash(store, state, **updates):
             result = transition(store, state, **updates)
-            if 'proof-reviews' in str(store.root) and updates.get('status') == interrupt and not interrupted:
+            boundary = 'received' if interrupt == 'invalid' else interrupt
+            if 'proof-reviews' in str(store.root) and updates.get('status') == boundary and not interrupted:
                 interrupted.append(True)
                 raise KeyboardInterrupt()
             return result
@@ -119,6 +220,11 @@ with Path('tests/test_owned.py').open('a') as f:
     if interrupt:
         assert result.status == 'paused'
         receipt = result.candidate_custody['receipt']['fingerprint']
+        if interrupt == 'invalid':
+            # Simulate the old validator rejecting this already received approval.
+            store = Store(root / '.auto-agents/state/proof-reviews' / result.proof_review['inputs'])
+            with store.locked():
+                store.transition(store.load(), status='invalid', error='incomplete amendment coverage')
         result = Session(Orchestrator(root), mode='fix', auto_approve=True).resume(child.session_id)
         assert result.candidate_custody['receipt']['fingerprint'] == receipt
     assert result.status == 'completed', [(r.get('action'), r.get('result')) for r in result.execution_log]
