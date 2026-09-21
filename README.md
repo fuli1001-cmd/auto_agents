@@ -1217,20 +1217,18 @@ the next batch's concurrency instead of incorrectly scaling it up. Integration m
 in the run state's `resume_context.parallel_integration_metrics` object.
 For `copilot-cli`, `subscription_tier` can also be set to `pro+`.
 
-Foreground workflows show timestamped user logs on stderr. By default, interactive terminals also
-show the current goal, stages, active tasks and a task progress bar; redirected output is plain text.
-The bar counts completed tasks in the **current accepted plan**, not elapsed time or a forecast.
-Plan changes explain changes to the denominator. Retries do not count as new tasks, and parallel
-work counts as complete only after the controller accepts its integration. Stage rewinds explicitly
-invalidate affected stages. Sessions without a task plan show their current operation instead.
+Foreground workflows show concise timestamped status updates on stderr. Interactive terminals
+show a single status line and elapsed time; redirected output is plain text. Model reasoning,
+protocol markers, internal identifiers and diagnostic paths stay in the detailed logs.
 
 Use `--log-mode plain` to disable the live display or `--log-mode debug` to print technical
 diagnostics. `--print-agent-output` additionally expands visible Agent output and disables the live
 display. These choices are inherited by nested workflows and automatic recovery. Built-in user
 messages follow `docs.language`; Agent replies remain verbatim. Questions and confirmations remain
-visible in concise mode. CLI command results remain on stdout for scripts.
+visible in concise mode. Session commands (`collab`, `fix`, `provider-resolve`) print their full
+state JSON only in debug mode; other structured command results remain on stdout for scripts.
 
-Diagnostics are collected even in concise mode. The startup message links to `diagnostics.json`:
+Diagnostics are collected even in concise mode and can be found through `diagnostics.json`:
 
 - Runs use `.auto-agents/runs/<run_id>/`; sessions use
   `.auto-agents/state/sessions/<session_id>/logs/`.
@@ -1927,6 +1925,15 @@ Standard `ROUTE_WORKFLOW v1` markers are accepted during both conversation and e
 the equivalent JSON envelope, and a saved unconsumed route is applied before another agent call.
 Saved `GOAL_CLEAR`, `GOAL_ACHIEVED`, and `NEED_USER_ASSIST` replies are likewise completed or replayed
 from their durable boundary instead of spending a fresh diagnostic turn.
+
+For acceptance of existing behavior, `target="acceptance"` and `spec_seed` select a session-owned
+execution stage. It uses the current checkout, including consumed child deliveries, and does not
+resume or replace the project's saved development run. The historical
+`target="run"` / `scope="existing_behavior_real_acceptance_only"` request maps to this entry too.
+Services, browser operations and runtime evidence are allowed within the original authorization;
+product/configuration changes are restored and rejected. Results are saved before independent
+evidence review, so resuming review does not repeat generation. Missing evidence or a rejected
+review cannot complete the goal. A stopped older development run remains stopped.
 
 If a provider emits a fix-only `FIX_DISPOSITION` while still inside the read-only collab frame,
 auto_agents deterministically normalizes bounded `fix`, `run_iteration`, and `resume_child`

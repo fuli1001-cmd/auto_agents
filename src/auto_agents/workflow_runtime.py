@@ -751,6 +751,12 @@ class WorkflowCoordinator:
         with context:
             if state.status != "completed":
                 return
+            if state.mode == 'collab' and state.acceptance_execution.get('phase') == 'completed':
+                from .session_acceptance import completed
+                if completed(session, state):
+                    return
+                from .session_verification import ownership_error
+                raise ownership_error(state, '已保存的验收证据不完整或发生变化，不能复用完成结果。')
             def committed():
                 return (bool(state.candidate_custody) and completed_delivery(state)
                         or _head_contains_completed_session(session.project_root, state.session_id))

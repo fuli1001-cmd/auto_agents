@@ -3992,7 +3992,11 @@ def _dispatch(args) -> int:
                 and _deferred_release_enabled(orchestrator)
             ):
                 ensure_release_worker(project_root)
-            print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
+            if orchestrator.reporter.presenter.mode == 'debug':
+                print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
+            else:
+                orchestrator.reporter.bind(state.mode, state.session_id, goal=state.goal, workflow_id=state.workflow_id)
+                orchestrator.reporter.observe_session(state)
             if state.status == "completed":
                 return 0
             if state.status in {"waiting_child", "waiting_user", "paused", "blocked"}:
@@ -4040,6 +4044,11 @@ def _dispatch(args) -> int:
                 status="failed",
                 error=str(error),
             )
+            if 'orchestrator' in locals() and orchestrator.reporter.presenter.mode != 'debug':
+                orchestrator.reporter.exception(error)
+                orchestrator.reporter.emit('status', status=(
+                    '执行失败' if orchestrator.reporter.language == 'zh' else 'Failed'))
+                return 1
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
         finally:

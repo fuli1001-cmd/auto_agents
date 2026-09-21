@@ -547,6 +547,8 @@ class Session:
                 # Restore that durable preimage before consuming a saved route
                 # or capturing any baseline for a child workflow.
                 self._reconcile_interrupted_collab_checkpoints(state)
+                if state.acceptance_execution and state.acceptance_execution.get('phase') not in {'blocked', 'completed'}:
+                    return self._phase_collab_loop(state)
                 routed, normalization_error = (
                     self._resume_pending_collab_disposition(state)
                 )
@@ -575,7 +577,9 @@ class Session:
                         )
                         self._save(state)
                 if state.status == "executing" and not state.active_handoff_id:
-                    self._resume_pending_collab_assistance(state)
+                    from .session_acceptance import recover_deferred
+                    if not recover_deferred(self, state):
+                        self._resume_pending_collab_assistance(state)
                     completed = self._resume_pending_collab_completion(state)
                     if completed is not None:
                         return completed
@@ -1651,8 +1655,8 @@ class Session:
             return None, ""
 
         target = str(route.get("target", "")).strip()
-        if target not in {"fix", "run", "resume"}:
-            return None, "ROUTE_WORKFLOW v1 target must be fix, run, or resume."
+        if target not in {"fix", "run", "resume", "acceptance"}:
+            return None, "ROUTE_WORKFLOW v1 target must be fix, run, resume, or acceptance."
 
         if target == "resume":
             resume_id = str(route.get("resume_handoff_id", "")).strip()
@@ -2090,6 +2094,9 @@ class Session:
                 else WorkflowStore(self.project_root)
             )
             snapshot = store.load(state.workflow_id)
+        from .session_acceptance import is_request, prepare
+        if self.mode == 'collab' and is_request(target, payload):
+            return prepare(self, state, payload)
         if target == "run" and self._coordinator is not None:
             route_ready, route_detail = self._coordinator.prepare_run_route(payload)
             state.execution_log.append(
@@ -2619,6 +2626,10 @@ class Session:
     # ── Phase 2b: Collab mode loop ───────────────────────────────
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
+        if state.acceptance_execution and state.acceptance_execution.get('phase') not in {'blocked', 'completed'}:
+            from .session_acceptance import drive
+            self._current_state = state
+            return drive(self, state)
         if not self._goal_environment_confirmed(state):
             state.status = "conversing"
             state.execution_log.append(
@@ -2978,12 +2989,13 @@ class Session:
         assistance: str,
     ) -> None:
         state.stall_count = 0
-        self._print(f"\nAgent:\n{reply.strip()}")
-        self._print(f"\nAgent needs your assistance: {assistance}")
+        reporter = getattr(self.orch, 'reporter', None)
+        if reporter is not None and reply:
+            reporter.text(reply, diagnostic=True)
         state.status = "waiting_user"
         self._save(state)
         user_reply = self._prompt_user(
-            "\nYour response (or result): ",
+            assistance + "\n请输入回复：",
             multiline=True,
         )
         state.conversation.append(
@@ -3810,10 +3822,11 @@ class Session:
             "4. For an existing-behavior defect, output one single-line ROUTE_WORKFLOW v1 JSON marker with target='fix', reason, summary, and issue_seed",
             "- Use issue_seed task_id/task_ids or requirement_ids as task authority only when taking responsibility for those tasks. For a focused existing-behavior fix that does not adopt planned work, set verification_scope={\"mode\":\"focused_fix\"}; requirement_ids then express association only. Retain a concrete targeted verification command. Never invent task ownership or adopt another workflow's work.",
             "5. For missing/new capability or a requirements, architecture, or persistence change, output one single-line ROUTE_WORKFLOW v1 JSON marker with target='run', reason, summary, and spec_seed",
+            "   For executing acceptance of EXISTING behavior (browser operations, running services, inspecting real results), use target='acceptance' with spec_seed describing the existing goal's acceptance steps. This entry does not read, resume or replace the project's saved development run. Never request restoration of unrelated stopped work merely to perform acceptance.",
             "6. To retry a previously returned child after its blocker changed, use target='resume' and resume_handoff_id",
             "7. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
             "8. Provide a brief diagnostic status update",
-            "9. Never implement, fix, commit, or edit target-project code in collab; route every write to fix or run",
+            "9. Never implement, fix, commit, or edit target-project code in collab; route product changes to fix or run, and runtime acceptance operations to acceptance",
             "10. Repository selection, implementation scope, test strategy, safe migration, engine self-repair, commits, and workflow recovery are internal decisions. Never ask the user to choose or authorize them.",
             "11. Every proposed engine repair must include necessity:{decision:required|needs_user|insufficient|skip, blocked_step, consequence, evidence_refs, recovery_check}. "
             "Judge this in the current diagnosis and reuse prior valid evidence. Tie it to the original user goal; "
@@ -3937,7 +3950,9 @@ class Session:
         # not disable the legacy idle watchdog when smart supervision is off.
         should_stream = self._print_agent_output
         acceleration = self.config.execution.acceleration
-        continuation_key = (
+        acceptance_purpose = ('acceptance_review' if label.startswith('acceptance-review-') else
+                              'acceptance_execute' if label.startswith('acceptance-execute-') else '')
+        continuation_key = acceptance_purpose or (
             "converse" if label.startswith("converse-") else self.mode
         )
         current_head = head_ref(self.project_root)
@@ -3960,7 +3975,7 @@ class Session:
                 resume_session_id = ""
         request = AgentRequest(
             stage=effort_stage,
-            purpose=(self.mode + "_converse" if label.startswith("converse-") else self.mode),
+            purpose=acceptance_purpose or (self.mode + "_converse" if label.startswith("converse-") else self.mode),
             effort=effort,
             prompt=prompt,
             cwd=self.project_root,
@@ -3971,9 +3986,10 @@ class Session:
             model_adaptation=self.config.prompting.model_adaptation,
             sandbox_mode=(
                 "read-only"
-                if label.startswith("converse-")
+                if acceptance_purpose == 'acceptance_review' or label.startswith("converse-")
                 or (
                     self.mode == "collab"
+                    and not acceptance_purpose
                     and acceleration.enabled
                     and acceleration.collab_read_only_enabled
                 )
@@ -5610,7 +5626,12 @@ class Session:
     def _print(self, msg: str, flush: bool = False) -> None:
         reporter = getattr(self.orch, "reporter", None)
         if reporter is not None:
-            reporter.text(msg)
+            # State changes are already published by _save/observe_session.
+            # Execution prose (including provider protocols) is diagnostic;
+            # interactive clarification remains visible as conversation.
+            current = getattr(self, '_current_state', None)
+            dialogue = current is not None and current.status == 'conversing'
+            reporter.text(msg, diagnostic=not dialogue)
         else:
             print(msg, file=sys.stderr, flush=flush)
 

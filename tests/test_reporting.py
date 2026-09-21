@@ -50,13 +50,14 @@ def test_progress_replans_rewinds_and_does_not_count_attempts(report):
     assert len(reporter.snapshot.tasks) == 2
     state.tasks[1:] = [task("T2a"), task("T2b")]
     reporter.observe_run(state)
-    assert "计划调整：2 → 3" in stream.getvalue()
+    assert any(e['type'] == 'plan.changed' and e['data']['total'] == 3 for e in events(reporter))
+    assert "计划调整" not in stream.getvalue()
     assert reporter.snapshot.done == 1
     state.tasks[0].status = "pending"
     reporter.rewind("plan")
     reporter.observe_run(state)
     assert reporter.snapshot.done == 0
-    assert "返回计划" in stream.getvalue()
+    assert any(e['type'] == 'stage.rewind' for e in events(reporter))
     assert not any("\x1b" in str(record) for record in events(reporter))
 
 
@@ -66,7 +67,7 @@ def test_same_count_replacement_is_a_plan_change(report):
     reporter.observe_run(state)
     state.tasks = [task("replacement")]
     reporter.observe_run(state)
-    assert "计划调整：1 → 1" in stream.getvalue()
+    assert any(e['type'] == 'plan.changed' and e['data']['total'] == 1 for e in events(reporter))
 
 
 def test_worker_done_waits_for_main_integration(report, tmp_path):
@@ -304,7 +305,8 @@ def test_live_panel_does_not_redirect_streams_and_cleans_up(tmp_path, monkeypatc
     for n in range(1, 5):
         reporter.task(str(n), "权限检查", "implement", 1)
     frame = reporter.presenter._frame(reporter)
-    assert "1/5" in frame and "+1" in frame and "处理中 4" in frame
+    assert '当前状态：' in frame and '\n' not in frame
+    assert '权限检查' not in frame and '1/5' not in frame
     assert reporter.presenter._live is not None
     reporter.presenter._live.update(Text(frame), refresh=True)
     with reporter.presenter.input():
@@ -404,8 +406,30 @@ def test_malformed_optional_logging_metadata_cannot_block_a_run(tmp_path):
     reporter.bind("run", "example")
     reporter.observe_run(RunState("example", tasks=[task()]))
     assert reporter.snapshot.subject == "example"
-    assert "Current plan" in stream.getvalue()
+    assert "Status:" in stream.getvalue()
     reporter.close()
+
+
+def test_user_log_is_concise_but_diagnostics_retain_protocol_and_details(report):
+    reporter, stream = report
+    from auto_agents.models import SessionState
+    from auto_agents.session import Session
+    orch = SimpleNamespace(project_root=reporter.project_root, reporter=reporter)
+    session = object.__new__(Session)
+    session.orch = orch
+    session._current_state = SessionState('example', mode='collab', status='executing')
+    protocol = 'Agent:\nLong explanation\nROUTE_WORKFLOW v1: {"target":"run","internal_id":"old-run"}'
+    session._print(protocol)
+    reporter.emit('diagnostics', path='/private/diagnostics.json')
+    reporter.repair('diagnosing', candidate='internal-candidate')
+    reporter.emit('status', status='等待用户')
+    reporter.text('是否继续本次验收？请输入回复：')
+    displayed = stream.getvalue()
+    user_log = (reporter.root / 'user.log').read_text()
+    for text in (displayed, user_log):
+        assert '等待用户' in text and '是否继续本次验收' in text
+        assert 'ROUTE_WORKFLOW' not in text and '/private/' not in text and 'internal-candidate' not in text
+    assert any(protocol == e['message'] for e in events(reporter))
 
 
 def test_live_stage_is_not_replaced_by_an_unchanged_persisted_stage(report):

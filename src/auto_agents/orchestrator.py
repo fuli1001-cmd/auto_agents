@@ -677,7 +677,12 @@ class Orchestrator:
         reporter: Optional[Reporter] = None,
     ) -> None:
         self.project_root = project_root.resolve()
-        self.config = load_project_config(self.project_root)
+        # Compatibility warnings are recorded by the config logger below;
+        # avoid also printing Python file/line diagnostics to the user's terminal.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*obsolete and ignored.*', category=UserWarning)
+            self.config = load_project_config(self.project_root)
         self.adapter = self._build_adapter(self.config)
         self.agent_output_stream = agent_output_stream or sys.stderr
         self.reporter = reporter or get_reporter(

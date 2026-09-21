@@ -40,8 +40,9 @@ _LABELS = {
     "implement": ("实现", "Implementation"), "visual_judge": ("视觉检查", "Visual checks"),
     "verify": ("验收", "Verification"), "readme": ("文档", "Documentation"),
     "conversing": ("讨论目标", "Discussing the goal"), "executing": ("执行", "Executing"),
+    "waiting_child": ("执行子任务", "Running a subtask"),
     "verifying": ("验证", "Verifying"), "pending": ("等待执行", "Pending"),
-    "in_progress": ("执行中", "In progress"), "done": ("已完成", "Done"),
+    "in_progress": ("执行中", "In progress"), "running": ("执行中", "Running"), "done": ("已完成", "Done"),
     "completed": ("已完成", "Completed"), "failed": ("执行失败", "Failed"),
     "blocked": ("受阻", "Blocked"), "waiting_user": ("等待用户", "Waiting for input"),
     "paused": ("已暂停", "Paused"), "review": ("审查", "Review"),
@@ -104,6 +105,27 @@ _MESSAGES = {
 def _label(key: str, language: str) -> str:
     pair = _LABELS.get(key)
     return pair[0 if language == "zh" else 1] if pair else key
+
+
+def _concise_message(kind: str, message: str, language: str) -> str:
+    """Keep the user log operational; full event payloads remain diagnostic."""
+    zh = language == 'zh'
+    if kind in {'status', 'command.completed', 'command.failed', 'user.message'}:
+        if kind == 'user.message':
+            message = '\n'.join(line for line in message.splitlines()
+                                if not re.match(r'^\s*(ROUTE_WORKFLOW|NEED_USER_ASSIST|GOAL_ACHIEVED|BUG_FOUND)\b', line))
+        return message.strip()
+    if kind.startswith('repair.'):
+        if '受阻' in message or 'failed' in message.lower():
+            return '当前状态：恢复受阻' if zh else 'Status: Recovery blocked'
+        return '当前状态：正在恢复任务' if zh else 'Status: Recovering the task'
+    if kind.startswith('verification.') or kind.startswith('verify.'):
+        return '当前状态：正在验证' if zh else 'Status: Verifying'
+    if kind == 'stage.started':
+        return message
+    if kind == 'heartbeat':
+        return '任务仍在执行中' if zh else 'Task is still running'
+    return ''
 
 
 def _elapsed(seconds: float) -> str:
@@ -265,6 +287,8 @@ class ConsolePresenter:
         zh = reporter.language == "zh"
         stamp = datetime.now().astimezone().strftime("[%H:%M:%S] ")
         duration = _elapsed(time.monotonic() - self._started)
+        if self.mode != 'debug':
+            return stamp + ("当前状态：" if zh else "Status: ") + _label(snapshot.status, reporter.language) + '  ' + duration
         goal = snapshot.goal or reporter.project_name
         label = ("目标" if zh else "Goal") if snapshot.goal else ("项目" if zh else "Project")
         lines = [f"{label}: {goal[:100]}  {duration}"]
@@ -576,6 +600,11 @@ class Reporter:
         output_root = owner.root if current_lane or self.root is None else self.root
         timestamp = now()
         message = plain_text(message)
+        visible = _concise_message(kind, message, self.language) if audience == 'user' else ''
+        if visible and visible == getattr(owner, '_last_user_message', None):
+            visible = ''
+        elif visible:
+            owner._last_user_message = visible
         with owner._lock:
             if owner._closed or self._closed:
                 return
@@ -594,14 +623,17 @@ class Reporter:
             try:
                 with (output_root / "events.jsonl").open("a", encoding="utf-8") as target:
                     target.write(json.dumps(record, ensure_ascii=False) + "\n")
-                if audience == "user" and message and current_lane:
+                if visible and current_lane:
                     with (owner.root / "user.log").open("a", encoding="utf-8") as target:
-                        for line in redact(message).splitlines():
+                        for line in redact(visible).splitlines():
                             target.write(f"{timestamp} {line}\n")
             except Exception as error:
                 owner.capture_failed(error)
         if message and current_lane:
-            owner.presenter.show(owner, message, timestamp=timestamp, debug=audience != "user")
+            if owner.presenter.mode == 'debug':
+                owner.presenter.show(owner, message, timestamp=timestamp, debug=audience != 'user')
+            elif visible:
+                owner.presenter.show(owner, visible, timestamp=timestamp)
 
     def emit(self, kind: str, **data: object) -> None:
         self.event(kind, data, audience="user", message=self.message(kind, **data))
@@ -708,6 +740,8 @@ class Reporter:
         self.snapshot = current
         self._last_snapshot = encoded
         self.event("state.snapshot", current.__dict__)
+        if not initialized or previous.status != current.status:
+            self.emit('status', status=_label(current.status, self.language))
         if previous.plan_id != current.plan_id and current.plan_id and self._announced_plan != current.plan_id:
             self.emit("plan.changed" if previous.plan_id else "plan.ready",
                       before=len(previous.tasks), total=len(current.tasks), done=current.done)

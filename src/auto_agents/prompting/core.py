@@ -97,7 +97,7 @@ class ProviderRuntime:
 READ_ONLY = frozenset({
     "review", "collab", "collab_converse", "fix_converse", "clarify_converse",
     "provider_resolve_converse", "evidence_preflight", "visual_judge", "arbiter",
-    "diagnosis", "self_repair_review", "sync-agent-instructions", "readme_proposal",
+    "diagnosis", "self_repair_review", "sync-agent-instructions", "readme_proposal", "acceptance_review",
 })
 IMPLEMENT = frozenset({"implement", "fix", "self_repair"})
 DOCUMENT = frozenset({"clarify", "design", "plan", "prototype", "readme",
@@ -140,6 +140,12 @@ def role_rules(purpose: str) -> Tuple[PromptBlock, ...]:
         rules.append(PromptBlock(
             "This stage is read-only. Inspect and return the required assessment or route. "
             "Do not edit files, install dependencies, commit, or run mutating operations.", "stage.read_only"))
+    elif purpose == 'acceptance_execute':
+        rules.append(PromptBlock(
+            "Execute only the existing user's acceptance scenario, using the required real environment. "
+            "You may start existing services, operate the browser and write runtime data/evidence. "
+            "Do not edit product code, tests, configuration, requirements or workflow control state. "
+            "Do not adopt unrelated development tasks. Preserve external-operation receipts and reuse results.", "stage.acceptance"))
     elif purpose in IMPLEMENT:
         rules.append(PromptBlock(
             "Implement the owned change and reuse sufficient behavioral coverage; add tests "
