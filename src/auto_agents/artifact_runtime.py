@@ -20,6 +20,7 @@ _context = contextvars.ContextVar("artifact_context", default=None)
 _owned = set()
 _acquired = {}
 _warned = False
+_pending_diagnostics = []
 _timer = None
 _timer_lock = threading.Lock()
 
@@ -73,9 +74,23 @@ def track(path, kind="scratch", *, project=None, scope=None, metadata=None, refe
         # Sandboxed producers may not own the host registry. Their enclosing
         # registered sandbox retains ownership; never broaden write permission.
         if not _warned:
-            print(f"Storage tracking unavailable; unregistered artifacts will be retained: {error}", file=sys.stderr)
             _warned = True
+            message = f"Storage tracking unavailable; unregistered artifacts will be retained: {error}"
+            from .reporting import find_reporter
+            reporter = find_reporter(project)
+            if reporter is not None:
+                reporter.text(message, diagnostic=True)
+            else:
+                # Command-scoped tracking starts before the CLI reporter.
+                # Preserve the diagnostic until its first subject is bound.
+                _pending_diagnostics.append(message)
         return None
+
+
+def take_tracking_diagnostics():
+    messages = list(_pending_diagnostics)
+    _pending_diagnostics.clear()
+    return messages
 
 
 def release(identity, *, failed=False):

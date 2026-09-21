@@ -493,6 +493,9 @@ class Reporter:
                 self.presenter.clock_announced = True
                 self.emit("clock", date=datetime.now().astimezone().isoformat(timespec="seconds"))
             self.emit("diagnostics", path=str(root / "diagnostics.json"))
+            from .artifact_runtime import take_tracking_diagnostics
+            for message in take_tracking_diagnostics():
+                self.text(message, diagnostic=True)
 
     @contextmanager
     def preserve_subject(self):

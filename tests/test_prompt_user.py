@@ -69,6 +69,23 @@ class PromptUserTests(unittest.TestCase):
         self.assertEqual(reopen.call_count, 1)
         read.assert_called_once_with("Confirm? ", "n")
 
+    def test_multiline_submission_hint_is_localized_for_the_terminal(self) -> None:
+        orchestrator = self._make_orchestrator()
+        orchestrator.reporter.language = 'zh'
+        fake_stdin = mock.Mock()
+        fake_stdin.isatty.return_value = True
+        fake_stdin.read.return_value = '保持原目标\n'
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop('unittest', None)
+            with mock.patch.object(sys, 'stdin', fake_stdin), \
+                    mock.patch.object(orchestrator, '_reopen_stdin_from_tty'), \
+                    mock.patch.object(orchestrator.logger, 'info') as log:
+                reply = orchestrator._prompt_user('请输入回复：', multiline=True)
+        assert reply == '保持原目标\n'
+        message = log.call_args.args[0]
+        assert '输入完成后，换行并按' in message
+        assert 'Press Ctrl' not in message and 'or Ctrl' not in message
+
 
 if __name__ == "__main__":
     unittest.main()

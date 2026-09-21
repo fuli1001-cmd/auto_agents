@@ -24,7 +24,7 @@ def setup_acceptance(tmp_path, monkeypatch, *, legacy=False, outcome='passed', a
     if legacy:
         state.conversation = [{'role': 'agent', 'content': route}, {'role': 'orchestrator', 'content': 'run remains blocked'},
             {'role': 'agent', 'content': 'NEED_USER_ASSIST v1: {"decision_class":"goal_choice","question":"Resume the stopped task?"}'}]
-        state.execution_log = [{'action': 'run_route_deferred'}, {'action': 'collab'}]
+        state.execution_log = [{'action': 'run_route_deferred', 'result': 'run remains blocked'}, {'action': 'collab'}]
         state.status, state.resume_phase, state.resolution = 'paused', 'executing', 'interrupted_by_user'
     save_session_state(root, state)
     preserved = {p: (root / p).read_bytes() for p in ['.auto-agents/state/run_state.json', '.auto-agents/state/task_plan.json', 'value.py']}
@@ -90,6 +90,35 @@ def test_restart_after_execution_reuses_result_before_review(tmp_path, monkeypat
     resumed = Session(Orchestrator(root), mode='collab', auto_approve=True).resume(state.session_id)
     assert resumed.status == 'completed'
     assert calls == ['acceptance_execute', 'acceptance_review']
+
+
+def test_legacy_acceptance_survives_real_resume_bookkeeping(tmp_path, monkeypatch):
+    root, state, calls, preserved = setup_acceptance(tmp_path, monkeypatch, legacy=True)
+    state.provider_continuations = {'collab': {'provider_session_id': 'retained-diagnostic-session'}}
+    save_session_state(root, state)
+    def obsolete_question(prompt):
+        pytest.fail('Replayed the obsolete scope-expansion question: ' + prompt)
+    result = Session(Orchestrator(root, user_input_fn=obsolete_question), mode='collab', auto_approve=True).resume(state.session_id)
+    assert result.status == 'completed'
+    assert calls == ['acceptance_execute', 'acceptance_review']
+    actions = [row['action'] for row in result.execution_log]
+    assert 'provider_continuation_invalidated' in actions and 'attempt_epoch_started' in actions
+    assert {p: (root / p).read_bytes() for p in preserved} == preserved
+
+
+@pytest.mark.parametrize('change', ['unrelated_refusal', 'different_route', 'answered_question'])
+def test_legacy_recovery_requires_the_unanswered_acceptance_boundary(tmp_path, monkeypatch, change):
+    from auto_agents.session_acceptance import recover_deferred
+    root, state, _, _ = setup_acceptance(tmp_path, monkeypatch, legacy=True)
+    state.execution_log.extend({'action': 'attempt_epoch_started'} for _ in range(10))
+    if change == 'unrelated_refusal':
+        state.conversation[-2]['content'] = 'A different issue needs a user decision'
+    elif change == 'different_route':
+        state.conversation[-3]['content'] = 'ROUTE_WORKFLOW v1: {"target":"run","spec_seed":{"scope":"new_feature"}}'
+    else:
+        state.conversation.append({'role': 'user', 'content': 'I choose a new goal'})
+    assert not recover_deferred(Session(Orchestrator(root), mode='collab'), state)
+    assert not state.acceptance_execution
 
 
 def test_completed_acceptance_with_changed_evidence_cannot_be_reused(tmp_path, monkeypatch):

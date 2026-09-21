@@ -432,6 +432,41 @@ def test_user_log_is_concise_but_diagnostics_retain_protocol_and_details(report)
     assert any(protocol == e['message'] for e in events(reporter))
 
 
+@pytest.mark.parametrize('bound', [False, True])
+def test_storage_tracking_failure_is_diagnostic_before_and_after_reporter_start(tmp_path, monkeypatch, capsys, bound):
+    from auto_agents import artifact_runtime
+    from auto_agents.artifact_store import ArtifactStore
+    monkeypatch.setattr(artifact_runtime, '_warned', False)
+    monkeypatch.setattr(artifact_runtime, '_pending_diagnostics', [])
+    project = tmp_path / 'target'
+    project.mkdir()
+    resource = project / 'retained'
+    resource.mkdir()
+    stream = io.StringIO()
+    reporter = Reporter(project, stream, language='zh') if bound else None
+    if reporter:
+        reporter.bind('collab', 'session')
+    def overlap(*args, **kwargs):
+        raise ValueError('overlapping artifact ownership')
+    monkeypatch.setattr(ArtifactStore, 'register', overlap)
+    token = artifact_runtime.activate(project)
+    try:
+        assert artifact_runtime.track(resource) is None
+    finally:
+        artifact_runtime.deactivate(token)
+    assert resource.exists()
+    if reporter is None:
+        reporter = Reporter(project, stream, language='zh')
+        reporter.bind('collab', 'session')
+    try:
+        assert any('overlapping artifact ownership' in e['message'] for e in events(reporter))
+        assert 'Storage tracking' not in stream.getvalue() + capsys.readouterr().err
+        user_log = reporter.root / 'user.log'
+        assert not user_log.exists() or 'overlapping' not in user_log.read_text()
+    finally:
+        reporter.close()
+
+
 def test_live_stage_is_not_replaced_by_an_unchanged_persisted_stage(report):
     reporter, stream = report
     state = RunState("example", workflow_version=2, current_stage="verify", tasks=[task(status="done")])

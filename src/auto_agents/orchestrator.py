@@ -6012,7 +6012,10 @@ class Orchestrator:
             return default
         if sys.stdin.isatty():
             if multiline:
-                self.logger.info(prompt + " (Press Ctrl+D or Ctrl+Z to submit):", extra={"audience": "user"})
+                submit_key = 'Ctrl+Z' if os.name == 'nt' else 'Ctrl+D'
+                hint = (f"输入完成后，换行并按 {submit_key} 提交。" if self.reporter.language == 'zh'
+                        else f"When finished, press Enter then {submit_key} to submit.")
+                self.logger.info(prompt + '\n' + hint, extra={"audience": "user"})
                 try:
                     text = sys.stdin.read()
                 except EOFError:

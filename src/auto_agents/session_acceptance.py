@@ -43,27 +43,31 @@ def prepare(session, state, payload):
 
 def recover_deferred(session, state):
     """Upgrade the specific pre-entry pause emitted by the legacy run router."""
-    if state.acceptance_execution or not state.conversation or state.conversation[-1].get('role') != 'agent':
+    if state.acceptance_execution or len(state.conversation) < 3 or state.conversation[-1].get('role') != 'agent':
         return False
     last = state.conversation[-1].get('content', '')
     if 'NEED_USER_ASSIST v1:' not in last:
         return False
-    if not any(row.get('action') == 'run_route_deferred' for row in state.execution_log[-3:]):
+    # Bind the unanswered question to its preceding route and controller
+    # refusal. Restart bookkeeping can append any number of execution events;
+    # it must neither hide this boundary nor revive an unrelated older route.
+    route_message, refusal = state.conversation[-3:-1]
+    if route_message.get('role') != 'agent' or refusal.get('role') != 'orchestrator':
         return False
-    # Only a previously requested acceptance route is eligible, not an arbitrary
-    # older route, a new product request, or an answered scope-change question.
-    for row in reversed(state.conversation[:-1]):
-        match = re.search(r'^ROUTE_WORKFLOW v1:\s*(\{.*\})\s*$', row.get('content', ''), re.MULTILINE)
-        if match:
-            try:
-                route = json.loads(match.group(1))
-            except ValueError:
-                return False
-            if not is_request(route.get('target'), route):
-                return False
-            prepare(session, state, route)
-            return True
-    return False
+    if not any(row.get('action') == 'run_route_deferred' and row.get('result') == refusal.get('content')
+               for row in state.execution_log):
+        return False
+    match = re.search(r'^ROUTE_WORKFLOW v1:\s*(\{.*\})\s*$', route_message.get('content', ''), re.MULTILINE)
+    if not match:
+        return False
+    try:
+        route = json.loads(match.group(1))
+    except ValueError:
+        return False
+    if not is_request(route.get('target'), route):
+        return False
+    prepare(session, state, route)
+    return True
 
 
 def _json(text):
