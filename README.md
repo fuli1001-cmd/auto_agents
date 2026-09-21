@@ -1903,6 +1903,13 @@ content-correction or background-job policies. Explicit user limits on product c
 still apply. Agent-generated route constraints remain derived context and cannot create user
 restrictions; a configured retry ceiling must not be reported as retries already consumed.
 
+Controlled `blocked` and `failed` results from session commands and workflow resume enter the
+same root-cause investigation as exceptions. The diagnostic context binds the current session or
+run, including acceptance evidence and the original goal; unrelated saved runs remain outside
+that investigation. Only an approved engine-owned diagnosis dispatches self-repair. Other owners
+and unavailable diagnoses preserve the failure, with a `terminal-triage.json` record beside the
+session state (or in the run's outputs). Waiting and paused states do not start this investigation.
+
 Before the first implementation route, collab records whether the requested outcome is real or
 simulated. An explicit goal is classified without another prompt; an ambiguous goal receives one
 plain-language, project-specific choice generated from the current project rather than a fixed

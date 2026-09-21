@@ -12,7 +12,8 @@ from test_repair_control import configuration
 
 
 @pytest.mark.parametrize("rerun", ["retry", "updated", "already_fixed"])
-def test_same_collab_command_continues_after_blocked_repair(tmp_path, monkeypatch, rerun):
+@pytest.mark.parametrize("failure_mode", ["exception", "controlled"])
+def test_same_collab_command_continues_after_blocked_repair(tmp_path, monkeypatch, rerun, failure_mode):
     from auto_agents import cli, repair_client
     project = tmp_path / "project"
     project.mkdir()
@@ -28,8 +29,11 @@ def test_same_collab_command_continues_after_blocked_repair(tmp_path, monkeypatc
 
     class Orchestrator:
         def __init__(self, project_root, **kwargs):
+            from auto_agents.reporting import get_reporter
+            import sys
             self.project_root = project_root
             self.config = SimpleNamespace(execution=SimpleNamespace(autonomy=autonomy))
+            self.reporter = get_reporter(project_root, sys.stderr)
 
         def _ensure_agent_instructions_synced(self):
             pass
@@ -45,6 +49,10 @@ def test_same_collab_command_continues_after_blocked_repair(tmp_path, monkeypatc
             resumed.append(session_id)
             if invocation == 2 and rerun == "already_fixed":
                 state.status = "completed"
+                return state
+            if failure_mode == 'controlled':
+                state.status, state.resolution = 'blocked', 'engine_bug'
+                save_session_state(project, state)
                 return state
             raise RuntimeError("engine bug prevents the retained collab from continuing")
 

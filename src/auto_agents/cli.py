@@ -2027,6 +2027,56 @@ def _record_blocked_self_repair_triage(
         pass
 
 
+def _triage_controlled_workflow_result(project_root, orchestrator, state, args,
+                                      run_lock, foreground, health_runtime=None):
+    """Use the same ownership investigation for returned failures and exceptions."""
+    from copy import copy
+    from .controlled_failure import capture, record
+    failure = capture(state)
+    if failure is None:
+        return None
+    evidence = failure.evidence
+    invocation = dict(getattr(orchestrator, '_invocation_context', {}) or {})
+    invocation.update(command=evidence['mode'], workflow_id=evidence['workflow_id'],
+                      controlled_failure=evidence)
+    resume_args = copy(args)
+    if evidence['kind'] == 'session':
+        invocation.update(session_id=state.session_id, run_id='',
+                          auto_approve=bool(state.auto_approve or getattr(args, 'auto_approve', False)))
+        # A new session or a directly resumed child must retain the exact
+        # returned workflow root when repair restarts this command.
+        resume_args.command = 'provider-resolve' if state.mode == 'provider_resolve' else state.mode
+        resume_args.session = state.session_id
+        resume_args.auto_approve = invocation['auto_approve']
+        resume_args.full_verify = bool(state.full_verify or getattr(args, 'full_verify', False))
+    else:
+        invocation.update(session_id='', run_id=state.run_id)
+    orchestrator._invocation_context = invocation
+    if health_runtime is not None:
+        health_runtime.set_phase('triage')
+    try:
+        triage = _triage_terminal_run_error(project_root, orchestrator, failure)
+    except (OSError, RuntimeError, ValueError) as error:
+        record(project_root, failure, error=str(error))
+        notice('diagnosis.unavailable', 'Controlled workflow diagnosis is unavailable; the original failure is retained.')
+        return None
+    path, owner = record(project_root, failure, triage)
+    reporter = getattr(orchestrator, 'reporter', None)
+    if reporter is not None:
+        reporter.register(path, {'kind': 'terminal_triage'})
+        labels = {'auto_agents': 'auto_agents 引擎', 'target_project': '目标项目',
+                  'execution_environment': '运行环境', 'external_provider': '外部服务',
+                  'user_input': '用户输入', 'unknown': '尚未确定'}
+        reporter.text(('问题归属：' + labels.get(owner, owner)) if reporter.language == 'zh' else
+                      'Failure owner: ' + owner)
+    if triage is not None and triage.decision.eligible:
+        foreground.release()
+        return _auto_repair_auto_agents_and_resume(
+            project_root, orchestrator, failure, triage.decision, resume_args, run_lock,
+            diagnosis=triage.root_cause)
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3760,6 +3810,10 @@ def _dispatch(args) -> int:
                 if str(args.workflow).strip()
                 else coordinator.resume_active()
             )
+            repair_exit = _triage_controlled_workflow_result(
+                project_root, orchestrator, result, args, workflow_lock, foreground, health_runtime)
+            if repair_exit is not None:
+                return repair_exit
             payload = result.to_dict()
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             status = str(payload.get("status", ""))
@@ -3979,6 +4033,10 @@ def _dispatch(args) -> int:
                 state = session.resume(args.session)
             else:
                 state = session.offer_resume_or_new()
+            repair_exit = _triage_controlled_workflow_result(
+                project_root, orchestrator, state, args, workflow_lock, foreground, health_runtime)
+            if repair_exit is not None:
+                return repair_exit
             if state.status == "completed" and health_runtime is not None:
                 health_runtime.set_phase("finalizing")
             _safe_notify(
