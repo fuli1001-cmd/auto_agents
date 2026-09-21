@@ -1726,6 +1726,7 @@ def validate_task_requirement_coverage(
     trace_payload: dict,
     *,
     historical_tasks: Iterable[dict] = (),
+    current_spec: Optional[Path] = None,
 ) -> List[str]:
     errors: List[str] = []
     if not isinstance(plan_payload, dict):
@@ -1738,7 +1739,14 @@ def validate_task_requirement_coverage(
     preservation_only_ids = set(
         preservation_only_frontend_requirement_ids(trace_payload)
     )
-    mandatory_ids = mandatory_active_requirement_ids(trace_payload) - preservation_only_ids
+    scoped_ids = requirement_scope_ids(
+        trace_payload,
+        current_spec=current_spec,
+        current_requirement_ids=_current_task_requirement_ids(tasks, known_ids),
+    )
+    mandatory_ids = (
+        mandatory_active_requirement_ids(trace_payload) & scoped_ids
+    ) - preservation_only_ids
     if not known_ids:
         return errors
 
@@ -1780,7 +1788,8 @@ def validate_task_requirement_coverage(
         validate_task_requirement_proofs(
             plan_payload,
             trace_payload,
-            historical_tasks=historical_tasks,
+            historical_tasks=historical_task_list,
+            current_spec=current_spec,
         )
     )
     return errors
@@ -1906,6 +1915,7 @@ def validate_task_requirement_proofs(
     trace_payload: dict,
     *,
     historical_tasks: Iterable[dict] = (),
+    current_spec: Optional[Path] = None,
 ) -> List[str]:
     errors: List[str] = []
     if not isinstance(plan_payload, dict):
@@ -1930,6 +1940,11 @@ def validate_task_requirement_proofs(
     known_ids = set(by_req)
     historical_requirement_ids = _historical_task_requirement_ids(historical_task_list, known_ids)
     current_requirement_ids = _current_task_requirement_ids(tasks, known_ids)
+    scoped_ids = requirement_scope_ids(
+        trace_payload,
+        current_spec=current_spec,
+        current_requirement_ids=current_requirement_ids,
+    )
     current_done_requirement_ids = _historical_task_requirement_ids(current_done_tasks, known_ids)
     preservation_only_ids = set(
         preservation_only_frontend_requirement_ids(trace_payload)
@@ -2017,6 +2032,8 @@ def validate_task_requirement_proofs(
             proofs_by_requirement.setdefault(req_id, []).append(proof)
 
     for req_id, requirement in by_req.items():
+        if req_id not in scoped_ids:
+            continue
         if req_id in preservation_only_ids:
             continue
         if str(requirement.get("status", "active")).strip() != "active":
@@ -2685,6 +2702,28 @@ def _requirement_in_current_scope(requirement: dict, spec_tokens: set) -> bool:
     return any(token and token in source for token in spec_tokens)
 
 
+def requirement_scope_ids(
+    trace_payload: dict,
+    *,
+    current_spec: Optional[Path] = None,
+    current_requirement_ids: Iterable[str] = (),
+) -> set[str]:
+    """Select run obligations without removing or rewriting historical contracts.
+
+    Only the caller's authoritative spec and current non-done task bindings
+    establish scope. With no spec, retain cumulative validation. This policy is
+    shared by planning and auditing; it never establishes proof of delivery.
+    """
+    spec_tokens = _current_spec_scope_tokens(current_spec)
+    selected = set(current_requirement_ids)
+    return {
+        str(item.get("id", "")).strip()
+        for item in requirement_records(trace_payload)
+        if _requirement_in_current_scope(item, spec_tokens)
+        or str(item.get("id", "")).strip() in selected
+    }
+
+
 def requirements_audit_context_sha256(
     project_root: Path,
     tasks: Iterable[TaskSpec],
@@ -2780,7 +2819,6 @@ def run_requirements_audit(
     preservation_only_ids = set(
         preservation_only_frontend_requirement_ids(trace)
     )
-    spec_tokens = _current_spec_scope_tokens(current_spec)
     current_requirement_ids = {
         req_id
         for task in current_tasks
@@ -2795,6 +2833,11 @@ def run_requirements_audit(
         for req_id in task.requirement_ids
         if req_id in known_ids
     }
+    scoped_ids = requirement_scope_ids(
+        trace,
+        current_spec=current_spec,
+        current_requirement_ids=current_requirement_ids,
+    )
     archived_requirement_ids = {
         req_id
         for task in archived_tasks
@@ -3005,11 +3048,7 @@ def run_requirements_audit(
         # is out-of-run-scope backlog: report its gaps as advisory instead of hard-failing the
         # run, so a run for one spec cannot be blocked (or generate 补齐 tasks) for unrelated
         # historical requirements from earlier iterations.
-        out_of_scope_backlog = (
-            bool(spec_tokens)
-            and not _requirement_in_current_scope(item, spec_tokens)
-            and req_id not in current_requirement_ids
-        )
+        out_of_scope_backlog = req_id not in scoped_ids
         if (
             blocking_blockers
             and status == "active"

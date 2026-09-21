@@ -321,6 +321,7 @@ from .requirements import (
     task_is_fully_historically_covered,
     requirements_for_task,
     requirement_contract_payload,
+    requirement_scope_ids,
     unique_historical_requirement_contract_ids,
     validate_done_task_requirement_proofs,
     validate_requirement_contract_transitions,
@@ -2774,6 +2775,125 @@ class Orchestrator:
         )
         return True
 
+    def _reconcile_iteration_plan_scope_repair(self, state: RunState) -> bool:
+        """Revalidate retained planning work after an approved scope-policy repair.
+
+        The offline repair boundary cannot generate another plan. Resolve only
+        the engine-induced historical coverage conflict, and only when the
+        retained candidate already passes every ordinary publication check.
+        """
+        blocker = state.active_blocker or {}
+        if (
+            state.status != "pending"
+            or blocker.get("owner") != "auto_agents"
+            or blocker.get("category") != "iteration_plan_scope_mismatch"
+            or blocker.get("status") != "retrying"
+            or not blocker.get("self_repair_commit")
+            or blocker.get("task_id")
+            or state.pending_approval
+            or state.active_input_request_id
+            or "plan" in state.stage_summaries
+            or self._pending_stages(state)[:1] != ["plan"]
+        ):
+            return False
+
+        saved_spec = str(state.resume_context.get("spec_file", "")).strip()
+        if not saved_spec:
+            return False
+        spec = Path(saved_spec).expanduser()
+        if not spec.is_absolute():
+            spec = self.project_root / spec
+        spec = spec.resolve()
+        active_spec = getattr(self, "_active_spec_file", None)
+        if not spec.is_file() or (active_spec is not None and Path(active_spec).resolve() != spec):
+            return False
+
+        payload = load_task_plan(self.project_root)
+        trace = load_requirements_trace(self.project_root)
+        tasks = payload.get("tasks", [])
+        conflicts = payload.get("blockers", [])
+        if (
+            payload.get("stage_status") != "blocked"
+            or payload.get("oracle_proof_schema_version") != 2
+            or not isinstance(tasks, list)
+            or not tasks
+            or not isinstance(conflicts, list)
+            or not conflicts
+        ):
+            return False
+        bound_ids = set()
+        for task in tasks:
+            if not isinstance(task, dict) or not isinstance(task.get("requirement_ids"), list):
+                return False
+            if task.get("status") != "done":
+                bound_ids.update(rid for rid in task["requirement_ids"] if isinstance(rid, str))
+        # An unmatched spec cannot authorize discarding all recorded obligations.
+        if not requirement_scope_ids(trace, current_spec=spec):
+            return False
+        scoped_ids = requirement_scope_ids(
+            trace, current_spec=spec, current_requirement_ids=bound_ids
+        )
+        known_ids = requirement_scope_ids(trace)
+        for conflict in conflicts:
+            if (
+                not isinstance(conflict, dict)
+                or conflict.get("category") != "requirement_scope_conflict"
+                or conflict.get("status") not in {"blocked", "needs_input"}
+            ):
+                return False
+            ids = conflict.get("requirement_ids")
+            if (
+                not isinstance(ids, list)
+                or not ids
+                or any(not isinstance(rid, str) or rid not in known_ids or rid in scoped_ids for rid in ids)
+            ):
+                return False
+
+        candidate = copy.deepcopy(payload)
+        candidate["blockers"] = []
+        candidate["stage_status"] = "ready"
+        prior_tasks = list(state.tasks)
+        trusted_done = (
+            load_archived_done_task_payloads(self.project_root)
+            + self._done_task_payloads(prior_tasks)
+        )
+        trusted_done_ids = {
+            task.get("task_id") for task in trusted_done if task.get("status") == "done"
+        }
+        if not any(task.get("status") == "pending" for task in tasks) or any(
+            task.get("status") != "pending"
+            and not (task.get("status") == "done" and task.get("task_id") in trusted_done_ids)
+            for task in tasks
+        ):
+            return False
+        # Do not stamp hashes, invent proofs, normalize away bad statuses, or
+        # write anything until all of the retained contracts pass unchanged.
+        normalized, status_updates = normalize_generated_task_plan_statuses(
+            candidate, trusted_done_tasks=trusted_done
+        )
+        if status_updates or self._task_plan_validation_errors(
+            normalized, trace, historical_tasks=trusted_done, current_spec=spec
+        ):
+            return False
+
+        save_task_plan(self.project_root, candidate)
+        self._complete_plan_stage(state, prior_tasks)
+        state.current_stage = "plan"
+        state.stage_summaries["plan"] = (
+            "Revalidated the retained current-iteration plan after the approved "
+            "engine scope repair; no planning provider call was required."
+        )
+        state.last_recovery_route = {
+            "outcome": "iteration_plan_scope_reconciled",
+            "from_stage": "plan",
+            "to_stage": "provider_research",
+            "fingerprint": str(blocker.get("fingerprint", "")),
+            "current_spec": str(spec),
+            "resolved_plan_blockers": copy.deepcopy(conflicts),
+        }
+        self._clear_run_blocker(state)
+        return True
+
     @staticmethod
     def _normalize_audit_blocker_path(path: object) -> str:
         normalized = str(path or "").strip().replace("\\", "/")
@@ -4639,7 +4759,9 @@ class Orchestrator:
 
         validator_map = {
             "design": self._design_validation_feedback,
-            "plan": self._plan_validation_feedback,
+            "plan": lambda result: self._plan_validation_feedback(
+                result, current_spec=spec_file
+            ),
         }
         validator = validator_map.get(stage)
         effort = None
@@ -4663,6 +4785,22 @@ class Orchestrator:
         state.last_error = ""
         if stage == "plan":
             self._complete_plan_stage(state, prior_tasks)
+            blocker = state.active_blocker
+            if (
+                blocker.get("owner") == "auto_agents"
+                and blocker.get("category") == "iteration_plan_scope_mismatch"
+                and blocker.get("status") == "retrying"
+                and blocker.get("self_repair_commit")
+            ):
+                # Retire only this approved repair's blocker, and only after
+                # corrected planning output has passed validation and loaded.
+                state.last_recovery_route = {
+                    "outcome": "iteration_plan_scope_reconciled",
+                    "from_stage": "plan",
+                    "to_stage": "provider_research",
+                    "fingerprint": str(blocker.get("fingerprint", "")),
+                }
+                self._clear_run_blocker(state)
         return state
 
     def _complete_plan_stage(
@@ -15988,6 +16126,8 @@ class Orchestrator:
                 state,
                 canonical_tasks,
             )
+        if self._reconcile_iteration_plan_scope_repair(state):
+            return True
         legacy_before_reconcile = (
             dict(state.active_blocker)
             if isinstance(state.active_blocker, dict)
@@ -21307,6 +21447,36 @@ class Orchestrator:
                     lines.append(f"    - {axis}")
         return "\n".join(lines)
 
+    def _record_iteration_plan_continuation(self, state: RunState, stage: str, **details: object) -> None:
+        """Persist the actual next boundary reached after scoped planning recovery."""
+        if (state.last_recovery_route.get("outcome") != "iteration_plan_scope_reconciled"
+                or state.status in {"blocked", "paused", "waiting_user"} or state.active_blocker):
+            return
+        spec_value = str(state.resume_context.get("spec_file", "")).strip()
+        if not spec_value:
+            return
+        spec = Path(spec_value)
+        if not spec.is_absolute():
+            spec = self.project_root / spec
+        plan = task_plan_path(self.project_root)
+        if not spec.is_file() or not plan.is_file():
+            return
+        # Save before publishing so observers can verify the event against the
+        # real task loader and state, without replacing any admission checks.
+        save_run_state(self.project_root, state)
+        self.reporter.event("implementation.entered" if stage == "implement" else "provider_research.required", {
+            "stage_id": stage, "run_id": state.run_id,
+            "workflow_id": str(state.resume_context.get("workflow_id", "")),
+            "spec_file": str(spec.resolve()),
+            "spec_sha256": hashlib.sha256(spec.read_bytes()).hexdigest(),
+            "plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
+            "task_ids": [task.task_id for task in state.tasks],
+            "pending_task_ids": [task.task_id for task in state.tasks if task.status == "pending"],
+            "agent_attempts": dict(state.agent_attempts),
+            "engine_runtime": self._auto_agents_runtime_identity(),
+            **details,
+        })
+
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
         tasks = self._load_implementation_tasks(state)
         state.current_stage = "implement"
@@ -21334,6 +21504,8 @@ class Orchestrator:
             )
         )
         save_run_state(self.project_root, state)
+
+        self._record_iteration_plan_continuation(state, "implement")
 
         if restored_persisted_owner_ids:
             self.logger.info(
@@ -36336,6 +36508,10 @@ class Orchestrator:
             state.last_error = ""
             return state
 
+        self._record_iteration_plan_continuation(
+            state, "provider_research",
+            prerequisites=self.provider_research_blockers(requirement_ids=current_requirement_ids),
+        )
         provider_references_dir(self.project_root).mkdir(parents=True, exist_ok=True)
         prompt = self._build_provider_research_prompt(unresolved)
         upgrade_reference_paths = {
@@ -40493,6 +40669,9 @@ class Orchestrator:
             return compose_prompt(lines, purpose=stage)
 
         if stage == "plan":
+            scope_ids = requirement_scope_ids(
+                load_requirements_trace(self.project_root), current_spec=spec_file
+            )
             lines = common + [
                 f"Read the input spec: {spec_file}",
                 f"Read: {brief}",
@@ -40513,15 +40692,19 @@ class Orchestrator:
                 "Map every non-initial persistence task's legacy_fixture_refs to a risk='critical', parallel_safe=false verification step with serial_reason='shared_mutable_state' or 'ordered_contract'.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
-                "All active mandatory requirements in requirements_trace.json must be covered by either archived verified done-task proof or at least one current task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
-                "All active mandatory requirement acceptance_oracles must also be covered by either archived verified done-task proof or at least one current task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
+                "PLANNING SCOPE: use the same policy as requirements auditing: requirements whose recorded source references the primary input spec, plus historical requirements explicitly adopted by a current non-done task's requirement_ids. Without an authoritative current spec, coverage remains cumulative and strict.",
+                "Requirements sourced from the primary input spec: " + (", ".join(sorted(scope_ids)) or "(none recorded)") + ". Explicit current task bindings additionally bring their requirements into scope.",
+                "All active mandatory requirements within this scope must be covered by either archived verified done-task proof or at least one current task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
+                "All active mandatory acceptance_oracles within this scope must also be covered by either archived verified done-task proof or at least one current task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
+                "Unselected historical requirements remain unchanged, undelivered backlog where unproved. Their gaps do not require catch-up tasks, fabricated proofs, blanket deferral, or resumption of stopped work. Keep the complete requirements trace and all bound proof contracts intact.",
+                "Reassess any retained scope-conflict blocker under this policy. Remove a resolved blocker from the active blockers list and clear stage_status='blocked' only when no blockers remain. Preserve unrelated blockers; a plan marked blocked or containing active blockers cannot be published.",
                 "If an acceptance_oracle covers docs or architecture semantics, its evidence_refs must include an executable test that reads/asserts those docs and a supporting ref to the affected document, such as .auto-agents/docs/architecture.md.",
                 "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
                 "If frontend_scope.requested=true and requirements_trace.json contains frontend_surfaces or frontend/prototype fidelity requirements, create or preserve at least one page-level task per affected surface. The task must implement the whole visible surface against the prototype, not only isolated components or payload behavior. When frontend_scope.requested=false, preservation-only visual requirements must not create any standalone task, implementation task, proof-rebinding task, or current-iteration requirement binding. Existing frontend regressions may run only as verification steps of genuinely affected non-frontend work or as final release verification.",
                 "Frontend prototype fidelity task acceptance must require deterministic DOM/CSS/static checks and screenshot/runtime visual evidence such as Playwright screenshots. A vision judge may be added when available, but it supplements deterministic and screenshot evidence rather than replacing them. Payload-only tests, route-existence checks, or component count checks are forbidden as the sole proof for visual fidelity.",
                 "For negative contract requirements such as 'must not contain', '不得', '不包含', or '不返回', preserve every concrete field/path/API token from the requirement in the task acceptance. For example, a requirement that forbids `tasks[].result` is NOT covered by only omitting `retry_trace`.",
                 "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",
-                "If a requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference/provider_references and tests against those protocol references.",
+                "If an in-scope requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference/provider_references and tests against those protocol references.",
                 *provider_policy_prompt_lines("plan"),
                 "Choose the smallest practical automated verification strategy for this stack.",
                 "If this is a Python project, require a project-local conda env at ./.conda.",
@@ -40545,7 +40728,7 @@ class Orchestrator:
                 "If future implementation will require test updates, encode that need in task scope, acceptance, and expected_test_migrations. Do NOT pre-edit repository tests in this planning stage.",
                 "CRITICAL — COVERAGE VERIFICATION: when determining whether a done task covers a brief requirement, you MUST compare the requirement against the task's ACCEPTANCE CRITERIA and REVIEW SUMMARY, not its title or description alone. A task titled 'Real X Integration' does NOT cover a requirement for actual real-model output if its acceptance criteria only verify adapter switching, infrastructure patterns, or fixture/stub results rather than actual external API calls producing real output.",
                 "If the brief explicitly states that a capability must be 'real' / 'production' / '真实' / '公网', verify that the done task's acceptance criteria confirm actual external API calls producing real output — not just adapter infrastructure or fixture-based testing.",
-                PromptBlock("Include a COVERAGE ANALYSIS in your final summary response (NOT in the JSON file): for each key requirement in the brief's current iteration scope, state which done task covers it (citing the specific acceptance criterion that proves delivery) or mark it as UNCOVERED. Any UNCOVERED requirement MUST result in a new task.", kind="output"),
+                PromptBlock("Include a COVERAGE ANALYSIS in your final summary response (NOT in the JSON file): for each key requirement in the brief's current iteration scope and each explicitly adopted historical requirement, state which done task covers it (citing the specific acceptance criterion that proves delivery) or mark it as UNCOVERED. Any UNCOVERED in-scope requirement MUST result in a new task. Unselected historical backlog does not create current tasks.", kind="output"),
                 "Each task must contain task_id, title, description, acceptance, status, commit_message, mutable_artifacts, and persistence_change. Use mutable_artifacts=[] unless implementation must update an otherwise-protected public artifact such as top-level spec.md.",
                 "mutable_artifacts entries must be exact project-relative files. Never grant the active input spec, specs/** iteration inputs, .auto-agents/**, or DESIGN.md. When the active input is under specs/** and a requirement explicitly synchronizes the public top-level spec.md, declare mutable_artifacts=['spec.md'] on that task.",
                 "Set task_origin='planned', recovery_epoch=0, and recovery_round=0 on every newly planned task. These fields are orchestrator-owned lineage metadata and must not be inferred from task_id spelling.",
@@ -44454,7 +44637,9 @@ class Orchestrator:
         self._persist_tasks(state.tasks)
         save_run_state(self.project_root, state)
 
-    def _plan_validation_feedback(self, result: AgentResult) -> Optional[str]:
+    def _plan_validation_feedback(
+        self, result: AgentResult, *, current_spec: Optional[Path] = None
+    ) -> Optional[str]:
         payload = load_task_plan(self.project_root)
         original_payload = copy.deepcopy(payload)
         payload, patch_error, patch_applied = self._apply_local_plan_patch(
@@ -44492,12 +44677,80 @@ class Orchestrator:
             save_task_plan(self.project_root, payload)
             for update in plan_normalization_updates:
                 self.logger.info(f"[plan] {update}")
+        errors = self._task_plan_validation_errors(
+            payload,
+            trace,
+            historical_tasks=trusted_done_tasks,
+            current_spec=(
+                current_spec
+                if current_spec is not None
+                else getattr(self, "_active_spec_file", None)
+            ),
+        )
+        if not errors:
+            # Soft warning: if this is an iteration with no new pending tasks, nudge the agent.
+            is_iteration = any(
+                isinstance(t, dict) and t.get("status") == "done"
+                for t in payload.get("tasks", [])
+            )
+            has_new = any(
+                isinstance(t, dict) and t.get("status") != "done"
+                for t in payload.get("tasks", [])
+            )
+            if is_iteration and not has_new:
+                if self._plan_summary_justifies_no_new_tasks(result.summary):
+                    return None
+                return (
+                    "WARNING: This is an iteration run but the task plan contains NO new pending tasks. "
+                    "All tasks are marked 'done'. Re-examine whether the done tasks' ACCEPTANCE CRITERIA "
+                    "truly cover every requirement in the brief's current iteration scope. "
+                    "If they do, add a brief justification to your summary. "
+                    "If not, append new tasks for the uncovered scope."
+                )
+            return None
+        if patch_applied:
+            save_task_plan(self.project_root, original_payload)
+        bullets = "\n".join(f"- {item}" for item in errors)
+        return (
+            "The task plan JSON is invalid. Rewrite the file and fix all issues exactly.\n"
+            f"{bullets}"
+        )
+
+    def _task_plan_validation_errors(
+        self,
+        payload: dict,
+        trace: dict,
+        *,
+        historical_tasks: Iterable[dict] = (),
+        current_spec: Optional[Path] = None,
+    ) -> List[str]:
+        """Check a plan without publishing it or rewriting its proof contracts."""
         errors = validate_task_plan_with_requirements(
             payload,
             trace,
             enforce_active_task_granularity=True,
-            historical_tasks=trusted_done_tasks,
+            historical_tasks=historical_tasks,
+            current_spec=current_spec,
         )
+        # Retained-plan admission runs before run()'s planning precondition.
+        # Active decisions must be ready even when no task declares a
+        # persistence_change; task-level validation cannot replace this guard.
+        errors.extend(
+            validate_active_persistence_target_readiness(
+                trace,
+                configured_targets=[
+                    target.to_dict() for target in self.config.persistence.targets
+                ],
+            )
+        )
+        # Coverage becoming valid is not permission to publish a blocked plan.
+        # The planning owner must resolve its marker under the corrected scope
+        # instructions, without discarding unrelated blockers.
+        if isinstance(payload, dict):
+            if str(payload.get("stage_status", "")).strip() == "blocked":
+                errors.append("task plan stage_status is blocked; resolve its blockers before publication")
+            if payload.get("blockers"):
+                errors.append("task plan has active blockers; resolve them before publication")
         errors.extend(
             validate_persistence_plan_contract(
                 payload,
@@ -44537,34 +44790,7 @@ class Orchestrator:
         errors.extend(
             self._artifact_publication_metadata_repair_errors(payload)
         )
-        if not errors:
-            # Soft warning: if this is an iteration with no new pending tasks, nudge the agent.
-            is_iteration = any(
-                isinstance(t, dict) and t.get("status") == "done"
-                for t in payload.get("tasks", [])
-            )
-            has_new = any(
-                isinstance(t, dict) and t.get("status") != "done"
-                for t in payload.get("tasks", [])
-            )
-            if is_iteration and not has_new:
-                if self._plan_summary_justifies_no_new_tasks(result.summary):
-                    return None
-                return (
-                    "WARNING: This is an iteration run but the task plan contains NO new pending tasks. "
-                    "All tasks are marked 'done'. Re-examine whether the done tasks' ACCEPTANCE CRITERIA "
-                    "truly cover every requirement in the brief's current iteration scope. "
-                    "If they do, add a brief justification to your summary. "
-                    "If not, append new tasks for the uncovered scope."
-                )
-            return None
-        if patch_applied:
-            save_task_plan(self.project_root, original_payload)
-        bullets = "\n".join(f"- {item}" for item in errors)
-        return (
-            "The task plan JSON is invalid. Rewrite the file and fix all issues exactly.\n"
-            f"{bullets}"
-        )
+        return errors
 
     def _apply_local_plan_patch(
         self,

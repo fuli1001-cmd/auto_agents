@@ -4,7 +4,7 @@ import re
 import shlex
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, run_state_path, task_plan_path
 from .execution_binding import PYTEST_VALUE_OPTIONS
@@ -1193,6 +1193,7 @@ def validate_task_plan_with_requirements(
     *,
     enforce_active_task_granularity: bool = False,
     historical_tasks: Iterable[dict] = (),
+    current_spec: Optional[Path] = None,
 ) -> List[str]:
     errors = validate_task_plan_payload(
         plan_payload,
@@ -1209,6 +1210,7 @@ def validate_task_plan_with_requirements(
                     plan_payload,
                     trace_payload,
                     historical_tasks=historical_tasks,
+                    current_spec=current_spec,
                 )
             )
             errors.extend(

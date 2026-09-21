@@ -25,6 +25,13 @@ class RuntimeIdentityError(RuntimeError):
 _MODULES = {
     'auto_agents': (),
     'auto_agents.config': (),
+    'auto_agents.orchestrator': ('Orchestrator.resume_saved_run',
+        'Orchestrator._reconcile_iteration_plan_scope_repair', 'Orchestrator._task_plan_validation_errors',
+        'Orchestrator._run_implementation_loop', 'Orchestrator._run_provider_research',
+        'Orchestrator._record_iteration_plan_continuation'),
+    'auto_agents.requirements': ('requirement_scope_ids', 'validate_task_requirement_coverage',
+        'validate_task_requirement_proofs'),
+    'auto_agents.validation': ('validate_task_plan_with_requirements',),
     'auto_agents.cli': ('main',),
     'auto_agents.session': ('Session.resume', 'Session._retain_resume_authority',
                            'Session._phase_fix_execute', 'Session._prepare_workflow_handoff',
@@ -50,7 +57,8 @@ _MODULES = {
         'WorkflowCoordinator._resume_existing_child', 'WorkflowCoordinator._validated_child_handoff',
         'WorkflowCoordinator._resolved_handoff_chain', 'WorkflowCoordinator._session_result',
         'WorkflowCoordinator._resume_session_state', 'WorkflowCoordinator._pending_engine_resume',
-        'WorkflowCoordinator._resume_blocked_engine_handoff'),
+        'WorkflowCoordinator._resume_blocked_engine_handoff', 'WorkflowCoordinator.resume_workflow',
+        'WorkflowCoordinator._resume_run_root'),
 }
 
 

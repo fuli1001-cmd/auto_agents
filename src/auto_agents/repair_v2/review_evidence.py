@@ -19,6 +19,9 @@ def recovery_evidence(controller, identity):
             'target_digest': case.get('target'), 'runtime': case.get('runtime'),
             'route_consumed': observed.get('route_consumed'),
             'error': observed.get('error'),
+            'run_id': observed.get('run_id'),
+            'workflow_id': observed.get('workflow_id'),
+            'current_stage': observed.get('current_stage'),
             'engine_runtime': {key: runtime.get(key) for key in ('ok', 'commit', 'runtime_root', 'mismatches')},
             'recovery_observation': {key: recovery.get(key) for key in (
                 'workflow_id', 'original_handoff_id', 'child_session_id', 'parent_session_id',
@@ -26,6 +29,10 @@ def recovery_evidence(controller, identity):
                 'preflight_outcome', 'new_preflight_events', 'diagnostic_origin',
                 'parent_budget', 'child_budget', 'parent_constraints_preserved',
                 'child_constraints_preserved', 'retained_constraints', 'diagnostic_provider_calls',
+                'run_id', 'implementation_entry', 'continuation_entry', 'implementation_entered',
+                'continuation_status', 'prerequisites', 'entry_event_ref', 'spec_sha256',
+                'accepted_plan_sha256', 'requirements_trace_sha256', 'accepted_task_ids',
+                'oracle_proof_count', 'verification_step_count',
                 'task_scope', 'ok')},
         })
     return {'artifact': reference, 'ok': report.get('ok'), 'snapshot': identity,
