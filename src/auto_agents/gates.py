@@ -1600,8 +1600,8 @@ def run_gate_plan(
         observation = GateObservation(progress, reporter,
                                       len(command_list) + sum(len(group.commands) for group in parallel_groups))
         progress = observation
-    if gate_executor is not None:
-        try:
+    try:
+        if gate_executor is not None:
             result = _run_overlapped_gate_plan(
                 command_list,
                 parallel_groups,
@@ -1613,18 +1613,20 @@ def run_gate_plan(
                 progress=progress,
                 gate_executor=gate_executor,
             )
-        except BaseException as error:
+        else:
+            result = _run_phased_gate_plan(
+                command_list, parallel_groups, cwd, collect_all=collect_all,
+                parallel_workers=parallel_workers, command_timeout_seconds=command_timeout_seconds,
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                command_idle_timeout_seconds=command_idle_timeout_seconds, progress=progress,
+            )
+    except BaseException as error:
+        if observation is not None:
             partial = getattr(error, 'partial_gate_result', None)
-            if observation is not None and partial is not None:
+            if partial is not None:
                 observation.finish(partial)
-            raise
-    else:
-        result = _run_phased_gate_plan(
-            command_list, parallel_groups, cwd, collect_all=collect_all,
-            parallel_workers=parallel_workers, command_timeout_seconds=command_timeout_seconds,
-            adaptive_timeout_enabled=adaptive_timeout_enabled,
-            command_idle_timeout_seconds=command_idle_timeout_seconds, progress=progress,
-        )
+            observation.abort()
+        raise
     if observation is not None:
         observation.finish(result)
     return result

@@ -51,7 +51,7 @@ def test_progress_replans_rewinds_and_does_not_count_attempts(report):
     state.tasks[1:] = [task("T2a"), task("T2b")]
     reporter.observe_run(state)
     assert any(e['type'] == 'plan.changed' and e['data']['total'] == 3 for e in events(reporter))
-    assert "计划调整" not in stream.getvalue()
+    assert "计划调整：2 → 3" in stream.getvalue()
     assert reporter.snapshot.done == 1
     state.tasks[0].status = "pending"
     reporter.rewind("plan")
@@ -305,8 +305,9 @@ def test_live_panel_does_not_redirect_streams_and_cleans_up(tmp_path, monkeypatc
     for n in range(1, 5):
         reporter.task(str(n), "权限检查", "implement", 1)
     frame = reporter.presenter._frame(reporter)
-    assert '当前状态：' in frame and '\n' not in frame
-    assert '权限检查' not in frame and '1/5' not in frame
+    assert '实现 → 并行执行' in frame and '\n' in frame
+    assert '权限检查' in frame and '1/5' in frame
+    assert '本次运行' not in frame and '阶段 00:' not in frame
     assert reporter.presenter._live is not None
     reporter.presenter._live.update(Text(frame), refresh=True)
     with reporter.presenter.input():

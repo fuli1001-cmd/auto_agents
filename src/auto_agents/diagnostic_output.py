@@ -69,11 +69,13 @@ class OutputCapture:
         register: Callable[[Path, Mapping[str, object]], None],
         failed: Callable[[Exception], None],
         enabled: bool = True,
+        observe: Optional[Callable[[str, Mapping[str, object]], None]] = None,
     ) -> None:
         self.root = root
         self.metadata = {**dict(metadata), "started_at": now(), "status": "running" if enabled else "closed"}
         self._register = register
         self._failed = failed
+        self._observe = observe
         self._pending = {"stdout": "", "stderr": ""}
         self._secrets: tuple[str, ...] = ()
         self._lock = threading.RLock()
@@ -106,6 +108,15 @@ class OutputCapture:
             else:
                 self.metadata["command"] = redact(command, self._secrets)
             self._write_metadata()
+            self._notify("start")
+
+    def _notify(self, event: str) -> None:
+        if self._observe is not None:
+            try:
+                self._observe(event, self.metadata)
+            except Exception:
+                # Presentation is optional and cannot interrupt output capture.
+                pass
 
     def protect(self, values: tuple[str, ...]) -> None:
         self._secrets = tuple(sorted({*self._secrets, *(str(value) for value in values if value)},
@@ -139,6 +150,8 @@ class OutputCapture:
         with self._lock:
             if self._finished:
                 return
+            if chunk:
+                self._notify("output")
             combined = self._pending[stream] + str(chunk)
             boundary = combined.rfind("\n") + 1
             self._write(stream, combined[:boundary])
@@ -169,6 +182,7 @@ class OutputCapture:
             self._finished = True
             self.metadata.update({"status": "finished", "finished_at": now(), **metadata})
             self._write_metadata()
+            self._notify("finish")
 
 
 def content_hash(path: Path) -> str:

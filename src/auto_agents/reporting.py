@@ -27,6 +27,7 @@ from uuid import uuid4
 
 from .diagnostic_output import OutputCapture, atomic_json, clean_payload, now, redact, plain_text
 from .reporting_messages import user_text, REPAIR_PHASES
+from .execution_display import Activity, CheckSet, ExecutionDisplay, check_name, text as display_text
 
 
 _CURRENT = contextvars.ContextVar("auto_agents_reporting", default=None)
@@ -49,6 +50,9 @@ _LABELS = {
     "resume": ("恢复", "Resuming"), "start": ("开始", "Starting"),
     "retry": ("修正", "Reworking"), "commit": ("集成", "Integrating"),
     "waiting_integration": ("等待集成", "Waiting for integration"),
+    "next": ("准备下一步", "Preparing next step"),
+    "result": ("处理执行结果", "Processing result"),
+    "task_verify": ("任务验证", "Task verification"),
     "current": ("当前阶段", "the current stage"),
     "run": ("准备任务", "Preparing the run"),
     "sync_agent_instructions": ("同步项目指令", "Synchronizing project instructions"),
@@ -72,7 +76,7 @@ _MESSAGES = {
     "task.result.fail": ("「{title}」{action}未通过，正在评估下一步", "{title}: {action} did not pass; evaluating next steps"),
     "run.resumed": ("已恢复执行，当前已完成 {done}/{total} 项任务", "Resuming with {done}/{total} tasks completed"),
     "status": ("当前状态：{status}", "Status: {status}"),
-    "heartbeat": ("仍在{stage}，已用时 {elapsed}", "Still in {stage}; elapsed {elapsed}"),
+    "heartbeat": ("仍在{stage}", "Still in {stage}"),
     "diagnostics": ("诊断记录：{path}", "Diagnostics: {path}"),
     "capture.failed": ("诊断记录不完整：{error}", "Diagnostic recording is incomplete: {error}"),
     "repair.phase": ("正在修复 auto_agents：{phase}", "Repairing auto_agents: {phase}"),
@@ -82,7 +86,7 @@ _MESSAGES = {
     "session.restored": ("已恢复 {mode} 会话 {session_id}；恢复记录：{receipt}", "Restored {mode} session {session_id}; restoration receipt: {receipt}"),
     "repair.checks": ("修复验证：{suite}，已执行 {completed}/{total} 组检查", "Repair validation: {suite}, {completed}/{total} check groups executed"),
     "verification.started": ("正在验证：{context}", "Verifying: {context}"),
-    "verification.finished": ("验证检查已执行 {completed}/{total} 项，通过 {passed}，失败 {failed}，取消 {cancelled}", "Checks executed: {completed}/{total}; passed {passed}, failed {failed}, cancelled {cancelled}"),
+    "verification.finished": ("验证结束：已结束 {completed}/{total} 项，通过 {passed}，失败 {failed}，取消 {cancelled}", "Verification finished: {completed}/{total}; passed {passed}, failed {failed}, cancelled {cancelled}"),
     "invocation.stopped": ("本次执行已结束，仍有待办任务", "This invocation has ended; work remains"),
     "release.pending": ("前台流程已完成；后台完整验证尚未完成", "Foreground workflow completed; background release verification is still pending"),
     "provider.recovering": ("服务调用暂未成功，正在切换恢复方式", "The provider call did not succeed; trying another recovery route"),
@@ -115,22 +119,17 @@ def _concise_message(kind: str, message: str, language: str) -> str:
             message = '\n'.join(line for line in message.splitlines()
                                 if not re.match(r'^\s*(ROUTE_WORKFLOW|NEED_USER_ASSIST|GOAL_ACHIEVED|BUG_FOUND)\b', line))
         return message.strip()
+    if kind == 'repair.phase' or kind == 'repair.checks':
+        return message
     if kind.startswith('repair.'):
         if '受阻' in message or 'failed' in message.lower():
             return '当前状态：恢复受阻' if zh else 'Status: Recovery blocked'
         return '当前状态：正在恢复任务' if zh else 'Status: Recovering the task'
-    if kind.startswith('verification.') or kind.startswith('verify.'):
-        return '当前状态：正在验证' if zh else 'Status: Verifying'
-    if kind == 'stage.started':
+    if kind.startswith(('verification.', 'verify.', 'stage.', 'task.', 'plan.')) or kind in {
+        'heartbeat', 'run.resumed', 'invocation.stopped', 'release.pending', 'provider.recovering',
+    }:
         return message
-    if kind == 'heartbeat':
-        return '任务仍在执行中' if zh else 'Task is still running'
     return ''
-
-
-def _elapsed(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
 
 
 def _read_json(path: Path) -> dict:
@@ -217,7 +216,6 @@ class ConsolePresenter:
         self._suspended = 0
         self._last_event = time.monotonic()
         self._last_heartbeat = self._last_event
-        self._started = self._last_event
         self._closed = False
         self.heartbeat_enabled = False
         self.clock_announced = False
@@ -293,12 +291,22 @@ class ConsolePresenter:
         snapshot = reporter.snapshot
         zh = reporter.language == "zh"
         stamp = datetime.now().astimezone().strftime("[%H:%M:%S] ")
-        duration = _elapsed(time.monotonic() - self._started)
         if self.mode != 'debug':
-            return stamp + ("当前状态：" if zh else "Status: ") + _label(snapshot.status, reporter.language) + '  ' + duration
+            lines = reporter.progress_lines()
+            # Rich crops by terminal cell width, including wide Chinese characters.
+            if self._console is not None:
+                from rich.text import Text
+                width = max(1, self._console.width - len(stamp))
+                cropped = []
+                for line in lines:
+                    value = Text(line)
+                    value.truncate(width, overflow="ellipsis")
+                    cropped.append(value.plain)
+                lines = cropped
+            return "\n".join(stamp + line for line in lines)
         goal = snapshot.goal or reporter.project_name
         label = ("目标" if zh else "Goal") if snapshot.goal else ("项目" if zh else "Project")
-        lines = [f"{label}: {goal[:100]}  {duration}"]
+        lines = [f"{label}: {goal[:100]}"]
         if snapshot.stages:
             symbols = {"completed": "✓", "skipped": "—", "pending": "○", "invalidated": "↺"}
             labels = [
@@ -337,19 +345,25 @@ class ConsolePresenter:
         return "\n".join(stamp + line for line in lines)
 
     def _refresh_loop(self) -> None:
-        while not self._stop.wait(0.5):
+        while not self._stop.wait(1.0):
             reporter = self.focus
             if reporter is None or self._suspended or self.external_owner:
                 continue
             heartbeat = False
+            # Render before taking the presenter lock: events lock reporter then presenter.
+            try:
+                frame = self._frame(reporter)
+            except Exception:
+                self._stop_live()
+                frame = ""
             with self._lock:
                 if self._live is not None:
                     try:
                         from rich.text import Text
-                        self._live.update(Text(self._frame(reporter)), refresh=True)
+                        self._live.update(Text(frame), refresh=True)
                     except Exception:
                         self._stop_live()
-                elif (
+                if (
                     (reporter.snapshot.status not in _TERMINAL or reporter.snapshot.repair)
                     and time.monotonic() - max(self._last_event, self._last_heartbeat) >= 60
                 ):
@@ -357,8 +371,7 @@ class ConsolePresenter:
                     heartbeat = True
             if heartbeat:
                 # Never acquire a reporter lock while holding the presentation lock.
-                reporter.emit("heartbeat", stage=_label(reporter.snapshot.stage, reporter.language),
-                              elapsed=_elapsed(self._last_heartbeat - self._started))
+                reporter.heartbeat()
 
     @contextmanager
     def input(self):
@@ -395,6 +408,14 @@ class ConsolePresenter:
             self._stop_live()
 
 
+def _synchronized(method):
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with (self.parent or self)._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 class Reporter:
     def __init__(self, project_root: Path, stream: TextIO, *, language: str = "en",
                  presenter: Optional[ConsolePresenter] = None, runtime=None,
@@ -409,6 +430,7 @@ class Reporter:
         self.root: Optional[Path] = None
         self.snapshot = ProgressSnapshot()
         self.active_tasks: Dict[str, str] = {}
+        self.display = ExecutionDisplay()
         self._lock = threading.RLock()
         self._sequence = 0
         self._invocation = uuid4().hex[:12]
@@ -432,6 +454,7 @@ class Reporter:
         if parent is None:
             self.presenter.focus = self
 
+    @_synchronized
     def child(self, project_root: Path, task_id: str) -> "Reporter":
         self.ensure_bound()
         child = Reporter(project_root, self.presenter.stream, language=self.language,
@@ -476,6 +499,8 @@ class Reporter:
             self._persisted_stage = ""
             self._announced_plan = ""
             self.active_tasks.clear()
+            self._lane_tokens.clear()
+            self.display = ExecutionDisplay()
             previous = _read_json(root / "diagnostics.json")
             artifacts = previous.get("artifacts", {})
             self._artifacts = {
@@ -506,17 +531,19 @@ class Reporter:
 
     @contextmanager
     def preserve_subject(self):
-        previous = (self.root, self.snapshot, self._artifacts, self.active_tasks, self._last_snapshot,
-                    self._announced_plan, set(self._invalidated_stages), self._persisted_stage)
+        previous = (self.root, self.snapshot, self._artifacts, dict(self.active_tasks), self._last_snapshot,
+                    self._announced_plan, set(self._invalidated_stages), self._persisted_stage, self.display,
+                    dict(self._lane_tokens))
         try:
             yield
         finally:
-            root, snapshot, artifacts, tasks, last, announced, invalidated, persisted_stage = previous
+            root, snapshot, artifacts, tasks, last, announced, invalidated, persisted_stage, display, lanes = previous
             if root is not None and not snapshot.subject.startswith("_commands/") and root != self.root:
                 child_root = self.root
                 self._index()
                 (self.root, self.snapshot, self._artifacts, self.active_tasks, self._last_snapshot,
-                 self._announced_plan, self._invalidated_stages, self._persisted_stage) = previous
+                 self._announced_plan, self._invalidated_stages, self._persisted_stage, self.display,
+                 self._lane_tokens) = previous
                 if child_root:
                     self._artifacts[str(child_root)] = {"path": str(child_root / "diagnostics.json"), "kind": "index"}
                 self._index()
@@ -574,6 +601,47 @@ class Reporter:
             }}
             self._index()
 
+    def progress_lines(self) -> list[str]:
+        owner = self.parent or self
+        with owner._lock:
+            return owner.display.lines(owner.snapshot, owner.active_tasks, owner.language, _label)
+
+    def heartbeat(self) -> None:
+        self.event("heartbeat", {}, audience="user", message=" | ".join(self.progress_lines()))
+
+    def _output_observer(self, identifier: str, task_id: str):
+        owner = self.parent or self
+        display = owner.display
+        activity = display.activities.get(task_id)
+
+        def observe(event: str, metadata: Mapping[str, object]) -> None:
+            with owner._lock:
+                if (owner._closed or self._closed or owner._handed_off or not self._current_lane()
+                        or owner.display is not display or display.activities.get(task_id) is not activity):
+                    return
+                if owner.snapshot.status in _TERMINAL and not owner.snapshot.repair:
+                    return
+                kind = metadata.get("kind")
+                mode = metadata.get("capture_mode")
+                if event == "start" and mode == "file":
+                    display.buffered[identifier] = task_id
+                elif event == "finish":
+                    display.buffered.pop(identifier, None)
+                if event == "output" and mode != "remote_result":
+                    display.last_output = time.monotonic()
+                if kind != "provider":
+                    return
+                if event == "start":
+                    display.calls[identifier] = (task_id, str(metadata.get("provider", "")))
+                elif event == "finish":
+                    display.calls.pop(identifier, None)
+                    if task_id in owner.active_tasks and not any(call[0] == task_id for call in display.calls.values()):
+                        owner.active_tasks[task_id] = "result"
+                        self.event("task.output_received", {"task_id": task_id, "capture_id": identifier},
+                                   audience="user", message="服务调用结束，处理执行结果" if self.language == "zh" else
+                                   "Provider call ended; processing result")
+        return observe
+
     def capture(self, *, stage: str = "", attempt_id: str = "", task_id: str = "",
                 **metadata: object) -> OutputCapture:
         owner = self.parent or self
@@ -583,13 +651,15 @@ class Reporter:
                                      failed=owner.capture_failed, enabled=False)
             owner.ensure_bound()
             identifier = uuid4().hex[:16]
+            task_id = task_id or self.lane_task or (
+                next(iter(self.active_tasks)) if len(self.active_tasks) == 1 else ""
+            )
             capture = OutputCapture(
                 owner.root / "diagnostic-output" / identifier,
                 {"stage": stage or self.snapshot.stage, "attempt_id": attempt_id or identifier,
-                 "task_id": task_id or self.lane_task or (
-                     next(iter(self.active_tasks)) if len(self.active_tasks) == 1 else ""
-                 ), "subject_id": self.snapshot.subject, **metadata},
+                 "task_id": task_id, "subject_id": self.snapshot.subject, **metadata},
                 register=owner.register, failed=owner.capture_failed,
+                observe=self._output_observer(identifier, task_id),
             )
             owner._captures.append(capture)
             return capture
@@ -611,13 +681,24 @@ class Reporter:
         timestamp = now()
         message = plain_text(message)
         visible = _concise_message(kind, message, self.language) if audience == 'user' else ''
-        if visible and visible == getattr(owner, '_last_user_message', None):
-            visible = ''
-        elif visible:
-            owner._last_user_message = visible
         with owner._lock:
             if owner._closed or self._closed:
                 return
+            task_id = str(data.get("task_id") or self.lane_task)
+            activity = owner.display.activities.get(task_id)
+            notice = (self.snapshot.subject, self.snapshot.stage, owner.display.epoch,
+                      activity.token if activity else "", kind, task_id,
+                      json.dumps(dict(data), sort_keys=True, default=str), visible)
+            if kind != "heartbeat" and visible:
+                if notice == getattr(owner, "_last_user_notice", None):
+                    visible = ""
+                else:
+                    owner._last_user_notice = notice
+            if visible and kind.startswith(("task.", "verification.", "verify.", "provider.")):
+                context = _label(self.snapshot.stage, self.language)
+                if task_id:
+                    context += "/" + display_text(task_id)
+                visible = f"[{context}] {visible}"
             owner._sequence += 1
             record = clean_payload({
                 "schema_version": 1, "timestamp": timestamp, "type": kind,
@@ -646,6 +727,17 @@ class Reporter:
                 owner.presenter.show(owner, visible, timestamp=timestamp)
 
     def emit(self, kind: str, **data: object) -> None:
+        if kind == "task.blocked" and self._current_lane():
+            owner = self.parent or self
+            task_id = str(data.get("task_id") or self.lane_task)
+            with owner._lock:
+                previous = owner.display.activities.get(task_id)
+                owner.display.clear_task(task_id)
+                if previous is not None:
+                    owner.display.activities[task_id] = Activity(previous.title, "blocked", previous.attempt)
+                    owner.active_tasks[task_id] = "blocked"
+                else:
+                    owner.active_tasks.pop(task_id, None)
         self.event(kind, data, audience="user", message=self.message(kind, **data))
 
     def text(self, message: str, *, diagnostic: bool = False) -> None:
@@ -666,21 +758,37 @@ class Reporter:
         if getattr(self, "_last_exception", None) is error:
             return
         self._last_exception = error
+        owner = self.parent or self
+        with owner._lock:
+            if self._current_lane():
+                if self.lane_task:
+                    owner.display.clear_task(self.lane_task)
+                    owner.active_tasks.pop(self.lane_task, None)
+                else:
+                    owner.display = ExecutionDisplay()
+                    owner.active_tasks.clear()
         self.event("diagnostic.exception", {
             "error_type": type(error).__name__, "error": str(error),
             "traceback": "".join(traceback.format_exception(type(error), error, error.__traceback__)),
         }, message=str(error), level="ERROR")
         self.emit("diagnostics", path=str((self.parent or self).root / "diagnostics.json"))
 
+    @_synchronized
     def stage(self, stage: str) -> None:
         if self.lane_task:
             self.task(self.lane_task, self.lane_task, stage, 1)
             return
-        self.snapshot.stage = stage
-        self.snapshot.status = "running"
-        self.snapshot.repair = ""
+        with self._lock:
+            self.display = ExecutionDisplay(stage_active=True)
+            self.active_tasks.clear()
+            self._lane_tokens.clear()
+            self.snapshot.checks = {}
+            self.snapshot.stage = stage
+            self.snapshot.status = "running"
+            self.snapshot.repair = ""
         self.emit("stage.started", stage=_label(stage, self.language))
 
+    @_synchronized
     def rewind(self, stage: str, *, source: str = "", reason: str = "") -> None:
         source = source or self.snapshot.stage or "current"
         found = False
@@ -690,6 +798,9 @@ class Reporter:
                 self._invalidated_stages.add(key)
                 self.snapshot.stages[key] = "invalidated"
         self.active_tasks.clear()
+        self._lane_tokens.clear()
+        self.display = ExecutionDisplay()
+        self.snapshot.checks = {}
         self.snapshot.stage = stage
         message = self.message("stage.rewind", source=_label(source, self.language), stage=_label(stage, self.language))
         if reason:
@@ -697,23 +808,35 @@ class Reporter:
         self.event("stage.rewind", {"source": source, "target": stage, "reason": reason},
                    audience="user", message=message)
 
+    @_synchronized
     def task(self, task_id: str, title: str, action: str, attempt: int) -> None:
         if not self._current_lane():
             return
         owner = self.parent or self
-        owner.active_tasks[task_id] = action
+        with owner._lock:
+            owner.display.clear_task(task_id)
+            owner.display.activities[task_id] = Activity(display_text(title), action, attempt)
+            owner.active_tasks[task_id] = action
         if action in {"implement", "verify"}:
             self.snapshot.checks = {}
         self.event("task.started", {"task_id": task_id, "action": action, "attempt": attempt},
                    audience="user", message=self.message("task.started", title=title,
-                       action=_label(action, self.language), attempt=attempt))
+                       action=_label("task_verify" if action == "verify" else action, self.language), attempt=attempt))
 
+    @_synchronized
     def task_result(self, task_id: str, title: str, action: str, decision: str) -> None:
+        if not self._current_lane():
+            return
+        owner = self.parent or self
+        with owner._lock:
+            if task_id in owner.active_tasks:
+                owner.active_tasks[task_id] = "next"
         passed = decision.lower() in {"pass", "passed", "approve", "approved", "accept", "accepted"}
         self.event("task.result", {"task_id": task_id, "action": action, "decision": decision},
                    audience="user", message=self.message("task.result.pass" if passed else "task.result.fail",
-                                                        title=title, action=_label(action, self.language)))
+                                                        title=title, action=_label("task_verify" if action == "verify" else action, self.language)))
 
+    @_synchronized
     def observe_run(self, state: object) -> None:
         if self._handed_off:
             return
@@ -748,10 +871,15 @@ class Reporter:
             elif status in {"completed", "skipped"}:
                 self._invalidated_stages.discard(stage)
         self.snapshot = current
+        if previous.stage != current.stage or current.status in _TERMINAL:
+            self.display = ExecutionDisplay()
+            self.active_tasks.clear()
+            self._lane_tokens.clear()
+            self.snapshot.checks = {}
         self._last_snapshot = encoded
         self.event("state.snapshot", current.__dict__)
         if not initialized or previous.status != current.status:
-            self.emit('status', status=_label(current.status, self.language))
+            self.emit('status', status=self.progress_lines()[0])
         if previous.plan_id != current.plan_id and current.plan_id and self._announced_plan != current.plan_id:
             self.emit("plan.changed" if previous.plan_id else "plan.ready",
                       before=len(previous.tasks), total=len(current.tasks), done=current.done)
@@ -760,19 +888,24 @@ class Reporter:
             for task_id, task in current.tasks.items():
                 if task["status"] == "done" and previous.tasks.get(task_id, {}).get("status") != "done":
                     self.active_tasks.pop(task_id, None)
+                    self.display.clear_task(task_id)
                     self.emit("task.completed", title=task["title"], task_id=task_id)
             for stage, status in current.stages.items():
                 if status in {"completed", "skipped"} and previous.stages.get(stage) != status:
                     self.emit("stage.skipped" if status == "skipped" else "stage.completed",
                               stage=_label(stage, self.language), stage_id=stage)
-            if current.status in _TERMINAL and previous.status != current.status:
-                self.emit("status", status=_label(current.status, self.language))
+                    if stage == current.stage:
+                        self.display.stage_active = False
         self.active_tasks = {
             task_id: action for task_id, action in self.active_tasks.items()
             if task_id in current.tasks and current.tasks[task_id]["status"] != "done"
         }
+        for task_id in list(self.display.activities):
+            if task_id not in self.active_tasks:
+                self.display.clear_task(task_id)
         self._index()
 
+    @_synchronized
     def observe_session(self, state: object) -> None:
         if self.snapshot.subject != str(state.session_id):
             return
@@ -781,6 +914,9 @@ class Reporter:
         self.snapshot.kind = str(state.mode)
         self.snapshot.stage = str(state.status)
         self.snapshot.status = str(state.status)
+        if previous_status != self.snapshot.status:
+            self.display = ExecutionDisplay()
+            self.active_tasks.clear()
         if previous_status != self.snapshot.status:
             label = _label(self.snapshot.status, self.language)
             acceptance = getattr(state, 'acceptance_execution', {})
@@ -803,7 +939,11 @@ class Reporter:
             "status": state.status, "attempt": state.current_attempt, "goal": state.goal,
         })
 
+    @_synchronized
     def repair(self, phase: str, **data: object) -> None:
+        if not self.snapshot.repair:
+            self.display = ExecutionDisplay()
+            self.active_tasks.clear()
         pair = REPAIR_PHASES.get(phase, ("处理当前修复步骤", "working on the current repair step"))
         rendered = pair[0 if self.language == "zh" else 1]
         self.snapshot.repair = self.message("repair.phase", phase=rendered)
@@ -849,6 +989,19 @@ class GateObservation:
         self.reporter = reporter
         self.context = str(getattr(progress, "context", "") or _label("verify", reporter.language))
         self.counts = {"total": total, "completed": 0, "passed": 0, "failed": 0, "cancelled": 0}
+        self.owner = reporter.parent or reporter
+        self.display = self.owner.display
+        self.task_id = reporter.lane_task or (next(iter(reporter.active_tasks)) if len(reporter.active_tasks) == 1 else "")
+        self.activity = self.display.activities.get(self.task_id)
+        self.identifier = uuid4().hex
+        self._reported_results: set[int] = set()
+        self.view = CheckSet(task_id=self.task_id, counts=dict(self.counts), baseline="baseline" in self.context)
+        with self.owner._lock:
+            if self._current():
+                # Keep concurrent sets, discard finished sets for this task only.
+                self.display.checks = {k: v for k, v in self.display.checks.items()
+                                       if v.task_id != self.task_id or not v.finished}
+                self.display.checks[self.identifier] = self.view
         self.reporter.snapshot.checks = dict(self.counts)
         if "baseline" in self.context:
             label = "验证基线" if reporter.language == "zh" else "baseline"
@@ -856,20 +1009,43 @@ class GateObservation:
             label = reporter.snapshot.tasks.get(reporter.lane_task, {}).get("title", reporter.lane_task)
         else:
             label = "当前任务" if reporter.language == "zh" else "current task"
-        self.reporter.emit("verification.started", context=label)
+        self.reporter.emit("verification.started", context=label, task_id=self.task_id, check_set_id=self.identifier)
         self.reporter.event("verification.selected", {"context": self.context, "total": total})
 
     def __call__(self, event: str, command: str, elapsed: float) -> None:
         if self.progress is not None:
             self.progress(event, command, elapsed)
+        if event not in {"start", "dispatch_serial", "dispatch_parallel", "finish", "cache_hit"}:
+            return
+        with self.owner._lock:
+            if not self._current() or self.view.finished:
+                return
+            name = self.view.names.setdefault(command, check_name(command, len(self.view.names) + 1, self.reporter.language == "zh"))
+            if event in {"start", "dispatch_serial", "dispatch_parallel"}:
+                state = "running" if event == "start" else "submitted"
+                self.view.active[command] = (name, time.monotonic(), state)
+            elif event in {"finish", "cache_hit"}:
+                self.view.active.pop(command, None)
+
+    def _current(self) -> bool:
+        return (self.reporter._current_lane() and not self.owner._closed and not self.reporter._closed
+                and not self.owner._handed_off and self.owner.display is self.display
+                and self.display.activities.get(self.task_id) is self.activity)
 
     def result(self, result: object) -> None:
-        if getattr(result, "termination_reason", "") == "cancelled":
-            self.counts["cancelled"] += 1
-        else:
-            self.counts["completed"] += 1
-            self.counts["passed" if result.ok else "failed"] += 1
-        self.reporter.snapshot.checks = dict(self.counts)
+        with self.owner._lock:
+            if self.view.finished or id(result) in self._reported_results:
+                return
+            self._reported_results.add(id(result))
+            if getattr(result, "termination_reason", "") == "cancelled":
+                self.counts["cancelled"] += 1
+            else:
+                self.counts["completed"] += 1
+                self.counts["passed" if result.ok else "failed"] += 1
+            if self._current():
+                self.view.counts = dict(self.counts)
+                self.view.active.pop(result.command, None)
+                self.reporter.snapshot.checks = dict(self.counts)
         self.reporter.event("verification.result", {
             "context": self.context, "command": result.command, "ok": result.ok,
             "returncode": result.returncode, "termination_reason": result.termination_reason,
@@ -877,6 +1053,12 @@ class GateObservation:
             "worker_id": getattr(result, "worker_id", ""), "job_id": getattr(result, "job_id", ""),
             **self.counts,
         })
+        if not result.ok and self._current():
+            cancelled = getattr(result, "termination_reason", "") == "cancelled"
+            name = self.view.names.get(result.command, check_name(result.command, self.counts["completed"] + self.counts["cancelled"], self.reporter.language == "zh"))
+            status = ("已取消" if cancelled else "未通过") if self.reporter.language == "zh" else ("cancelled" if cancelled else "failed")
+            self.reporter.event("verification.check_failed", {"task_id": self.task_id, "check_set_id": self.identifier},
+                                audience="user", message=f"{name} {status}")
         if getattr(result, "backend", "") == "lan-worker":
             capture = self.reporter.capture(kind="gate", backend="lan-worker",
                                            job_id=result.job_id, worker_id=result.worker_id)
@@ -889,14 +1071,36 @@ class GateObservation:
     def finish(self, result: object) -> None:
         # Reconcile all returned results, including one-command and cached paths.
         commands = result.commands
+        for command in commands:
+            self.result(command)
         self.counts.update(
             completed=sum(item.termination_reason != "cancelled" for item in commands),
             passed=sum(item.ok for item in commands),
             failed=sum(not item.ok and item.termination_reason != "cancelled" for item in commands),
             cancelled=sum(item.termination_reason == "cancelled" for item in commands),
         )
-        self.reporter.snapshot.checks = dict(self.counts)
-        self.reporter.emit("verification.finished", **self.counts)
+        with self.owner._lock:
+            if not self._current():
+                return
+            self.view.counts = dict(self.counts)
+            self.view.finished = True
+            self.view.active.clear()
+            self.reporter.snapshot.checks = dict(self.counts)
+            if self.task_id in self.owner.active_tasks:
+                self.owner.active_tasks[self.task_id] = "next"
+        self.reporter.emit("verification.finished", task_id=self.task_id, check_set_id=self.identifier, **self.counts)
+
+    def abort(self) -> None:
+        with self.owner._lock:
+            if not self._current():
+                return
+            self.view.finished = True
+            self.view.interrupted = True
+            self.view.active.clear()
+            if self.task_id in self.owner.active_tasks:
+                self.owner.active_tasks[self.task_id] = "next"
+        self.reporter.event("verification.interrupted", {"task_id": self.task_id, "check_set_id": self.identifier},
+                            audience="user", message="验证中断" if self.reporter.language == "zh" else "Verification interrupted")
 
 
 def observe_gate_result(progress, result: object) -> None:
