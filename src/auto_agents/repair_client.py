@@ -421,6 +421,12 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     else:
         state = load_run_state(project)
         invocation["run_id"] = state.run_id
+        saved_workflow = str(getattr(state, 'resume_context', {}).get('workflow_id') or '')
+        recorded_workflow = str(invocation.get('workflow_id') or '')
+        if saved_workflow and recorded_workflow and saved_workflow != recorded_workflow:
+            raise RuntimeError('repair invocation conflicts with the saved run workflow')
+        if saved_workflow:
+            invocation['workflow_id'] = saved_workflow
         boundary = {"kind": "run_stage", "stage": state.current_stage, "fingerprint": decision.fingerprint}
         orchestrator.record_run_blocker(owner="auto_agents", category=decision.category,
             reason=decision.reason, fingerprint=decision.fingerprint)
@@ -462,6 +468,15 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     # rather than treating diagnosis=None as permission for legacy repair.
     response = rpc(registration["config"], {"op": "submit", "subscriber": registration["subscriber"], "payload": payload})
     job = response["job"]
+    reporter = getattr(orchestrator, 'reporter', None)
+    if reporter is not None:
+        reporter.event('repair.submitted', {
+            'job_id': job, 'subscriber_id': registration['subscriber'],
+            'run_id': invocation.get('run_id', ''), 'workflow_id': invocation.get('workflow_id', ''),
+            'diagnosis_digest': digest(payload['diagnosis']),
+            'scope_receipt_digest': digest(payload['scope_receipt']),
+            'engine_commit': payload['base'],
+        })
     last = None
     announced = set()
     imported_announced = set()

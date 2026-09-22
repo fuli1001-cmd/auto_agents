@@ -21551,8 +21551,19 @@ class Orchestrator:
 
     def _record_iteration_plan_continuation(self, state: RunState, stage: str, **details: object) -> None:
         """Persist the actual next boundary reached after scoped planning recovery."""
+        diagnostic = state.last_recovery_route.get("diagnostic_evidence_repair", {})
+        repaired = diagnostic.get("repaired_blocker", {})
+        diagnostic_ready = bool(
+            diagnostic.get("outcome") == "admission_retry_ready"
+            and diagnostic.get("run_id") == state.run_id
+            and diagnostic.get("workflow_id") == state.resume_context.get("workflow_id")
+            and repaired.get("self_repair_commit")
+            and repaired.get("prepared_self_repair_commit") == repaired.get("self_repair_commit")
+            and repaired.get("category") == "diagnostic_evidence_reference_binding_gap"
+        )
         if (state.last_recovery_route.get("outcome") not in {
                 "iteration_plan_scope_reconciled", "provider_reference_review_repaired"}
+                and not diagnostic_ready
                 or state.status in {"blocked", "paused", "waiting_user"} or state.active_blocker):
             return
         spec_value = str(state.resume_context.get("spec_file", "")).strip()

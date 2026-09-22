@@ -247,6 +247,8 @@ def _repair_entry(request):
                 import shutil
                 shutil.rmtree(staging)  # never a live project or a candidate
             RootCauseCoordinator._copy_diagnostic_tree(Path(job['payload']['project']), staging)
+            from .diagnostic_replay import copy_submission_evidence
+            copy_submission_evidence(Path(job['payload']['project']), staging, job['payload'])
             if target.exists():
                 raise RepairBlocked('incomplete_evidence', 'unsealed target evidence must not be overwritten')
             dissociate(staging)
@@ -270,6 +272,8 @@ def _repair_entry(request):
                 case = root / 'counterexamples' / digest(current_incident)
                 if not (case / 'target').exists():
                     RootCauseCoordinator._copy_diagnostic_tree(Path(job['payload']['project']), case / 'target')
+                    from .diagnostic_replay import copy_submission_evidence
+                    copy_submission_evidence(Path(job['payload']['project']), case / 'target', job['payload'])
                     dissociate(case / 'target')
                     atomic_json(case / 'payload.json', job['payload'])
                 scope_target = case / 'target'
@@ -551,6 +555,8 @@ def _validate_subscriber(request):
         with tempfile.TemporaryDirectory(prefix='v2-subscriber-', dir=root) as temporary:
             evidence = Path(temporary) / 'target'
             RootCauseCoordinator._copy_diagnostic_tree(Path(subscriber['project']), evidence)
+            from .diagnostic_replay import copy_submission_evidence
+            copy_submission_evidence(Path(subscriber['project']), evidence, subscriber['payload']['repair'])
             result = _boundary_once(verifier, root, approved['v2_receipt']['snapshot'], Path(approved['runtime']),
                                     evidence, subscriber['payload']['repair'], threading.Event())
             _assert_owner(request)

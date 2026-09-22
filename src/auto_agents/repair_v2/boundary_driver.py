@@ -8,11 +8,36 @@ import sys
 import subprocess
 
 
-CONTINUATION_CATEGORIES = {'iteration_plan_scope_mismatch', 'provider_reference_freshness_validity_conflation'}
+DIAGNOSTIC_BINDING_CATEGORY = 'diagnostic_evidence_reference_binding_gap'
+CONTINUATION_CATEGORIES = {'iteration_plan_scope_mismatch', 'provider_reference_freshness_validity_conflation',
+                           DIAGNOSTIC_BINDING_CATEGORY}
 
 
 class ReplayEnvironmentUnavailable(RuntimeError):
     pass
+
+
+def diagnostic_continuation_complete(observed, original):
+    """Reject older clearance-only reports even if their top-level flag is true."""
+    proof = observed.get('recovery_observation') or {}
+    submission = proof.get('submission_receipt') or {}
+    entry = proof.get('implementation_entry') or {}
+    runtime = observed.get('engine_runtime') or {}
+    workflow = original.get('resume_context', {}).get('workflow_id')
+    run = original.get('run_id')
+    return bool(
+        observed.get('ok') is True and proof.get('ok') is True
+        and proof.get('implementation_entered') is True and proof.get('entry_event_ref')
+        and entry.get('type') == 'implementation.entered' and entry.get('event_id')
+        and runtime.get('ok') is True and runtime.get('commit')
+        and entry.get('data', {}).get('engine_runtime', {}).get('repository_head') == runtime.get('commit')
+        and submission.get('engine_commit') == runtime.get('commit')
+        and submission.get('accepted') is True and submission.get('job_state') == 'queued' and submission.get('job_id')
+        and submission.get('scope_receipt_digest') and submission.get('event', {}).get('event_id')
+        and run and workflow
+        and all(row.get('run_id') == run and row.get('workflow_id') == workflow
+                for row in (observed, proof, submission, entry.get('data', {})))
+    )
 
 
 def check_environments(request):
@@ -82,7 +107,8 @@ def run_input_hashes(target, original):
     }
 
 
-def observe_run_continuation(orchestrator, original, original_plan, request, runtime, frozen_inputs):
+def observe_run_continuation(orchestrator, original, original_plan, request, runtime, frozen_inputs,
+                             submission=None):
     """Observe the retained workflow at implementation or its next real prerequisite.
 
     The caller retains its provider fence and disposable original project. No
@@ -118,16 +144,61 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
     trace_before = trace_path.read_bytes()
     if run_input_hashes(target, original) != frozen_inputs:
         raise RuntimeError('original run inputs changed during reconciliation')
+    diagnostic = original.active_blocker.get('category') == DIAGNOSTIC_BINDING_CATEGORY
     require_admission = original.active_blocker.get('category') == 'provider_reference_freshness_validity_conflation'
+    requeued = []
+    if diagnostic:
+        if (not isinstance(submission, dict) or submission.get('accepted') is not True
+                or submission.get('job_state') != 'queued' or not submission.get('job_id')
+                or not submission.get('subscriber_id') or not submission.get('scope_receipt_digest')
+                or not submission.get('diagnosis_digest') or not submission.get('request_digest')
+                or not submission.get('event_ref') or not submission.get('event', {}).get('event_id')
+                or submission.get('run_id') != original.run_id
+                or submission.get('workflow_id') != workflow_id
+                or submission.get('engine_commit') != request['commit']):
+            raise RuntimeError('retained diagnostic recovery lacks supervisor-accepted submission evidence')
+        submitted_event = submission['event']
+        submitted_path = Path('.auto-agents/runs') / original.run_id / 'events.jsonl'
+        if (submission['event_ref'] != submitted_path.as_posix()
+                or submitted_event.get('type') != 'repair.submitted'
+                or submitted_event.get('subject_id') != original.run_id
+                or any(submitted_event.get('data', {}).get(key) != submission.get(key) for key in (
+                    'job_id', 'subscriber_id', 'run_id', 'workflow_id', 'engine_commit',
+                    'scope_receipt_digest', 'diagnosis_digest'))):
+            raise RuntimeError('submission receipt conflicts with its persisted acknowledgment')
+        with (target / submitted_path).open() as stream:
+            matches = [row for line in stream if line.strip()
+                       if (row := json.loads(line)).get('event_id') == submitted_event['event_id']]
+        if matches != [submitted_event]:
+            raise RuntimeError('submission receipt acknowledgment is missing or changed')
+        prepared = load_run_state(target)
+        if prepared.pending_approval or prepared.active_input_request_id or prepared.pending_input_requests:
+            raise RuntimeError('retained diagnostic recovery is awaiting human input')
+        route = prepared.last_recovery_route.get('diagnostic_evidence_repair', {})
+        repaired = route.get('repaired_blocker', {})
+        requeued = repaired.get('requeued_task_ids', [])
+        blocked_ids = {task['task_id'] for task in original_plan['tasks'] if task.get('status') == 'blocked'}
+        if (route.get('outcome') != 'admission_retry_ready' or route.get('run_id') != original.run_id
+                or route.get('workflow_id') != workflow_id
+                or repaired.get('category') != DIAGNOSTIC_BINDING_CATEGORY
+                or repaired.get('self_repair_commit') != request['commit']
+                or repaired.get('prepared_self_repair_commit') != request['commit']
+                or not isinstance(requeued, list) or not requeued
+                or any(not isinstance(task_id, str) or task_id not in blocked_ids for task_id in requeued)
+                or len(set(requeued)) != len(requeued)):
+            raise RuntimeError('diagnostic recovery requeued tasks outside the retained repair contract')
     required_references = {b['reference'] for b in orchestrator.provider_research_blockers(
         requirement_ids=orchestrator._current_provider_research_requirement_ids(original))} if require_admission else set()
-    accepted_events = {'implementation.entered'} if require_admission else {'implementation.entered', 'provider_research.required'}
+    accepted_events = ({'implementation.entered'} if require_admission or diagnostic
+                       else {'implementation.entered', 'provider_research.required'})
     event_path = target / '.auto-agents/runs' / original.run_id / 'events.jsonl'
     offset = event_path.stat().st_size if event_path.exists() else 0
     emit_event = orchestrator.reporter.event
 
     def observe(kind, data, **options):
         emit_event(kind, data, **options)
+        if diagnostic and kind == 'provider_research.required':
+            raise RuntimeError('diagnostic recovery reached a prerequisite, not implementation entry')
         if kind in accepted_events:
             raise ContinuationBoundaryObserved()
 
@@ -156,7 +227,8 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
         requirement_ids=orchestrator._current_provider_research_requirement_ids(state))
         if not implemented else [])
     task_ids = [task['task_id'] for task in original_plan['tasks']]
-    pending_ids = [task['task_id'] for task in original_plan['tasks'] if task.get('status') == 'pending']
+    pending_ids = [task['task_id'] for task in original_plan['tasks']
+                   if task.get('status') == 'pending' or task['task_id'] in requeued]
     plan_hash = hashlib.sha256(task_plan_path(target).read_bytes()).hexdigest()
     expected_module = Path(runtime['runtime_root']) / 'src/auto_agents/orchestrator.py'
     engine = data.get('engine_runtime', {})
@@ -164,6 +236,14 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
                  and trace_path.read_bytes() == trace_before
                  and hashlib.sha256(spec.read_bytes()).hexdigest() == spec_hash
                  and state.agent_attempts == original.agent_attempts)
+    if diagnostic:
+        expected_status = {task['task_id']: 'pending' if task['task_id'] in requeued else task.get('status', 'pending')
+                           for task in original_plan['tasks']}
+        histories = {task.task_id: (task.verify_history, task.review_history) for task in original.tasks}
+        preserved = (preserved and {task.task_id: task.status for task in state.tasks} == expected_status
+                     and state.localized_blockers == original.localized_blockers
+                     and state.task_failure_checkpoints == original.task_failure_checkpoints
+                     and {task.task_id: (task.verify_history, task.review_history) for task in state.tasks} == histories)
     entered = (
         state.run_id == original.run_id and state.resume_context.get('workflow_id') == workflow_id
         and state.current_stage == ('implement' if implemented else 'plan') and state.status not in {'blocked', 'failed', 'paused', 'waiting_user'}
@@ -228,6 +308,7 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
             'accepted_task_ids': task_ids, 'retained_constraints': True,
             'oracle_proof_count': sum(len(task.get('requirement_proofs', [])) for task in plan['tasks']),
             'verification_step_count': len(plan.get('verification_steps', [])),
+            'submission_receipt': submission,
         },
     }
 
@@ -285,12 +366,27 @@ def main():
         before = dict(original.active_blocker)
         if not before and not blocked:
             raise RuntimeError('frozen run has no original blocked boundary')
-        frozen_inputs = (run_input_hashes(target, original)
-                         if before.get('category') in CONTINUATION_CATEGORIES else None)
+        try:
+            frozen_inputs = (run_input_hashes(target, original)
+                             if before.get('category') in CONTINUATION_CATEGORIES else None)
+        except FileNotFoundError as error:
+            raise ReplayEnvironmentUnavailable('retained continuation input is absent: ' + str(error)) from error
         orchestrator = Orchestrator(target)
         def forbidden(*args, **kwargs):
             raise RuntimeError('offline boundary verification must not invoke providers')
         orchestrator._call_with_failover = forbidden
+        submission = None
+        if before.get('category') == DIAGNOSTIC_BINDING_CATEGORY:
+            identity = runpy.run_path('/opt/repair/repair_runtime_identity.py')
+            runtime = identity['observe_engine'](Path('/work'), expected_commit=request['commit'])
+            if not runtime.get('ok'):
+                raise RuntimeError('submission runtime does not match the verified candidate')
+            replay = runpy.run_path(str(Path(__file__).with_name('diagnostic_replay.py')))
+            try:
+                diagnosis, _ = replay['retained_diagnosis'](target, request)
+            except FileNotFoundError as error:
+                raise ReplayEnvironmentUnavailable(str(error)) from error
+            submission = replay['observe_submission'](orchestrator, original, diagnosis, request, runtime, Path('/result'))
         state = orchestrator.mark_self_repair_applied(request['commit'])
         changed = orchestrator._resume_blocked_run(state)
         save_run_state(target, state)
@@ -308,7 +404,7 @@ def main():
             identity = runpy.run_path('/opt/repair/repair_runtime_identity.py')
             runtime = identity['observe_engine'](Path('/work'), expected_commit=request['commit'])
             observed.update(observe_run_continuation(
-                orchestrator, original, original_plan, request, runtime, frozen_inputs
+                orchestrator, original, original_plan, request, runtime, frozen_inputs, submission=submission
             ))
         emit(observed)
         return

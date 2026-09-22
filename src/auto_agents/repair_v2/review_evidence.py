@@ -32,7 +32,7 @@ def recovery_evidence(controller, identity):
                 'run_id', 'implementation_entry', 'continuation_entry', 'implementation_entered',
                 'continuation_status', 'prerequisites', 'provider_admission', 'entry_event_ref', 'spec_sha256',
                 'accepted_plan_sha256', 'requirements_trace_sha256', 'accepted_task_ids',
-                'oracle_proof_count', 'verification_step_count',
+                'oracle_proof_count', 'verification_step_count', 'submission_receipt',
                 'task_scope', 'ok')},
         })
     return {'artifact': reference, 'ok': report.get('ok'), 'snapshot': identity,
