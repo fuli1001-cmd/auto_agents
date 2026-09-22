@@ -53,6 +53,34 @@ gate rejects a refreshed reference that omits those sections or does not set `co
 in its lock entry. Existing verified legacy references remain reusable until a run creates or refreshes
 them.
 
+Provider reference review separates **applicability**, **freshness**, and **validity**:
+
+- New/changed requirement bindings produce `needs_assessment`, not automatic source
+  invalidation. Research first maps current protocol dependencies to retained local
+  sections and earlier approvals; covered facts can be reused without a network fetch.
+- Version-2 references are checked every 30 days by default. Set a positive integer
+  `review_interval_days` on an individual `provider_references.lock.json` entry to
+  change that interval. Legacy references enrol when upgraded to version 2. A resumed
+  unfinished run also schedules due reviews without resetting completed product stages
+  or task attempt counters.
+- The controller uses bounded HTTPS conditional requests (ETag / Last-Modified) and
+  normalized document-body SHA-256 hashes. Changed content requires comparison for
+  the deployed provider/model/endpoint/version; layout or another model's documentation
+  does not by itself invalidate the contract. When all source checks are unchanged
+  and the consumer contract still matches, reuse is automatic and needs no model call.
+- Failed retrievals and JavaScript shells are recorded as `freshness.outcome=unavailable`.
+  They preserve the last successful check and existing approval, with a one-day retry
+  interval. Source age schedules a review; it is not a declaration that the API expired.
+- Each assessed reference records a controller-bound `review_id`, per-requirement
+  protocol facts, evidence citations, a target, and separate applicability/freshness
+  conclusions. Missing new capabilities or relevant contradictory evidence still
+  block; an old assessment cannot authorize newly added requirements or assumptions.
+- The controller retains exact earlier markdown and lock entries in
+  `.auto-agents/state/provider-reference-history/`. The lock's `evidence_snapshot`
+  points to a content-checked record, so a failed refresh does not erase earlier facts
+  or the original scope of a user's approval. Research does not grant new assumptions;
+  those still require an explicit user decision.
+
 Clarify, design, plan, implement, review, fix, and collab prompts share the same provider boundary
 rules: body-level provider semantics take precedence over coarse HTTP fallback; recognizable safety
 or refusal outcomes remain distinct from malformed requests and transient failures; unchanged

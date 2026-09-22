@@ -2576,7 +2576,7 @@ def provider_reference_effective_status(
             return status
         expected = provider_reference_consumer_contract_sha256(trace_payload, reference_path)
         recorded = str(value.get("consumer_contract_sha256", "")).strip()
-        return status if recorded == expected else "needs_refresh"
+        return status if recorded == expected else "needs_assessment"
     return "missing"
 
 
@@ -2625,7 +2625,7 @@ def migrate_legacy_provider_reference_consumer_hashes(
     pre-clarify trace is the authoritative comparison point: only references
     whose aggregate active-consumer contract is identical before and after the
     clarify pass are grandfathered. Changed contracts remain unbound and will
-    correctly resolve to ``needs_refresh``.
+    correctly require an applicability assessment (``needs_assessment``).
     """
     if (
         not isinstance(lock_payload, dict)

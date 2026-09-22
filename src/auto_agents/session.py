@@ -86,6 +86,7 @@ from .session_operation_policy import operation_policy_lines
 from .prompting import (ContextBlock, PromptBlock, append_context, compose_prompt,
                         instruction_fingerprint, policy_fingerprint)
 from .requirements import (
+    external_doc_requirements,
     load_requirements_trace,
     validate_provider_resolve_trace_transition,
     validate_requirements_trace_payload,
@@ -676,6 +677,7 @@ class Session:
     # ── Phase 1: Conversational clarification ────────────────────
 
     def _phase_converse(self, state: SessionState) -> SessionState:
+        self._display_state = state
         if not state.goal:
             if self.mode == "provider_resolve":
                 blocked_run = self.orch.restore_exhausted_provider_recovery()
@@ -1018,7 +1020,7 @@ class Session:
                         self._save(state)
                         self._print_agent_thinking()
                         continue
-                    self._print(f"\nAgent:\n{reply.strip()}")
+                    self._print(f"\nAgent:\n{reply.strip()}", user_facing=True)
                     user_reply = self._prompt_user(f"\n{question}\nYour reply: ", multiline=True)
                     state.conversation.append(
                         {"role": "user", "content": user_reply.strip() or "No additional information."}
@@ -3024,6 +3026,12 @@ class Session:
 
     def _phase_provider_resolve_execute(self, state: SessionState) -> SessionState:
         self._current_state = state
+        trace = load_requirements_trace(self.project_root)
+        allowed = self.orch._current_provider_research_requirement_ids(load_run_state(self.project_root))
+        self.orch._prepare_provider_reference_reviews([
+            item for item in external_doc_requirements(trace)
+            if allowed is None or item.get("id") in allowed
+        ])
         feedback = ""
         while True:
             self._check_health_action()
@@ -3217,7 +3225,7 @@ class Session:
                         )
                         continue
                     state.stall_count = 0
-                    self._print(f"\nAgent:\n{reply.strip()}")
+                    self._print(f"\nAgent:\n{reply.strip()}", user_facing=True)
                     state.status = "waiting_user"
                     self._save(state)
                     user_reply = self._prompt_user(
@@ -3244,8 +3252,8 @@ class Session:
                 assist_match = _NEED_USER_ASSIST.search(reply)
                 if assist_match:
                     state.stall_count = 0
-                    self._print(f"\nAgent:\n{reply.strip()}")
-                    self._print(f"\nAgent needs your assistance: {assist_match.group(1)}")
+                    self._print(f"\nAgent:\n{reply.strip()}", user_facing=True)
+                    self._print(f"\nAgent needs your assistance: {assist_match.group(1)}", user_facing=True)
                     state.status = "waiting_user"
                     self._save(state)
                     user_reply = self._prompt_user("\nYour response (or decision): ", multiline=True)
@@ -3257,7 +3265,15 @@ class Session:
                     continue
 
             self._print(f"\nAgent:\n{reply.strip()}")
-            self.orch.bind_resolved_provider_reference_contracts()
+            try:
+                self.orch.bind_resolved_provider_reference_contracts()
+            except RuntimeError as error:
+                feedback = str(error)
+                state.execution_log.append({"attempt": state.current_attempt,
+                    "action": "provider_review_rejected", "result": feedback, "timestamp": self._now()})
+                self._save(state)
+                self._print(feedback)
+                continue
             verify = self.orch.provider_research_resolution_report()
             verify_reason = "" if verify["eligible"] is False and not verify["blockers"] else str(
                 verify.get("reason") or "\n".join(
@@ -3449,6 +3465,8 @@ class Session:
             lines.extend([
                 "",
                 "Analyze the unresolved provider references and the user's goal.",
+                self.orch._provider_reference_review_prompt(),
+                "Assess retained evidence and approval scope first. Routine comparison work is not a user decision: use GOAL_CLEAR to perform it. Ask only about a concrete uncovered dependency or changed authorization after checking prior evidence.",
                 "- Ask targeted questions only when a decision is still needed.",
                 "- If the unblock path is clear enough to begin editing provider-research artifacts, output 'GOAL_CLEAR' on a line by itself at the end.",
                 "- Do not propose product-code changes in this mode.",
@@ -3623,6 +3641,7 @@ class Session:
             "",
             "Your task:",
             "1. Inspect the current provider reference markdown and lock files.",
+            self.orch._provider_reference_review_prompt(),
             "2. Discuss the unblock path with the user when a decision is needed.",
             "3. Apply only the minimal edits needed to provider-research artifacts.",
             "4. If you need the user to choose between options, output 'NEED_USER_ASSIST: <question or decision needed>' on a line by itself.",
@@ -5615,6 +5634,7 @@ class Session:
         return contexts
 
     def _save(self, state: SessionState) -> None:
+        self._display_state = state
         state.updated_at = self._now()
         save_session_state(self.project_root, state)
         control_root = getattr(self, "_custody_control_root", self.project_root)
@@ -5643,20 +5663,20 @@ class Session:
             + str(request.get("reason", "unknown health anomaly"))
         )
 
-    def _print(self, msg: str, flush: bool = False) -> None:
+    def _print(self, msg: str, flush: bool = False, *, user_facing: bool = False) -> None:
         reporter = getattr(self.orch, "reporter", None)
         if reporter is not None:
             # State changes are already published by _save/observe_session.
             # Execution prose (including provider protocols) is diagnostic;
             # interactive clarification remains visible as conversation.
-            current = getattr(self, '_current_state', None)
-            dialogue = current is not None and current.status == 'conversing'
+            current = getattr(self, '_display_state', None) or getattr(self, '_current_state', None)
+            dialogue = user_facing or (current is not None and current.status in {'conversing', 'waiting_user'})
             reporter.text(msg, diagnostic=not dialogue)
         else:
             print(msg, file=sys.stderr, flush=flush)
 
     def _print_agent_thinking(self) -> None:
-        self._print("\nAgent is thinking, please wait...", flush=True)
+        self._print("\nAgent is thinking, please wait...", flush=True, user_facing=True)
 
     @staticmethod
     def _now() -> str:

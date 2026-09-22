@@ -3509,6 +3509,8 @@ class Orchestrator:
                 if state.status == "blocked":
                     save_run_state(self.project_root, state)
                     return state
+            if self._schedule_due_provider_reference_review(state):
+                save_run_state(self.project_root, state)
             if self._normalize_legacy_requirements_audit_resume(state):
                 save_run_state(self.project_root, state)
             self._capture_resume_context(
@@ -6412,6 +6414,9 @@ class Orchestrator:
                 entry = {"path": reference}
                 refs[key] = entry
             previous_status = str(entry.get("status", "")).strip()
+            if previous_status in {"verified", "assumption_approved", "deferred"}:
+                from .provider_reference_review import retain
+                entry["evidence_snapshot"] = retain(self.project_root, reference, entry)
             entry["path"] = reference
             entry.setdefault("retrieved_at", "")
             entry.setdefault("source_urls", [])
@@ -36480,13 +36485,14 @@ class Orchestrator:
             state.stage_summaries["provider_research"] = summary
             state.last_error = ""
             return state
+        from .provider_reference_review import reasons as reference_review_reasons
         unresolved = []
         for requirement in docs_required:
             references = provider_reference_paths(requirement)
             if not references or any(
                 self._normalize_relative_artifact_path(reference) in forced_refresh_refs
-                or
-                not self._is_resolved_provider_reference_status(
+                or reference_review_reasons(provider_reference_lock_entry(lock, reference), trace, reference)
+                or not self._is_resolved_provider_reference_status(
                     provider_reference_effective_status(lock, trace, reference)
                 )
                 for reference in references
@@ -36512,6 +36518,16 @@ class Orchestrator:
             state, "provider_research",
             prerequisites=self.provider_research_blockers(requirement_ids=current_requirement_ids),
         )
+        self._prepare_provider_reference_reviews(unresolved)
+        if not self._provider_reference_review_context and not self.provider_research_blockers(
+            requirement_ids=current_requirement_ids
+        ):
+            summary = "Provider sources are unchanged; existing applicability and approvals reused."
+            write_text(self._stage_output_path(state.run_id, "provider_research"), summary + "\n")
+            state.current_stage = "provider_research"
+            state.stage_summaries["provider_research"] = summary
+            state.last_error = ""
+            return state
         provider_references_dir(self.project_root).mkdir(parents=True, exist_ok=True)
         prompt = self._build_provider_research_prompt(unresolved)
         upgrade_reference_paths = {
@@ -36544,6 +36560,9 @@ class Orchestrator:
             for requirement in docs_required
             for reference in provider_reference_paths(requirement)
         }
+        from .provider_reference_review import finish as finish_reference_reviews
+        lock = finish_reference_reviews(self.project_root, lock, self._provider_reference_review_context)
+        write_json(provider_references_lock_path(self.project_root), lock)
         stamped_lock, lock_updates = stamp_provider_reference_consumer_hashes(
             lock,
             trace,
@@ -36981,6 +37000,14 @@ class Orchestrator:
                 f"{detail}"
             )
         lock = load_provider_references_lock(self.project_root)
+        from .provider_reference_review import validate as validate_reference_reviews, finish as finish_reference_reviews
+        context = getattr(self, "_provider_reference_review_context", {})
+        errors = validate_reference_reviews(lock, trace, context)
+        if errors:
+            raise RuntimeError("Provider reference review is incomplete:\n" + "\n".join(errors))
+        lock = finish_reference_reviews(self.project_root, lock, context)
+        if context:
+            write_json(provider_references_lock_path(self.project_root), lock)
         stamped, updates = stamp_provider_reference_consumer_hashes(lock, trace)
         if updates and isinstance(stamped, dict):
             write_json(provider_references_lock_path(self.project_root), stamped)
@@ -37002,7 +37029,9 @@ class Orchestrator:
 
     def provider_research_resolution_report(self, state: Optional[RunState] = None) -> Dict[str, object]:
         state = state or load_run_state(self.project_root)
-        blockers = self.provider_research_blockers()
+        blockers = self.provider_research_blockers(
+            requirement_ids=self._current_provider_research_requirement_ids(state)
+        )
         if not self.is_provider_research_blocked_error(state.last_error):
             return {
                 "eligible": False,
@@ -40308,6 +40337,49 @@ class Orchestrator:
             lines.append("\nBased on the conversation above, present the UPDATED list of planned README sections.")
         return compose_prompt(lines, purpose="readme_proposal")
 
+    def _schedule_due_provider_reference_review(self, state: RunState) -> bool:
+        """Recheck due references on resume without rewinding product work."""
+        if state.status in {"completed", "blocked", "failed", "paused", "waiting_user"} or "provider_research" not in state.stage_summaries:
+            return False
+        from .provider_reference_review import reasons
+        trace = load_requirements_trace(self.project_root)
+        lock = load_provider_references_lock(self.project_root)
+        allowed = self._current_provider_research_requirement_ids(state)
+        due = {ref for item in external_doc_requirements(trace)
+               if allowed is None or item.get("id") in allowed
+               for ref in provider_reference_paths(item)
+               if "freshness" in reasons(provider_reference_lock_entry(lock, ref), trace, ref)}
+        if not due:
+            return False
+        self._record_health_control("provider_reference_review", stage="provider_research", rewind=True)
+        state.stage_summaries.pop("provider_research")
+        advance_run_health_control(state, kind="provider_reference_review", rewind=True)
+        self.logger.info("[provider-research] scheduled source review for %s", ", ".join(sorted(due)))
+        return True
+
+    def _prepare_provider_reference_reviews(self, requirements: List[dict]) -> None:
+        from .provider_reference_review import prepare, reuse_unchanged
+        lock = load_provider_references_lock(self.project_root)
+        references = {ref for item in requirements for ref in provider_reference_paths(item)}
+        self._provider_reference_review_context = prepare(
+            self.project_root, load_requirements_trace(self.project_root), lock, references,
+            requirement_ids={item["id"] for item in requirements},
+        )
+        self._provider_reference_review_context = reuse_unchanged(
+            self.project_root, lock, self._provider_reference_review_context
+        )
+        for entry in lock.get("references", {}).values():
+            item = self._provider_reference_review_context.get(entry.get("path"))
+            if item:
+                entry["evidence_snapshot"] = item["evidence_snapshot"]
+        write_json(provider_references_lock_path(self.project_root), lock)
+
+    def _provider_reference_review_prompt(self) -> str:
+        from .provider_reference_review import INSTRUCTION
+        return INSTRUCTION + "\nRetained evidence and controller source observations:\n" + json.dumps(
+            getattr(self, "_provider_reference_review_context", {}), ensure_ascii=False
+        )
+
     def _build_provider_research_prompt(self, requirements: List[dict]) -> str:
         trace_path = requirements_trace_path(self.project_root)
         lock_path = provider_references_lock_path(self.project_root)
@@ -40325,9 +40397,10 @@ class Orchestrator:
             "Do not implement product code in this stage.",
             "Only modify provider reference markdown files under .auto-agents/docs/provider_references/ and .auto-agents/state/provider_references.lock.json.",
             "Do not modify project code, tests, README.md, or task-planning artifacts in this stage.",
-            "For each requirement below, create or update every provider reference markdown file named in the trace.",
+            "Assess only the references listed in the supplied review context. Reuse other already-applicable references without edits; map the listed current requirements to their retained evidence.",
             "Each reference must include: Status, Retrieved at, Official sources, Authentication, Request, Response, Errors, Contract Test Requirements, Unknowns / Ambiguities.",
-            "If official docs are unavailable or ambiguous, write a blocked/needs_user_input reference with the exact missing information and recovery options.",
+            "For genuinely uncovered protocol facts or relevant contradictions, record the exact affected requirement and evidence. Unavailable fresh retrieval alone must not revoke retained evidence or existing approvals.",
+            self._provider_reference_review_prompt(),
             "Update provider_references.lock.json with one entry per provider reference. Each entry must include path, status, retrieved_at, source_urls, and notes.",
             "Allowed lock statuses: verified, blocked, needs_user_input, ambiguous, deferred, temporary_stub, assumption_approved.",
             *provider_policy_prompt_lines("provider_research"),
@@ -44963,6 +45036,8 @@ class Orchestrator:
                             ),
                         )
                     )
+        from .provider_reference_review import validate as validate_reference_reviews
+        missing.extend(validate_reference_reviews(lock, trace, getattr(self, "_provider_reference_review_context", {})))
         missing = list(dict.fromkeys(missing))
         if missing:
             bullets = "\n".join(f"- {item}" for item in missing)

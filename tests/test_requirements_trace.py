@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -1310,7 +1311,7 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertEqual(stamped, legacy)
         self.assertEqual(updates, [])
 
-    def test_provider_reference_verified_lock_is_invalidated_by_contract_change(self) -> None:
+    def test_provider_reference_verified_lock_requires_assessment_after_contract_change(self) -> None:
         reference = ".auto-agents/docs/provider_references/provider.md"
         trace, _ = stamp_requirement_contract_hashes(
             {
@@ -1358,7 +1359,7 @@ class RequirementsTraceTests(unittest.TestCase):
         )
         self.assertEqual(
             provider_reference_effective_status(lock, changed_trace, reference),
-            "needs_refresh",
+            "needs_assessment",
         )
 
     def test_legacy_provider_lock_migration_backfills_only_unchanged_consumers(self) -> None:
@@ -1413,7 +1414,7 @@ class RequirementsTraceTests(unittest.TestCase):
         )
         self.assertEqual(
             provider_reference_effective_status(migrated, current, changed_ref),
-            "needs_refresh",
+            "needs_assessment",
         )
 
     def test_visual_judge_extracts_explicit_visual_evidence_pairs(self) -> None:
@@ -5109,6 +5110,15 @@ class RequirementsTraceTests(unittest.TestCase):
                                 "retrieved_at": "2026-04-11T00:00:00Z",
                                 "source_urls": ["https://example.com/official"],
                                 "notes": "refreshed after review",
+                                "review": {
+                                    "review_id": re.search(r'"review_id":\s*"([a-f0-9]+)"', request.prompt).group(1),
+                                    "applicability": "covered", "freshness": "not_checked",
+                                    "facts": [{"requirement_id": "REQ-102", "fact": "Existing provider protocol",
+                                               "result": "covered", "evidence_ref": self.reference + "#request"}],
+                                    "reason": "Canonical sections now explicitly document the existing contract.",
+                                    "evidence_refs": [self.reference + "#request"],
+                                    "target": {"provider": "fixture", "model": "fixture", "endpoint": "/fixture", "version": "v1"},
+                                },
                             }
                         },
                     },

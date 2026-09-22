@@ -2629,7 +2629,17 @@ class SessionCollabFlowTests(unittest.TestCase):
                 state = session.start()
 
             self.assertEqual(state.status, "completed")
-            self.assertEqual(captured.getvalue().count("Agent is thinking, please wait..."), 3)
+            # The concise presenter collapses consecutive identical messages;
+            # retain all three user-facing events and show feedback after input.
+            events = [json.loads(line) for line in
+                      (orchestrator.reporter.root / "events.jsonl").read_text().splitlines()]
+            thinking = [event for event in events
+                        if event.get("message", "").strip() == "Agent is thinking, please wait..."
+                        and event.get("audience") == "user"]
+            self.assertEqual(len(thinking), 3)
+            after_input = captured.getvalue().split("Status: Waiting for input", 1)
+            self.assertEqual(len(after_input), 2)
+            self.assertIn("Agent is thinking, please wait...", after_input[1])
 
     def test_collab_flow_commits_completed_session_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
