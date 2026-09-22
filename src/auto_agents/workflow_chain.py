@@ -562,6 +562,9 @@ class WorkflowStore:
         reason: str,
         details: Optional[Dict[str, object]] = None,
     ) -> None:
+        # Signal handlers can retain the parent's pre-child snapshot. Reload
+        # before saving flags, otherwise that save rolls back the journal head.
+        snapshot.__dict__.update(self.load(snapshot.workflow_id).__dict__)
         snapshot.recovery_required = True
         self.save(snapshot)
         payload = {"reason": str(reason)}
@@ -569,6 +572,7 @@ class WorkflowStore:
         self.append_event(snapshot, "recovery_required", details=payload)
 
     def begin_resume(self, snapshot: WorkflowSnapshot) -> None:
+        snapshot.__dict__.update(self.load(snapshot.workflow_id).__dict__)
         snapshot.resume_epoch += 1
         snapshot.recovery_required = False
         snapshot.status = "active"
@@ -580,6 +584,7 @@ class WorkflowStore:
         )
 
     def complete(self, snapshot: WorkflowSnapshot, *, status: str = "completed") -> None:
+        snapshot.__dict__.update(self.load(snapshot.workflow_id).__dict__)
         snapshot.status = status
         snapshot.active_handoff_id = ""
         self.save(snapshot)

@@ -71,6 +71,15 @@ Provider reference review separates **applicability**, **freshness**, and **vali
 - Failed retrievals and JavaScript shells are recorded as `freshness.outcome=unavailable`.
   They preserve the last successful check and existing approval, with a one-day retry
   interval. Source age schedules a review; it is not a declaration that the API expired.
+- Freshness and applicability are independent: a relevant documentation update can
+  remain `covered` when every required protocol fact is still supported within the
+  existing approval. Retain historical source disagreements separately from current
+  dependencies. A `blocking=false` field cannot waive a missing or contradicted
+  required fact.
+- Review inputs are retained under `provider-reference-history/reviews/`. After an
+  interruption, an existing review can be admitted without another model call only
+  when the saved input receipt matches the consumer, evidence snapshot and source
+  observations, and the complete current reference validation passes again.
 - Each assessed reference records a controller-bound `review_id`, per-requirement
   protocol facts, evidence citations, a target, and separate applicability/freshness
   conclusions. Missing new capabilities or relevant contradictory evidence still

@@ -137,6 +137,46 @@ def reasons(entry, trace, reference, *, now=None):
     return result
 
 
+def _context_identity(reference, item):
+    return _digest([reference, item['consumer_contract_sha256'], item['evidence_snapshot'],
+                    item['reasons'], item['sources'], item['requirement_ids']])
+
+
+def _context_path(project, review_id):
+    if not isinstance(review_id, str) or not re.fullmatch(r'[a-f0-9]{64}', review_id):
+        raise ValueError('invalid provider review identity')
+    path = Path(project) / HISTORY / 'reviews' / (review_id + '.json')
+    if path.is_symlink() or not path.resolve().is_relative_to(Path(project).resolve()):
+        raise ValueError('provider review context escapes project')
+    return path
+
+
+def pending_context(project, lock, prepared):
+    """Recover only a controller-retained input, then revalidate its output.
+
+    A status changing from blocked to usable can change the scheduling reasons;
+    it cannot change the authority, consumer, target snapshot or source checks.
+    A model-written review_id without a matching input receipt grants nothing.
+    """
+    recovered = {}
+    for reference, current in prepared.items():
+        entry = next((v for v in lock.get('references', {}).values()
+                      if isinstance(v, dict) and v.get('path') == reference), {})
+        assessment = entry.get('review') or {}
+        review_id = assessment.get('review_id') if isinstance(assessment, dict) else None
+        try:
+            saved = json.loads(_context_path(project, review_id).read_text())
+            previous = saved['context']
+            if (saved.get('reference') != reference or _context_identity(reference, previous) != review_id
+                    or any(previous.get(k) != current.get(k) for k in (
+                        'prior', 'consumer_contract_sha256', 'evidence_snapshot', 'requirement_ids', 'sources'))):
+                return None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        recovered[reference] = previous
+    return recovered or None
+
+
 def prepare(project, trace, lock, references, *, requirement_ids=None, fetch=True, now=None):
     from .requirements import provider_reference_consumer_contract_sha256, provider_reference_paths
     now = now or now_utc()
@@ -169,7 +209,11 @@ def prepare(project, trace, lock, references, *, requirement_ids=None, fetch=Tru
             if 'freshness' in item['reasons']:
                 item['sources'] = [results[url] for url in entry.get('source_urls', []) if url in results]
     for reference, item in context.items():
-        item['review_id'] = _digest([reference, item['consumer_contract_sha256'], item['evidence_snapshot'], item['reasons'], item['sources'], item['requirement_ids']])
+        item['review_id'] = _context_identity(reference, item)
+        from .io_utils import write_json
+        path = _context_path(project, item['review_id'])
+        if not path.exists():
+            write_json(path, {'reference': reference, 'context': item})
     return context
 
 
@@ -194,8 +238,19 @@ For each requested reference write a review object in its lock entry:
  "freshness":"not_checked|unchanged|changed_unrelated|changed_relevant|unavailable",
  "target":{"provider":"...","model":"...","endpoint":"...","version":"..."}}.
 Cover every supplied requirement_id with facts. Local policy changes can cite existing
-protocol facts without claiming a new provider capability. Only a concrete new uncovered protocol dependency or relevant contradictory evidence
-can block. Explain the requirement and exact fact; retrieval failure alone is not a gap.
+protocol facts without claiming a new provider capability. Freshness and applicability
+are independent: use covered with changed_relevant when an evidence-supported source
+update (including deployed request timeout guidance) leaves every required protocol
+dependency covered within the prior approval. Do not relabel relevant changes unrelated.
+Keep historical source discrepancies in dated reference sections linked by evidence_refs;
+facts must describe dependencies of the current consumer, not unused provider claims.
+Explain why each discrepancy does or does not affect those dependencies, preserving the
+original evidence and conservative request/recovery limitations. Reconcile the current
+assessment in both the reference document and lock without erasing historical records.
+Only a concrete missing or contradicted required protocol dependency can justify gap or
+conflict. Explain the requirement and exact fact; retrieval failure alone is not a gap.
+An unresolved required fact cannot be marked covered or usable, even with a nonblocking
+conflict_disposition or blocking=false. Such fields do not override this contract.
 Preserve the prior verified/assumption_approved status when covered, including on
 unavailable freshness. Keep source timestamps, validators and historical evidence;
 consumer hashes and admitted timestamps are controller-owned. Do not approve new
@@ -251,8 +306,8 @@ def validate(lock, trace, context):
         if applicability == 'covered':
             if entry.get('status') != prior.get('status'):
                 errors.append(f'{reference}: covered evidence must retain its prior validity/approval status')
-            if freshness == 'changed_relevant':
-                errors.append(f'{reference}: relevant protocol changes require a conflict/gap assessment')
+            # A relevant source update need not leave a required capability
+            # unresolved. Coverage, evidence and approval checks still apply.
         else:
             affected = review.get('affected_requirement_ids', [])
             if (not isinstance(affected, list) or not affected

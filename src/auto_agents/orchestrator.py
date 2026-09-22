@@ -16124,6 +16124,56 @@ class Orchestrator:
         }
         return bool(owned_targets and set(targets).issubset(owned_targets))
 
+    def _resume_provider_reference_review_repair(self, state: RunState) -> bool:
+        """Hand an approved engine repair back to the pending reference review.
+
+        This is a stage prerequisite, not a failed implementation task. Keep
+        the accepted plan and consumed attempts, and let provider_research own
+        reassessment and admission of the retained (possibly invalid) artifacts.
+        """
+        blocker = state.active_blocker or {}
+        if (
+            state.status != "pending"
+            or blocker.get("owner") != "auto_agents"
+            or blocker.get("category") != "provider_reference_freshness_validity_conflation"
+            or blocker.get("status") != "retrying"
+            or not isinstance(blocker.get("self_repair_commit"), str)
+            or not blocker["self_repair_commit"].strip()
+            or blocker.get("task_id")
+            or state.pending_approval
+            or state.active_input_request_id
+            or state.pending_input_requests
+            or state.current_stage not in {"plan", "provider_research"}
+            or "plan" not in state.stage_summaries
+            or self._pending_stages(state)[:1] != ["provider_research"]
+        ):
+            return False
+
+        requirement_ids = self._current_provider_research_requirement_ids(state)
+        references = sorted({
+            reference
+            for requirement in external_doc_requirements(load_requirements_trace(self.project_root))
+            if requirement_ids is None or requirement["id"] in requirement_ids
+            for reference in provider_reference_paths(requirement)
+        })
+        if not references:
+            return False
+
+        # Preserve the repaired blocker as evidence without presenting it as an
+        # active failure. Neither this receipt nor the installed-engine marker
+        # grants provider approval, stamps consumer hashes or skips validation.
+        state.last_recovery_route = {
+            "outcome": "provider_reference_review_repaired",
+            "run_id": state.run_id,
+            "from_stage": state.current_stage,
+            "to_stage": "provider_research",
+            "references": references,
+            "repaired_blocker": copy.deepcopy(blocker),
+            "prepared_at": utc_now_iso(),
+        }
+        self._clear_run_blocker(state)
+        return True
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         if self._legacy_applied_checkpoint_records(state):
             canonical_tasks = self._load_implementation_tasks(state)
@@ -16133,6 +16183,8 @@ class Orchestrator:
             )
         if self._reconcile_iteration_plan_scope_repair(state):
             return True
+        if (state.active_blocker or {}).get("category") == "provider_reference_freshness_validity_conflation":
+            return self._resume_provider_reference_review_repair(state)
         legacy_before_reconcile = (
             dict(state.active_blocker)
             if isinstance(state.active_blocker, dict)
@@ -21454,7 +21506,8 @@ class Orchestrator:
 
     def _record_iteration_plan_continuation(self, state: RunState, stage: str, **details: object) -> None:
         """Persist the actual next boundary reached after scoped planning recovery."""
-        if (state.last_recovery_route.get("outcome") != "iteration_plan_scope_reconciled"
+        if (state.last_recovery_route.get("outcome") not in {
+                "iteration_plan_scope_reconciled", "provider_reference_review_repaired"}
                 or state.status in {"blocked", "paused", "waiting_user"} or state.active_blocker):
             return
         spec_value = str(state.resume_context.get("spec_file", "")).strip()
@@ -36542,18 +36595,34 @@ class Orchestrator:
             )
             state.rejected_stage = ""
             state.rejection_reason = ""
-        result = self._run_agent_with_retries(
-            state=state,
-            stage="provider_research",
-            stage_key="provider_research",
-            prompt=prompt,
-            validation_feedback=lambda agent_result: self._provider_research_validation_feedback(
-                agent_result,
-                requirement_ids=current_requirement_ids,
-                upgrade_reference_paths=upgrade_reference_paths,
-            ),
-            effort=self.config.efforts.get("provider_research", "deep"),
+        from .provider_reference_review import pending_context
+        retained_context = pending_context(
+            self.project_root, load_provider_references_lock(self.project_root),
+            self._provider_reference_review_context,
         )
+        prepared_context = self._provider_reference_review_context
+        if retained_context:
+            self._provider_reference_review_context = retained_context
+        retained_valid = retained_context and self._provider_research_validation_feedback(
+            None, requirement_ids=current_requirement_ids, upgrade_reference_paths=upgrade_reference_paths
+        ) is None
+        if retained_valid:
+            summary = "Retained provider reviews revalidated and admitted against their original inputs."
+        else:
+            self._provider_reference_review_context = prepared_context
+            result = self._run_agent_with_retries(
+                state=state,
+                stage="provider_research",
+                stage_key="provider_research",
+                prompt=prompt,
+                validation_feedback=lambda agent_result: self._provider_research_validation_feedback(
+                    agent_result,
+                    requirement_ids=current_requirement_ids,
+                    upgrade_reference_paths=upgrade_reference_paths,
+                ),
+                effort=self.config.efforts.get("provider_research", "deep"),
+            )
+            summary = result.summary.strip()
         lock = load_provider_references_lock(self.project_root)
         scoped_reference_paths = {
             reference
@@ -36588,8 +36657,18 @@ class Orchestrator:
                 f"{detail}"
             )
         state.current_stage = "provider_research"
-        state.stage_summaries["provider_research"] = result.summary.strip()
+        state.stage_summaries["provider_research"] = summary
         state.last_error = ""
+        save_run_state(self.project_root, state)
+        self.reporter.event("provider_references.admitted", {
+            "stage_id": "provider_research", "run_id": state.run_id,
+            "workflow_id": str(state.resume_context.get("workflow_id", "")),
+            "references": sorted(self._provider_reference_review_context),
+            "lock_sha256": hashlib.sha256(provider_references_lock_path(self.project_root).read_bytes()).hexdigest(),
+            "document_sha256": {ref: hashlib.sha256((self.project_root / ref).read_bytes()).hexdigest()
+                                for ref in sorted(self._provider_reference_review_context)},
+            "reused_retained_review": bool(retained_valid),
+        })
         return state
 
     @staticmethod

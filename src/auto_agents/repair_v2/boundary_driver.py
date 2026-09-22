@@ -8,6 +8,9 @@ import sys
 import subprocess
 
 
+CONTINUATION_CATEGORIES = {'iteration_plan_scope_mismatch', 'provider_reference_freshness_validity_conflation'}
+
+
 class ReplayEnvironmentUnavailable(RuntimeError):
     pass
 
@@ -115,13 +118,17 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
     trace_before = trace_path.read_bytes()
     if run_input_hashes(target, original) != frozen_inputs:
         raise RuntimeError('original run inputs changed during reconciliation')
+    require_admission = original.active_blocker.get('category') == 'provider_reference_freshness_validity_conflation'
+    required_references = {b['reference'] for b in orchestrator.provider_research_blockers(
+        requirement_ids=orchestrator._current_provider_research_requirement_ids(original))} if require_admission else set()
+    accepted_events = {'implementation.entered'} if require_admission else {'implementation.entered', 'provider_research.required'}
     event_path = target / '.auto-agents/runs' / original.run_id / 'events.jsonl'
     offset = event_path.stat().st_size if event_path.exists() else 0
     emit_event = orchestrator.reporter.event
 
     def observe(kind, data, **options):
         emit_event(kind, data, **options)
-        if kind in {'implementation.entered', 'provider_research.required'}:
+        if kind in accepted_events:
             raise ContinuationBoundaryObserved()
 
     orchestrator.reporter.event = observe
@@ -137,7 +144,7 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
     plan = load_task_plan(target)
     events = ([json.loads(line) for line in event_path.read_bytes()[offset:].splitlines()]
               if event_path.exists() else [])
-    entries = [event for event in events if event.get('type') in {'implementation.entered', 'provider_research.required'}]
+    entries = [event for event in events if event.get('type') in accepted_events]
     if len(entries) != 1:
         raise RuntimeError('original workflow did not persist a fresh implementation entry or prerequisite boundary')
     entry = entries[0]
@@ -175,6 +182,33 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
         and engine.get('orchestrator_module') == str(expected_module.resolve())
         and engine.get('orchestrator_sha256') == hashlib.sha256(expected_module.read_bytes()).hexdigest()
     )
+    admission = None
+    if require_admission:
+        from auto_agents.config import provider_references_lock_path
+        admissions = [event for event in events if event.get('type') == 'provider_references.admitted']
+        if len(admissions) != 1:
+            raise RuntimeError('original workflow lacks a fresh provider-review admission receipt')
+        admission = admissions[0]
+        bound = admission.get('data', {})
+        paths = bound.get('document_sha256', {})
+        valid_paths = isinstance(paths, dict) and all(
+            isinstance(path, str) and not Path(path).is_absolute() and '..' not in Path(path).parts
+            and path.startswith('.auto-agents/docs/provider_references/')
+            and (target / path).resolve().is_relative_to(target.resolve()) for path in paths)
+        valid_admission = (
+            admission.get('event_id') and admission.get('subject_id') == original.run_id
+            and admission.get('stage_id') == 'provider_research'
+            and bound.get('run_id') == original.run_id and bound.get('workflow_id') == workflow_id
+            and bound.get('lock_sha256') == hashlib.sha256(provider_references_lock_path(target).read_bytes()).hexdigest()
+            and valid_paths and set(bound.get('references', [])) == set(paths)
+            and required_references.issubset(paths)
+            and all(hashlib.sha256((target / path).read_bytes()).hexdigest() == checksum for path, checksum in paths.items())
+            and events.index(admission) < events.index(entry)
+            and not orchestrator.provider_research_blockers(
+                requirement_ids=orchestrator._current_provider_research_requirement_ids(state))
+        )
+        if not valid_admission:
+            raise RuntimeError('provider-review receipt does not attest the original run admission')
     if not preserved or not entered:
         raise RuntimeError('original workflow continuation failed identity or preservation checks')
     return {
@@ -185,6 +219,7 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
             'ok': True, 'boundary_kind': 'implementation' if implemented else 'provider_research', 'run_id': state.run_id,
             'workflow_id': workflow_id, 'implementation_entry': entry if implemented else None,
             'continuation_entry': entry, 'implementation_entered': implemented,
+            'provider_admission': admission,
             'continuation_status': 'implementation_entered' if implemented else 'prerequisite_required',
             'prerequisites': prerequisites,
             'entry_event_ref': str(event_path.relative_to(target)),
@@ -213,7 +248,7 @@ def main():
     scoped_run = False
     if invocation.get('run_id'):
         from auto_agents.config import load_run_state
-        scoped_run = load_run_state(target).active_blocker.get('category') == 'iteration_plan_scope_mismatch'
+        scoped_run = load_run_state(target).active_blocker.get('category') in CONTINUATION_CATEGORIES
     if case.get('progress_history') and not bound_child and not scoped_run:
         from auto_agents.health_watch import replay_health_events
         items = replay_health_events(case['progress_history'], progress_lease_seconds=60)
@@ -251,7 +286,7 @@ def main():
         if not before and not blocked:
             raise RuntimeError('frozen run has no original blocked boundary')
         frozen_inputs = (run_input_hashes(target, original)
-                         if before.get('category') == 'iteration_plan_scope_mismatch' else None)
+                         if before.get('category') in CONTINUATION_CATEGORIES else None)
         orchestrator = Orchestrator(target)
         def forbidden(*args, **kwargs):
             raise RuntimeError('offline boundary verification must not invoke providers')
@@ -266,7 +301,7 @@ def main():
         ok = not same and (bool(blocked - remains) if blocked else bool(changed))
         observed = {'ok': ok, 'run_id': state.run_id, 'status': state.status,
                     'remaining_blocked': sorted(remains), 'same_blocker': same}
-        if ok and before.get('category') == 'iteration_plan_scope_mismatch':
+        if ok and before.get('category') in CONTINUATION_CATEGORIES:
             # Keep the existing reconciliation checks, then prove the stronger
             # postcondition through the saved workflow. This probe is pinned by
             # the controller, independently of the candidate engine imports.

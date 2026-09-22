@@ -75,6 +75,32 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(sequences, [1, 2, 3])
             self.assertEqual(store.load(created.workflow_id).event_sequence, 3)
 
+    def test_stale_parent_lifecycle_updates_preserve_the_child_journal_head(self) -> None:
+        for action in ("interrupt", "resume", "complete"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
+                store = WorkflowStore(Path(tmp))
+                original = store.create_root(WorkflowRef("run", "run-a"))
+                stale = store.load(original.workflow_id)
+                child = store.load(original.workflow_id)
+                child.active_frame = WorkflowRef("provider_resolve", "child-a")
+                store.save(child)
+                event = store.append_event(child, "provider_resolve_child_started",
+                                           details={"session_id": "child-a"})
+                if action == "interrupt":
+                    store.mark_recovery_required(stale, reason="run interrupted by SIGINT")
+                elif action == "resume":
+                    store.begin_resume(stale)
+                else:
+                    store.complete(stale)
+                events = store.events(original.workflow_id)
+                self.assertEqual([e["sequence"] for e in events], [1, 2, 3])
+                self.assertEqual(events[-1]["previous_event_sha256"], event["event_sha256"])
+                self.assertEqual(store.load(original.workflow_id).active_frame, child.active_frame)
+                store.snapshot_path(original.workflow_id).unlink()
+                rebuilt = store.load(original.workflow_id)
+                self.assertEqual(rebuilt.event_sequence, 3)
+                self.assertEqual(rebuilt.active_frame, child.active_frame)
+
     def test_event_index_is_rebuilt_from_authoritative_hash_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"

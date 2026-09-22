@@ -282,3 +282,336 @@ def test_all_unchanged_sources_reuse_applicable_contract_without_model(tmp_path,
     trace['requirements'][0]['text'] = 'New capability'
     new_context = review.prepare(tmp_path, trace, lock, [REF], now=NOW)
     assert review.reuse_unchanged(tmp_path, lock, new_context, now=NOW)  # Still assess the new dependency.
+
+
+@pytest.mark.parametrize('prior_status', ['assumption_approved', 'verified'])
+def test_relevant_source_change_with_covered_dependencies_is_admitted_and_reused(
+    tmp_path, monkeypatch, prior_status,
+):
+    """Synthetic source/research responses; real validation and durable admission."""
+    import json
+    from auto_agents.config import (
+        load_run_state, provider_references_lock_path, requirements_trace_path,
+        save_run_state, task_plan_path,
+    )
+    from auto_agents.io_utils import write_json, write_text
+    from auto_agents.models import AgentResult, TaskSpec
+    from auto_agents.orchestrator import Orchestrator
+    from auto_agents.requirements import (
+        provider_reference_consumer_contract_sha256, stamp_requirement_contract_hashes,
+    )
+    from test_provider_contract_policy import _sourced_reference_markdown
+    from test_requirements_trace import _requirement
+
+    root = tmp_path / 'project'
+    Orchestrator.init_project(root, 'review', 'mock')
+    trace = {'version': 1, 'contract_identity_schema_version': 1, 'requirements': [
+        _requirement(id=rid, external_docs_required=True, provider_reference=REF)
+        for rid in ('REQ-001', 'REQ-002')
+    ]}
+    old_date = (NOW - timedelta(days=40)).isoformat()
+    lock, _ = stamp_provider_reference_consumer_hashes({'references': {'provider': {
+        'path': REF, 'status': prior_status, 'contract_version': 2,
+        'retrieved_at': old_date, 'source_urls': ['https://example.com/docs'],
+        'notes': 'Existing request omits optional quality; unknown completion cannot be resubmitted.',
+    }}}, trace)
+    prior_entry = deepcopy(lock['references']['provider'])
+    trace['requirements'][0]['text'] = 'Local recovery compares candidates within the existing request scope.'
+    trace, _ = stamp_requirement_contract_hashes(trace)
+    write_json(requirements_trace_path(root), trace)
+    write_json(provider_references_lock_path(root), lock)
+    historical = (
+        '\n## Historical source comparison\n\n'
+        'Synthetic retained source: timeout guidance was 300 seconds; optional quality '
+        'was described as rejected. The approved payload omits quality.\n'
+    )
+    prior_document = _sourced_reference_markdown() + historical
+    write_text(root / REF, prior_document)
+    tasks = [dict(task_id=f'T{i:02}', title='Retained task', description='Existing work',
+                  acceptance=['Keep the existing contract.'], requirement_ids=['REQ-001', 'REQ-002'])
+             for i in range(19)]
+    write_json(task_plan_path(root), {'tasks': tasks})
+    write_text(root / 'unrelated.txt', 'Unrelated unfinished work.\n')
+    protected_paths = [task_plan_path(root), requirements_trace_path(root),
+                       root / '.auto-agents/config.json', root / 'unrelated.txt']
+    protected = {path: path.read_bytes() for path in protected_paths}
+    state = load_run_state(root)
+    state.current_stage = 'plan'
+    state.tasks = [TaskSpec.from_dict(task) for task in tasks]
+    state.agent_attempts = {'plan': 3, 'provider_research': 2}
+    state.approved_gates = ['requirements', 'architecture']
+    state.resume_context = {'workflow_id': 'wf-retained', 'max_tasks': 19, 'skip_validate': False}
+    save_run_state(root, state)
+    preserved_state = deepcopy(state)
+    orch = Orchestrator(root)
+    monkeypatch.setattr(review, 'now_utc', lambda: NOW)
+    source_calls, research_calls = [], []
+
+    def source(url, previous):
+        source_calls.append(url)
+        return {'url': url, 'outcome': 'content_available', 'content_sha256': 'b' * 64}
+
+    monkeypatch.setattr(review, 'check_source', source)
+    captured = {}
+
+    def research(**kwargs):
+        research_calls.append(kwargs)
+        assert kwargs['stage'] == 'provider_research'
+        assert 'retained local evidence' in kwargs['prompt']
+        context = orch._provider_reference_review_context
+        assert set(context[REF]['reasons']) == {'applicability', 'freshness'}
+        assert context[REF]['prior'] == prior_entry
+        snapshot = root / context[REF]['evidence_snapshot']
+        captured['prior_snapshot'] = snapshot
+        captured['prior_bytes'] = snapshot.read_bytes()
+        generated = json.loads(provider_references_lock_path(root).read_text())
+        assessment = decision(
+            context=context, freshness='changed_relevant', affected_requirement_ids=[],
+            reason='The deployed timeout recommendation changed; the request and recovery dependencies remain covered.',
+            evidence_refs=[REF + '#historical-source-comparison', REF + '#current-source-comparison'],
+        )
+        for fact in assessment['facts']:
+            fact.update(fact='The unchanged request omits optional quality; reuse completed receipts and stop on unknown completion.',
+                        evidence_ref=REF + '#current-source-comparison')
+        generated['references']['provider']['review'] = assessment
+        captured['assessment'] = deepcopy(assessment)
+        current_document = prior_document + (
+            '\n## Current source comparison\n\n'
+            'Synthetic official-source update: https://example.com/docs now recommends '
+            '360 seconds and describes optional quality as accepted but not guaranteed. '
+            'This is a relevant change, not an unresolved required capability: the approved '
+            'request still omits quality. Retain conservative timeout guidance, existing '
+            'refusal handling and zero duplicate submission after unknown completion.\n'
+        )
+        write_text(root / REF, current_document)
+        captured['document'] = current_document
+        write_json(provider_references_lock_path(root), generated)
+        result = AgentResult(True, [], root / 'result.md', summary='Relevant update assessed; required dependencies covered.')
+        # This acceptance assertion fails on the base engine's freshness rejection.
+        assert kwargs['validation_feedback'](result) is None
+        return result
+
+    monkeypatch.setattr(orch, '_run_agent_with_retries', research)
+    state = orch._run_provider_research(load_run_state(root), root / 'spec.md')
+    assert state.current_stage == 'provider_research' and not state.last_error
+    save_run_state(root, state)
+    admitted = json.loads(provider_references_lock_path(root).read_text())
+    entry = admitted['references']['provider']
+    assert entry['status'] == prior_status
+    assert entry['review'] == captured['assessment']
+    assert entry['freshness']['outcome'] == 'changed_relevant'
+    assert entry['freshness']['last_checked_at'] == NOW.isoformat()
+    assert entry['applicability_checked_at'] == NOW.isoformat()
+    assert entry['consumer_contract_sha256'] == provider_reference_consumer_contract_sha256(trace, REF)
+    assert entry['consumer_contract_sha256'] != prior_entry['consumer_contract_sha256']
+    assert provider_reference_effective_status(admitted, trace, REF) == prior_status
+    saved = review.retained(root, REF, entry)  # Verifies the persisted content-addressed identity.
+    assert saved['entry']['review'] == captured['assessment']
+    assert saved['entry']['consumer_contract_sha256'] == entry['consumer_contract_sha256']
+    assert saved['text'] == captured['document']
+    assert historical in saved['text']
+    assert captured['prior_snapshot'].read_bytes() == captured['prior_bytes']
+    assert root / entry['evidence_snapshot'] != captured['prior_snapshot']
+    assert review.reasons(entry, trace, REF, now=NOW) == []
+
+    reloaded = Orchestrator(root)
+    monkeypatch.setattr(reloaded, '_run_agent_with_retries', lambda **kw: pytest.fail('admitted review must be reused'))
+    reused = reloaded._run_provider_research(load_run_state(root), root / 'spec.md')
+    assert reused.current_stage == 'provider_research' and not reused.last_error
+    assert reloaded.provider_research_blockers(requirement_ids={'REQ-001', 'REQ-002'}) == []
+    assert len(research_calls) == 1 and source_calls == ['https://example.com/docs']
+    assert json.loads(provider_references_lock_path(root).read_text()) == admitted
+    for field in ('run_id', 'tasks', 'agent_attempts', 'approved_gates', 'resume_context'):
+        assert getattr(reused, field) == getattr(preserved_state, field)
+    assert len(reused.tasks) == 19
+    assert {path: path.read_bytes() for path in protected_paths} == protected
+
+
+@pytest.mark.parametrize('applicability', ['covered', 'gap', 'conflict'])
+@pytest.mark.parametrize('result', ['missing', 'contradicted'])
+def test_relevant_change_cannot_contain_an_unresolved_required_fact(
+    tmp_path, applicability, result,
+):
+    trace, lock = scene(tmp_path)
+    trace['requirements'][0]['text'] = 'Requires a callback capability'
+    context = review.prepare(tmp_path, trace, lock, [REF], now=NOW)
+    entry = lock['references']['provider']
+    prior_hash = entry['consumer_contract_sha256']
+    entry['review'] = decision(
+        context=context, applicability=applicability, freshness='changed_relevant',
+        affected_requirement_ids=['REQ-001'],
+        conflict_disposition={'blocking': False, 'status': 'contained_within_retained_scope'},
+    )
+    entry['review']['facts'][0]['result'] = result
+    errors = review.validate(lock, trace, context)
+    expected = 'uncovered facts cannot be marked covered' if applicability == 'covered' else 'unresolved protocol gaps/conflicts cannot be marked usable'
+    assert any(expected in error for error in errors)
+    assert entry['consumer_contract_sha256'] == prior_hash
+    if applicability != 'covered':
+        entry['status'] = 'blocked'
+        assert review.validate(lock, trace, context) == []
+        review.finish(tmp_path, lock, context, now=NOW)
+        assert provider_reference_effective_status(lock, trace, REF) == 'blocked'
+        assert entry['consumer_contract_sha256'] == prior_hash
+        assert review.retained(tmp_path, REF, entry)['entry']['status'] == 'assumption_approved'
+
+
+@pytest.mark.parametrize('case, diagnostic', [
+    ('missing_mapping', 'map every current requirement'),
+    ('missing_evidence', 'scoped applicability/freshness review'),
+    ('missing_fact_evidence', 'map every current requirement'),
+    ('missing_target', 'scoped applicability/freshness review'),
+    ('stale_review', 'scoped applicability/freshness review'),
+    ('stale_consumer', 'requirements changed during review'),
+    ('expanded_approval', 'prior validity/approval status'),
+    ('unsupported_conflict', 'blocking requires a concrete uncovered'),
+    ('unavailable_source', 'unavailable source checks cannot establish'),
+])
+def test_relevant_covered_change_preserves_review_safeguards(tmp_path, case, diagnostic):
+    trace, lock = scene(tmp_path)
+    trace['requirements'][0]['text'] = 'New local recovery policy'
+    context = review.prepare(tmp_path, trace, lock, [REF], now=NOW)
+    entry = lock['references']['provider']
+    entry['review'] = assessment = decision(context=context, freshness='changed_relevant')
+    if case == 'missing_mapping':
+        assessment['facts'] = []
+    elif case == 'missing_evidence':
+        assessment['evidence_refs'] = []
+    elif case == 'missing_fact_evidence':
+        assessment['facts'][0]['evidence_ref'] = ''
+    elif case == 'missing_target':
+        assessment['target'].pop('endpoint')
+    elif case == 'stale_review':
+        assessment['review_id'] = 'stale'
+    elif case == 'stale_consumer':
+        trace['requirements'][0]['text'] = 'A different required capability'
+    elif case == 'expanded_approval':
+        entry['status'] = 'verified'
+    elif case == 'unsupported_conflict':
+        assessment.update(applicability='conflict', affected_requirement_ids=['REQ-001'],
+                          conflict_disposition={'blocking': False})
+    elif case == 'unavailable_source':
+        context[REF]['sources'] = [{'url': 'https://example.com/docs', 'outcome': 'unavailable'}]
+    assert any(diagnostic in error for error in review.validate(lock, trace, context))
+
+
+def blocked_provider_review_scene(tmp_path):
+    """Synthetic retained run with an accepted plan and a rejected source review."""
+    from auto_agents.config import (
+        load_run_state, provider_references_lock_path, requirements_trace_path,
+        save_run_state, task_plan_path,
+    )
+    from auto_agents.io_utils import write_json, write_text
+    from auto_agents.models import TaskSpec
+    from auto_agents.orchestrator import Orchestrator
+    from test_provider_contract_policy import _sourced_reference_markdown
+
+    root = tmp_path / 'project'
+    Orchestrator.init_project(root, 'review recovery', 'mock')
+    trace, lock = scene(root)
+    write_text(root / REF, _sourced_reference_markdown())
+    trace['requirements'][0]['text'] = 'Local recovery still uses the approved request without optional quality.'
+    context = review.prepare(root, trace, lock, [REF], fetch=False, now=NOW)
+    entry = lock['references']['provider']
+    entry['evidence_snapshot'] = context[REF]['evidence_snapshot']
+    entry['review'] = decision(context=context, freshness='changed_relevant')
+    entry['review']['facts'].append({
+        'requirement_id': 'REQ-001', 'fact': 'Historical universal rejection of optional quality.',
+        'result': 'contradicted', 'evidence_ref': REF + '#source-comparison',
+    })
+    entry['review'].update(applicability='conflict', affected_requirement_ids=['REQ-001'],
+                           conflict_disposition={'blocking': False})
+    write_text(root / REF, _sourced_reference_markdown() + (
+        '\n## Source comparison\n\nSynthetic documentation update: timeout guidance '
+        'changed from 300 to 360 seconds, and universal quality rejection is disputed. '
+        'The approved request omits quality and never duplicates an unknown submission.\n'
+    ))
+    write_json(requirements_trace_path(root), trace)
+    write_json(provider_references_lock_path(root), lock)
+    spec = root / 'spec.md'
+    write_text(spec, '# Synthetic bounded recovery iteration\nPreserve the accepted task plan.\n')
+    tasks = [TaskSpec(task_id=f'T{i:02}', title='Existing task', description='Retained work',
+                      acceptance=['Preserve the current contract.'], requirement_ids=['REQ-001'])
+             for i in range(19)]
+    write_json(task_plan_path(root), {'tasks': [task.to_dict() for task in tasks]})
+    write_text(root / 'unrelated.txt', 'Unrelated unfinished work.\n')
+    write_json(root / '.auto-agents/history/task_plans/stopped.json', {'status': 'stopped'})
+    state = load_run_state(root)
+    state.current_stage = 'plan'
+    state.stage_summaries = dict(clarify='accepted', prototype='not requested', design='accepted', plan='accepted')
+    state.tasks = tasks
+    state.agent_attempts = {'plan': 3, 'provider_research': 2}
+    state.approved_gates = ['requirements', 'architecture']
+    state.resume_context.update(spec_file=str(spec), max_tasks=19, skip_validate=False)
+    state.last_recovery_route = dict(outcome='iteration_plan_scope_reconciled', from_stage='plan', to_stage='provider_research')
+    state.status = 'blocked'
+    state.active_blocker = dict(owner='auto_agents', category='provider_reference_freshness_validity_conflation',
+                                status='blocked', fingerprint='retained-review-failure', reason='Relevant coverage rejected')
+    state.last_error = state.active_blocker['reason']
+    save_run_state(root, state)
+    return root, Orchestrator(root), trace, context
+
+
+def test_pending_review_is_revalidated_after_status_changes_on_restart(tmp_path):
+    trace, lock = scene(tmp_path)
+    entry = lock['references']['provider']
+    entry['evidence_snapshot'] = review.retain(tmp_path, REF, entry)
+    entry['status'] = 'blocked'
+    trace['requirements'][0]['text'] = 'New local policy within the existing protocol'
+    dispatched = review.prepare(tmp_path, trace, lock, [REF], fetch=False, now=NOW)
+    entry.update(status='assumption_approved', review=decision(context=dispatched, freshness='changed_relevant'))
+    restarted = review.prepare(tmp_path, trace, lock, [REF], fetch=False, now=NOW)
+    assert restarted[REF]['review_id'] != dispatched[REF]['review_id']
+    recovered = review.pending_context(tmp_path, lock, restarted)
+    assert recovered == dispatched
+    assert review.validate(lock, trace, recovered) == []
+    review.finish(tmp_path, lock, recovered, now=NOW)
+    assert provider_reference_effective_status(lock, trace, REF) == 'assumption_approved'
+
+
+@pytest.mark.parametrize('change', ['unregistered', 'consumer', 'source', 'snapshot', 'required_fact'])
+def test_pending_review_cannot_bypass_changed_inputs_or_uncovered_facts(tmp_path, change):
+    trace, lock = scene(tmp_path)
+    trace['requirements'][0]['text'] = 'Local policy update'
+    context = review.prepare(tmp_path, trace, lock, [REF], fetch=False, now=NOW)
+    entry = lock['references']['provider']
+    entry['evidence_snapshot'] = context[REF]['evidence_snapshot']
+    entry['review'] = decision(context=context, freshness='changed_relevant')
+    assert review.pending_context(tmp_path, lock, context) == context
+    if change == 'unregistered':
+        entry['review']['review_id'] = '0' * 64
+    elif change == 'consumer':
+        trace['requirements'][0]['text'] = 'New provider capability'
+    elif change == 'source':
+        context[REF]['sources'] = [{'url':'https://example.com/docs', 'outcome':'content_available', 'content_sha256':'f'*64}]
+    elif change == 'snapshot':
+        entry['evidence_snapshot'] = review.retain(tmp_path, REF, entry)
+    else:
+        entry['review']['facts'][0]['result'] = 'missing'
+    current = (context if change == 'source' else review.prepare(tmp_path, trace, lock, [REF], fetch=False, now=NOW))
+    recovered = review.pending_context(tmp_path, lock, current)
+    assert recovered is None or review.validate(lock, trace, recovered)
+
+
+def test_provider_recovery_replay_requires_admission_not_only_flag_clearance():
+    from test_iteration_plan_scope import continuation_probe_project
+    from auto_agents.repair_v2.boundary_driver import observe_run_continuation
+    with continuation_probe_project() as (_, orch, original, plan, request, runtime, frozen):
+        original.active_blocker['category'] = 'provider_reference_freshness_validity_conflation'
+        with pytest.raises(RuntimeError, match='fresh provider-review admission'):
+            observe_run_continuation(orch, original, plan, request, runtime, frozen)
+
+
+def test_applied_provider_repair_only_routes_to_reassessment(tmp_path, monkeypatch):
+    from auto_agents.config import load_run_state, provider_references_lock_path
+    root, orch, _, _ = blocked_provider_review_scene(tmp_path)
+    state = load_run_state(root)
+    before = provider_references_lock_path(root).read_bytes()
+    attempts = deepcopy(state.agent_attempts)
+    monkeypatch.setattr(orch, '_call_with_failover', lambda *a,**k: pytest.fail('routing cannot execute a provider'))
+    state = orch.mark_self_repair_applied('approved-candidate')
+    assert orch._resume_blocked_run(state)
+    assert state.current_stage == 'plan' and 'provider_research' not in state.stage_summaries
+    assert state.agent_attempts == attempts
+    assert state.last_recovery_route['outcome'] == 'provider_reference_review_repaired'
+    assert provider_references_lock_path(root).read_bytes() == before
