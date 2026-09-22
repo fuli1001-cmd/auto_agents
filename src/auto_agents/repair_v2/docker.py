@@ -182,6 +182,7 @@ class DockerVerifier:
         self.runtime = digest({'image': identity_text.strip(), 'driver': driver, 'docker': server.strip(),
                                'uid': os.getuid(), 'gid': os.getgid(), 'memory': '1g', 'tmpfs': 'exec,4g',
                                'boundary': Path(__file__).with_name('boundary_driver.py').read_text(),
+                               'diagnostic_replay': Path(__file__).with_name('diagnostic_replay.py').read_text(),
                                'session': Path(__file__).parent.parent.joinpath('session_replay.py').read_text(),
                                'runtime_identity': Path(__file__).parent.parent.joinpath('repair_runtime_identity.py').read_text(),
                                'replay_environment': Path(__file__).with_name('replay_environment.py').read_text(),
@@ -430,11 +431,18 @@ class DockerVerifier:
         target, source, output = base / 'target', base / 'source', base / 'result'
         project_path = replay_project_path(payload)
         before = evidence_identity(frozen_target)
+        run_file = Path(frozen_target) / '.auto-agents/state/run_state.json'
+        retained_run = json.loads(run_file.read_text()) if run_file.is_file() else {}
         custody = {'clear': True}
         with execution_lease(base), disposable_source(snapshot, source, cleanup=lambda: custody['clear']):
             output.mkdir(exist_ok=True)
             try:
                 RootCauseCoordinator._copy_diagnostic_tree(Path(frozen_target), target)
+                from .diagnostic_replay import copy_submission_evidence
+                try:
+                    copy_submission_evidence(frozen_target, target, payload)
+                except FileNotFoundError as error:
+                    raise EnvironmentUnavailable(str(error)) from error
                 if payload.get('_budget_anchors'):
                     from .budget_recovery import reconcile
                     reconcile(target, payload['_budget_anchors'], payload.get('invocation', {}))
@@ -460,6 +468,7 @@ class DockerVerifier:
                 for environment in environments:
                     command += ['--mount', f'type=bind,src={environment.root},dst={environment.prefix},readonly']
                 for script in (Path(__file__).with_name('boundary_driver.py'),
+                               Path(__file__).with_name('diagnostic_replay.py'),
                                Path(__file__).parent.parent / 'session_replay.py',
                                Path(__file__).parent.parent / 'repair_runtime_identity.py'):
                     command += ['--mount', f'type=bind,src={script},dst=/opt/repair/{script.name},readonly']
@@ -468,10 +477,18 @@ class DockerVerifier:
                 code, text = run([*command, self.image, 'python', '/opt/repair/boundary_driver.py'],
                                  cancel=cancel, timeout=self.timeout, output=base / 'output.log',
                                  observation=execution)
+                proof_incomplete = False
                 try:
                     observed = json.loads((output / 'boundary.json').read_text())
                     if not isinstance(observed, dict) or not isinstance(observed.get('ok'), bool):
                         raise ValueError('invalid boundary report')
+                    if (observed['ok'] and retained_run.get('active_blocker', {}).get('category')
+                            == 'diagnostic_evidence_reference_binding_gap'):
+                        from .boundary_driver import diagnostic_continuation_complete
+                        if not diagnostic_continuation_complete(observed, retained_run):
+                            proof_incomplete = True
+                            observed = {**observed, 'ok': False,
+                                'error': 'Trusted recovery harness omitted required submission or implementation-entry proof.'}
                 except (OSError, ValueError):
                     observed = {'ok': False, 'infrastructure': True,
                                 'error': '隔离恢复未产生有效验证结果，已停止自动代码修复。',
@@ -484,6 +501,8 @@ class DockerVerifier:
                           'observed': observed, 'output': str(base / 'output.log'), 'returncode': code}
                 result['isolation_profile'] = profile
                 result['environment_inputs'] = [item.describe() for item in environments]
+                if proof_incomplete:
+                    result['proof_incomplete'] = True
                 infrastructure_reason = replay_infrastructure_reason(observed)
                 if infrastructure_reason:
                     result.update(ok=False, infrastructure=True, reason=infrastructure_reason)

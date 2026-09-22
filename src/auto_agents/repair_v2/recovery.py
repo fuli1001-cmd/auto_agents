@@ -17,7 +17,10 @@ def classify(result, payload):
     mismatch = set(runtime.get('mismatches') or [])
     domain, code, owner, stage = 'unknown', 'recovery_unclassified', 'controller', 'subscriber_validation'
     message = '恢复检查未通过，原因尚未明确；已保留代码验收结果，停止自动实施。'
-    if result.get('infrastructure') or result.get('cancelled'):
+    if result.get('proof_incomplete'):
+        domain, code, owner, stage = 'controller', 'recovery_proof_incomplete', 'controller', 'boundary_preflight'
+        message = '恢复验证器缺少提交回执或实现入口证据；保留候选，更新控制器后重新验证。'
+    elif result.get('infrastructure') or result.get('cancelled'):
         domain, code, owner = 'environment', 'verification_infrastructure', 'environment'
         message = result.get('reason') or '恢复验证环境不可用；已保留代码验收结果。'
     elif mismatch:

@@ -500,3 +500,377 @@ def test_diagnostic_json_pointer_rejects_invalid_or_missing_values(scene, pointe
     atomic_json(project / 'evidence.json', {'items': [{'value': 1}]})
     with pytest.raises(RepairBlocked):
         witnesses([{'origin': 'target', 'path': 'evidence.json', 'pointer': pointer}], project, source)
+
+
+@pytest.fixture
+def diagnostic_scope(scene):
+    """Synthetic evidence with the retained incident's identities and citation shape."""
+    from auto_agents.root_cause import RootCauseDiagnosis, RootCauseReport
+    from test_root_cause import _report
+
+    project, source, _, proposal = scene
+    run, workflow = '82288622684f', 'wf-cea9506a7499'
+    task = {'task_id': 'task-pp-07', 'title': 'Planning provider safety', 'status': 'blocked',
+            'commit_sha': '', 'acceptance': ['Verify, review, publish and integrate'],
+            'verification_refs': [
+                'tests/test_text_protocol_boundary_api.py::TextProtocolBoundaryTests::'
+                'test_req_284_planning_progress_wire_is_positive_typed_and_deduplicated',
+                'tests/test_text_protocol_boundary_api.py::TextProtocolBoundaryTests::'
+                'test_req_284_planning_safety_body_precedes_http_without_unchanged_retry']}
+    atomic_json(project / '.auto-agents/state/run_state.json', {
+        'run_id': run, 'current_stage': 'implement', 'status': 'blocked',
+        'goal': 'Synthetic planning recovery goal', 'last_error': 'publication failed on ignored .conda',
+        'resume_context': {'workflow_id': workflow}, 'tasks': [task]})
+    atomic_json(project / '.auto-agents/state/task_plan.json', {'tasks': [task]})
+    atomic_json(project / f'.auto-agents/state/workflows/{workflow}/workflow.json', {
+        'workflow_id': workflow, 'status': 'blocked',
+        'root': {'kind': 'run', 'native_id': run},
+        'active_frame': {'kind': 'run', 'native_id': run}})
+    (project / 'spec.md').write_text('Synthetic planning recovery goal')
+    (project / 'unrelated.txt').write_text('unrelated unfinished work')
+    payload = {'project': str(project), 'invocation': {'run_id': run, 'workflow_id': workflow}}
+    evidence = project / f'.auto-agents/runs/{run}/root-cause/diagnosis/evidence.json'
+    contents = {'repair_case': {'run_id': run, 'stage': 'implement', 'synthetic': True},
+                'traceback': ['synthetic admission traceback'], 'run_log': ['publication still pending'],
+                'items': [{'a/b': {'~key': 1}}]}
+    atomic_json(evidence, contents)
+    report = RootCauseReport.from_dict({**_report(role='investigator', verdict='ROOT_CAUSE'),
+        'necessity': {**proposal, 'blocked_step': 'Publish task-pp-07',
+            'consequence': 'Publication repair cannot be submitted',
+            'recovery_check': 'Submit the existing repair; publication and integration remain required',
+            'evidence_refs': ['target:spec.md:5', 'source:engine.py:1:2',
+                {'origin': 'source', 'path': '.root-cause-evidence.json#/repair_case'}]}},
+        role='investigator')
+    reviewer = RootCauseReport.from_dict(_report(role='reviewer', verdict='AGREE'), role='reviewer')
+    diagnosis = RootCauseDiagnosis('diagnosis', str(evidence), report, reviewer, report, None, True, '')
+    diagnosis = RootCauseDiagnosis.from_dict(json.loads(json.dumps(diagnosis.to_dict())))
+    return project, source, payload, diagnosis, evidence, contents
+
+
+def test_structured_diagnostic_citations_survive_scope_admission_and_restart(diagnostic_scope, tmp_path):
+    from auto_agents.root_cause import RootCauseCoordinator, RootCauseDiagnosis
+    project, source, payload, diagnosis, evidence, contents = diagnostic_scope
+    refs = diagnosis.final.necessity['evidence_refs']
+    refs.extend([
+        '.root-cause-evidence.json#/traceback',
+        'source:.root-cause-evidence.json#/run_log',
+        'target:.root-cause-evidence.json#/repair_case',
+        {'origin': 'target', 'path': '.root-cause-evidence.json', 'pointer': '/repair_case',
+         'sha256': digest(contents['repair_case']), 'snapshot': digest(contents['repair_case'])},
+        {'origin': 'source', 'path': '.root-cause-evidence.json#/items/0/a~1b/~0key',
+         'pointer': '/items/0/a~1b/~0key', 'sha256': digest(1)},
+    ])
+    diagnosis = RootCauseDiagnosis.from_dict(json.loads(json.dumps(diagnosis.to_dict())))
+    original = deepcopy(diagnosis.to_dict())
+    # Neither a source nor a target snapshot alias may substitute foreign content.
+    for root in (project, source):
+        atomic_json(root / '.root-cause-evidence.json', {'repair_case': 'foreign evidence'})
+    guard = ScopeGuard(tmp_path / 'scope', payload, project, source)
+    bound = diagnosis.scope_necessity(project)
+    ref = guard.admit(bound)
+    saved = guard.store.read(ref)
+    assert diagnosis.to_dict() == original
+    assert bound['evidence_refs'][:2] == refs[:2]
+    assert [row['origin'] for row in saved['witnesses']] == ['target', 'source'] + ['target'] * 6
+    assert [row['pointer'] for row in saved['witnesses'][2:]] == [
+        '/repair_case', '/traceback', '/run_log', '/repair_case', '/repair_case', '/items/0/a~1b/~0key']
+    assert saved['witnesses'][2]['sha256'] == digest(contents['repair_case'])
+    assert bound['evidence_refs'][-2]['sha256'] == digest(contents['repair_case'])
+    assert bound['evidence_refs'][-2]['snapshot'] == digest(contents['repair_case'])
+    retained = project / saved['witnesses'][2]['path']
+    assert json.loads(retained.read_text()) == contents
+    assert retained.name == digest(contents) + '.json'
+    assert len(list(retained.parent.glob('*.json'))) == 1
+    before = retained.stat().st_mtime_ns
+    assert diagnosis.scope_necessity(project) == bound
+    assert retained.stat().st_mtime_ns == before
+    for root in (project, source):
+        (root / '.root-cause-evidence.json').unlink()
+    frozen = tmp_path / 'frozen'
+    RootCauseCoordinator._copy_diagnostic_tree(project, frozen)
+    assert not (frozen / evidence.relative_to(project)).exists()
+    evidence.unlink()
+    restarted = ScopeGuard(tmp_path / 'scope', payload, project, source)
+    assert restarted.current() == ref
+    assert restarted.admit(None) == ref
+    worker = ScopeGuard(tmp_path / 'worker', payload, frozen, source)
+    imported = worker.import_receipt(saved)
+    assert imported is not None
+    assert worker.current() == imported
+    assert worker.admit(None) == imported
+    assert worker.store.read(imported) == saved
+    assert diagnosis.to_dict() == original
+    atomic_json(frozen / saved['witnesses'][2]['path'], {**contents, 'repair_case': {'run_id': 'foreign'}})
+    assert worker.current() is None
+    assert worker.import_receipt(saved) is None
+
+
+@pytest.mark.parametrize('ref', [
+    '.root-cause-evidence.json#/repair_case',
+    'source:.root-cause-evidence.json#/repair_case',
+    'target:.root-cause-evidence.json#/repair_case',
+    {'origin': 'source', 'path': '.root-cause-evidence.json#/repair_case'},
+    {'origin': 'target', 'path': '.root-cause-evidence.json#/repair_case'},
+    {'origin': 'source', 'path': '.root-cause-evidence.json', 'pointer': '/repair_case'},
+    {'origin': 'target', 'path': '.root-cause-evidence.json#/repair_case', 'pointer': '/repair_case'},
+    '.root-cause-evidence.json',
+    'source:.root-cause-evidence.json',
+    {'origin': 'target', 'path': '.root-cause-evidence.json', 'pointer': ''},
+])
+def test_diagnostic_scope_binds_object_and_qualified_references(diagnostic_scope, tmp_path, ref):
+    from auto_agents.root_cause import RootCauseDiagnosis
+    project, source, payload, diagnosis, _, contents = diagnostic_scope
+    diagnosis.final.necessity['evidence_refs'] = [deepcopy(ref)]
+    diagnosis = RootCauseDiagnosis.from_dict(json.loads(json.dumps(diagnosis.to_dict())))
+    original = deepcopy(diagnosis.to_dict())
+    guard = ScopeGuard(tmp_path / 'scope', payload, project, source)
+    receipt = guard.store.read(guard.admit(diagnosis.scope_necessity(project)))
+    witness, = receipt['witnesses']
+    assert witness['origin'] == 'target'
+    assert witness['path'] == f'.auto-agents/state/repair-scope-evidence/{digest(contents)}.json'
+    assert witness['pointer'] == ('/repair_case' if '/repair_case' in str(ref) else '')
+    assert diagnosis.to_dict() == original
+
+
+@pytest.mark.parametrize('ref', [
+    {'origin': 'foreign', 'path': '.root-cause-evidence.json#/repair_case'},
+    {'origin': [], 'path': '.root-cause-evidence.json#/repair_case'},
+    {'path': '.root-cause-evidence.json#/repair_case'},
+    'foreign:.root-cause-evidence.json#/repair_case',
+    {'origin': 'source', 'path': '.root-cause-evidence.json#/repair_case', 'pointer': '/run_log'},
+    {'origin': 'target', 'path': '.root-cause-evidence.json#/repair_case', 'pointer': ''},
+    {'origin': 'source', 'path': '.root-cause-evidence.json', 'pointer': None},
+    {'origin': 'target', 'path': '.root-cause-evidence.json#/repair_case', 'sha256': '0' * 64},
+    {'origin': 'source', 'path': '.root-cause-evidence.json#/repair_case', 'snapshot': '0' * 64},
+    {'origin': 'source', 'path': '.root-cause-evidence.json#/repair_case', 'sha256': 'invalid'},
+    {'origin': 'target', 'path': '.root-cause-evidence.json#/repair_case', 'snapshot': None},
+    'source:.root-cause-evidence.json#repair_case',
+    'target:.root-cause-evidence.json#/missing',
+    'source:.root-cause-evidence.json#/items/-1',
+    'target:.root-cause-evidence.json#/items/01',
+    'source:.root-cause-evidence.json#/items/2',
+    'target:.root-cause-evidence.json#/bad~2escape',
+    'source:.root-cause-evidence.json#/items/0/a~1b/~0key/missing',
+    {'origin': 'target', 'path': '../.root-cause-evidence.json#/repair_case'},
+    {'origin': 'source', 'path': '/tmp/.root-cause-evidence.json#/repair_case'},
+])
+def test_diagnostic_scope_rejects_invalid_reference_constraints(diagnostic_scope, tmp_path, ref):
+    project, source, payload, diagnosis, _, _ = diagnostic_scope
+    diagnosis.final.necessity['evidence_refs'] = [deepcopy(ref)]
+    original = deepcopy(diagnosis.to_dict())
+    guard = ScopeGuard(tmp_path / 'scope', payload, project, source)
+    with pytest.raises(RepairBlocked) as failure:
+        guard.admit(diagnosis.scope_necessity(project))
+    assert failure.value.code == 'scope_evidence'
+    assert guard.current() is None
+    assert diagnosis.to_dict() == original
+
+
+@pytest.mark.parametrize('location', ['foreign', 'symlink', 'retained_symlink', 'retained_tamper'])
+def test_diagnostic_scope_rejects_foreign_or_changed_retention(diagnostic_scope, tmp_path, location):
+    project, _, _, diagnosis, evidence, contents = diagnostic_scope
+    outside = tmp_path / 'foreign.json'
+    atomic_json(outside, contents)
+    retained = project / '.auto-agents/state/repair-scope-evidence' / (digest(contents) + '.json')
+    if location == 'foreign':
+        diagnosis.evidence_path = str(outside)
+    elif location == 'symlink':
+        evidence.unlink()
+        evidence.symlink_to(outside)
+    elif location == 'retained_symlink':
+        retained.parent.mkdir(parents=True)
+        retained.symlink_to(outside)
+    else:
+        atomic_json(retained, {'repair_case': 'changed'})
+    before = outside.read_bytes()
+    with pytest.raises(RepairBlocked) as failure:
+        diagnosis.scope_necessity(project)
+    assert failure.value.code == 'scope_evidence'
+    assert outside.read_bytes() == before
+    if location == 'retained_tamper':
+        assert json.loads(retained.read_text()) == {'repair_case': 'changed'}
+
+
+@pytest.mark.parametrize('valid', [True, False])
+def test_diagnostic_scope_submission_preserves_bound_run(diagnostic_scope, tmp_path, monkeypatch, valid):
+    from auto_agents import repair_client
+    from auto_agents.self_repair import SelfRepairDecision
+    project, source, payload, diagnosis, evidence, _ = diagnostic_scope
+    if not valid:
+        diagnosis.final.necessity['evidence_refs'][-1]['pointer'] = '/conflicting'
+    original = deepcopy(diagnosis.to_dict())
+    protected = [project / name for name in (
+        '.auto-agents/state/run_state.json', '.auto-agents/state/task_plan.json',
+        '.auto-agents/state/workflows/wf-cea9506a7499/workflow.json', 'unrelated.txt')]
+    before = {path: path.read_bytes() for path in protected}
+    registration = {'config': {'root': str(tmp_path / 'control')}, 'subscriber': 'original'}
+    autonomy = SimpleNamespace(mode='max', to_dict=lambda: {'mode': 'max'})
+    orchestrator = SimpleNamespace(_repair_registration=registration,
+        _invocation_context=deepcopy(payload['invocation']), record_run_blocker=lambda **kwargs: None,
+        config=SimpleNamespace(active_provider='codex', execution=SimpleNamespace(autonomy=autonomy)))
+    argv = ['python', 'auto_agents.py', 'run', '--project', str(project)]
+    monkeypatch.setattr('auto_agents.cli._run_command_for_self_repair_resume', lambda args: argv)
+    monkeypatch.setattr('auto_agents.self_repair.auto_agents_repo_root', lambda: source)
+    monkeypatch.setattr('auto_agents.process_supervision.ACTIVE_PROCESSES.terminate_all', lambda: None)
+    monkeypatch.setattr('auto_agents.process_supervision.ACTIVE_PROCESSES.snapshot', lambda: [])
+    monkeypatch.setattr(repair_client, 'git', lambda *args: 'engine-base')
+    submitted = []
+
+    class Submitted(BaseException):
+        pass
+
+    def transport(config, request):
+        assert request['op'] == 'submit'
+        submitted.append(request['payload'])
+        raise Submitted()
+
+    monkeypatch.setattr(repair_client, 'rpc', transport)
+    def submit():
+        repair_client.submit_and_wait(project, orchestrator, RuntimeError('publication failed on ignored .conda'),
+            SelfRepairDecision(True, category='publication', fingerprint='original'),
+            SimpleNamespace(command='run', provider='codex', autonomy=None), SimpleNamespace(), diagnosis=diagnosis)
+
+    with pytest.raises(Submitted if valid else RepairBlocked):
+        submit()
+    assert {path: path.read_bytes() for path in protected} == before
+    assert diagnosis.to_dict() == original
+    if valid:
+        request, = submitted
+        assert request['invocation'] == payload['invocation']
+        assert request['resume_argv'] == argv
+        assert request['diagnosis'] == original
+        assert request['boundary']['stage'] == 'implement'
+        assert request['scope_receipt']['context']['owner']['subject'] == 'run:82288622684f'
+        assert request['scope_receipt']['context']['owner']['workflow_id'] == 'wf-cea9506a7499'
+        assert request['scope_receipt']['context']['original_goal'] == 'Synthetic planning recovery goal'
+        worker = ScopeGuard(tmp_path / 'worker', request, project, source)
+        assert worker.import_receipt(request['scope_receipt']) is not None
+        # A restarted submitter must reuse its validated receipt before trying
+        # to bind citations from diagnostic files that no longer exist.
+        evidence.unlink()
+        with pytest.raises(Submitted):
+            submit()
+        assert len(submitted) == 2
+        assert submitted[1]['scope_receipt'] == request['scope_receipt']
+        assert submitted[1]['invocation'] == request['invocation']
+        retained = project / request['scope_receipt']['witnesses'][-1]['path']
+        atomic_json(retained, {'repair_case': 'changed'})
+        with pytest.raises(RepairBlocked) as failure:
+            submit()
+        assert failure.value.code == 'scope_evidence'
+        assert len(submitted) == 2
+        assert {path: path.read_bytes() for path in protected} == before
+        assert diagnosis.to_dict() == original
+    else:
+        assert submitted == []
+
+
+@pytest.mark.parametrize('category', ['diagnostic_evidence_reference_binding_gap', 'unrelated_engine_failure'])
+def test_diagnostic_evidence_repair_resumes_retained_run(diagnostic_scope, monkeypatch, category):
+    from auto_agents.config import DEFAULT_CONFIG, load_run_state, load_task_plan, save_run_state
+    from auto_agents.orchestrator import Orchestrator
+    from auto_agents.repair_v2.boundary_driver import run_plan_contract
+
+    project, _, _, _, _, _ = diagnostic_scope
+    atomic_json(project / '.auto-agents/config.json', deepcopy(DEFAULT_CONFIG))
+    state = load_run_state(project)
+    state.active_blocker = {'owner': 'auto_agents', 'category': category,
+                            'fingerprint': 'binding-gap', 'status': 'blocked', 'resume_attempts': 0}
+    state.localized_blockers = [{'task_id': 'task-pp-07', 'affected_task_ids': ['task-pp-07'],
+        'source': 'parallel_lane_failure', 'category': 'parallel_lane_checkpoint_unavailable',
+        'status': 'localized', 'owner': 'auto_agents', 'resumable': True,
+        'reason': 'publication and checkpoint retention failed on ignored .conda'}]
+    state.task_failure_checkpoints = {'task-pp-07': {'status': 'unavailable', 'ref': '',
+        'task_id': 'task-pp-07', 'resume_mode': 'implementation', 'implementation_completed': False}}
+    state.stage_summaries = {'plan': 'Accepted plan', 'provider_research': 'Existing provider contract'}
+    state.agent_attempts = {'planning': 4, 'implement': 2}
+    state.tasks[0].verify_history = [{'decision': 'pass', 'candidate_fingerprint': 'retained-candidate'}]
+    state.tasks[0].review_history = [{'summary': 'Retained review evidence'}]
+    state.last_recovery_route = {'outcome': 'publication_pending', 'task_id': 'task-pp-07'}
+    save_run_state(project, state)
+    before = deepcopy(state)
+    contract = run_plan_contract(load_task_plan(project))
+    workflow = project / '.auto-agents/state/workflows/wf-cea9506a7499/workflow.json'
+    protected = {path: path.read_bytes() for path in (workflow, project / 'unrelated.txt')}
+    orchestrator = Orchestrator(project)
+    monkeypatch.setattr(orchestrator, '_call_with_failover', lambda *a, **k: pytest.fail('resume called a provider'))
+    # This synthetic project has no Git metadata; only the read-only Git probe
+    # is replaced, while task reconciliation and persistence remain real.
+    monkeypatch.setattr(orchestrator, '_changed_paths_excluding_agent_instructions', lambda: [])
+    state = orchestrator.mark_self_repair_applied('verified-engine')
+    assert orchestrator._resume_blocked_run(state)
+    assert state.status == 'pending'
+    assert state.tasks[0].status == 'pending' and not state.tasks[0].commit_sha
+    if category == 'diagnostic_evidence_reference_binding_gap':
+        assert not state.active_blocker
+        receipt = state.last_recovery_route['diagnostic_evidence_repair']
+        assert receipt['outcome'] == 'admission_retry_ready'
+        assert receipt['repaired_blocker']['fingerprint'] == 'binding-gap'
+        assert receipt['repaired_blocker']['self_repair_commit'] == 'verified-engine'
+        assert receipt['repaired_blocker']['prepared_self_repair_commit'] == 'verified-engine'
+        assert receipt['repaired_blocker']['requeued_task_ids'] == ['task-pp-07']
+    else:
+        assert state.active_blocker['category'] == category
+        assert 'diagnostic_evidence_repair' not in state.last_recovery_route
+    assert state.localized_blockers == before.localized_blockers
+    assert state.task_failure_checkpoints == before.task_failure_checkpoints
+    assert state.stage_summaries == before.stage_summaries
+    assert state.agent_attempts == before.agent_attempts
+    assert state.tasks[0].verification_refs == before.tasks[0].verification_refs
+    assert state.tasks[0].verify_history == before.tasks[0].verify_history
+    assert state.tasks[0].review_history == before.tasks[0].review_history
+    assert run_plan_contract(load_task_plan(project)) == contract
+    assert {path: path.read_bytes() for path in protected} == protected
+    save_run_state(project, state)
+    restarted = Orchestrator(project)
+    saved = load_run_state(project)
+    snapshot = saved.to_dict()
+    assert not restarted._resume_blocked_run(saved)
+    assert saved.to_dict() == snapshot
+
+
+@pytest.mark.parametrize('condition', [
+    'ready', 'no_install', 'not_prepared', 'different_commit', 'no_requeue',
+    'blocked_task', 'missing_task', 'approval', 'input', 'foreign_owner', 'blocked_run', 'wrong_stage',
+])
+def test_diagnostic_evidence_retirement_requires_prepared_retry(diagnostic_scope, condition):
+    from auto_agents.config import load_run_state
+    from auto_agents.orchestrator import Orchestrator
+
+    project, _, _, _, _, _ = diagnostic_scope
+    state = load_run_state(project)
+    state.status = 'pending'
+    state.tasks[0].status = 'pending'
+    state.active_blocker = {'owner': 'auto_agents', 'category': 'diagnostic_evidence_reference_binding_gap',
+        'status': 'retrying', 'self_repair_commit': 'verified', 'prepared_self_repair_commit': 'verified',
+        'requeued_task_ids': ['task-pp-07'], 'fingerprint': 'retained-failure'}
+    if condition == 'no_install':
+        state.active_blocker.pop('self_repair_commit')
+    elif condition == 'not_prepared':
+        state.active_blocker.pop('prepared_self_repair_commit')
+    elif condition == 'different_commit':
+        state.active_blocker['prepared_self_repair_commit'] = 'older'
+    elif condition == 'no_requeue':
+        state.active_blocker['requeued_task_ids'] = []
+    elif condition == 'blocked_task':
+        state.tasks[0].status = 'blocked'
+    elif condition == 'missing_task':
+        state.active_blocker['requeued_task_ids'] = ['foreign-task']
+    elif condition == 'approval':
+        state.pending_approval = 'implement'
+    elif condition == 'input':
+        state.active_input_request_id = 'pending-input'
+    elif condition == 'foreign_owner':
+        state.active_blocker['owner'] = 'external_provider'
+    elif condition == 'blocked_run':
+        state.status = 'blocked'
+    elif condition == 'wrong_stage':
+        state.current_stage = 'plan'
+    before = deepcopy(state.to_dict())
+    assert Orchestrator._retire_prepared_diagnostic_evidence_repair(state) == (condition == 'ready')
+    if condition == 'ready':
+        assert state.active_blocker == {}
+        assert state.last_recovery_route['diagnostic_evidence_repair']['repaired_blocker'] == before['active_blocker']
+        assert state.tasks[0].status == 'pending' and not state.tasks[0].commit_sha
+    else:
+        assert state.to_dict() == before

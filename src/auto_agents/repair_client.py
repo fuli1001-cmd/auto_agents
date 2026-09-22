@@ -402,6 +402,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
         invocation["engine_route"] = error.route_payload
     from .config import load_session_state, load_run_state
     boundary = {"kind": "completion"}
+    submission_workflow = ''
     if invocation.get("session_id"):
         root_state = load_session_state(project, invocation["session_id"])
         recorded_workflow = str(invocation.get("workflow_id") or "")
@@ -410,6 +411,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
         # A fresh CLI starts with workflow_id="" before Session creates its
         # durable workflow. setdefault cannot fill that existing empty value.
         invocation["workflow_id"] = root_state.workflow_id or recorded_workflow
+        submission_workflow = invocation['workflow_id']
         session = root_state
         if root_state.active_handoff_id:
             from .workflow_chain import WorkflowStore
@@ -421,9 +423,23 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     else:
         state = load_run_state(project)
         invocation["run_id"] = state.run_id
+        saved_workflow = str(getattr(state, 'resume_context', {}).get('workflow_id') or '')
+        recorded_workflow = str(invocation.get('workflow_id') or '')
+        if saved_workflow and recorded_workflow and saved_workflow != recorded_workflow:
+            raise RuntimeError('repair invocation conflicts with the saved run workflow')
+        # A run-only invocation is an existing scope identity. Keep its cache
+        # key and receipt owner unchanged; the saved workflow is routing and
+        # observation metadata, not permission to rewrite a frozen receipt.
+        submission_workflow = saved_workflow or recorded_workflow
         boundary = {"kind": "run_stage", "stage": state.current_stage, "fingerprint": decision.fingerprint}
-        orchestrator.record_run_blocker(owner="auto_agents", category=decision.category,
-            reason=decision.reason, fingerprint=decision.fingerprint)
+        blocker = getattr(state, 'active_blocker', {}) or {}
+        already_recorded = (getattr(state, 'status', '') == 'blocked'
+                            and blocker.get('owner') == 'auto_agents'
+                            and blocker.get('category') == decision.category
+                            and blocker.get('fingerprint') == decision.fingerprint)
+        if not already_recorded:
+            orchestrator.record_run_blocker(owner="auto_agents", category=decision.category,
+                reason=decision.reason, fingerprint=decision.fingerprint)
     if invocation.get("engine_route"):
         boundary = {"kind": "engine_route", "route_digest": digest(invocation["engine_route"])}
     source = auto_agents_repo_root()
@@ -451,13 +467,26 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
         if necessity.get('decision') == 'required':
             guard = ScopeGuard(Path(registration['config']['root']) / 'scope-inputs' / digest(invocation),
                                payload, project, source)
-            reference = guard.admit(diagnosis.scope_necessity(Path(project)))
+            # Revalidate retained witnesses before touching temporary diagnosis
+            # files, which may already be gone when this submitter restarts.
+            reference = guard.current()
+            if reference is None:
+                reference = guard.admit(diagnosis.scope_necessity(Path(project)))
             payload['scope_receipt'] = guard.store.read(reference)
     # The request marker deliberately is not a valid RootCauseDiagnosis. An
     # old immutable worker that cannot fetch a newer runtime must fail closed,
     # rather than treating diagnosis=None as permission for legacy repair.
     response = rpc(registration["config"], {"op": "submit", "subscriber": registration["subscriber"], "payload": payload})
     job = response["job"]
+    reporter = getattr(orchestrator, 'reporter', None)
+    if reporter is not None:
+        reporter.event('repair.submitted', {
+            'job_id': job, 'subscriber_id': registration['subscriber'],
+            'run_id': invocation.get('run_id', ''), 'workflow_id': submission_workflow,
+            'diagnosis_digest': digest(payload['diagnosis']),
+            'scope_receipt_digest': digest(payload['scope_receipt']),
+            'engine_commit': payload['base'],
+        })
     last = None
     announced = set()
     imported_announced = set()

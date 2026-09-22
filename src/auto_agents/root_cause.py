@@ -248,6 +248,40 @@ class RootCauseReport:
         )
 
 
+def _diagnostic_scope_reference(ref: object) -> Optional[Dict[str, object]]:
+    """Normalize only the reserved diagnostic alias, without resolving a path."""
+    from .repair_v2.types import RepairBlocked
+
+    alias = '.root-cause-evidence.json'
+    if isinstance(ref, str):
+        origin, path = 'target', ref
+        if path.partition('#')[0] != alias:
+            origin, separator, path = ref.partition(':')
+            if not separator or path.partition('#')[0] != alias:
+                return None
+        selected = {'origin': origin, 'path': path}
+    elif isinstance(ref, dict) and isinstance(ref.get('path'), str):
+        if ref['path'].partition('#')[0] != alias:
+            return None
+        selected = dict(ref)
+    else:
+        return None
+
+    _, fragment, pointer = selected['path'].partition('#')
+    explicit = selected.get('pointer', pointer)
+    if (selected.get('origin') not in ('source', 'target')
+            or not isinstance(explicit, str)
+            or (fragment and explicit != pointer)
+            or (explicit and (not explicit.startswith('/') or re.search(r'~(?![01])', explicit)))
+            or any(key in selected and (not isinstance(selected[key], str)
+                   or not re.fullmatch(r'[0-9a-f]{64}', selected[key]))
+                   for key in ('sha256', 'snapshot'))):
+        raise RepairBlocked('scope_evidence', '诊断依据的来源、定位或内容摘要无效。')
+    # Keep supplied digest constraints: rebinding must not replace or discard
+    # them. The witness resolver validates the selected value and its digest.
+    return {**selected, 'path': alias, 'pointer': explicit}
+
+
 @dataclass
 class RootCauseDiagnosis:
     diagnosis_id: str
@@ -268,7 +302,8 @@ class RootCauseDiagnosis:
         bound = []
         retained = None
         for ref in refs:
-            if isinstance(ref, str) and ref.partition('#')[0] == '.root-cause-evidence.json':
+            selected = _diagnostic_scope_reference(ref)
+            if selected is not None:
                 from .repair_v2.scope import read_json
                 from .repair_v2.store import atomic_json, digest
                 from .repair_v2.types import RepairBlocked
@@ -278,16 +313,27 @@ class RootCauseDiagnosis:
                         relative = Path(self.evidence_path).relative_to(target)
                     except ValueError as error:
                         raise RepairBlocked('scope_evidence', '诊断依据不属于当前任务。') from error
-                    evidence = read_json(target, relative)
+                    try:
+                        evidence = read_json(target, relative)
+                    except (OSError, ValueError) as error:
+                        raise RepairBlocked('scope_evidence', '无法读取诊断依据。') from error
                     # Run logs are omitted from isolated repair snapshots. Keep
                     # an immutable copy under state so the scope receipt can be
                     # revalidated in every worker and after process restart.
                     retained = Path('.auto-agents/state/repair-scope-evidence') / (digest(evidence) + '.json')
-                    if not (target / retained).resolve().is_relative_to(target):
+                    path = target / retained
+                    if path.is_symlink() or not path.resolve().is_relative_to(target):
                         raise RepairBlocked('scope_evidence', '诊断依据目录不属于当前任务。')
-                    atomic_json(target / retained, evidence)
-                bound.append({'origin': 'target', 'path': retained.as_posix(),
-                              'pointer': ref.partition('#')[2]})
+                    if path.exists():
+                        try:
+                            unchanged = digest(read_json(target, retained)) == digest(evidence)
+                        except (OSError, ValueError) as error:
+                            raise RepairBlocked('scope_evidence', '保留的诊断依据无效。') from error
+                        if not unchanged:
+                            raise RepairBlocked('scope_evidence', '保留的诊断依据已变化。')
+                    else:
+                        atomic_json(path, evidence)
+                bound.append({**selected, 'origin': 'target', 'path': retained.as_posix()})
             else:
                 bound.append(ref)
         necessity['evidence_refs'] = bound

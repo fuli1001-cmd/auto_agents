@@ -693,6 +693,8 @@ class Controller:
                     'verification_environment_changed', 'image_unavailable',
                     'original_boundary_failed',
                     'provider_timeout', 'provider_cleanup_failed'}
+                if self.state.get('blocker', {}).get('code') == 'recovery_proof_incomplete':
+                    retryable = self.state.get('verification_runtime', '') != getattr(self.verifier, 'runtime', '')
                 if self.state.get('blocker', {}).get('code') == 'repair_chain_exhausted' and self.chain is not None:
                     budget = self.chain.context()
                     required = ['model_calls', *(['implementations'] if self.state.get('phase') == 'implement' else [])]
