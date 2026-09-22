@@ -211,6 +211,24 @@ class Store:
             db.execute("INSERT INTO events(job,kind,payload,created) VALUES(?,?,?,?)",
                        (job, kind, json.dumps(payload or {}), time.time()))
 
+    def retained_run_repair(self, project, run_id, fingerprint):
+        """Return this run's stopped contract, never a cross-project hypothesis."""
+        if not run_id or not fingerprint:
+            return None
+        with self.connect() as db:
+            rows = db.execute("SELECT payload FROM jobs WHERE state='blocked' ORDER BY updated DESC").fetchall()
+        for row in rows:
+            payload = json.loads(row['payload'])
+            invocation = payload.get('invocation', {})
+            diagnosis = payload.get('diagnosis') or {}
+            if (payload.get('repair_engine') == 'v2' and payload.get('project') == project
+                    and invocation.get('run_id') == run_id and not invocation.get('session_id')
+                    and payload.get('fingerprint') == fingerprint
+                    and diagnosis.get('repair_approved') and (payload.get('decision') or {}).get('eligible')
+                    and payload.get('scope_receipt')):
+                return payload
+        return None
+
     def register(self, payload):
         identity = digest([payload["project"], payload["token"]])[:24]
         with self.connect() as db:
@@ -851,6 +869,13 @@ class Supervisor:
                 return {"ok": True, "job": self.store.job(request["job"], include_progress=True), "subscribers": self.store.subscriptions(request["job"]), "registered": list(self.registrations)}
             with self.store.connect() as db:
                 return {"ok": True, "jobs": [dict(row) for row in db.execute("SELECT id,state,updated FROM jobs ORDER BY updated DESC")], "publications": [dict(row) for row in db.execute("SELECT * FROM outbox")]}
+        if op == 'lookup-retained-run-repair':
+            registration = self.registrations.get(request.get('subscriber'))
+            if not registration or request.get('_peer_pid') != registration['payload']['pid']:
+                raise RuntimeError('retained repair lookup requires the registered workflow owner')
+            return {'ok': True, 'payload': self.store.retained_run_repair(
+                registration['payload']['project'], request.get('run_id'),
+                request.get('fingerprint'))}
         if op == "lookup-contract":
             with self.store.connect() as db:
                 rows = db.execute("SELECT payload FROM jobs WHERE state!='cancelled' ORDER BY updated DESC").fetchall()

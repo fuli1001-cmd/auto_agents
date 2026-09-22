@@ -121,11 +121,16 @@ def symptom_key(error, project):
 
 
 def cached_contract(orchestrator, project, error):
+    orchestrator.__dict__.pop('_retained_repair_payload', None)
     registration = getattr(orchestrator, "_repair_registration", None)
     if not registration or not enabled() or os.environ.get("AUTO_AGENTS_REPAIR_SUBSCRIBER"):
         return None
     from .self_repair import auto_agents_repo_root
     try:
+        retained = retained_run_contract(orchestrator, project, error)
+        if retained:
+            orchestrator._retained_repair_payload = retained
+            return {**retained, 'source': 'retained_repair_contract'}
         response = rpc(registration["config"], {"op": "lookup-contract",
             "symptom_key": symptom_key(error, project), "base": git(auto_agents_repo_root(), "rev-parse", "HEAD")})
         cached = response.get("contract")
@@ -136,6 +141,91 @@ def cached_contract(orchestrator, project, error):
     except (OSError, RuntimeError, ValueError):
         pass
     return None
+
+
+def validate_retained_run_contract(project, source, payload, error, *, frozen_target=None):
+    """Reprove retained ownership and witnesses before reusing any authority."""
+    from .config import load_run_state
+    from .repair_v2.scope import context, same_context, witnesses
+    state = load_run_state(project)
+    blocker = state.active_blocker or {}
+    invocation = payload.get('invocation', {})
+    receipt = payload.get('scope_receipt') or {}
+    if (state.status != 'blocked' or blocker.get('owner') != 'auto_agents'
+            or state.pending_approval or state.active_input_request_id or state.pending_input_requests
+            or payload.get('project') != str(Path(project).resolve())
+            or invocation.get('run_id') != state.run_id or invocation.get('session_id')
+            or invocation.get('workflow_id') not in (None, '', state.resume_context.get('workflow_id'))
+            or payload.get('fingerprint') != blocker.get('fingerprint')
+            or str(error) not in {state.last_error, payload.get('error', '')}
+            or not (payload.get('diagnosis') or {}).get('repair_approved')
+            or not (payload.get('decision') or {}).get('eligible')
+            or (payload.get('decision') or {}).get('category') != blocker.get('category')
+            or payload.get('repair_engine') != 'v2' or not receipt.get('witnesses')
+            or receipt.get('policy') != 'goal-scope-v2'
+            or receipt.get('proposal', {}).get('decision') != 'required'
+            or not same_context(receipt.get('context'), context(project, payload))):
+        raise ValueError('retained repair no longer belongs to the current blocked run')
+    from copy import deepcopy
+    from .repair_v2.scope import read_json
+    references = receipt['proposal']['evidence_refs']
+    current = witnesses(references, project, source)
+    saved = receipt.get('witnesses') or []
+    if len(saved) != len(current):
+        raise ValueError('retained repair witness count changed')
+    workflow_file = '.auto-agents/state/workflows/' + state.resume_context.get('workflow_id', '') + '/workflow.json'
+    for reference, old, new in zip(references, saved, current):
+        if old == new:
+            continue
+        # Normal run entry updates the workflow timestamp. Rebind that one
+        # unconstrained document only after proving all semantic fields match
+        # the sealed original; explicit digests and all other witnesses stay exact.
+        if (frozen_target is None or not isinstance(reference, dict)
+                or reference.get('origin') != 'target' or reference.get('path') != workflow_file
+                or any(reference.get(key) for key in ('pointer', 'sha256', 'snapshot'))
+                or witnesses([reference], frozen_target, source) != [old]):
+            raise ValueError('retained repair witness changed')
+        before = read_json(frozen_target, workflow_file)
+        after = read_json(project, workflow_file)
+        if ({k: v for k, v in before.items() if k != 'updated_at'}
+                != {k: v for k, v in after.items() if k != 'updated_at'}):
+            raise ValueError('retained workflow changed beyond its observation timestamp')
+    rebound = deepcopy(receipt)
+    rebound['witnesses'] = current
+    return rebound
+
+
+def retained_run_contract(orchestrator, project, error):
+    """An explicit source upgrade resumes a stopped repair before new diagnosis."""
+    from .config import load_run_state
+    from .self_repair import auto_agents_repo_root
+    from .repair_v2.types import RepairBlocked
+    invocation = getattr(orchestrator, '_invocation_context', {}) or {}
+    if invocation.get('session_id'):
+        return None
+    registration = getattr(orchestrator, '_repair_registration', None)
+    if not registration:
+        return None
+    try:
+        state = load_run_state(project)
+        if state.status != 'blocked' or state.active_blocker.get('owner') != 'auto_agents':
+            return None
+        source = auto_agents_repo_root()
+        base = git(source, 'rev-parse', 'HEAD')
+        if git(source, 'status', '--porcelain'):
+            return None  # Only committed corrections can be pinned by the worker.
+        response = rpc(registration['config'], {'op': 'lookup-retained-run-repair',
+            'subscriber': registration['subscriber'], 'run_id': state.run_id,
+            'fingerprint': state.active_blocker.get('fingerprint')})
+        payload = response.get('payload')
+        if not payload or payload.get('base') == base:
+            return None
+        from .repair_v2.transaction import transaction_root
+        frozen = transaction_root(registration['config'], payload) / 'target-evidence'
+        receipt = validate_retained_run_contract(project, source, payload, error, frozen_target=frozen)
+        return {**payload, 'scope_receipt': receipt}
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, RepairBlocked):
+        return None
 
 
 def register(lock, args, orchestrator):
@@ -387,7 +477,12 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     if health is not None:
         health.set_phase("self_repair")
         health.set_active_operation("self_repair", "independent repair supervisor owns recovery")
-    invocation = dict(getattr(orchestrator, "_invocation_context", {}) or {})
+    retained = getattr(orchestrator, '_retained_repair_payload', None)
+    if retained:
+        validate_retained_run_contract(project, auto_agents_repo_root(), retained, error)
+        if diagnosis is None or diagnosis.to_dict() != retained['diagnosis']:
+            raise ValueError('retained repair diagnosis changed before submission')
+    invocation = dict(retained['invocation'] if retained else getattr(orchestrator, "_invocation_context", {}) or {})
     argv = _run_command_for_self_repair_resume(args)
     if "--session" in argv:
         invocation["session_id"] = argv[argv.index("--session") + 1]
@@ -458,6 +553,11 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                "provider": getattr(args, "provider", None) or getattr(orchestrator, "_current_provider", None) or getattr(orchestrator.config, "active_provider", None),
                "autonomy": getattr(args, "autonomy", None) or orchestrator.config.execution.autonomy.mode,
                "resume_argv": argv}
+    if retained:
+        payload['scope_receipt'] = retained['scope_receipt']
+        payload['contract'] = retained['contract']
+        payload['error'] = retained['error']
+        payload['symptom_key'] = retained['symptom_key']
     if diagnosis and getattr(diagnosis.final, 'necessity', None) and not payload['scope_receipt']:
         from .repair_v2.scope import ScopeGuard, context
         necessity = diagnosis.final.necessity

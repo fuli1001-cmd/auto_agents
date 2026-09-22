@@ -135,6 +135,10 @@ def observation(state, owner, operation):
         anchor_event = {'index': anchor_index, 'sha256': digest(anchor)}
     else:
         observed = {k: failure_condition(state[k]) for k in ('last_error', 'active_blocker') if state.get(k)}
+        if isinstance(observed.get('active_blocker'), dict):
+            # A later diagnosis describes this failure; it is not a new failure
+            # and must not strand the original repair's scope and retry budget.
+            observed['active_blocker'].pop('self_repair_triage', None)
         if not observed:
             return {}, None
         phase, code, check = 'execution', 'execution_failed', 'execution_failed'

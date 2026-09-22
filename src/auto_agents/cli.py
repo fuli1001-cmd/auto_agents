@@ -1973,7 +1973,7 @@ def _triage_terminal_run_error(
         try:
             diagnosis = RootCauseDiagnosis.from_dict(prior["diagnosis"])
             return SelfRepairTriageResult(decision=SelfRepairDecision(**prior["decision"]),
-                source="shared_repair_contract", reason="reusing a generic contract; frozen behavior and boundary must be revalidated",
+                source=prior.get('source', 'shared_repair_contract'), reason="reusing an approved repair contract; frozen behavior and boundary must be revalidated",
                 root_cause=diagnosis)
         except (ValueError, TypeError, KeyError):
             pass  # An obsolete cached schema cannot replace fresh diagnosis.
