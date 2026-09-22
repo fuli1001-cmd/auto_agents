@@ -451,7 +451,11 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
         if necessity.get('decision') == 'required':
             guard = ScopeGuard(Path(registration['config']['root']) / 'scope-inputs' / digest(invocation),
                                payload, project, source)
-            reference = guard.admit(diagnosis.scope_necessity(Path(project)))
+            # Revalidate retained witnesses before touching temporary diagnosis
+            # files, which may already be gone when this submitter restarts.
+            reference = guard.current()
+            if reference is None:
+                reference = guard.admit(diagnosis.scope_necessity(Path(project)))
             payload['scope_receipt'] = guard.store.read(reference)
     # The request marker deliberately is not a valid RootCauseDiagnosis. An
     # old immutable worker that cannot fetch a newer runtime must fail closed,
