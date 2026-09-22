@@ -763,3 +763,114 @@ def test_diagnostic_scope_submission_preserves_bound_run(diagnostic_scope, tmp_p
         assert diagnosis.to_dict() == original
     else:
         assert submitted == []
+
+
+@pytest.mark.parametrize('category', ['diagnostic_evidence_reference_binding_gap', 'unrelated_engine_failure'])
+def test_diagnostic_evidence_repair_resumes_retained_run(diagnostic_scope, monkeypatch, category):
+    from auto_agents.config import DEFAULT_CONFIG, load_run_state, load_task_plan, save_run_state
+    from auto_agents.orchestrator import Orchestrator
+    from auto_agents.repair_v2.boundary_driver import run_plan_contract
+
+    project, _, _, _, _, _ = diagnostic_scope
+    atomic_json(project / '.auto-agents/config.json', deepcopy(DEFAULT_CONFIG))
+    state = load_run_state(project)
+    state.active_blocker = {'owner': 'auto_agents', 'category': category,
+                            'fingerprint': 'binding-gap', 'status': 'blocked', 'resume_attempts': 0}
+    state.localized_blockers = [{'task_id': 'task-pp-07', 'affected_task_ids': ['task-pp-07'],
+        'source': 'parallel_lane_failure', 'category': 'parallel_lane_checkpoint_unavailable',
+        'status': 'localized', 'owner': 'auto_agents', 'resumable': True,
+        'reason': 'publication and checkpoint retention failed on ignored .conda'}]
+    state.task_failure_checkpoints = {'task-pp-07': {'status': 'unavailable', 'ref': '',
+        'task_id': 'task-pp-07', 'resume_mode': 'implementation', 'implementation_completed': False}}
+    state.stage_summaries = {'plan': 'Accepted plan', 'provider_research': 'Existing provider contract'}
+    state.agent_attempts = {'planning': 4, 'implement': 2}
+    state.tasks[0].verify_history = [{'decision': 'pass', 'candidate_fingerprint': 'retained-candidate'}]
+    state.tasks[0].review_history = [{'summary': 'Retained review evidence'}]
+    state.last_recovery_route = {'outcome': 'publication_pending', 'task_id': 'task-pp-07'}
+    save_run_state(project, state)
+    before = deepcopy(state)
+    contract = run_plan_contract(load_task_plan(project))
+    workflow = project / '.auto-agents/state/workflows/wf-cea9506a7499/workflow.json'
+    protected = {path: path.read_bytes() for path in (workflow, project / 'unrelated.txt')}
+    orchestrator = Orchestrator(project)
+    monkeypatch.setattr(orchestrator, '_call_with_failover', lambda *a, **k: pytest.fail('resume called a provider'))
+    # This synthetic project has no Git metadata; only the read-only Git probe
+    # is replaced, while task reconciliation and persistence remain real.
+    monkeypatch.setattr(orchestrator, '_changed_paths_excluding_agent_instructions', lambda: [])
+    state = orchestrator.mark_self_repair_applied('verified-engine')
+    assert orchestrator._resume_blocked_run(state)
+    assert state.status == 'pending'
+    assert state.tasks[0].status == 'pending' and not state.tasks[0].commit_sha
+    if category == 'diagnostic_evidence_reference_binding_gap':
+        assert not state.active_blocker
+        receipt = state.last_recovery_route['diagnostic_evidence_repair']
+        assert receipt['outcome'] == 'admission_retry_ready'
+        assert receipt['repaired_blocker']['fingerprint'] == 'binding-gap'
+        assert receipt['repaired_blocker']['self_repair_commit'] == 'verified-engine'
+        assert receipt['repaired_blocker']['prepared_self_repair_commit'] == 'verified-engine'
+        assert receipt['repaired_blocker']['requeued_task_ids'] == ['task-pp-07']
+    else:
+        assert state.active_blocker['category'] == category
+        assert 'diagnostic_evidence_repair' not in state.last_recovery_route
+    assert state.localized_blockers == before.localized_blockers
+    assert state.task_failure_checkpoints == before.task_failure_checkpoints
+    assert state.stage_summaries == before.stage_summaries
+    assert state.agent_attempts == before.agent_attempts
+    assert state.tasks[0].verification_refs == before.tasks[0].verification_refs
+    assert state.tasks[0].verify_history == before.tasks[0].verify_history
+    assert state.tasks[0].review_history == before.tasks[0].review_history
+    assert run_plan_contract(load_task_plan(project)) == contract
+    assert {path: path.read_bytes() for path in protected} == protected
+    save_run_state(project, state)
+    restarted = Orchestrator(project)
+    saved = load_run_state(project)
+    snapshot = saved.to_dict()
+    assert not restarted._resume_blocked_run(saved)
+    assert saved.to_dict() == snapshot
+
+
+@pytest.mark.parametrize('condition', [
+    'ready', 'no_install', 'not_prepared', 'different_commit', 'no_requeue',
+    'blocked_task', 'missing_task', 'approval', 'input', 'foreign_owner', 'blocked_run', 'wrong_stage',
+])
+def test_diagnostic_evidence_retirement_requires_prepared_retry(diagnostic_scope, condition):
+    from auto_agents.config import load_run_state
+    from auto_agents.orchestrator import Orchestrator
+
+    project, _, _, _, _, _ = diagnostic_scope
+    state = load_run_state(project)
+    state.status = 'pending'
+    state.tasks[0].status = 'pending'
+    state.active_blocker = {'owner': 'auto_agents', 'category': 'diagnostic_evidence_reference_binding_gap',
+        'status': 'retrying', 'self_repair_commit': 'verified', 'prepared_self_repair_commit': 'verified',
+        'requeued_task_ids': ['task-pp-07'], 'fingerprint': 'retained-failure'}
+    if condition == 'no_install':
+        state.active_blocker.pop('self_repair_commit')
+    elif condition == 'not_prepared':
+        state.active_blocker.pop('prepared_self_repair_commit')
+    elif condition == 'different_commit':
+        state.active_blocker['prepared_self_repair_commit'] = 'older'
+    elif condition == 'no_requeue':
+        state.active_blocker['requeued_task_ids'] = []
+    elif condition == 'blocked_task':
+        state.tasks[0].status = 'blocked'
+    elif condition == 'missing_task':
+        state.active_blocker['requeued_task_ids'] = ['foreign-task']
+    elif condition == 'approval':
+        state.pending_approval = 'implement'
+    elif condition == 'input':
+        state.active_input_request_id = 'pending-input'
+    elif condition == 'foreign_owner':
+        state.active_blocker['owner'] = 'external_provider'
+    elif condition == 'blocked_run':
+        state.status = 'blocked'
+    elif condition == 'wrong_stage':
+        state.current_stage = 'plan'
+    before = deepcopy(state.to_dict())
+    assert Orchestrator._retire_prepared_diagnostic_evidence_repair(state) == (condition == 'ready')
+    if condition == 'ready':
+        assert state.active_blocker == {}
+        assert state.last_recovery_route['diagnostic_evidence_repair']['repaired_blocker'] == before['active_blocker']
+        assert state.tasks[0].status == 'pending' and not state.tasks[0].commit_sha
+    else:
+        assert state.to_dict() == before

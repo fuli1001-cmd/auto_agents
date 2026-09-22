@@ -16174,6 +16174,48 @@ class Orchestrator:
         self._clear_run_blocker(state)
         return True
 
+    @staticmethod
+    def _retire_prepared_diagnostic_evidence_repair(state: RunState) -> bool:
+        """Return an installed admission repair to the existing task recovery."""
+        blocker = state.active_blocker or {}
+        commit = str(blocker.get("self_repair_commit", "")).strip()
+        task_ids = blocker.get("requeued_task_ids", [])
+        tasks = {task.task_id: task for task in state.tasks}
+        if (
+            state.status != "pending"
+            or state.current_stage != "implement"
+            or blocker.get("owner") != "auto_agents"
+            or blocker.get("category") != "diagnostic_evidence_reference_binding_gap"
+            or blocker.get("status") != "retrying"
+            or not commit
+            or blocker.get("prepared_self_repair_commit") != commit
+            or state.pending_approval
+            or state.active_input_request_id
+            or state.pending_input_requests
+            or not isinstance(task_ids, list)
+            or not task_ids
+            or any(not isinstance(task_id, str) or task_id not in tasks
+                   or tasks[task_id].status not in {"pending", "in_progress"}
+                   for task_id in task_ids)
+        ):
+            return False
+        state.last_recovery_route = {
+            **state.last_recovery_route,
+            "diagnostic_evidence_repair": {
+                "outcome": "admission_retry_ready",
+                "run_id": state.run_id,
+                "workflow_id": state.resume_context.get("workflow_id", ""),
+                "repaired_blocker": copy.deepcopy(blocker),
+                "prepared_at": utc_now_iso(),
+            },
+        }
+        # The task retries were prepared by the existing recovery machinery.
+        # Retire only the repaired admission failure, not the localized
+        # publication failures, retained checkpoints or outstanding task gates.
+        state.active_blocker = {}
+        state.last_error = ""
+        return True
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         if self._legacy_applied_checkpoint_records(state):
             canonical_tasks = self._load_implementation_tasks(state)
@@ -16185,6 +16227,8 @@ class Orchestrator:
             return True
         if (state.active_blocker or {}).get("category") == "provider_reference_freshness_validity_conflation":
             return self._resume_provider_reference_review_repair(state)
+        if self._retire_prepared_diagnostic_evidence_repair(state):
+            return True
         legacy_before_reconcile = (
             dict(state.active_blocker)
             if isinstance(state.active_blocker, dict)
@@ -16628,6 +16672,7 @@ class Orchestrator:
                 }
             )
             self._incident_store(state).save(active_incident, state)
+        self._retire_prepared_diagnostic_evidence_repair(state)
         return True
 
     def _resume_blocked_pending_user_input(self, state: RunState) -> bool:
