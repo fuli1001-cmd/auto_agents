@@ -4,6 +4,7 @@ An approval is an overlay on immutable proof sources, never a replacement of
 the writer receipt or a claim that tests passed. No candidate code is imported.
 """
 import ast
+from collections import Counter
 from copy import deepcopy
 import hashlib
 import json
@@ -90,6 +91,25 @@ def admissible(before, after):
         old, new = ast.parse(before), ast.parse(after)
         previous, current = _definitions(old), _definitions(new)
         if not previous.keys() <= current.keys():
+            return False
+        def execution_controls(tree):
+            controls = []
+            for item in ast.walk(tree):
+                if isinstance(item, (ast.Return, ast.Yield, ast.YieldFrom, ast.Global, ast.Nonlocal)):
+                    controls.append(ast.dump(item))
+                elif (isinstance(item, ast.Attribute) and isinstance(item.ctx, (ast.Store, ast.Del))
+                      and item.attr in {'__code__', '__defaults__', '__kwdefaults__'}):
+                    controls.append(ast.dump(item))
+                elif isinstance(item, ast.Call):
+                    called = item.func.id if isinstance(item.func, ast.Name) else ''
+                    if (called in {'globals', 'locals'} or called in {'setattr', 'delattr'}
+                            and len(item.args) > 1 and isinstance(item.args[1], ast.Constant)
+                            and item.args[1].value in {'__code__', '__defaults__', '__kwdefaults__'}):
+                        controls.append(ast.dump(item))
+            return Counter(controls)
+        # Assertions left after a new early return, or in a replaced callable,
+        # are not executable proof. A review cannot authorize those bypasses.
+        if execution_controls(new) - execution_controls(old):
             return False
         def skeleton(tree):
             value = deepcopy(tree)

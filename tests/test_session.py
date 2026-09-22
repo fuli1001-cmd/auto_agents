@@ -3387,7 +3387,7 @@ class SessionProviderResolveTests(unittest.TestCase):
             orchestrator.resume_saved_run = mock_resume_saved_run
             state = Session(orchestrator, mode="provider_resolve").start()
 
-            self.assertEqual(state.status, "completed")
+            self.assertEqual(state.status, "completed", state.to_dict())
             self.assertEqual(
                 load_requirements_trace(project_root, normalize=False)["requirements"][0]["status"],
                 "deferred",

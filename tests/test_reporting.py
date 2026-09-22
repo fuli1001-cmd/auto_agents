@@ -621,3 +621,14 @@ def test_output_callback_waiting_for_lock_cannot_write_after_finish(report):
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert not capture.root.exists()
+
+
+def test_repair_log_location_does_not_replace_terminal_blocked_status(report):
+    reporter, stream = report
+    reporter.event('repair.control', {}, audience='user', message='Self-repair example：正在集中验收')
+    reporter.event('repair.control', {}, audience='user', message='Self-repair example：修复受阻：Acceptance failed')
+    reporter.event('repair.control', {}, audience='user', message='详细日志：/private/repair/job')
+    lines = stream.getvalue().splitlines()
+    assert lines[-1].endswith('当前状态：恢复受阻')
+    assert '正在恢复任务' not in lines[-1]
+    assert events(reporter)[-1]['message'] == '详细日志：/private/repair/job'

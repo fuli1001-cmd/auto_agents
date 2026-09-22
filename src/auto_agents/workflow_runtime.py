@@ -459,7 +459,10 @@ class WorkflowCoordinator:
         child_id = self._engine_child_id(payload, snapshot)
         if not child_id:
             return None
-        child = load_session_state(self.project_root, child_id)
+        try:
+            child = load_session_state(self.project_root, child_id)
+        except FileNotFoundError:
+            return None  # Missing custody is not an amendment; keep the engine binding check.
         return child if pending(child) else None
 
     def _resume_blocked_engine_handoff(self, state, snapshot):

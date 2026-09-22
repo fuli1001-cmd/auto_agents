@@ -24,6 +24,7 @@ from auto_agents.cli import (
     main,
 )
 from auto_agents.adapters.codex import CodexAdapter
+from auto_agents.reporting import get_reporter
 from auto_agents.config import (
     DEFAULT_CONFIG,
     auto_dir,
@@ -3142,7 +3143,7 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(runner_calls["count"], 1)
             self.assertIn("Starting automatic auto_agents self-repair", stderr.getvalue())
-            self.assertIn("preparing to resume the original task", stderr.getvalue())
+            self.assertIn("Status: Recovering the task", stderr.getvalue())
             self.assertTrue(any(
                 "Resuming run without a new repair" in path.read_text(encoding="utf-8")
                 for path in (project_root / ".auto-agents/runs").rglob("events.jsonl")
@@ -3730,6 +3731,7 @@ class ProjectValidationTests(unittest.TestCase):
                         def __init__(self, project_root, agent_output_stream=None):
                             self.project_root = project_root
                             self._print_agent_output = False
+                            self.reporter = get_reporter(project_root, agent_output_stream or sys.stderr)
 
                         def _ensure_agent_instructions_synced(self):
                             return None
@@ -3769,6 +3771,7 @@ class ProjectValidationTests(unittest.TestCase):
                 def __init__(self, project_root, agent_output_stream=None):
                     self.project_root = project_root
                     self._print_agent_output = False
+                    self.reporter = get_reporter(project_root, agent_output_stream or sys.stderr)
 
                 def _ensure_agent_instructions_synced(self):
                     return None
@@ -3811,6 +3814,7 @@ class ProjectValidationTests(unittest.TestCase):
                 def __init__(self, project_root, agent_output_stream=None):
                     self.project_root = project_root
                     self._print_agent_output = False
+                    self.reporter = get_reporter(project_root, agent_output_stream or sys.stderr)
 
                 def _ensure_agent_instructions_synced(self):
                     return None
@@ -3876,6 +3880,7 @@ class ProjectValidationTests(unittest.TestCase):
                 def __init__(self, project_root, agent_output_stream=None):
                     self.project_root = project_root
                     self._print_agent_output = False
+                    self.reporter = get_reporter(project_root, agent_output_stream or sys.stderr)
 
                 def _ensure_agent_instructions_synced(self):
                     return None
@@ -4555,7 +4560,7 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertEqual(state.status, "paused")
             rendered = stream.getvalue()
-            self.assertIn("Starting Requirements", rendered)
+            self.assertIn("    Requirements", rendered)
             self.assertNotIn("provider=mock", rendered)
             self.assertIn("[stage:clarify] start provider=mock model=mock",
                           (orchestrator.reporter.root / "run.log").read_text())
@@ -4602,7 +4607,10 @@ class ProjectValidationTests(unittest.TestCase):
             orchestrator._run_agent_stage("plan", state, spec_file)
 
             rendered = stream.getvalue()
-            self.assertIn("Current plan: 1 tasks", rendered)
+            events = [json.loads(line) for line in
+                      (orchestrator.reporter.root / "events.jsonl").read_text().splitlines()]
+            self.assertTrue(any(event["type"] == "plan.ready" and event["data"]["total"] == 1
+                                for event in events))
             self.assertIn("[stage:plan] tasks=1", (orchestrator.reporter.root / "run.log").read_text())
 
     def test_valid_plan_artifact_is_reconciled_after_retry_mismatch(self) -> None:
@@ -5122,8 +5130,11 @@ class ProjectValidationTests(unittest.TestCase):
             orchestrator._execute_task_with_retries(state, task)
 
             rendered = stream.getvalue()
-            self.assertIn("Build health endpoint: Implementation, attempt 1", rendered)
-            self.assertIn("Build health endpoint: Review passed", rendered)
+            self.assertIn("task-001：Build health endpoint", rendered)
+            self.assertIn("    Coding", rendered)
+            self.assertIn("    Verification", rendered)
+            self.assertIn("    Review", rendered)
+            self.assertLess(rendered.index("    Coding"), rendered.index("    Review"))
             diagnostic = (orchestrator.reporter.root / "run.log").read_text()
             self.assertIn("[task:task-001] implement attempt=1 title=Build health endpoint", diagnostic)
             self.assertIn("[task:task-001] review attempt=1 title=Build health endpoint", diagnostic)

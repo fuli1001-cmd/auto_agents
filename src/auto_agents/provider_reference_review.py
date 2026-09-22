@@ -121,6 +121,7 @@ def retained(project, reference, entry):
 
 def reasons(entry, trace, reference, *, now=None):
     from .requirements import provider_reference_consumer_contract_sha256
+    entry = entry or {}
     result = []
     if entry.get('status') not in RESOLVED:
         result.append('unresolved_protocol')
@@ -257,6 +258,32 @@ consumer hashes and admitted timestamps are controller-owned. Do not approve new
 assumptions or infer expanded authorization. Do not claim unchanged/relevant change
 without inspectable official evidence. New provider abilities still need evidence.
 '''
+
+
+def after_approved_defer(project, trace, context, deferred_ids):
+    """Rebind review obligations after a validated, user-approved trace transition.
+
+    Retained provider evidence and approval are unchanged. Remaining consumers
+    still require a review for their new identity; removed consumers do not.
+    """
+    from .requirements import provider_reference_consumer_contract_sha256
+    from .io_utils import write_json
+    result = dict(context)
+    for reference, baseline in context.items():
+        if not set(baseline['requirement_ids']).intersection(deferred_ids):
+            continue
+        remaining = [identity for identity in baseline['requirement_ids'] if identity not in deferred_ids]
+        if not remaining:
+            result.pop(reference)
+            continue
+        item = {**baseline, 'requirement_ids': remaining,
+                'consumer_contract_sha256': provider_reference_consumer_contract_sha256(trace, reference)}
+        item['review_id'] = _context_identity(reference, item)
+        path = _context_path(project, item['review_id'])
+        if not path.exists():
+            write_json(path, {'reference': reference, 'context': item})
+        result[reference] = item
+    return result
 
 
 def validate(lock, trace, context):

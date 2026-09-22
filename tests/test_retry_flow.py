@@ -14065,7 +14065,9 @@ class RetryFlowTests(unittest.TestCase):
             log_path = project_root / ".auto-agents" / "runs" / state.run_id / "run.log"
             self.assertTrue(log_path.exists())
             self.assertIn("[stage:implement] start", log_path.read_text(encoding="utf-8"))
-            self.assertIn("Starting Implementation", stream.getvalue())
+            events = [json.loads(line) for line in (log_path.parent / "events.jsonl").read_text().splitlines()]
+            self.assertTrue(any(event["type"] == "stage.started" and event["stage_id"] == "implement"
+                                for event in events))
 
 
     def test_reject_resets_stage_and_injects_feedback(self):

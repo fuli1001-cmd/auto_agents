@@ -121,6 +121,8 @@ def _concise_message(kind: str, message: str, language: str) -> str:
         return message.strip()
     if kind == 'repair.phase' or kind == 'repair.checks':
         return message
+    if kind == 'repair.control' and message.startswith('详细日志：'):
+        return ''  # A diagnostic location is not a new recovery transition.
     if kind.startswith('repair.'):
         if '受阻' in message or 'failed' in message.lower():
             return '当前状态：恢复受阻' if zh else 'Status: Recovery blocked'

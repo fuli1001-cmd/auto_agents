@@ -615,3 +615,33 @@ def test_applied_provider_repair_only_routes_to_reassessment(tmp_path, monkeypat
     assert state.agent_attempts == attempts
     assert state.last_recovery_route['outcome'] == 'provider_reference_review_repaired'
     assert provider_references_lock_path(root).read_bytes() == before
+
+
+def test_approved_defer_rebinds_only_remaining_review_consumers(tmp_path):
+    trace, lock = scene(tmp_path)
+    trace['requirements'].append({**trace['requirements'][0], 'id': 'REQ-002'})
+    context = review.prepare(tmp_path, trace, lock, [REF], fetch=False, now=NOW)
+    lock['references']['provider']['review'] = decision(context=context)
+    previous = deepcopy(context)
+    unchanged_lock = deepcopy(lock)
+    trace['requirements'][0]['status'] = 'deferred'
+    updated = review.after_approved_defer(tmp_path, trace, context, {'REQ-001'})
+    assert context == previous and lock == unchanged_lock
+    assert updated[REF]['prior'] == context[REF]['prior']
+    assert updated[REF]['evidence_snapshot'] == context[REF]['evidence_snapshot']
+    assert updated[REF]['requirement_ids'] == ['REQ-002']
+    assert review.validate(lock, trace, updated)  # The old review cannot approve the new scope.
+    lock['references']['provider']['review'] = decision(context=updated)
+    assert review.validate(lock, trace, updated) == []
+    trace['requirements'][1]['status'] = 'deferred'
+    assert review.after_approved_defer(tmp_path, trace, updated, {'REQ-002'}) == {}
+
+
+def test_unapproved_defer_keeps_the_original_review_blocker(tmp_path):
+    trace, lock = scene(tmp_path)
+    trace['requirements'].append({**trace['requirements'][0], 'id': 'REQ-002'})
+    context = review.prepare(tmp_path, trace, lock, [REF], fetch=False, now=NOW)
+    trace['requirements'][0]['status'] = 'deferred'
+    unchanged = review.after_approved_defer(tmp_path, trace, context, set())
+    assert unchanged == context
+    assert any('requirements changed' in error for error in review.validate(lock, trace, unchanged))

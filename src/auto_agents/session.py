@@ -3185,6 +3185,20 @@ class Session:
                     self._print(reason)
                     continue
 
+                # Trace validation above has already limited status changes to
+                # the exact requirement IDs approved by this session's user.
+                newly_deferred = {
+                    item['id'] for item in trace_after.get('requirements', [])
+                    if item.get('status') == 'deferred' and item.get('id') in approved_defer_ids
+                    and any(old.get('id') == item['id'] and old.get('status', 'active') == 'active'
+                            for old in trace_before.get('requirements', []))
+                }
+                if newly_deferred:
+                    from .provider_reference_review import after_approved_defer
+                    self.orch._provider_reference_review_context = after_approved_defer(
+                        self.project_root, trace_after,
+                        getattr(self.orch, '_provider_reference_review_context', {}), newly_deferred)
+
                 clarify_match = _REQUIRES_CLARIFY.search(reply)
                 if clarify_match:
                     self._restore_provider_artifacts(restore_root)
