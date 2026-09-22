@@ -305,8 +305,9 @@ def test_live_panel_does_not_redirect_streams_and_cleans_up(tmp_path, monkeypatc
     for n in range(1, 5):
         reporter.task(str(n), "权限检查", "implement", 1)
     frame = reporter.presenter._frame(reporter)
-    assert '实现 → 并行执行' in frame and '\n' in frame
-    assert '权限检查' in frame and '1/5' in frame
+    assert '1 · 编码' in frame and '4 · 编码' in frame and '\n' in frame
+    assert '权限检查' not in frame
+    assert '（实现阶段：2/5）1：权限检查' in (reporter.root / 'user.log').read_text()
     assert '本次运行' not in frame and '阶段 00:' not in frame
     assert reporter.presenter._live is not None
     reporter.presenter._live.update(Text(frame), refresh=True)
@@ -407,7 +408,8 @@ def test_malformed_optional_logging_metadata_cannot_block_a_run(tmp_path):
     reporter.bind("run", "example")
     reporter.observe_run(RunState("example", tasks=[task()]))
     assert reporter.snapshot.subject == "example"
-    assert "Status:" in stream.getvalue()
+    reporter.task("T1", "Permissions", "implement", 1)
+    assert "Coding" in stream.getvalue()
     reporter.close()
 
 

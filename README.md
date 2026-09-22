@@ -1254,18 +1254,19 @@ the next batch's concurrency instead of incorrectly scaling it up. Integration m
 in the run state's `resume_context.parallel_integration_metrics` object.
 For `copilot-cli`, `subscription_tier` can also be set to `pro+`.
 
-Foreground workflows show timestamped execution events on stderr. Interactive terminals retain
-event history above a progress panel, refreshed once per second. The panel shows the workflow
-stage, current action, task ID/title and attempt, completed tasks, and per-task verification
-counts. Active checks show a safe check name and elapsed time; recent execution output has its
-own age. Stage duration and total invocation duration are not displayed. Parallel tasks retain
-separate check counts. Task/action changes append events and update the panel in place;
-ordinary successful checks only update progress, while failures and verification results are
-logged immediately. After 60 seconds without a visible event, a contextual heartbeat is logged.
-Redirected output is plain text with the same events and heartbeats. Model reasoning, protocol
-markers, internal execution identifiers and diagnostic paths stay in the detailed logs.
-Buffered calls indicate that their output is collected at completion. A restored state without
-a current execution observation shows an unknown action instead of inventing live progress.
+Foreground workflows show timestamped task headings and indented action names on stderr.
+Headings include the workflow stage, task position in the current plan (for example `5/19`),
+task ID and title. Retries keep the task heading and append the next action, such as Coding,
+Verification or Review. Successful results do not add a separate line; unsuccessful actions do.
+In interactive terminals, only current action lines update once per second with per-action
+output age and a check progress bar. When an action ends, its plain name remains in history
+without transient progress or output age. Parallel tasks use their plan positions and retain
+separate action lines, counters and output timestamps. Redirected output and `--log-mode plain`
+record headings, action starts and necessary failure/wait notices, with no periodic heartbeats,
+progress bars or output-age messages. Stage/run duration, attempt counts, provider names and
+routine intermediate status messages stay out of concise output. Model reasoning, protocols,
+internal execution identities and diagnostic paths remain in detailed logs. A restored run waits
+for an actual action instead of printing an unknown-action placeholder.
 
 Use `--log-mode plain` to disable the live display or `--log-mode debug` to print technical
 diagnostics. `--print-agent-output` additionally expands visible Agent output and disables the live

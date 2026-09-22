@@ -27,7 +27,7 @@ from uuid import uuid4
 
 from .diagnostic_output import OutputCapture, atomic_json, clean_payload, now, redact, plain_text
 from .reporting_messages import user_text, REPAIR_PHASES
-from .execution_display import Activity, CheckSet, ExecutionDisplay, check_name, text as display_text
+from .execution_display import ActionLine, Activity, CheckSet, ExecutionDisplay, action_name, check_name, text as display_text
 
 
 _CURRENT = contextvars.ContextVar("auto_agents_reporting", default=None)
@@ -149,6 +149,7 @@ class ProgressSnapshot:
     status: str = "pending"
     plan_id: str = ""
     tasks: Dict[str, dict] = field(default_factory=dict)
+    task_order: list[str] = field(default_factory=list)
     stages: Dict[str, str] = field(default_factory=dict)
     repair: str = ""
     checks: Dict[str, int] = field(default_factory=dict)
@@ -198,7 +199,7 @@ class ProgressSnapshot:
         context = getattr(state, "resume_context", {})
         return cls(subject=str(state.run_id), kind="run",
                    goal=str(context.get("goal", "")), stage=str(state.current_stage),
-                   status=str(state.status), tasks=tasks, stages=stages, plan_id=plan_id)
+                   status=str(state.status), tasks=tasks, task_order=list(tasks), stages=stages, plan_id=plan_id)
 
 
 class ConsolePresenter:
@@ -214,10 +215,7 @@ class ConsolePresenter:
         self._stop = threading.Event()
         self._thread = None
         self._suspended = 0
-        self._last_event = time.monotonic()
-        self._last_heartbeat = self._last_event
         self._closed = False
-        self.heartbeat_enabled = False
         self.clock_announced = False
         self.external_owner = False
 
@@ -238,7 +236,7 @@ class ConsolePresenter:
             self._stop_live()
             self._live_unavailable = True
             self._console = None
-        if self._live is None and not self.heartbeat_enabled:
+        if self._live is None:
             return
         self._thread = threading.Thread(target=self._refresh_loop, name="auto-agents-display", daemon=True)
         self._thread.start()
@@ -256,6 +254,48 @@ class ConsolePresenter:
                 live.stop()
             except Exception:
                 pass
+        # Finalize pending names without transient suffixes, also on fallback.
+        reporter = self.focus
+        if reporter is not None:
+            for row in list(reporter.action_lines.values()):
+                if row.live:
+                    row.live = False
+                    self.show(reporter, row.message, timestamp=row.timestamp)
+
+    def finish_action(self, reporter: "Reporter", task_id: str) -> None:
+        with reporter._lock, self._lock:
+            row = reporter.action_lines.pop(task_id, None)
+            if row is not None and row.live:
+                if self._live is not None:
+                    try:
+                        from rich.text import Text
+                        self._live.update(Text(""), refresh=True)
+                    except Exception:
+                        self._stop_live()
+                self.show(reporter, row.message, timestamp=row.timestamp)
+
+    def finish_actions(self, reporter: "Reporter") -> None:
+        for task_id in list(reporter.action_lines):
+            self.finish_action(reporter, task_id)
+
+    def start_action(self, reporter: "Reporter", task_id: str, name: str, timestamp: str) -> None:
+        with reporter._lock, self._lock:
+            self.finish_action(reporter, task_id)
+            self._ensure_started()
+            parallel = len(reporter.active_tasks) > 1
+            if parallel:
+                for row in reporter.action_lines.values():
+                    row.contextual = True
+            row = ActionLine(name, timestamp, task_id, self._live is not None, parallel)
+            reporter.action_lines[task_id] = row
+            if not row.live:
+                self.show(reporter, row.message, timestamp=timestamp)
+            else:
+                try:
+                    from rich.text import Text
+                    self._live.update(Text(self._frame(reporter)), refresh=True)
+                except Exception:
+                    self._stop_live()
 
     def show(self, reporter: "Reporter", message: str, *, timestamp: str = "", debug: bool = False) -> None:
         if debug and self.mode != "debug":
@@ -271,7 +311,6 @@ class ConsolePresenter:
                 return
             self._last_notice = notice
             self._ensure_started()
-            self._last_event = time.monotonic()
             try:
                 when = datetime.fromisoformat(timestamp) if timestamp else datetime.now().astimezone()
                 prefix = when.astimezone().strftime("[%H:%M:%S] ")
@@ -296,14 +335,14 @@ class ConsolePresenter:
             # Rich crops by terminal cell width, including wide Chinese characters.
             if self._console is not None:
                 from rich.text import Text
-                width = max(1, self._console.width - len(stamp))
+                width = max(1, self._console.width)
                 cropped = []
                 for line in lines:
                     value = Text(line)
                     value.truncate(width, overflow="ellipsis")
                     cropped.append(value.plain)
                 lines = cropped
-            return "\n".join(stamp + line for line in lines)
+            return "\n".join(lines)
         goal = snapshot.goal or reporter.project_name
         label = ("目标" if zh else "Goal") if snapshot.goal else ("项目" if zh else "Project")
         lines = [f"{label}: {goal[:100]}"]
@@ -349,7 +388,6 @@ class ConsolePresenter:
             reporter = self.focus
             if reporter is None or self._suspended or self.external_owner:
                 continue
-            heartbeat = False
             # Render before taking the presenter lock: events lock reporter then presenter.
             try:
                 frame = self._frame(reporter)
@@ -363,15 +401,6 @@ class ConsolePresenter:
                         self._live.update(Text(frame), refresh=True)
                     except Exception:
                         self._stop_live()
-                if (
-                    (reporter.snapshot.status not in _TERMINAL or reporter.snapshot.repair)
-                    and time.monotonic() - max(self._last_event, self._last_heartbeat) >= 60
-                ):
-                    self._last_heartbeat = time.monotonic()
-                    heartbeat = True
-            if heartbeat:
-                # Never acquire a reporter lock while holding the presentation lock.
-                reporter.heartbeat()
 
     @contextmanager
     def input(self):
@@ -430,6 +459,9 @@ class Reporter:
         self.root: Optional[Path] = None
         self.snapshot = ProgressSnapshot()
         self.active_tasks: Dict[str, str] = {}
+        self.action_lines: Dict[str, ActionLine] = {}
+        self._task_headings: dict = {}
+        self._action_failures: set = set()
         self.display = ExecutionDisplay()
         self._lock = threading.RLock()
         self._sequence = 0
@@ -485,6 +517,7 @@ class Reporter:
             self.presenter.focus = self
             return
         with self._lock:
+            self.presenter.finish_actions(self)
             root = (self.project_root / ".auto-agents" / "runs" / subject
                     if kind == "run" else
                     self.project_root / ".auto-agents" / "state" / "sessions" / subject / "logs")
@@ -501,6 +534,8 @@ class Reporter:
             self.active_tasks.clear()
             self._lane_tokens.clear()
             self.display = ExecutionDisplay()
+            self._task_headings.clear()
+            self._action_failures.clear()
             previous = _read_json(root / "diagnostics.json")
             artifacts = previous.get("artifacts", {})
             self._artifacts = {
@@ -531,6 +566,8 @@ class Reporter:
 
     @contextmanager
     def preserve_subject(self):
+        saved_actions = dict(self.action_lines)
+        saved_headings = dict(self._task_headings)
         previous = (self.root, self.snapshot, self._artifacts, dict(self.active_tasks), self._last_snapshot,
                     self._announced_plan, set(self._invalidated_stages), self._persisted_stage, self.display,
                     dict(self._lane_tokens))
@@ -539,6 +576,7 @@ class Reporter:
         finally:
             root, snapshot, artifacts, tasks, last, announced, invalidated, persisted_stage, display, lanes = previous
             if root is not None and not snapshot.subject.startswith("_commands/") and root != self.root:
+                self.presenter.finish_actions(self)
                 child_root = self.root
                 self._index()
                 (self.root, self.snapshot, self._artifacts, self.active_tasks, self._last_snapshot,
@@ -551,7 +589,10 @@ class Reporter:
                 for logger in self._loggers:
                     attach_run_file_logger(logger, root / "run.log")
                 self.presenter.focus = self
+                self._task_headings = saved_headings
                 self.event("subject.returned", {"child": str(child_root)})
+                for task_id, row in saved_actions.items():
+                    self.event("action.resumed", {"task_id": task_id, "name": row.name}, audience="user", message=row.name)
 
     def ensure_bound(self) -> None:
         if self.root is None:
@@ -604,7 +645,12 @@ class Reporter:
     def progress_lines(self) -> list[str]:
         owner = self.parent or self
         with owner._lock:
-            return owner.display.lines(owner.snapshot, owner.active_tasks, owner.language, _label)
+            lines = []
+            for task_id, row in owner.action_lines.items():
+                stamp = datetime.fromisoformat(row.timestamp).astimezone().strftime("[%H:%M:%S] ")
+                suffix = owner.display.suffix(task_id, owner.language)
+                lines.append(stamp + row.message + (" | " + suffix if suffix else ""))
+            return lines
 
     def heartbeat(self) -> None:
         self.event("heartbeat", {}, audience="user", message=" | ".join(self.progress_lines()))
@@ -629,6 +675,7 @@ class Reporter:
                     display.buffered.pop(identifier, None)
                 if event == "output" and mode != "remote_result":
                     display.last_output = time.monotonic()
+                    display.output_times[task_id] = display.last_output
                 if kind != "provider":
                     return
                 if event == "start":
@@ -670,6 +717,58 @@ class Reporter:
             return str(values.get("message", kind))
         return pair[0 if self.language == "zh" else 1].format(**values)
 
+    def _presentation(self, kind: str, data: Mapping[str, object], message: str, task_id: str):
+        """Return concise text and an action transition; diagnostics stay verbatim."""
+        owner = self.parent or self
+        zh = self.language == "zh"
+        if kind == "task.started":
+            return action_name(str(data.get("action", "")), self.language), "start"
+        if kind == "action.resumed":
+            return str(data["name"]), "start"
+        if kind == "stage.started":
+            owner.presenter.finish_actions(owner)
+            return ("", "") if owner.snapshot.stage == "implement" else (str(data["stage"]), "start")
+        if kind == "verification.started":
+            name = "验证" if zh else "Verification"
+            if "baseline" in str(data.get("context", "")) or "基线" in str(data.get("context", "")):
+                name = "基线验证" if zh else "Baseline verification"
+            row = owner.action_lines.get(task_id)
+            if row and row.name == name:
+                return "", ""
+            owner._action_failures = {key for key in owner._action_failures if not (key[1] == task_id and key[3] == "verify")}
+            return name, "start"
+        if kind in {"task.result", "verification.finished"}:
+            action = str(data.get("action", "verify"))
+            passed = (str(data.get("decision", "")).lower() in {"pass", "passed", "approve", "approved", "accept", "accepted"}
+                      if kind == "task.result" else not (data.get("failed", 0) or data.get("cancelled", 0)))
+            activity = owner.display.activities.get(task_id)
+            identity = (owner.display.epoch, task_id, activity.token if activity else "", action)
+            if passed or identity in owner._action_failures:
+                return "", "finish"
+            owner._action_failures.add(identity)
+            name = action_name(action, self.language)
+            return name + ("未通过" if zh else " failed"), "finish"
+        if kind in {"task.completed", "verify.passed"}:
+            return "", "finish"
+        if kind == "stage.completed":
+            return "", "finish" if data.get("stage_id") == owner.snapshot.stage else ""
+        if kind in {"task.blocked", "verification.interrupted", "verify.failed"}:
+            return message, "finish"
+        if kind == "repair.phase":
+            return ("恢复：" if zh else "Recovery: ") + str(data.get("phase", "")), "start"
+        if kind == "stage.retry":
+            return str(data["stage"]), "start"
+        if kind == "plan.changed":
+            return (f"计划调整：{data['before']} → {data['total']} 项任务" if zh else
+                    f"Plan changed: {data['before']} → {data['total']} tasks"), ""
+        if kind == "status" and "state_status" in data and data["state_status"] not in _TERMINAL:
+            return ("", "") if owner.snapshot.kind == "run" else (str(data["status"]), "start")
+        if kind in {"heartbeat", "plan.ready", "task.output_received", "verification.check_failed", "repair.checks"}:
+            return "", ""
+        if kind in {"stage.rewind", "command.failed", "invocation.stopped"} or kind == "status":
+            owner.presenter.finish_actions(owner)
+        return _concise_message(kind, message, self.language), ""
+
     def event(self, kind: str, data: Mapping[str, object], *, audience: str = "debug",
               message: str = "", level: str = "INFO") -> None:
         owner = self.parent or self
@@ -680,11 +779,18 @@ class Reporter:
         output_root = owner.root if current_lane or self.root is None else self.root
         timestamp = now()
         message = plain_text(message)
-        visible = _concise_message(kind, message, self.language) if audience == 'user' else ''
+        visible, transition = "", ""
         with owner._lock:
             if owner._closed or self._closed:
                 return
             task_id = str(data.get("task_id") or self.lane_task)
+            if audience == "user" and current_lane:
+                visible, transition = self._presentation(kind, data, message, task_id)
+            if transition == "finish":
+                owner.presenter.finish_action(owner, task_id)
+            if transition == "start":
+                owner.presenter.finish_action(owner, task_id)
+                owner.display.output_times.pop(task_id, None)
             activity = owner.display.activities.get(task_id)
             notice = (self.snapshot.subject, self.snapshot.stage, owner.display.epoch,
                       activity.token if activity else "", kind, task_id,
@@ -694,11 +800,10 @@ class Reporter:
                     visible = ""
                 else:
                     owner._last_user_notice = notice
-            if visible and kind.startswith(("task.", "verification.", "verify.", "provider.")):
-                context = _label(self.snapshot.stage, self.language)
-                if task_id:
-                    context += "/" + display_text(task_id)
-                visible = f"[{context}] {visible}"
+            name = visible
+            if visible and (transition or kind.startswith(("task.", "verification."))) and kind != "task.heading":
+                context = display_text(task_id) + " · " if task_id and len(owner.active_tasks) > 1 else ""
+                visible = "    " + context + visible
             owner._sequence += 1
             record = clean_payload({
                 "schema_version": 1, "timestamp": timestamp, "type": kind,
@@ -720,11 +825,14 @@ class Reporter:
                             target.write(f"{timestamp} {line}\n")
             except Exception as error:
                 owner.capture_failed(error)
-        if message and current_lane:
-            if owner.presenter.mode == 'debug':
-                owner.presenter.show(owner, message, timestamp=timestamp, debug=audience != 'user')
-            elif visible:
-                owner.presenter.show(owner, visible, timestamp=timestamp)
+            if message and current_lane:
+                if owner.presenter.mode == 'debug':
+                    owner.presenter.show(owner, message, timestamp=timestamp, debug=audience != 'user')
+                elif visible:
+                    if transition == "start":
+                        owner.presenter.start_action(owner, task_id, name, timestamp)
+                    else:
+                        owner.presenter.show(owner, visible, timestamp=timestamp)
 
     def emit(self, kind: str, **data: object) -> None:
         if kind == "task.blocked" and self._current_lane():
@@ -762,9 +870,11 @@ class Reporter:
         with owner._lock:
             if self._current_lane():
                 if self.lane_task:
+                    owner.presenter.finish_action(owner, self.lane_task)
                     owner.display.clear_task(self.lane_task)
                     owner.active_tasks.pop(self.lane_task, None)
                 else:
+                    owner.presenter.finish_actions(owner)
                     owner.display = ExecutionDisplay()
                     owner.active_tasks.clear()
         self.event("diagnostic.exception", {
@@ -814,6 +924,19 @@ class Reporter:
             return
         owner = self.parent or self
         with owner._lock:
+            task_ids = owner.snapshot.task_order or list(owner.snapshot.tasks)
+            position = task_ids.index(task_id) + 1 if task_id in task_ids else None
+            stage = _label(owner.snapshot.stage, self.language)
+            ordinal = f"{position}/{len(task_ids)}" if position is not None else ""
+            signature = (owner.display.epoch, owner.snapshot.plan_id, title, ordinal)
+            if owner._task_headings.get(task_id) != signature:
+                owner.presenter.finish_action(owner, task_id)
+                owner._task_headings[task_id] = signature
+                context = f"{stage}阶段" if self.language == "zh" else stage
+                if ordinal:
+                    context += ("：" if self.language == "zh" else ": ") + ordinal
+                self.event("task.heading", {"task_id": task_id}, audience="user",
+                           message=f"（{context}）{display_text(task_id)}：{display_text(title)}")
             owner.display.clear_task(task_id)
             owner.display.activities[task_id] = Activity(display_text(title), action, attempt)
             owner.active_tasks[task_id] = action
@@ -845,7 +968,10 @@ class Reporter:
                 return
             for task in state.tasks:
                 if task.task_id == self.lane_task and task.status == "done":
-                    self.parent.active_tasks[self.lane_task] = "waiting_integration"
+                    if self.parent.active_tasks.get(self.lane_task) != "waiting_integration":
+                        self.parent.active_tasks[self.lane_task] = "waiting_integration"
+                        name = action_name("waiting_integration", self.language)
+                        self.event("action.resumed", {"task_id": self.lane_task, "name": name}, audience="user", message=name)
             return
         if self.snapshot.kind != "run" or self.snapshot.subject != str(state.run_id):
             return
@@ -872,6 +998,7 @@ class Reporter:
                 self._invalidated_stages.discard(stage)
         self.snapshot = current
         if previous.stage != current.stage or current.status in _TERMINAL:
+            self.presenter.finish_actions(self)
             self.display = ExecutionDisplay()
             self.active_tasks.clear()
             self._lane_tokens.clear()
@@ -879,7 +1006,7 @@ class Reporter:
         self._last_snapshot = encoded
         self.event("state.snapshot", current.__dict__)
         if not initialized or previous.status != current.status:
-            self.emit('status', status=self.progress_lines()[0])
+            self.emit('status', status=_label(current.status, self.language), state_status=current.status)
         if previous.plan_id != current.plan_id and current.plan_id and self._announced_plan != current.plan_id:
             self.emit("plan.changed" if previous.plan_id else "plan.ready",
                       before=len(previous.tasks), total=len(current.tasks), done=current.done)
@@ -902,6 +1029,7 @@ class Reporter:
         }
         for task_id in list(self.display.activities):
             if task_id not in self.active_tasks:
+                self.presenter.finish_action(self, task_id)
                 self.display.clear_task(task_id)
         self._index()
 
@@ -915,6 +1043,7 @@ class Reporter:
         self.snapshot.stage = str(state.status)
         self.snapshot.status = str(state.status)
         if previous_status != self.snapshot.status:
+            self.presenter.finish_actions(self)
             self.display = ExecutionDisplay()
             self.active_tasks.clear()
         if previous_status != self.snapshot.status:
@@ -934,7 +1063,7 @@ class Reporter:
             if reason:
                 reason = ' '.join(plain_text(str(reason)).split())[:600]
                 label += ('；原因：' if self.language == 'zh' else '; reason: ') + reason
-            self.emit("status", status=label)
+            self.emit("status", status=label, state_status=self.snapshot.status)
         self.event("session.snapshot", {
             "status": state.status, "attempt": state.current_attempt, "goal": state.goal,
         })
@@ -942,6 +1071,7 @@ class Reporter:
     @_synchronized
     def repair(self, phase: str, **data: object) -> None:
         if not self.snapshot.repair:
+            self.presenter.finish_actions(self)
             self.display = ExecutionDisplay()
             self.active_tasks.clear()
         pair = REPAIR_PHASES.get(phase, ("处理当前修复步骤", "working on the current repair step"))
@@ -1009,7 +1139,9 @@ class GateObservation:
             label = reporter.snapshot.tasks.get(reporter.lane_task, {}).get("title", reporter.lane_task)
         else:
             label = "当前任务" if reporter.language == "zh" else "current task"
-        self.reporter.emit("verification.started", context=label, task_id=self.task_id, check_set_id=self.identifier)
+        with self.owner._lock:
+            if self._current():
+                self.reporter.emit("verification.started", context=label, task_id=self.task_id, check_set_id=self.identifier)
         self.reporter.event("verification.selected", {"context": self.context, "total": total})
 
     def __call__(self, event: str, command: str, elapsed: float) -> None:
@@ -1088,7 +1220,7 @@ class GateObservation:
             self.reporter.snapshot.checks = dict(self.counts)
             if self.task_id in self.owner.active_tasks:
                 self.owner.active_tasks[self.task_id] = "next"
-        self.reporter.emit("verification.finished", task_id=self.task_id, check_set_id=self.identifier, **self.counts)
+            self.reporter.emit("verification.finished", task_id=self.task_id, check_set_id=self.identifier, **self.counts)
 
     def abort(self) -> None:
         with self.owner._lock:
@@ -1099,8 +1231,8 @@ class GateObservation:
             self.view.active.clear()
             if self.task_id in self.owner.active_tasks:
                 self.owner.active_tasks[self.task_id] = "next"
-        self.reporter.event("verification.interrupted", {"task_id": self.task_id, "check_set_id": self.identifier},
-                            audience="user", message="验证中断" if self.reporter.language == "zh" else "Verification interrupted")
+            self.reporter.event("verification.interrupted", {"task_id": self.task_id, "check_set_id": self.identifier},
+                                audience="user", message="验证中断" if self.reporter.language == "zh" else "Verification interrupted")
 
 
 def observe_gate_result(progress, result: object) -> None:
@@ -1115,7 +1247,6 @@ class ReportingRuntime:
         self.explicit_raw = bool(getattr(args, "print_agent_output", False))
         self.presenter = ConsolePresenter(sys.stderr, self.explicit_mode or "auto")
         self.presenter.raw_output = self.explicit_raw
-        self.presenter.heartbeat_enabled = True
         self.reporters: list[Reporter] = []
         self._resolved = False
         project = getattr(args, "project", None)
