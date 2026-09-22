@@ -13,6 +13,60 @@ import time
 from types import SimpleNamespace
 
 
+def retained_document_from_receipt(target, request, diagnosis):
+    """Locate this diagnosis's immutable document without resurrecting its temp file.
+
+    This validates transport of the owned target evidence, not repair admission.
+    Submission still revalidates the entire receipt, including source witnesses,
+    through ScopeGuard against the actual engine checkout.
+    """
+    from auto_agents.root_cause import _diagnostic_scope_reference
+    from auto_agents.repair_v2.scope import context, same_context, witnesses
+    from auto_agents.repair_v2.store import digest
+
+    receipt = request.get('scope_receipt')
+    if not isinstance(receipt, dict):
+        raise FileNotFoundError('retained diagnosis evidence is absent: ' + diagnosis.evidence_path)
+    if (receipt.get('policy') != 'goal-scope-v2'
+            or not same_context(receipt.get('context'), context(target, request))):
+        raise ValueError('retained diagnostic receipt belongs to a different scope')
+    proposal = receipt.get('proposal') or {}
+    raw_refs = diagnosis.final.necessity.get('evidence_refs')
+    bound_refs = proposal.get('evidence_refs')
+    evidence = receipt.get('witnesses')
+    if (not isinstance(raw_refs, list) or not isinstance(bound_refs, list)
+            or not isinstance(evidence, list) or len(raw_refs) != len(bound_refs)
+            or len(evidence) != len(bound_refs)):
+        raise ValueError('retained diagnostic receipt does not bind this report')
+    expected, paths = [], set()
+    for raw, bound, witness in zip(raw_refs, bound_refs, evidence):
+        selected = _diagnostic_scope_reference(raw)
+        if selected is None:
+            expected.append(raw)
+            continue
+        if not isinstance(bound, dict) or not isinstance(bound.get('path'), str):
+            raise ValueError('retained diagnostic reference is invalid')
+        relative = Path(bound['path'])
+        if (relative.parent != Path('.auto-agents/state/repair-scope-evidence')
+                or relative.suffix != '.json' or len(relative.stem) != 64
+                or any(c not in '0123456789abcdef' for c in relative.stem)):
+            raise ValueError('retained diagnostic reference is not content addressed')
+        path = Path(target) / relative
+        if path.is_symlink() or not path.resolve().is_relative_to(Path(target).resolve()):
+            raise ValueError('retained diagnostic document escapes the frozen project')
+        if digest(json.loads(path.read_text())) != relative.stem:
+            raise ValueError('retained diagnostic document digest mismatch')
+        expected.append({**selected, 'origin': 'target', 'path': relative.as_posix()})
+        # Pin the selected value to the previously admitted witness as well as
+        # any explicit sha256/snapshot constraints in the original reference.
+        if not isinstance(witness, dict) or witnesses([expected[-1]], target, target) != [witness]:
+            raise ValueError('retained diagnostic witness changed')
+        paths.add(relative)
+    if len(paths) != 1 or proposal != {**diagnosis.final.necessity, 'evidence_refs': expected}:
+        raise ValueError('retained diagnostic receipt does not bind this report')
+    return paths.pop()
+
+
 def retained_diagnosis(target, request):
     from auto_agents.root_cause import RootCauseDiagnosis
 
@@ -49,7 +103,7 @@ def retained_diagnosis(target, request):
     if '..' in relative.parts or evidence.is_symlink() or not evidence.resolve().is_relative_to(target):
         raise ValueError('retained diagnostic evidence escapes the frozen project')
     if not evidence.is_file():
-        raise FileNotFoundError('retained diagnosis evidence is absent: ' + str(relative))
+        return diagnosis, retained_document_from_receipt(target, request, diagnosis)
     return diagnosis, relative
 
 
@@ -127,8 +181,13 @@ def observe_submission(orchestrator, original, diagnosis, request, runtime, outp
                     'ticks': start_ticks(os.getpid()), 'command': ['run', '--project', str(target)]}},
                     [lock.fileno])
                 orchestrator._repair_registration = {'config': config, 'subscriber': registration['subscriber']}
-                orchestrator._invocation_context = {**request.get('invocation', {}),
-                                                   'run_id': original.run_id, 'workflow_id': workflow}
+                orchestrator._invocation_context = {**request.get('invocation', {}), 'run_id': original.run_id}
+                if not Path(diagnosis.evidence_path).is_file():
+                    retained_document_from_receipt(target, request, diagnosis)
+                    guard = ScopeGuard(Path(config['root']) / 'scope-inputs' /
+                                       digest(orchestrator._invocation_context), request, target, runtime['runtime_root'])
+                    if guard.import_receipt(request['scope_receipt']) is None:
+                        raise ValueError('retained submission scope receipt no longer validates')
                 orchestrator.reporter.event = observe
                 blocker = original.active_blocker
                 args = SimpleNamespace(command='run', project=str(target),
@@ -157,7 +216,8 @@ def observe_submission(orchestrator, original, diagnosis, request, runtime, outp
                         or event.get('diagnosis_digest') != digest(report)
                         or event.get('scope_receipt_digest') != digest(receipt)
                         or payload['invocation'].get('run_id') != original.run_id
-                        or payload['invocation'].get('workflow_id') != workflow
+                        or payload['invocation'].get('workflow_id') not in (None, '', workflow)
+                        or event.get('workflow_id') != workflow
                         or event.get('engine_commit') != runtime['commit']
                         or not guard.import_receipt(receipt)):
                     raise RuntimeError('submission acknowledgment lacks a matching durable job and scope receipt')
