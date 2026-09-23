@@ -339,6 +339,22 @@ def test_recovery_replaces_task_action_instead_of_leaving_it_active(report):
     assert "[引擎自修复] 定位故障原因" in frame(report) and "编码" not in frame(report)
 
 
+@pytest.mark.parametrize('eligible', [False, True])
+def test_diagnosis_decision_finalizes_live_action_before_cli_summary(report, screen, eligible):
+    report.repair('diagnosing')
+    report.display.output_times[''] = 0
+    report.emit('repair.eligible' if eligible else 'repair.not_eligible')
+    assert frame(report) == ''
+    assert report.snapshot.repair == ''
+    assert screen.history[-2].endswith('[引擎自修复] 定位故障原因')
+    assert '最近输出' not in screen.history[-2]
+    assert ('准备修复' if eligible else '本次未获准自动修复') in screen.history[-1]
+    assert '正在恢复任务' not in history(report)
+    before = list(screen.history)
+    report.presenter.close()
+    assert screen.history == before
+
+
 def repair_job(phase='implement', **display):
     return {'id': 'private-job', 'generation': 1, 'state': 'repairing',
             'display': {'phase': phase, 'sequence': 1, **display}}

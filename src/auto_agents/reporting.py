@@ -761,6 +761,15 @@ class Reporter:
             return message, "finish"
         if kind == "repair.phase":
             return ("[引擎自修复] " if zh else "[Engine repair] ") + str(data.get("phase", "")), "start"
+        if kind in {'repair.eligible', 'repair.not_eligible', 'diagnosis.unavailable', 'diagnosis.review_incomplete'}:
+            owner.presenter.finish_actions(owner)
+            owner.display = ExecutionDisplay()
+            owner.snapshot.repair = ''
+            if kind == 'repair.eligible':
+                return ('[引擎自修复] 诊断完成，准备修复' if zh else
+                        '[Engine repair] Diagnosis complete; preparing repair'), ''
+            return ('[引擎自修复] 诊断已结束，本次未获准自动修复' if zh else
+                    '[Engine repair] Diagnosis ended; automatic repair was not approved'), ''
         if kind == 'repair.action':
             return message, 'finish' if data.get('terminal') else 'start'
         if kind == 'repair.control' and getattr(owner, '_repair_display_managed', False):

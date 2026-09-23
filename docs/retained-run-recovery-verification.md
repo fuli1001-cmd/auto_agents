@@ -12,6 +12,16 @@ can provide a new driver on the next invocation. Candidate edits do not replace
 the verifier that approves them. The retained request, candidate, histories and
 consumed repair budgets remain in the same transaction.
 
+Normal CLI entry updates the recorded engine revision and source hash in
+`run_state.json`; a subsequent diagnosis appends `active_blocker.self_repair_triage`.
+For an unconstrained whole-document witness, these observation-only fields and
+the workflow document's `updated_at` may be rebound after checking against the
+original sealed document. All other state fields remain exact, including tasks,
+budgets, authorization, checkpoints and runtime paths. Explicit hash/pointer
+constraints are never relaxed. This lets an approved retained repair proceed to
+verification after a committed upgrade without requesting another diagnosis of
+an already corrected source tree.
+
 The metadata/checkpoint repair:
 
 - Preserves meaningful leading dots in paths, so quoted SQL in `.auto-agents`

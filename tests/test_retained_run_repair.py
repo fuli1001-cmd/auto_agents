@@ -23,7 +23,15 @@ from test_diagnostic_recovery_boundary import retained_submission_scene
 def stopped_repair(tmp_path, monkeypatch):
     monkeypatch.delenv('AUTO_AGENTS_REPAIR_CONTROL_DISABLED', raising=False)
     with retained_submission_scene() as (root, orch, original, _, request, runtime, _, diagnosis):
+        original.resume_context['auto_agents_runtime'] = {
+            'repository_root': str(tmp_path / 'trusted-engine'),
+            'orchestrator_module': str(tmp_path / 'trusted-engine/src/auto_agents/orchestrator.py'),
+            'python_executable': '/trusted/python', 'repository_head': 'previous-engine',
+            'orchestrator_sha256': 'previous-module-hash',
+        }
+        save_run_state(root, original)
         workflow_file = '.auto-agents/state/workflows/' + original.resume_context['workflow_id'] + '/workflow.json'
+        diagnosis.final.necessity['evidence_refs'].append({'origin': 'target', 'path': '.auto-agents/state/run_state.json'})
         diagnosis.final.necessity['evidence_refs'].append({'origin': 'target', 'path': workflow_file})
         request['diagnosis'] = diagnosis.to_dict()
         proof = tmp_path / 'previous'
@@ -77,6 +85,7 @@ def test_normal_run_reuses_stopped_contract_and_budget_after_source_upgrade(tmp_
         state = load_run_state(root)
         state.active_blocker['self_repair_triage'] = {'decision': {'eligible': False},
             'reason': 'source is already corrected; no new implementation is justified'}
+        state.resume_context['auto_agents_runtime'].update(repository_head='new-engine', orchestrator_sha256='new-module-hash')
         save_run_state(root, state)
         workflow_path = root / '.auto-agents/state/workflows' / state.resume_context['workflow_id'] / 'workflow.json'
         workflow = json.loads(workflow_path.read_text())
@@ -119,7 +128,8 @@ def test_normal_run_reuses_stopped_contract_and_budget_after_source_upgrade(tmp_
         assert load_run_state(root).status == 'blocked'  # Acceptance has not happened yet.
 
 
-@pytest.mark.parametrize('change', ['run', 'fingerprint', 'goal', 'witness', 'approval', 'workflow', 'workflow_document', 'dirty', 'same_source', 'unrelated_error'])
+@pytest.mark.parametrize('change', ['run', 'fingerprint', 'goal', 'witness', 'approval', 'workflow', 'workflow_document', 'dirty', 'same_source', 'unrelated_error',
+                                  'attempts', 'task', 'checkpoint', 'runtime_path', 'authorization'])
 def test_retained_repair_requires_current_owner_witnesses_and_committed_upgrade(tmp_path, monkeypatch, change):
     with stopped_repair(tmp_path, monkeypatch) as (root, orch, original, source, payload, supervisor, lock, transaction, usage):
         state = load_run_state(root)
@@ -144,6 +154,11 @@ def test_retained_repair_requires_current_owner_witnesses_and_committed_upgrade(
             payload['base'] = git(source, 'rev-parse', 'HEAD')
             with supervisor.store.connect() as db:
                 db.execute('UPDATE jobs SET payload=?', (json.dumps(payload),))
+        elif change == 'attempts': state.agent_attempts['implement-task-current'] = 99
+        elif change == 'task': state.tasks[0].acceptance.append('new obligation')
+        elif change == 'checkpoint': state.task_failure_checkpoints['task-current'] = {'ref': 'foreign'}
+        elif change == 'runtime_path': state.resume_context['auto_agents_runtime']['repository_root'] = '/other/engine'
+        elif change == 'authorization': state.resume_context['auto_approve'] = False
         save_run_state(root, state)
         error = RuntimeError('unrelated fresh exception' if change == 'unrelated_error' else original.last_error)
         assert repair_client.retained_run_contract(orch, root, error) is None
@@ -198,6 +213,11 @@ def test_three_source_upgrades_reuse_original_anchor_and_budget(tmp_path, monkey
         for attempt in range(3):
             (source / 'fix.py').write_text(f'correction = {attempt}\n')
             git(source, 'commit', '-qam', f'correction {attempt}')
+            state = load_run_state(root)
+            state.active_blocker['self_repair_triage'] = {'diagnosis_id': f'observation-{attempt}'}
+            state.resume_context['auto_agents_runtime'].update(repository_head=f'engine-{attempt}',
+                                                              orchestrator_sha256=f'module-{attempt}')
+            save_run_state(root, state)
             atomic_json(workflow_path, {**workflow, 'updated_at': f'2026-09-23T0{attempt}:00:00+00:00'})
             with ProjectRunLock(root) as lock:
                 registration = supervisor.register({'payload': {'project': str(root), 'token': lock.run_token,
@@ -260,16 +280,22 @@ def test_rebound_timestamp_cannot_relax_the_sealed_contract(tmp_path, monkeypatc
                                                          frozen_target=frozen, frozen_receipt=anchor)
 
 
-def test_timestamp_rebind_preserves_explicit_digest_constraints(tmp_path, monkeypatch):
+@pytest.mark.parametrize('document', ['workflow', 'run'])
+def test_timestamp_rebind_preserves_explicit_digest_constraints(tmp_path, monkeypatch, document):
     from copy import deepcopy
     from auto_agents.repair_v2.types import RepairBlocked
     with stopped_repair(tmp_path, monkeypatch) as (root, _, original, source, payload, _, _, transaction, _):
         latest = deepcopy(payload)
         receipt = latest['scope_receipt']
-        reference = receipt['proposal']['evidence_refs'][-1]
-        reference['sha256'] = receipt['witnesses'][-1]['sha256']
-        workflow = json.loads((root / reference['path']).read_text())
-        atomic_json(root / reference['path'], {**workflow, 'updated_at': 'changed timestamp'})
+        index = -1 if document == 'workflow' else -2
+        reference = receipt['proposal']['evidence_refs'][index]
+        reference['sha256'] = receipt['witnesses'][index]['sha256']
+        observed = json.loads((root / reference['path']).read_text())
+        if document == 'workflow':
+            observed['updated_at'] = 'changed timestamp'
+        else:
+            observed['active_blocker']['self_repair_triage'] = {'diagnosis_id': 'new observation'}
+        atomic_json(root / reference['path'], observed)
         with pytest.raises(RepairBlocked):
             repair_client.validate_retained_run_contract(root, source, latest, RuntimeError(original.last_error),
                 frozen_target=transaction / 'target-evidence', frozen_receipt=receipt)

@@ -180,28 +180,48 @@ def validate_retained_run_contract(project, source, payload, error, *, frozen_ta
             or len(anchor.get('witnesses', [])) != len(saved)):
         raise ValueError('retained repair differs from its sealed scope')
     workflow_file = '.auto-agents/state/workflows/' + state.resume_context.get('workflow_id', '') + '/workflow.json'
+    run_file = '.auto-agents/state/run_state.json'
     for reference, old, new, sealed in zip(references, saved, current, anchor['witnesses']):
         if old == new == sealed:
             continue
-        # Normal run entry updates the workflow timestamp. Rebind that one
-        # unconstrained document only after proving all semantic fields match
-        # the sealed original; explicit digests and all other witnesses stay exact.
+        # Normal entry updates workflow time and the observed engine revision;
+        # triage also appends its report to the blocker. These are observations,
+        # not changes to the original task, authorization or consumed budgets.
+        # Rebind only unconstrained documents against the immutable sealed input.
         # The latest job may already carry a rebound timestamp. Its receipt is
         # not the immutable anchor for the next invocation: always authenticate
         # against the original transaction's receipt and frozen document.
         if (frozen_target is None or not isinstance(reference, dict)
-                or reference.get('origin') != 'target' or reference.get('path') != workflow_file
+                or reference.get('origin') != 'target' or reference.get('path') not in {workflow_file, run_file}
                 or any(reference.get(key) for key in ('pointer', 'sha256', 'snapshot'))
                 or witnesses([reference], frozen_target, source) != [sealed]):
             raise ValueError('retained repair witness changed')
-        before = read_json(frozen_target, workflow_file)
-        after = read_json(project, workflow_file)
-        if ({k: v for k, v in before.items() if k != 'updated_at'}
-                != {k: v for k, v in after.items() if k != 'updated_at'}):
-            raise ValueError('retained workflow changed beyond its observation timestamp')
+        before = read_json(frozen_target, reference['path'])
+        after = read_json(project, reference['path'])
+        if reference['path'] == workflow_file:
+            equivalent = ({k: v for k, v in before.items() if k != 'updated_at'}
+                          == {k: v for k, v in after.items() if k != 'updated_at'})
+        else:
+            equivalent = _retained_run_semantics(before) == _retained_run_semantics(after)
+        if not equivalent:
+            raise ValueError('retained recovery state changed beyond its observation metadata')
     rebound = deepcopy(receipt)
     rebound['witnesses'] = current
     return rebound
+
+
+def _retained_run_semantics(document):
+    """Remove only known observations; the full remaining state stays binding."""
+    from copy import deepcopy
+    result = deepcopy(document)
+    blocker = result.get('active_blocker')
+    if isinstance(blocker, dict):
+        blocker.pop('self_repair_triage', None)
+    runtime = result.get('resume_context', {}).get('auto_agents_runtime')
+    if isinstance(runtime, dict):
+        runtime.pop('repository_head', None)
+        runtime.pop('orchestrator_sha256', None)
+    return result
 
 
 def retained_run_contract(orchestrator, project, error):
