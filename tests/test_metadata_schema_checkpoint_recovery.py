@@ -21,6 +21,7 @@ from auto_agents.git_ops import commit_all_except
 from auto_agents.models import RunState, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.persistence import detect_persistence_schema_changes
+from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
 
 
 def _git(root: Path, *args: str) -> bytes:
@@ -294,3 +295,170 @@ def test_checkpoint_failure_never_dispatches_rewind(tmp_path: Path, failure: str
     assert task.task_id not in state.task_failure_checkpoints
     assert not task.commit_sha and task.status != "done"
     assert (root / "app.py").read_text() == "candidate\n"
+
+
+def _ready_metadata_repair_scene(tmp_path: Path):
+    """Model the retained run: ready attempt 1, unavailable checkpoint 0."""
+    root = tmp_path / "project"
+    orch = _project(root)
+    _write(root, "app.py", "VALUE = 1\n")
+    _write(root, "spec.md", "Synthetic independent iteration\n")
+    _write(root, ".auto-agents/state/sessions/stopped/session_state.json", '{"status":"stopped"}\n')
+    base = _commit(root)
+    owner = TaskSpec(
+        "task-pp-07", "Retained candidate", "Verify the existing work", ["Keep the contract"],
+        status="in_progress", verify_retry_epoch=1,
+        persistence_change={"storage_transition": "none"},
+        verification_refs=["tests/test_candidate.py::test_contract"],
+        verify_history=[{"attempt": 1, "decision": "pass", "candidate_fingerprint": "earlier"}],
+        review_history=[{"attempt": 1, "summary": "Earlier review"}],
+    )
+    other = TaskSpec("task-pp-08", "Separate obligation", "Keep pending", ["Publish its own evidence"])
+    state = RunState(run_id="82288622684f", current_stage="implement", tasks=[owner, other])
+    workflow = WorkflowStore(root).create_root(WorkflowRef("run", state.run_id))
+    state.resume_context.update(
+        workflow_id=workflow.workflow_id, spec_file=str(root / "spec.md"),
+        parallel_sequential_retry_tasks=[owner.task_id, other.task_id],
+    )
+    state.stage_summaries = {stage: "Retained accepted evidence" for stage in ("clarify", "design", "plan", "provider_research")}
+    state.agent_attempts = {"plan": 3, "implement-task-pp-07": 2}
+    state.task_review_cache[owner.task_id] = {"decision": "pass", "fingerprint": "earlier"}
+    state.task_failure_checkpoints = {
+        task.task_id: {
+            "task_id": task.task_id, "status": "unavailable", "ref": "",
+            "has_candidate_changes": False, "changed_paths": [],
+            "verify_retry_epoch": 0, "commit_sha": base, "base_ref": base,
+            "reason": "ignored dependency rejected checkpoint staging",
+        } for task in state.tasks
+    }
+    state.last_recovery_route = {"outcome": "publication_pending", "other_task": other.task_id}
+    orch._persist_tasks(state.tasks)
+    _write(root, "app.py", "VALUE = 2\n")
+    _write(root, ".auto-agents/state/synthetic-diagnostic.json", '{"quote":"DROP TABLE example"}\n')
+    orch._set_task_attempt_base_ref(state, owner, base)
+    orch._set_implementation_ready_marker(state, owner, True)
+    orch._block_run(
+        state, owner="auto_agents", category="metadata_schema_false_positive_and_checkpoint_failure",
+        reason="metadata guard and checkpoint staging failed", fingerprint="retained-failure",
+    )
+    save_run_state(root, state)
+    return root, orch, state, owner
+
+
+@pytest.mark.parametrize("partially_staged", [False, True])
+def test_applied_metadata_repair_reaches_fresh_verification_without_resetting_history(
+    tmp_path: Path, partially_staged: bool,
+) -> None:
+    root, orch, original, owner = _ready_metadata_repair_scene(tmp_path)
+    if partially_staged:
+        # The failed add can change index status without changing candidate bytes.
+        _git(root, "add", "--", "app.py")
+    plan_path = root / ".auto-agents/state/task_plan.json"
+    protected = [plan_path, root / "spec.md", root / "app.py",
+                 root / ".auto-agents/state/sessions/stopped/session_state.json"]
+    before_bytes = {p: p.read_bytes() for p in protected}
+    index_before = _git(root, "ls-files", "--stage", "-z")
+    before = copy.deepcopy(original.to_dict())
+    with patch.object(orch, "_call_with_failover", side_effect=AssertionError("no provider in recovery")):
+        # Exactly the pinned boundary's preparation and resume calls.
+        state = orch.mark_self_repair_applied("verified-engine-candidate")
+        assert orch._resume_blocked_run(state)
+    assert state.run_id == original.run_id and state.status == "pending"
+    assert state.current_stage == "implement" and not state.active_blocker
+    receipt = state.last_recovery_route["metadata_checkpoint_repair"]
+    assert receipt["task_id"] == owner.task_id and receipt["outcome"] == "verification_ready"
+    assert receipt["repaired_blocker"]["fingerprint"] == original.active_blocker["fingerprint"]
+    assert receipt["superseded_checkpoint"] == before["task_failure_checkpoints"][owner.task_id]
+    assert receipt["previous_review_cache"] == before["task_review_cache"][owner.task_id]
+    assert owner.task_id not in state.task_failure_checkpoints
+    assert state.task_failure_checkpoints["task-pp-08"] == before["task_failure_checkpoints"]["task-pp-08"]
+    assert state.agent_attempts == original.agent_attempts
+    assert state.stage_summaries == original.stage_summaries
+    assert [task.to_dict() for task in state.tasks] == before["tasks"]
+    assert state.resume_context == original.resume_context
+    assert {p: p.read_bytes() for p in protected} == before_bytes
+    assert _git(root, "ls-files", "--stage", "-z") == index_before
+    assert WorkflowStore(root).load(receipt["workflow_id"]).root.native_id == state.run_id
+
+    restarted = Orchestrator(root)
+    state = load_run_state(root)
+    snapshot = copy.deepcopy(state.to_dict())
+    assert not restarted._resume_blocked_run(state)
+    assert state.to_dict() == snapshot  # Repeated resume does not repeat preparation.
+    reached = []
+
+    class VerificationEntered(Exception):
+        pass
+
+    def managed_verification(task, *, state):
+        reached.append((state.run_id, task.task_id, task.verification_refs))
+        assert state.resume_context["implementation_ready_tasks"][task.task_id]
+        assert not task.commit_sha and task.status == "in_progress"
+        assert task.task_id not in state.task_review_cache
+        raise VerificationEntered()
+
+    with (
+        patch.object(restarted, "_route_frontend_design_contract_prerequisite", return_value=None),
+        patch.object(restarted, "_ensure_evidence_preflight", return_value=None),
+        patch.object(restarted, "_ensure_task_verify_baseline", return_value=False),
+        patch.object(restarted, "_quick_verify_failure_details", return_value=None),
+        patch.object(restarted, "_run_task_verify", side_effect=managed_verification),
+        patch.object(restarted, "_run_agent_with_retries", side_effect=AssertionError("do not regenerate implementation")),
+    ):
+        with pytest.raises(VerificationEntered):
+            restarted._execute_task_in_main_worktree(state, state.tasks, state.tasks[0])
+    assert reached == [(original.run_id, owner.task_id, owner.verification_refs)]
+    assert state.agent_attempts == original.agent_attempts
+    assert not state.tasks[0].commit_sha and state.tasks[0].status != "done"
+
+
+@pytest.mark.parametrize("obstacle", [
+    "not_applied", "foreign_category", "foreign_owner", "approval", "input",
+    "workflow", "not_ready", "ambiguous_owner", "changed_content", "schema_change",
+    "changed_head", "foreign_paths", "current_checkpoint", "checkpoint_ref",
+])
+def test_metadata_repair_does_not_override_unproven_or_current_blockers(
+    tmp_path: Path, obstacle: str,
+) -> None:
+    root, orch, original, owner = _ready_metadata_repair_scene(tmp_path)
+    state = orch.mark_self_repair_applied("verified-engine-candidate")
+    if obstacle == "not_applied":
+        state = copy.deepcopy(original)
+    elif obstacle == "foreign_category":
+        state.active_blocker["category"] = "other_failure"
+    elif obstacle == "foreign_owner":
+        state.active_blocker["owner"] = "target_project"
+    elif obstacle == "approval":
+        state.pending_approval = "persistence-reset"
+    elif obstacle == "input":
+        state.active_input_request_id = "unanswered"
+    elif obstacle == "workflow":
+        state.resume_context.pop("workflow_id")
+    elif obstacle == "not_ready":
+        state.resume_context["implementation_ready_tasks"][owner.task_id] = False
+    elif obstacle == "ambiguous_owner":
+        state.tasks[1].status = "in_progress"
+        state.resume_context["implementation_ready_tasks"][state.tasks[1].task_id] = True
+    elif obstacle == "changed_content":
+        _write(root, "app.py", "VALUE = 3\n")
+    elif obstacle == "schema_change":
+        _write(root, "app.py", "db.execute('CREATE TABLE example (id INTEGER)')\n")
+        # Genuine DDL remains guarded even with matching retained ownership.
+        orch._set_implementation_ready_marker(state, state.tasks[0], True)
+    elif obstacle == "changed_head":
+        state.resume_context["task_attempt_base_refs"][owner.task_id] = "different-base"
+    elif obstacle == "foreign_paths":
+        _write(root, "unrelated.py", "keep unrelated work\n")
+    elif obstacle == "current_checkpoint":
+        state.task_failure_checkpoints[owner.task_id]["verify_retry_epoch"] = owner.verify_retry_epoch
+    elif obstacle == "checkpoint_ref":
+        state.task_failure_checkpoints[owner.task_id]["ref"] = "refs/retained/current"
+    before = copy.deepcopy(state.to_dict())
+    assert not orch._resume_metadata_checkpoint_repair(state)
+    assert state.to_dict() == before
+    if obstacle not in {"not_applied", "foreign_category", "foreign_owner"}:
+        assert not orch._resume_blocked_run(state)
+        assert state.status == "blocked"
+        assert state.active_blocker["fingerprint"] == before["active_blocker"]["fingerprint"]
+        assert state.task_failure_checkpoints == before["task_failure_checkpoints"]
+        assert state.agent_attempts == before["agent_attempts"]

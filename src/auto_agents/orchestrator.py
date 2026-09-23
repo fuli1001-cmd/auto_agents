@@ -16216,7 +16216,123 @@ class Orchestrator:
         state.last_error = ""
         return True
 
+    def _resume_metadata_checkpoint_repair(self, state: RunState) -> bool:
+        """Return a proven ready candidate to verification after engine repair.
+
+        A failed Git add may have staged the candidate before rejecting an
+        ignored exclusion. That index-only change does not invalidate the
+        retained content, but an older unavailable checkpoint must not override
+        the newer implementation-ready attempt.
+        """
+        blocker = state.active_blocker or {}
+        if (
+            state.status != "pending"
+            or state.current_stage != "implement"
+            or blocker.get("owner") != "auto_agents"
+            or blocker.get("category") != "metadata_schema_false_positive_and_checkpoint_failure"
+            or blocker.get("status") != "retrying"
+            or not str(blocker.get("self_repair_commit", "")).strip()
+            or not state.resume_context.get("workflow_id")
+            or state.pending_approval
+            or state.active_input_request_id
+            or state.pending_input_requests
+            or self._active_checkpoint_ownership_records(state)
+        ):
+            return False
+        ready = self._implementation_ready_markers(state)
+        owners = [task for task in state.tasks
+                  if task.status == "in_progress" and ready.get(task.task_id) is True]
+        if len(owners) != 1:
+            return False
+        task = owners[0]
+        if blocker.get("task_id") not in (None, "", task.task_id):
+            return False
+        record = self._retained_worktree_ownership_records(state).get(task.task_id, {})
+        exclusions = self._parallel_commit_exclude_prefixes()
+        paths = sorted(path for path in self._changed_paths_excluding_agent_instructions()
+                       if not repository_path_is_excluded(path, exclusions))
+        current_head = head_ref(self.project_root)
+        if (
+            not paths
+            or record.get("owner_task_id") != task.task_id
+            or set(record.get("changed_paths", [])) != set(paths)
+            or not current_head
+            or self._task_attempt_base_ref(state, task) != current_head
+        ):
+            return False
+        failure_snapshot = blocker.get("checkpoint", {})
+        exact_failure_candidate = bool(
+            isinstance(failure_snapshot, dict)
+            and failure_snapshot.get("head") == current_head
+            and failure_snapshot.get("stage") == "implement"
+            and failure_snapshot.get("worktree") == worktree_fingerprint(self.project_root)
+        )
+        path_fingerprints = self._retained_worktree_path_fingerprints(paths)
+        retained_content_matches = bool(
+            record.get("head_ref") == current_head
+            and record.get("path_fingerprints") == path_fingerprints
+        )
+        if not (exact_failure_candidate or retained_content_matches):
+            return False
+        if self._persistence_contract_issue(task):
+            return False
+        checkpoint = state.task_failure_checkpoints.get(task.task_id)
+        if checkpoint is not None and (
+            not isinstance(checkpoint, dict)
+            or checkpoint.get("task_id") != task.task_id
+            or checkpoint.get("status") != "unavailable"
+            or checkpoint.get("ref")
+            or checkpoint.get("has_candidate_changes")
+            or type(checkpoint.get("verify_retry_epoch")) is not int
+            or checkpoint["verify_retry_epoch"] >= task.verify_retry_epoch
+        ):
+            return False
+
+        receipt = {
+            "outcome": "verification_ready",
+            "run_id": state.run_id,
+            "workflow_id": state.resume_context["workflow_id"],
+            "task_id": task.task_id,
+            "verify_retry_epoch": task.verify_retry_epoch,
+            "repaired_blocker": copy.deepcopy(blocker),
+            "superseded_checkpoint": copy.deepcopy(checkpoint),
+            "previous_review_cache": copy.deepcopy(state.task_review_cache.get(task.task_id)),
+            "candidate_head": current_head,
+            "candidate_paths": paths,
+            "candidate_path_fingerprints": path_fingerprints,
+            "persistence_guard": "passed",
+            "prepared_at": utc_now_iso(),
+        }
+        # Preserve historical evidence in the handoff before removing only the
+        # obsolete failure projection. No task counters or proof history reset.
+        state.last_recovery_route = {
+            **state.last_recovery_route,
+            "metadata_checkpoint_repair": receipt,
+        }
+        state.task_failure_checkpoints.pop(task.task_id, None)
+        state.task_review_cache.pop(task.task_id, None)
+        state.active_blocker = {}
+        state.last_error = ""
+        save_run_state(self.project_root, state)
+        return True
+
     def _resume_blocked_run(self, state: RunState) -> bool:
+        if (state.active_blocker or {}).get("category") == "metadata_schema_false_positive_and_checkpoint_failure":
+            if self._resume_metadata_checkpoint_repair(state):
+                return True
+            blocker = state.active_blocker
+            if (state.status == "pending" and blocker.get("owner") == "auto_agents"
+                    and blocker.get("status") == "retrying"):
+                # mark_self_repair_applied opens a pending run. An unproven
+                # handoff must not fall through into implementation from there.
+                blocker["status"] = "blocked"
+                blocker["resume_error"] = (
+                    "retained implementation ownership, checkpoint age or "
+                    "persistence guard could not be revalidated"
+                )
+                state.status = "blocked"
+                state.last_error = str(blocker.get("reason", blocker["resume_error"]))
+            return False
         if self._legacy_applied_checkpoint_records(state):
             canonical_tasks = self._load_implementation_tasks(state)
             return self._prepare_legacy_checkpoint_owner_continuation(
