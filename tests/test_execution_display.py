@@ -501,3 +501,57 @@ def test_terminated_worker_does_not_leave_a_live_action(report, tmp_path):
         assert frame(report) == ""
     finally:
         worker.close()
+
+
+def test_repair_retries_and_terminal_failure_survive_one_poll(report, tmp_path):
+    from test_repair_control import registration, failure
+    from auto_agents.repair_control import Store
+    store = Store(tmp_path / 'control')
+    subscriber = store.register(registration(tmp_path / 'project'))
+    identity = store.submit(subscriber, failure(tmp_path / 'project'))
+    store.transition(identity, 'repairing')
+    store.event(identity, 'phase_started', {'phase': 'implement', 'attempt': 0})
+    report.repair_update(store.job(identity, include_progress=True), {'state': 'waiting'})
+    finding = {'requirement': 'internal', 'reason': 'private verbose review',
+               'summary_zh': '原任务恢复证据不足', 'summary_en': 'Task recovery evidence is incomplete'}
+    store.event(identity, 'acceptance_failed', {'attempt': 1, 'failures': [finding]})
+    store.event(identity, 'phase_started', {'phase': 'plan', 'attempt': 1, 'replans': 1})
+    store.event(identity, 'phase_started', {'phase': 'implement', 'attempt': 1, 'correcting': True})
+    store.event(identity, 'acceptance_failed', {'attempt': 2, 'failures': [finding]})
+    store.transition(identity, 'blocked', {'error': 'repair made no verified progress after its bounded rediagnosis'})
+    job = store.job(identity, include_progress=True)
+    report.repair_update(job, {'state': 'blocked'})
+    value = history(report)
+    expected = ['第1轮 · 编码', '第1轮 · 验收未通过：原任务恢复证据不足',
+                '重新规划：调整修复方案', '第2轮 · 继续编码：修正上一轮未通过项',
+                '第2轮 · 验收未通过：原任务恢复证据不足', '连续修正未取得新的验证进展']
+    positions = [value.index(label) for label in expected]
+    assert positions == sorted(positions)
+    assert '剩余：原任务恢复证据不足' in value
+    assert '累计2轮' in value
+    assert 'private verbose review' not in value
+    report.repair_update(job, {'state': 'blocked'})
+    assert history(report) == value
+    assert frame(report) == ''
+
+
+def test_repair_first_poll_marks_history_and_keeps_current_counts(report):
+    report.repair_update(repair_job('validate', sequence=3, attempt=1, review_running=True,
+        checks={'completed': 4, 'total': 169}, transitions=[
+            {'phase': 'implement', 'sequence': 1, 'attempt': 0},
+            {'phase': 'audit', 'sequence': 2, 'attempt': 1},
+            {'phase': 'validate', 'sequence': 3, 'attempt': 1},
+        ]), {'state': 'waiting'})
+    assert '历史记录 · 第1轮 · 编码' in history(report)
+    assert '第1轮 · 验证与审查 |' in frame(report)
+    assert '4/169' in frame(report)
+    assert '历史记录' not in frame(report)
+
+
+def test_repair_summary_is_bounded_safe_and_supports_legacy_events():
+    from auto_agents.repair_display import failure_summary
+    assert failure_summary([{'unit': 'original-boundary'}]) == '原任务恢复检查未通过'
+    assert failure_summary([{'requirement': 'old', 'reason': 'long private text'}]) == '审查发现问题'
+    assert failure_summary([{'requirement': 'x', 'summary_zh': 'password=secret /private/path'}]) == '审查发现问题'
+    assert failure_summary([{'requirement': 'x', 'summary_en': 'Task recovery evidence is incomplete'}], 'en') == 'Task recovery evidence is incomplete'
+    assert failure_summary([{'requirement': 'x', 'summary_zh': '长' * 100}]) == '审查发现问题'

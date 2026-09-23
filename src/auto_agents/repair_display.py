@@ -52,6 +52,41 @@ PHASES = {
 }
 
 
+def failure_summary(failures, language='zh'):
+    """Short, conservative categories; never print arbitrary reviewer prose."""
+    labels = []
+    for failure in failures:
+        if failure.get('unit') in {'original-boundary', 'subscriber-boundary'}:
+            pair = ('原任务恢复检查未通过', 'Task recovery check failed')
+        elif failure.get('infrastructure'):
+            pair = ('验证环境不可用', 'Verification environment unavailable')
+        elif failure.get('failed'):
+            pair = ('测试未通过', 'Tests failed')
+        elif failure.get('missing'):
+            pair = ('部分测试未执行', 'Some tests did not run')
+        elif failure.get('requirement'):
+            pair = ('审查发现问题', 'Review found issues')
+        elif failure.get('path'):
+            pair = ('测试完整性检查未通过', 'Test preservation check failed')
+        else:
+            pair = ('验证未通过', 'Verification failed')
+        label = pair[0 if language == 'zh' else 1]
+        summary = failure.get('summary_zh' if language == 'zh' else 'summary_en')
+        if isinstance(summary, str) and summary.strip():
+            from .repair_environment_log import sanitize
+            import re
+            summary = ' '.join(sanitize(summary).split())
+            # Invalid/technical summaries fall back to the stable category.
+            limit = 48 if language == 'zh' else 96
+            if len(summary) <= limit and not re.search(r'[/\\`]|[0-9a-f]{16,}|<redacted', summary):
+                label = summary
+        if label not in labels:
+            labels.append(label)
+    if len(labels) > 3:
+        labels = labels[:3] + [('另有问题' if language == 'zh' else 'Other issues')]
+    return '；'.join(labels) if language == 'zh' else '; '.join(labels)
+
+
 def observation(job, subscriber, language='zh'):
     """Project a status response without exposing IDs, commands or model prose."""
     zh = language == 'zh'
@@ -68,7 +103,7 @@ def observation(job, subscriber, language='zh'):
         elif 'recovery_proof_incomplete' in error or '恢复验证证据不完整' in error:
             label = ('原任务恢复证据不完整；更新验证控制器后重试',
                      'Task recovery evidence is incomplete; update the verifier and retry')
-        elif 'no verified progress' in error:
+        elif 'no verified progress' in error or 'no_progress' in error:
             label = ('连续修正未取得新的验证进展；已停止自动修复，候选已保留',
                      'No new verified progress; automatic repair stopped, candidate retained')
         else:
@@ -97,12 +132,39 @@ def observation(job, subscriber, language='zh'):
             if progress.get('review_running'):
                 label = (('审查', 'Review') if progress.get('checks_finished') else
                          ('验证与审查', 'Verification and review'))
+        if phase == 'acceptance_failed':
+            summary = failure_summary(progress.get('failures', []), language)
+            count = len(progress.get('failures', []))
+            label = (f'验收未通过：{summary}（{count}项）',
+                     f'Acceptance failed: {summary} ({count} findings)')
+        elif phase == 'implement' and (progress.get('correcting') or progress.get('attempt', 0) > 0):
+            label = ('继续编码：修正上一轮未通过项', 'Coding: correcting the previous attempt')
+        elif phase == 'plan' and progress.get('replans', 0):
+            label = ('重新规划：调整修复方案', 'Replanning: revising the repair')
+    name = label[0 if zh else 1]
+    attempt = progress.get('attempt')
+    if not terminal and active_phase(state, workflow) and isinstance(attempt, int):
+        number = attempt + 1 if phase == 'implement' else attempt
+        if number > 0 and phase != 'plan':
+            name = (f'第{number}轮 · ' if zh else f'Attempt {number} · ') + name
+    if terminal and state == 'blocked' and phase == 'acceptance_failed':
+        if isinstance(attempt, int) and attempt > 0:
+            name += f'（累计{attempt}轮）' if zh else f' ({attempt} attempts)'
+        summary = failure_summary(progress.get('failures', []), language)
+        if summary:
+            name += ('；剩余：' if zh else '; Remaining: ') + summary
+    if progress.get('historical'):
+        name = ('历史记录 · ' if zh else 'History · ') + name
     active = state == 'repairing' and workflow not in {'validating', 'verified', 'resuming'} and not terminal
     # A subscriber recovery action must not inherit the last coding/check output.
     return {
-        'name': label[0 if zh else 1], 'terminal': terminal,
+        'name': name, 'terminal': terminal,
         'identity': (job.get('id'), job.get('generation'), state, workflow,
                      progress.get('sequence', (phase, progress.get('attempt'), progress.get('candidate'))), label),
         'checks': counts if active and not progress.get('checks_finished') else {},
         'output_at': progress.get('last_output_at') if active else None,
     }
+
+
+def active_phase(state, workflow):
+    return state == 'repairing' and workflow not in {'validating', 'verified', 'resuming', 'finished'}

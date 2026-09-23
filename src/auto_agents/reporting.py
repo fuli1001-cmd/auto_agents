@@ -1097,11 +1097,18 @@ class Reporter:
         display = job.get('display') or {}
         source = (job.get('id'), job.get('generation'))
         prior_source, prior_sequence = getattr(owner, '_repair_display_cursor', (None, 0))
-        if source == prior_source and job.get('state') == 'repairing' and subscriber.get('state') == 'waiting':
+        if display.get('transitions'):
             # Preserve short actions that started and ended between status polls.
+            after = prior_sequence if source == prior_source else 0
             for step in display.get('transitions', []):
-                if prior_sequence < step['sequence'] < display.get('sequence', 0):
-                    self.repair_update({**job, 'display': step}, subscriber)
+                if after < step['sequence'] < display.get('sequence', 0):
+                    self.repair_update({**job, 'state': 'repairing', 'display': {
+                        **step, 'historical': source != prior_source}}, {'state': 'waiting'})
+            # Terminal observations otherwise hide the last acceptance result.
+            if (job.get('state') != 'repairing' and display.get('phase') == 'acceptance_failed'
+                    and (source != prior_source or prior_sequence < display.get('sequence', 0))):
+                self.repair_update({**job, 'state': 'repairing', 'display': {
+                    **display, 'transitions': [], 'historical': source != prior_source}}, {'state': 'waiting'})
         owner._repair_display_cursor = (source, display.get('sequence', 0))
         observed = observation(job, subscriber, self.language)
         owner._repair_display_managed = True

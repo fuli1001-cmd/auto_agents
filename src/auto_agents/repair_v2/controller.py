@@ -18,8 +18,9 @@ REVIEW_SCHEMA = {'type': 'object', 'properties': {
         'required': ['requirement', 'nodes'], 'additionalProperties': False}},
     'findings': {'type': 'array', 'items': {'type': 'object', 'properties': {
         'requirement': {'type': 'string'}, 'reason': {'type': 'string'},
+        'summary_zh': {'type': 'string'}, 'summary_en': {'type': 'string'},
         'counterexample': {'type': 'string'}, 'check': {'type': 'string'}},
-        'required': ['requirement', 'reason', 'counterexample', 'check'], 'additionalProperties': False}}},
+        'required': ['requirement', 'reason', 'counterexample', 'check', 'summary_zh', 'summary_en'], 'additionalProperties': False}}},
     'required': ['decision', 'findings', 'coverage'], 'additionalProperties': False}
 
 
@@ -87,7 +88,9 @@ class Controller:
         total = self.state.get('attempts', 0)
         usage = self.state.get('invocation_usage', {})
         current = max(0, total - usage.get('attempts', total)) if usage.get('token') == self.resume_token else 0
-        self.store.event('phase_started', phase=name, attempt=total, invocation_attempts=current)
+        self.store.event('phase_started', phase=name, attempt=total, invocation_attempts=current,
+                         replans=self.state.get('replans', 0),
+                         correcting=bool(self.state.get('failures')))
 
     def agent(self, role, prompt, root, *, schema=None, cancel=None, fallback_prompt=None):
         if self.cancel.is_set(): raise KeyboardInterrupt()
@@ -325,8 +328,12 @@ class Controller:
             'Inspect the diff, relevant source and coverage. Do not modify files or run a broad test suite. '
             'Block only demonstrated violations or introduced regressions, with a concrete counterexample and check. '
             'Editorial preferences and unrelated improvements are not blockers. '
-            'Return JSON {decision:APPROVE|REJECT, findings:[{requirement,reason,counterexample,check}], '
+            'Return JSON {decision:APPROVE|REJECT, findings:[{requirement,reason,counterexample,check,summary_zh,summary_en}], '
             'coverage:[{requirement,nodes:["tests/test_file.py::test_behavior"]}]}. '
+            'For each finding, summary_zh and summary_en describe the observed problem in plain Chinese '
+            '(at most 40 characters) and English (at most 90 characters). These are console labels only. '
+            'Omit commands, paths, identifiers, secrets and implementation details. '
+            'For example: 原任务恢复证据不足 / Task recovery evidence is incomplete. '
             'An approval maps every requirement to actual behavioral tests; generic passing tests are not coverage. '
             'Every finding must name one supplied requirement identity. APPROVE requires no findings.\n'
             + self.context() + '\nOriginal baseline: ' + self.request.engine_base
@@ -607,6 +614,7 @@ class Controller:
                         failure_diagnosis=diagnose(failures), progress_policy_version=2,
                         stagnant=0 if progress['progressed'] else self.state['stagnant'] + 1, phase='implement')
         self.store.event('acceptance_failed', snapshot=identity, failures=failures,
+                         attempt=self.state.get('attempts', 0),
                          progressed=progress['progressed'], newly_verified=progress['newly_verified'])
 
     def _recover_verified_progress(self):

@@ -363,6 +363,9 @@ class Store:
                                       "started_at": progress["created"]}
                 if previous:
                     result["progress"]["last_result"] = json.loads(previous["payload"])
+        if include_progress and result['state'] != 'queued':
+            with self.connect() as db:
+                start = db.execute("SELECT MAX(sequence) FROM events WHERE job=? AND kind='repairing'", (identity,)).fetchone()[0] or 0
             result['display'] = self.display_progress(identity, start, result['generation'])
         return result
 
@@ -377,20 +380,21 @@ class Store:
                     f'SELECT sequence,kind,payload,created FROM events WHERE {scope} '
                     f'AND kind IN ({placeholders}) ORDER BY sequence DESC LIMIT 1',
                     (identity, after, generation, *kinds)).fetchone()
-            phase = latest(('phase_started', 'request_contract_planning', 'request_contract_ready'), generation_start)
+            phase = latest(('phase_started', 'request_contract_planning', 'request_contract_ready', 'acceptance_failed'), generation_start)
             if not phase:
                 return {}
             details = json.loads(phase['payload'])
-            result = {'phase': details.get('phase', phase['kind']), 'sequence': phase['sequence'],
+            result = {**details, 'phase': details.get('phase', phase['kind']), 'sequence': phase['sequence'],
                       'started_at': phase['created']}
             transitions = db.execute(
                 f"SELECT sequence,kind,payload,created FROM events WHERE {scope} "
-                "AND kind IN ('phase_started','request_contract_planning','request_contract_ready') "
+                "AND kind IN ('phase_started','request_contract_planning','request_contract_ready','acceptance_failed') "
                 "ORDER BY sequence DESC LIMIT 64", (identity, generation_start, generation)).fetchall()
-            result['transitions'] = [
-                {'phase': json.loads(row['payload']).get('phase', row['kind']),
-                 'sequence': row['sequence'], 'started_at': row['created']}
-                for row in reversed(transitions)]
+            result['transitions'] = []
+            for row in reversed(transitions):
+                payload = json.loads(row['payload'])
+                result['transitions'].append({**payload, 'phase': payload.get('phase', row['kind']),
+                    'sequence': row['sequence'], 'started_at': row['created']})
             checks = latest(('checks_started', 'check_finished', 'checks_finished'), phase['sequence'])
             if checks:
                 c = json.loads(checks['payload'])
