@@ -133,13 +133,48 @@ def commit_all(project_root: Path, message: str) -> str:
 
 def commit_all_except(project_root: Path, message: str, exclude_prefixes: tuple[str, ...]) -> str:
     normalized_excludes = normalize_repository_exclusions(exclude_prefixes)
-    add_args = ["add", "-A", "--", "."]
-    add_args.extend(
-        f":(top,exclude,literal){prefix}" for prefix in normalized_excludes
-    )
-    add_process = _git(project_root, *add_args)
-    if add_process.returncode != 0:
-        raise RuntimeError(add_process.stderr.strip() or "git add failed")
+    excluded_bytes = tuple(os.fsencode(prefix) for prefix in normalized_excludes)
+    # Git can reject an ignored dependency link even when it is supplied as a
+    # negative pathspec. Enumerate eligible paths instead, without following
+    # links or interpreting whitespace, newlines and pathspec metacharacters.
+    staging_sets = []
+    for listing_args, add_args in (
+        (("--cached",), ("-u",)),
+        (("--others", "--exclude-standard"), ()),
+    ):
+        listing = _git_bytes(project_root, "ls-files", "-z", *listing_args)
+        if listing.returncode != 0:
+            raise RuntimeError(
+                listing.stderr.decode("utf-8", errors="replace").strip()
+                or "git ls-files failed"
+            )
+        paths = tuple(
+            dict.fromkeys(
+                path for path in listing.stdout.split(b"\0")
+                if path and not any(
+                    path == prefix or path.startswith(prefix + b"/")
+                    for prefix in excluded_bytes
+                )
+            )
+        )
+        staging_sets.append((add_args, paths))
+    for add_args, paths in staging_sets:
+        if not paths:
+            continue
+        add_process = subprocess.run(
+            [
+                "git", "--literal-pathspecs", "add", *add_args,
+                "--pathspec-from-file=-", "--pathspec-file-nul",
+            ],
+            cwd=str(project_root),
+            input=b"\0".join(paths) + b"\0",
+            capture_output=True,
+        )
+        if add_process.returncode != 0:
+            raise RuntimeError(
+                add_process.stderr.decode("utf-8", errors="replace").strip()
+                or "git add failed"
+            )
 
     if normalized_excludes:
         head_process = _git(project_root, "rev-parse", "--verify", "HEAD")

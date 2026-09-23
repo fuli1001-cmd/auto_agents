@@ -222,7 +222,10 @@ def detect_persistence_schema_changes(
 
 
 def _path_is_detection_ignored(path: str) -> bool:
-    normalized = str(path).replace("\\", "/").lstrip("./")
+    normalized = str(path).replace("\\", "/")
+    # Strip relative-path components, not significant dots in directory names.
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
     if normalized in {"README.md", "DESIGN.md"}:
         return True
     if normalized.startswith(_IGNORED_DETECTION_PREFIXES):
