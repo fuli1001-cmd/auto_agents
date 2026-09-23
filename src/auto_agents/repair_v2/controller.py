@@ -103,6 +103,7 @@ class Controller:
                         call_state='dispatched')
         self.store.event('agent_started', role=role, call=call, input=reference)
         started = time.monotonic()
+        last_display_output = [float('-inf')]
 
         def progress(event):
             if event.get('session'):
@@ -110,7 +111,14 @@ class Controller:
                     if self.state['sessions'].get(role) != event['session']:
                         self.state['sessions'][role] = event['session']
                         self.store.save(self.state)
-            if event.get('event', '').lower().endswith('delta'):
+            kind = event.get('event', '').lower()
+            if (kind.endswith('delta') or kind in {'item/completed', 'item.completed', 'content_block_stop'}):
+                # Output observations are display-only. Account/heartbeat events
+                # must not make a silent provider appear to be producing output.
+                if time.monotonic() - last_display_output[0] >= 1:
+                    last_display_output[0] = time.monotonic()
+                    self.store.event('agent_output', role=role)
+            if kind.endswith('delta'):
                 return  # Native transcripts hold deltas; journal records transitions.
             self.store.event('agent_progress', role=role, **event)
 

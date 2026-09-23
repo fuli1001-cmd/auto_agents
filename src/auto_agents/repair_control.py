@@ -363,6 +363,65 @@ class Store:
                                       "started_at": progress["created"]}
                 if previous:
                     result["progress"]["last_result"] = json.loads(previous["payload"])
+            result['display'] = self.display_progress(identity, start, result['generation'])
+        return result
+
+    def display_progress(self, identity, generation_start, generation):
+        """Read-only console projection, isolated from durable recovery progress."""
+        with self.connect() as db:
+            scope = ("job=? AND sequence>? AND (json_extract(payload, '$.generation') IS NULL "
+                     "OR json_extract(payload, '$.generation')=?)")
+            def latest(kinds, after):
+                placeholders = ','.join('?' for _ in kinds)
+                return db.execute(
+                    f'SELECT sequence,kind,payload,created FROM events WHERE {scope} '
+                    f'AND kind IN ({placeholders}) ORDER BY sequence DESC LIMIT 1',
+                    (identity, after, generation, *kinds)).fetchone()
+            phase = latest(('phase_started', 'request_contract_planning', 'request_contract_ready'), generation_start)
+            if not phase:
+                return {}
+            details = json.loads(phase['payload'])
+            result = {'phase': details.get('phase', phase['kind']), 'sequence': phase['sequence'],
+                      'started_at': phase['created']}
+            transitions = db.execute(
+                f"SELECT sequence,kind,payload,created FROM events WHERE {scope} "
+                "AND kind IN ('phase_started','request_contract_planning','request_contract_ready') "
+                "ORDER BY sequence DESC LIMIT 64", (identity, generation_start, generation)).fetchall()
+            result['transitions'] = [
+                {'phase': json.loads(row['payload']).get('phase', row['kind']),
+                 'sequence': row['sequence'], 'started_at': row['created']}
+                for row in reversed(transitions)]
+            checks = latest(('checks_started', 'check_finished', 'checks_finished'), phase['sequence'])
+            if checks:
+                c = json.loads(checks['payload'])
+                cancelled = c.get('cancelled_count', 0)
+                result['checks'] = {'completed': max(0, c.get('completed', 0) - cancelled),
+                                    'total': c.get('total', 0), 'failed': c.get('failed_count', 0),
+                                    'cancelled': cancelled}
+                result['checks_finished'] = (checks['kind'] == 'checks_finished'
+                                             or bool(c.get('total') and c.get('completed', 0) >= c['total']))
+            review = db.execute(
+                f"SELECT kind FROM events WHERE {scope} AND kind IN ('agent_started','agent_finished') "
+                "AND json_extract(payload, '$.role')='review' ORDER BY sequence DESC LIMIT 1",
+                (identity, phase['sequence'], generation)).fetchone()
+            if review:
+                result['review_running'] = review['kind'] == 'agent_started'
+                result['review_finished'] = review['kind'] == 'agent_finished'
+            output_filter = ''
+            if result.get('review_running') and result.get('checks_finished'):
+                output_filter = " AND json_extract(payload, '$.role')='review'"
+            elif result.get('review_finished') and not result.get('checks_finished'):
+                output_filter = " AND kind IN ('check_output','check_finished')"
+            # Retained workers may predate agent_output. Their completed item
+            # events are real output; account/connection events are not.
+            output = db.execute(
+                f"SELECT created FROM events WHERE {scope} AND "
+                "(kind IN ('agent_output','check_output','check_finished','agent_finished') OR "
+                "(kind='agent_progress' AND json_extract(payload, '$.event') IN "
+                "('item/completed','item.completed','content_block_stop')))" + output_filter +
+                " ORDER BY sequence DESC LIMIT 1", (identity, phase['sequence'], generation)).fetchone()
+            if output:
+                result['last_output_at'] = output['created']
         return result
 
     def transition(self, identity, state, result=None, *, generation=None):

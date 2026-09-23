@@ -64,6 +64,27 @@ def test_success_has_three_calls_one_candidate_and_no_group_state(job):
     assert 'finding_groups' not in state
 
 
+def test_provider_display_output_does_not_count_account_notifications(job):
+    runner = controller(job)
+    events = []
+    runner.store.callback = lambda kind, details: events.append((kind, details))
+    original = runner.driver.run
+    def run(role, *args, **kwargs):
+        if role == 'plan':
+            kwargs['progress']({'event': 'account/rateLimits/updated'})
+            kwargs['progress']({'event': 'thread/status/changed'})
+            assert not any(kind == 'agent_output' for kind, _ in events)
+            kwargs['progress']({'event': 'item/agentMessage/delta'})
+            assert any(kind == 'agent_output' for kind, _ in events)
+        return original(role, *args, **kwargs)
+    runner.driver.run = run
+    state = runner.run()
+    assert state['status'] == 'ready'
+    output_events = [data for kind, data in events if kind == 'agent_output']
+    assert output_events == [{'role': 'plan'}]
+    assert state['calls'] == 3 and state['attempts'] == 1
+
+
 @pytest.mark.parametrize('weaken', [False, True])
 def test_integration_with_lagging_upstream_protects_frozen_base_tests(job, weaken):
     from dataclasses import replace

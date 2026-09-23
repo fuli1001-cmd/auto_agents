@@ -29,6 +29,32 @@ def test_timeout_has_a_distinct_cause_from_controller_cancellation():
     assert observed['termination'] == 'timeout'
 
 
+def test_display_output_callback_requires_real_process_output():
+    notices = []
+    code, output = run([sys.executable, '-c', 'print("actual output")'],
+                       on_output=lambda: notices.append('output'))
+    assert code == 0 and 'actual output' in output and notices
+    notices.clear()
+    code, _ = run([sys.executable, '-c', 'pass'], on_output=lambda: notices.append('output'))
+    assert code == 0 and notices == []
+
+
+def test_check_counts_start_before_execution_and_finish_after_results(tmp_path, monkeypatch):
+    events = []
+    verifier = DockerVerifier(tmp_path / 'verify', image='fixed', workers=1,
+                              callback=lambda kind, data: events.append((kind, data)))
+    monkeypatch.setattr(verifier, 'concurrency', lambda: 1)
+    def execute(identity, snapshot, unit, cancel):
+        assert events[0] == ('checks_started', {'completed': 0, 'total': 2})
+        return {'unit': unit.identity, 'command': unit.command, 'ok': True,
+                'infrastructure': False, 'failed': [], 'missing': []}
+    monkeypatch.setattr(verifier, 'execute', execute)
+    result = verifier.validate('snapshot', tmp_path, [ValidationUnit('a', 'a'), ValidationUnit('b', 'b')], threading.Event())
+    assert result.ok
+    assert [data['completed'] for kind, data in events if kind == 'check_finished'] == [1, 2]
+    assert events[-1] == ('checks_finished', {'completed': 2, 'total': 2})
+
+
 @pytest.mark.parametrize('state,exit_code,infrastructure', [({}, -15, False), ({'OOMKilled': True}, -9, True), ({}, 125, True)])
 def test_cancellation_with_missing_container_does_not_mask_real_oom_or_launch_error(
         tmp_path, monkeypatch, state, exit_code, infrastructure):

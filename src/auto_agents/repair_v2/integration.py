@@ -146,6 +146,7 @@ def _components(request, root, accepted, workspace, python):
     verifier = DockerVerifier(Path(config['root']) / 'v2-verification', python=python,
                               callback=event, workers=config.get('verification_workers'),
                               codex_binary=selected.binary if selected.kind == 'codex' else None)
+    event('phase_started', {'phase': 'environment_preparation'})
     verifier.prepare()
     from . import images
     images.pin(verifier.image, root)

@@ -96,8 +96,11 @@ class ActionLine:
     task_id: str = ""
     live: bool = False
     contextual: bool = False
+    repair: bool = False
 
     @property
     def message(self) -> str:
+        if self.repair:
+            return text(self.name)
         context = f"{text(self.task_id)} · " if self.contextual and self.task_id else ""
         return "    " + context + text(self.name)

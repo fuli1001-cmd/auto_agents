@@ -144,6 +144,44 @@ def test_status_exposes_phase_and_previous_failure_without_stale_generation(tmp_
     assert "progress" not in store.job(job, include_progress=True)
 
 
+def test_display_observation_keeps_phase_during_checks_and_ignores_poll_heartbeats(tmp_path):
+    store = Store(tmp_path / 'state')
+    subscriber = store.register(registration(tmp_path / 'project'))
+    job = store.submit(subscriber, failure(tmp_path / 'project'))
+    store.transition(job, 'repairing')
+    store.event(job, 'phase_started', {'phase': 'validate', 'engine': 'v2'})
+    store.event(job, 'agent_started', {'role': 'review'})
+    store.event(job, 'checks_started', {'completed': 0, 'total': 4})
+    initial = store.job(job, include_progress=True)['display']
+    assert initial['phase'] == 'validate' and initial['review_running']
+    assert initial['checks']['total'] == 4 and initial['checks']['completed'] == 0
+    assert 'last_output_at' not in initial
+    store.event(job, 'agent_output', {'role': 'review'})
+    observed = store.job(job, include_progress=True)['display']
+    store.event(job, 'agent_progress', {'role': 'review', 'event': 'account/rateLimits/updated'})
+    assert store.job(job, include_progress=True)['display'] == observed
+    store.event(job, 'check_finished', {'completed': 2, 'total': 4, 'failed_count': 1,
+                                      'cancelled_count': 1, 'failed': ['test_failure']})
+    store.event(job, 'agent_finished', {'role': 'review'})
+    observed = store.job(job, include_progress=True)['display']
+    assert observed['sequence'] == initial['sequence'] and observed['phase'] == 'validate'
+    assert observed['checks'] == {'completed': 1, 'total': 4, 'failed': 1, 'cancelled': 1}
+    assert observed['review_finished'] and not observed['review_running']
+    before = store.job(job)
+    for _ in range(3):
+        assert store.job(job, include_progress=True)['display'] == observed
+    assert store.job(job) == before  # Observation cannot renew a lease or alter recovery.
+    store.event(job, 'phase_started', {'phase': 'implement'})
+    observed = store.job(job, include_progress=True)['display']
+    assert 'checks' not in observed and 'last_output_at' not in observed
+    store.event(job, 'phase_started', {'phase': 'review', 'generation': 0})
+    store.event(job, 'agent_output', {'role': 'review', 'generation': 0})
+    assert store.job(job, include_progress=True)['display'] == observed
+    store.transition(job, 'blocked')
+    store.transition(job, 'repairing')
+    assert store.job(job, include_progress=True)['display'] == {}
+
+
 def test_foreground_phase_changes_are_visible_while_top_level_state_stays_repairing():
     from auto_agents.repair_client import _repair_progress_message
     messages = [_repair_progress_message({"state": "repairing", "progress": {"phase": phase, "candidate": 2}},

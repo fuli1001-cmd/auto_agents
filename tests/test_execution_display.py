@@ -288,7 +288,7 @@ def test_recovery_uses_an_action_line(report):
     state.status = "blocked"
     report.observe_run(state)
     report.repair("diagnosing")
-    assert "恢复：" in frame(report)
+    assert "[引擎自修复] 定位故障原因" in frame(report)
     assert "正在修复 auto_agents" not in frame(report)
 
 
@@ -336,7 +336,126 @@ def test_recovery_replaces_task_action_instead_of_leaving_it_active(report):
     setup_tasks(report)
     report.task("T1", "任务1", "implement", 1)
     report.repair("diagnosing")
-    assert "恢复：" in frame(report) and "编码" not in frame(report)
+    assert "[引擎自修复] 定位故障原因" in frame(report) and "编码" not in frame(report)
+
+
+def repair_job(phase='implement', **display):
+    return {'id': 'private-job', 'generation': 1, 'state': 'repairing',
+            'display': {'phase': phase, 'sequence': 1, **display}}
+
+
+def test_repair_live_output_ages_without_renewing_on_poll_and_finalizes(report, screen, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr('auto_agents.reporting.time.time', lambda: clock[0])
+    monkeypatch.setattr('auto_agents.reporting.time.monotonic', lambda: clock[0])
+    subscriber = {'state': 'waiting'}
+    job = repair_job(last_output_at=1000)
+    report.repair_update(job, subscriber)
+    clock[0] += 3
+    report.repair_update(job, subscriber)
+    assert '[引擎自修复] 编码 | 最近输出 3 秒前' in frame(report)
+    clock[0] += 7
+    report.repair_update(job, subscriber)
+    assert '最近输出 10 秒前' in frame(report)
+    assert history(report).count('[引擎自修复] 编码') == 1
+    report.repair_update(repair_job('validate', sequence=2, review_running=True, checks={'completed': 1, 'total': 4}), subscriber)
+    assert screen.history[-1].endswith('[引擎自修复] 编码')
+    assert '最近输出' not in screen.history[-1]
+    assert '[引擎自修复] 验证与审查 | [███░░░░░░░░░] 1/4' in frame(report)
+    assert '最近输出' not in frame(report)
+    assert 'private-job' not in history(report)
+
+
+def test_repair_parallel_completion_and_terminal_reason(report, screen):
+    subscriber = {'state': 'waiting'}
+    report.repair_update(repair_job('validate', checks={'completed': 2, 'total': 4}, review_running=True), subscriber)
+    report.repair_update(repair_job('validate', checks={'completed': 2, 'total': 4}, review_finished=True), subscriber)
+    assert '[引擎自修复] 验证 |' in frame(report)
+    assert '验证与审查' in screen.history[-1]
+    report.repair_update(repair_job('validate', checks_finished=True, review_running=True), subscriber)
+    assert '[引擎自修复] 审查' in frame(report) and '/4' not in frame(report)
+    job = {**repair_job(), 'state': 'blocked', 'result': {
+        'error': 'Insufficient disk space at /private/path: password=hidden'}}
+    report.repair_update(job, {'state': 'blocked'})
+    assert frame(report) == ''
+    assert '磁盘空间不足；清理空间后重新运行以继续' in screen.history[-1]
+    assert 'hidden' not in history(report) and '/private' not in history(report)
+
+
+def test_repair_plain_progress_is_periodic_and_detailed_control_stays_in_events(report, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr('auto_agents.reporting.time.time', lambda: clock[0])
+    monkeypatch.setattr('auto_agents.reporting.time.monotonic', lambda: clock[0])
+    job = repair_job('validate', last_output_at=1000, checks={'completed': 1, 'total': 3})
+    report.repair_update(job, {'state': 'waiting'})
+    report.event('repair.control', {}, audience='user', message='Self-repair private-id: command internals')
+    for _ in range(59):
+        clock[0] += 1
+        report.repair_update(job, {'state': 'waiting'})
+    assert len(history(report).splitlines()) == 1
+    clock[0] += 1
+    report.repair_update(job, {'state': 'waiting'})
+    assert '1/3 | 最近输出 60 秒前' in history(report)
+    assert '\x1b' not in report.presenter.stream.getvalue()
+    assert 'command internals' not in history(report)
+    assert 'command internals' in (report.root / 'events.jsonl').read_text()
+    report.repair_update({**job, 'state': 'ready'}, {'state': 'resuming'})
+    assert '最近输出' not in frame(report) and '1/3' not in frame(report)
+
+
+def test_repair_diagnosis_uses_actual_provider_output(report, screen, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr('auto_agents.execution_display.time.monotonic', lambda: clock[0])
+    report.repair('diagnosing')
+    capture = report.capture(kind='provider')
+    capture.start(['provider'], {}, provider='codex', capture_mode='live')
+    capture('stdout', 'actual diagnosis output')
+    clock[0] += 4
+    assert '[引擎自修复] 定位故障原因 | 最近输出 4 秒前' in frame(report)
+    capture.finish(returncode=0)
+    report.repair_update(repair_job('plan'), {'state': 'waiting'})
+    assert screen.history[-1].endswith('[引擎自修复] 定位故障原因')
+    assert '最近输出' not in frame(report)
+
+
+def test_repair_short_actions_between_polls_are_not_lost(report):
+    report.repair_update(repair_job('implement', sequence=10), {'state': 'waiting'})
+    report.repair_update(repair_job('validate', sequence=13, transitions=[
+        {'phase': 'implement', 'sequence': 10}, {'phase': 'audit', 'sequence': 11},
+        {'phase': 'boundary_preflight', 'sequence': 12}, {'phase': 'validate', 'sequence': 13},
+    ]), {'state': 'waiting'})
+    assert [line.split('[引擎自修复] ')[1] for line in history(report).splitlines()] == [
+        '编码', '检查测试完整性', '检查任务恢复', '验证']
+
+
+def test_repair_display_can_resume_old_worker_and_keep_health_state_unchanged(report, tmp_path):
+    from test_repair_control import registration, failure
+    from auto_agents.repair_control import Store
+    store = Store(tmp_path / 'control')
+    subscriber = store.register(registration(tmp_path / 'project'))
+    identity = store.submit(subscriber, failure(tmp_path / 'project'))
+    store.transition(identity, 'repairing')
+    store.event(identity, 'phase_started', {'phase': 'implement'})
+    # Older retained workers supply item events rather than agent_output.
+    store.event(identity, 'agent_progress', {'role': 'implement', 'event': 'item/completed'})
+    report.repair_update(store.job(identity, include_progress=True), {'state': 'waiting'})
+    assert '编码 | 最近输出' in frame(report)
+    stamp = report.display.output_times['']
+    store.event(identity, 'agent_progress', {'role': 'implement', 'event': 'thread/status/changed'})
+    report.repair_update(store.job(identity, include_progress=True), {'state': 'waiting'})
+    assert abs(report.display.output_times[''] - stamp) < .1
+    assert not (report.project_root / '.auto-agents/state/run_state.json').exists()
+
+
+def test_repair_english_and_confirmed_handoff_finalize_without_stale_checks(report, screen):
+    report.language = 'en'
+    report.repair_update(repair_job('plan'), {'state': 'waiting'})
+    assert '[Engine repair] Planning' in frame(report)
+    job = {**repair_job(), 'state': 'completed'}
+    report.repair_update(job, {'state': 'resuming', 'payload': {'recovery_confirmed': {
+        'job': job['id'], 'generation': job['generation']}}})
+    assert frame(report) == ''
+    assert screen.history[-1].endswith('[Engine repair] Original task resumed')
 
 
 def test_each_new_verification_round_can_report_failure(report):

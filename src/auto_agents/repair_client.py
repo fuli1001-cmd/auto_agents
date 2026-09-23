@@ -624,6 +624,10 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
             status = response["job"]["state"]
             job = response["job"]["id"]
             subscriber = next(item for item in response["subscribers"] if item["id"] == registration["subscriber"])
+            from .reporting import find_reporter
+            reporter = find_reporter(project)
+            if reporter is not None:
+                reporter.repair_update(response['job'], subscriber)
             if response['job'].get('state') == 'skipped' and response['job'].get('result', {}).get('return_goal'):
                 from .scope_decisions import resume_original
                 return resume_original(orchestrator, project, None, args, lock,

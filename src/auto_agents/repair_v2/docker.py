@@ -99,7 +99,7 @@ def container_mounts():
             for m in (json.loads(line) or []) if m.get('Source')]
 
 
-def run(command, *, cancel=None, timeout=1800, output=None, env=None, observation=None):
+def run(command, *, cancel=None, timeout=1800, output=None, env=None, observation=None, on_output=None):
     """Drain continuously, retain a bounded diagnostic tail and reap this group."""
     buffer, truncated, stopped = bytearray(), False, False
     if observation is not None: observation.update(started=False, termination='', exit_code=None)
@@ -111,6 +111,7 @@ def run(command, *, cancel=None, timeout=1800, output=None, env=None, observatio
                                env=env, start_new_session=True) as process:
         if observation is not None: observation['started'] = True
         started = time.monotonic()
+        last_output_notice = float('-inf')
         termination = None
         with selectors.DefaultSelector() as selector:
             os.set_blocking(process.stdout.fileno(), False)
@@ -134,6 +135,9 @@ def run(command, *, cancel=None, timeout=1800, output=None, env=None, observatio
                             selector.unregister(key.fileobj)
                         else:
                             buffer.extend(chunk)
+                            if on_output and now - last_output_notice >= 1:
+                                last_output_notice = now
+                                on_output()
                             if len(buffer) > MAX_OUTPUT_BYTES:
                                 del buffer[:-MAX_OUTPUT_BYTES]
                                 truncated = True
@@ -259,7 +263,8 @@ class DockerVerifier:
         execution, state, info = {}, {}, ''
         try:
             custody['clear'] = False
-            code, text = run(command, cancel=cancel, timeout=self.timeout, output=base / 'output.log', observation=execution)
+            code, text = run(command, cancel=cancel, timeout=self.timeout, output=base / 'output.log', observation=execution,
+                             on_output=(lambda: self.callback('check_output', {})) if self.callback else None)
             if execution.get('started') is not False:
                 info_code, info = run(['docker', 'inspect', name, '--format', '{{json .State}}'], timeout=10)
                 state = json.loads(info) if not info_code else {}
@@ -536,6 +541,8 @@ class DockerVerifier:
         total_nodes = len({node for unit in unique.values() for node in unit.expected_nodes})
         stopped = threading.Event()
         execution_cancel = Cancellation(cancel, stopped)
+        if self.callback:
+            self.callback('checks_started', {'completed': 0, 'total': len(unique)})
         with ThreadPoolExecutor(max_workers=capacity) as pool:
             running = {}
             def dispatch():
@@ -555,6 +562,8 @@ class DockerVerifier:
                         if result['infrastructure']: stopped.set()
                         if self.callback: self.callback('check_finished', {**result, 'completed': len(results),
                             'total': len(unique), 'workers': workers, 'total_nodes': total_nodes,
+                            'failed_count': sum(not r['ok'] and not r.get('cancelled') for r in results),
+                            'cancelled_count': sum(bool(r.get('cancelled')) for r in results),
                             'tested_nodes': len({node for check in results for node in check.get('collected', [])})})
                     if (collect_all or not failed) and not execution_cancel.is_set():
                         # Review/container memory can be released mid-run. Use
@@ -575,5 +584,7 @@ class DockerVerifier:
                      'failed': r['failed'], 'missing': r['missing'], 'infrastructure': r['infrastructure'],
                      'failure_details': r.get('failure_details', [])}
                     for r in actionable]
+        if self.callback:
+            self.callback('checks_finished', {'completed': len(results), 'total': len(unique)})
         return ValidationResult(not failures and not cancel.is_set(), identity, results, failures,
             cancel.is_set(), any(r['infrastructure'] for r in actionable))

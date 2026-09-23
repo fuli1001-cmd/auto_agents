@@ -280,7 +280,7 @@ class ConsolePresenter:
         for task_id in list(reporter.action_lines):
             self.finish_action(reporter, task_id)
 
-    def start_action(self, reporter: "Reporter", task_id: str, name: str, timestamp: str) -> None:
+    def start_action(self, reporter: "Reporter", task_id: str, name: str, timestamp: str, *, repair: bool = False) -> None:
         with reporter._lock, self._lock:
             self.finish_action(reporter, task_id)
             self._ensure_started()
@@ -288,7 +288,7 @@ class ConsolePresenter:
             if parallel:
                 for row in reporter.action_lines.values():
                     row.contextual = True
-            row = ActionLine(name, timestamp, task_id, self._live is not None, parallel)
+            row = ActionLine(name, timestamp, task_id, self._live is not None, parallel, repair)
             reporter.action_lines[task_id] = row
             if not row.live:
                 self.show(reporter, row.message, timestamp=timestamp)
@@ -538,6 +538,9 @@ class Reporter:
             self.display = ExecutionDisplay()
             self._task_headings.clear()
             self._action_failures.clear()
+            self._repair_display_identity = None
+            self._repair_display_managed = False
+            self._repair_display_cursor = (None, 0)
             previous = _read_json(root / "diagnostics.json")
             artifacts = previous.get("artifacts", {})
             self._artifacts = {
@@ -757,7 +760,11 @@ class Reporter:
         if kind in {"task.blocked", "verification.interrupted", "verify.failed"}:
             return message, "finish"
         if kind == "repair.phase":
-            return ("恢复：" if zh else "Recovery: ") + str(data.get("phase", "")), "start"
+            return ("[引擎自修复] " if zh else "[Engine repair] ") + str(data.get("phase", "")), "start"
+        if kind == 'repair.action':
+            return message, 'finish' if data.get('terminal') else 'start'
+        if kind == 'repair.control' and getattr(owner, '_repair_display_managed', False):
+            return '', ''  # Full control details remain in events.jsonl.
         if kind == "stage.retry":
             return str(data["stage"]), "start"
         if kind == "plan.changed":
@@ -803,7 +810,7 @@ class Reporter:
                 else:
                     owner._last_user_notice = notice
             name = visible
-            if visible and (transition or kind.startswith(("task.", "verification."))) and kind != "task.heading":
+            if visible and (transition or kind.startswith(("task.", "verification."))) and kind != "task.heading" and not kind.startswith('repair.'):
                 context = display_text(task_id) + " · " if task_id and len(owner.active_tasks) > 1 else ""
                 visible = "    " + context + visible
             owner._sequence += 1
@@ -832,7 +839,7 @@ class Reporter:
                     owner.presenter.show(owner, message, timestamp=timestamp, debug=audience != 'user')
                 elif visible:
                     if transition == "start":
-                        owner.presenter.start_action(owner, task_id, name, timestamp)
+                        owner.presenter.start_action(owner, task_id, name, timestamp, repair=kind.startswith('repair.'))
                     else:
                         owner.presenter.show(owner, visible, timestamp=timestamp)
 
@@ -1080,6 +1087,55 @@ class Reporter:
         rendered = pair[0 if self.language == "zh" else 1]
         self.snapshot.repair = self.message("repair.phase", phase=rendered)
         self.emit("repair.phase", phase=rendered, phase_id=phase, **data)
+
+    @_synchronized
+    def repair_update(self, job: dict, subscriber: dict) -> None:
+        """Refresh one live action from supervisor observations, never its leases."""
+        from .repair_display import observation
+        owner = self.parent or self
+        owner.ensure_bound()
+        display = job.get('display') or {}
+        source = (job.get('id'), job.get('generation'))
+        prior_source, prior_sequence = getattr(owner, '_repair_display_cursor', (None, 0))
+        if source == prior_source and job.get('state') == 'repairing' and subscriber.get('state') == 'waiting':
+            # Preserve short actions that started and ended between status polls.
+            for step in display.get('transitions', []):
+                if prior_sequence < step['sequence'] < display.get('sequence', 0):
+                    self.repair_update({**job, 'display': step}, subscriber)
+        owner._repair_display_cursor = (source, display.get('sequence', 0))
+        observed = observation(job, subscriber, self.language)
+        owner._repair_display_managed = True
+        prefix = '[引擎自修复] ' if self.language == 'zh' else '[Engine repair] '
+        changed = observed['identity'] != getattr(owner, '_repair_display_identity', None)
+        if changed:
+            owner.presenter.finish_actions(owner)
+            owner.display = ExecutionDisplay()
+            owner.active_tasks.clear()
+            owner._repair_display_identity = observed['identity']
+            owner.snapshot.repair = '' if observed['terminal'] else observed['name']
+            self.event('repair.action', {'name': observed['name'], 'terminal': observed['terminal']},
+                       audience='user', message=prefix + observed['name'])
+        if observed['terminal']:
+            owner.display = ExecutionDisplay()
+            return
+        counts = observed['checks']
+        if counts:
+            owner.display.checks['repair'] = CheckSet(counts=counts)
+        else:
+            owner.display.checks.pop('repair', None)
+        output_at = observed['output_at']
+        if isinstance(output_at, (int, float)):
+            owner.display.output_times[''] = time.monotonic() - max(0, time.time() - output_at)
+        # Plain logs retain occasional count updates without cursor controls or
+        # per-second polling noise. Live output refreshes via the existing timer.
+        elapsed = time.monotonic() - getattr(owner, '_repair_plain_at', 0)
+        if changed:
+            owner._repair_plain_at = time.monotonic()
+        if owner.presenter._live is None and not changed and elapsed >= 60:
+            suffix = owner.display.suffix('', self.language)
+            message = prefix + observed['name'] + (' | ' + suffix if suffix else '')
+            self.event('user.message', {}, audience='user', message=message)
+            owner._repair_plain_at = time.monotonic()
 
     def plan(self, tasks: list) -> None:
         from .models import RunState
