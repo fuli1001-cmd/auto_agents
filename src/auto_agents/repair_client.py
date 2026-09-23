@@ -143,7 +143,7 @@ def cached_contract(orchestrator, project, error):
     return None
 
 
-def validate_retained_run_contract(project, source, payload, error, *, frozen_target=None):
+def validate_retained_run_contract(project, source, payload, error, *, frozen_target=None, frozen_receipt=None):
     """Reprove retained ownership and witnesses before reusing any authority."""
     from .config import load_run_state
     from .repair_v2.scope import context, same_context, witnesses
@@ -173,17 +173,26 @@ def validate_retained_run_contract(project, source, payload, error, *, frozen_ta
     saved = receipt.get('witnesses') or []
     if len(saved) != len(current):
         raise ValueError('retained repair witness count changed')
+    anchor = frozen_receipt if frozen_receipt is not None else receipt
+    if (anchor.get('policy') != receipt['policy']
+            or anchor.get('proposal') != receipt['proposal']
+            or not same_context(anchor.get('context'), receipt['context'])
+            or len(anchor.get('witnesses', [])) != len(saved)):
+        raise ValueError('retained repair differs from its sealed scope')
     workflow_file = '.auto-agents/state/workflows/' + state.resume_context.get('workflow_id', '') + '/workflow.json'
-    for reference, old, new in zip(references, saved, current):
-        if old == new:
+    for reference, old, new, sealed in zip(references, saved, current, anchor['witnesses']):
+        if old == new == sealed:
             continue
         # Normal run entry updates the workflow timestamp. Rebind that one
         # unconstrained document only after proving all semantic fields match
         # the sealed original; explicit digests and all other witnesses stay exact.
+        # The latest job may already carry a rebound timestamp. Its receipt is
+        # not the immutable anchor for the next invocation: always authenticate
+        # against the original transaction's receipt and frozen document.
         if (frozen_target is None or not isinstance(reference, dict)
                 or reference.get('origin') != 'target' or reference.get('path') != workflow_file
                 or any(reference.get(key) for key in ('pointer', 'sha256', 'snapshot'))
-                or witnesses([reference], frozen_target, source) != [old]):
+                or witnesses([reference], frozen_target, source) != [sealed]):
             raise ValueError('retained repair witness changed')
         before = read_json(frozen_target, workflow_file)
         after = read_json(project, workflow_file)
@@ -222,9 +231,15 @@ def retained_run_contract(orchestrator, project, error):
             return None
         from .repair_v2.transaction import transaction_root
         frozen = transaction_root(registration['config'], payload) / 'target-evidence'
-        receipt = validate_retained_run_contract(project, source, payload, error, frozen_target=frozen)
+        from .repair_v2.scope import read_json
+        original = read_json(frozen.parent, 'original-payload.json')
+        receipt = validate_retained_run_contract(project, source, payload, error, frozen_target=frozen,
+                                                frozen_receipt=original.get('scope_receipt'))
         return {**payload, 'scope_receipt': receipt}
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError, RepairBlocked):
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, RepairBlocked) as error:
+        reporter = getattr(orchestrator, 'reporter', None)
+        if reporter is not None:
+            reporter.event('repair.retained_rejected', {'reason': str(error)}, message=str(error))
         return None
 
 

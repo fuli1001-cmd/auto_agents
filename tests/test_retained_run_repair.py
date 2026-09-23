@@ -168,3 +168,108 @@ def test_retained_lookup_requires_registered_owner(tmp_path):
     with pytest.raises(RuntimeError, match='registered workflow owner'):
         supervisor.dispatch({'version': VERSION, 'op': 'lookup-retained-run-repair',
                              'subscriber': 'foreign', '_peer_pid': os.getpid()}, [])
+
+
+def test_three_source_upgrades_reuse_original_anchor_and_budget(tmp_path, monkeypatch):
+    with stopped_repair(tmp_path, monkeypatch) as (root, orch, original, source, payload, supervisor, initial_lock, transaction, usage):
+        # Release the first foreground registration, as an exited CLI would.
+        first = orch._repair_registration['subscriber']
+        for fd in supervisor.registrations.pop(first)['fds']:
+            os.close(fd)
+        initial_lock.release()
+        original_request = (transaction / 'original-payload.json').read_bytes()
+        workflow_path = root / '.auto-agents/state/workflows' / original.resume_context['workflow_id'] / 'workflow.json'
+        workflow = json.loads(workflow_path.read_text())
+        monkeypatch.setattr(cli, 'adjudicate_auto_agents_error',
+                            lambda *a, **k: pytest.fail('repeated explicit resume rediagnosed the same failure'))
+        event = orch.reporter.event
+        submitted = []
+        class Submitted(BaseException):
+            pass
+        def observe(kind, data, **options):
+            event(kind, data, **options)
+            if kind == 'repair.submitted':
+                submitted.append(data)
+                raise Submitted()
+        monkeypatch.setattr(orch.reporter, 'event', observe)
+        args = SimpleNamespace(command='run', project=str(root), spec_file=original.resume_context['spec_file'],
+                               auto_approve=True, provider='codex', autonomy='max')
+        receipts = []
+        for attempt in range(3):
+            (source / 'fix.py').write_text(f'correction = {attempt}\n')
+            git(source, 'commit', '-qam', f'correction {attempt}')
+            atomic_json(workflow_path, {**workflow, 'updated_at': f'2026-09-23T0{attempt}:00:00+00:00'})
+            with ProjectRunLock(root) as lock:
+                registration = supervisor.register({'payload': {'project': str(root), 'token': lock.run_token,
+                    'pid': os.getpid(), 'ticks': start_ticks(os.getpid()), 'command': 'run'}}, [os.dup(lock.fileno)])
+                orch._repair_registration = {'config': supervisor.config, 'subscriber': registration['subscriber']}
+                lock.repair_registration = orch._repair_registration
+                try:
+                    result = cli._triage_terminal_run_error(root, orch, RuntimeError(original.last_error))
+                    assert result.source == 'retained_repair_contract'
+                    with pytest.raises(Submitted):
+                        cli._auto_repair_auto_agents_and_resume(root, orch, RuntimeError(original.last_error),
+                            result.decision, args, lock, diagnosis=result.root_cause)
+                    renewed = supervisor.store.job(submitted[-1]['job_id'])
+                    assert renewed['state'] == 'queued'
+                    receipt = renewed['payload']['scope_receipt']
+                    receipts.append(receipt)
+                    assert receipt['proposal'] == payload['scope_receipt']['proposal']
+                    assert renewed['payload']['diagnosis'] == payload['diagnosis']
+                    assert transaction_root(supervisor.config, renewed['payload']) == transaction
+                    assert TransactionStore(transaction).load()['attempts'] == usage['attempts']
+                    assert TransactionStore(transaction).load()['calls'] == usage['calls']
+                    supervisor.store.transition(renewed['id'], 'blocked', {'ok': False, 'engine': 'v2',
+                        'status': 'v2_blocked', 'v2_transaction': str(transaction)})
+                    with supervisor.store.connect() as db:
+                        db.execute("UPDATE subscribers SET state='blocked' WHERE id=?", (registration['subscriber'],))
+                finally:
+                    for fd in supervisor.registrations.pop(registration['subscriber'])['fds']:
+                        os.close(fd)
+        assert len(submitted) == 3 and receipts[0] != receipts[1] != receipts[2]
+        assert (transaction / 'original-payload.json').read_bytes() == original_request
+        assert load_run_state(root).status == 'blocked'
+
+
+@pytest.mark.parametrize('tamper', ['scope', 'sealed_document', 'current_workflow', 'other_witness'])
+def test_rebound_timestamp_cannot_relax_the_sealed_contract(tmp_path, monkeypatch, tamper):
+    from copy import deepcopy
+    from auto_agents.repair_v2.scope import witnesses
+    with stopped_repair(tmp_path, monkeypatch) as (root, _, original, source, payload, _, _, transaction, _):
+        path = '.auto-agents/state/workflows/' + original.resume_context['workflow_id'] + '/workflow.json'
+        workflow = json.loads((root / path).read_text())
+        atomic_json(root / path, {**workflow, 'updated_at': 'first resume'})
+        frozen = transaction / 'target-evidence'
+        anchor = deepcopy(payload['scope_receipt'])
+        rebound = repair_client.validate_retained_run_contract(root, source, payload, RuntimeError(original.last_error),
+                                                               frozen_target=frozen, frozen_receipt=anchor)
+        latest = {**payload, 'scope_receipt': rebound}
+        atomic_json(root / path, {**workflow, 'updated_at': 'second resume'})
+        if tamper == 'scope':
+            anchor['proposal']['blocked_step'] = 'different work'
+        elif tamper == 'sealed_document':
+            atomic_json(frozen / path, {**workflow, 'root': {'kind': 'run', 'native_id': 'foreign'}})
+        elif tamper == 'current_workflow':
+            atomic_json(root / path, {**workflow, 'active_frame': {'kind': 'run', 'native_id': 'foreign'}})
+        else:
+            ref = rebound['proposal']['evidence_refs'][0]
+            atomic_json(root / ref['path'], {'repair_case': 'changed evidence'})
+            rebound['witnesses'][0] = witnesses([ref], root, source)[0]
+        with pytest.raises(ValueError):
+            repair_client.validate_retained_run_contract(root, source, latest, RuntimeError(original.last_error),
+                                                         frozen_target=frozen, frozen_receipt=anchor)
+
+
+def test_timestamp_rebind_preserves_explicit_digest_constraints(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from auto_agents.repair_v2.types import RepairBlocked
+    with stopped_repair(tmp_path, monkeypatch) as (root, _, original, source, payload, _, _, transaction, _):
+        latest = deepcopy(payload)
+        receipt = latest['scope_receipt']
+        reference = receipt['proposal']['evidence_refs'][-1]
+        reference['sha256'] = receipt['witnesses'][-1]['sha256']
+        workflow = json.loads((root / reference['path']).read_text())
+        atomic_json(root / reference['path'], {**workflow, 'updated_at': 'changed timestamp'})
+        with pytest.raises(RepairBlocked):
+            repair_client.validate_retained_run_contract(root, source, latest, RuntimeError(original.last_error),
+                frozen_target=transaction / 'target-evidence', frozen_receipt=receipt)
