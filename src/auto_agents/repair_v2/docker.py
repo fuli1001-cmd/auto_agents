@@ -494,6 +494,14 @@ class DockerVerifier:
                             proof_incomplete = True
                             observed = {**observed, 'ok': False,
                                 'error': 'Trusted recovery harness omitted required submission or implementation-entry proof.'}
+                    if (observed['ok'] and retained_run.get('active_blocker', {}).get('category')
+                            == 'metadata_schema_false_positive_and_checkpoint_failure'):
+                        from .boundary_driver import metadata_continuation_complete, metadata_execution_reports_published
+                        if (not metadata_continuation_complete(observed, retained_run)
+                                or not metadata_execution_reports_published(observed, output)):
+                            proof_incomplete = True
+                            observed = {**observed, 'ok': False,
+                                'error': 'Trusted recovery harness omitted bound task entry or fresh managed-verification proof.'}
                 except (OSError, ValueError):
                     observed = {'ok': False, 'infrastructure': True,
                                 'error': '隔离恢复未产生有效验证结果，已停止自动代码修复。',
@@ -504,6 +512,8 @@ class DockerVerifier:
                 result = {'ok': code == 0 and observed.get('ok') is True and before == after,
                           'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
                           'observed': observed, 'output': str(base / 'output.log'), 'returncode': code}
+                if retained_run.get('active_blocker', {}).get('category') == 'metadata_schema_false_positive_and_checkpoint_failure':
+                    result['proof_directory'] = str(output)
                 result['isolation_profile'] = profile
                 result['environment_inputs'] = [item.describe() for item in environments]
                 if proof_incomplete:

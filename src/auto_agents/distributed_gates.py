@@ -70,6 +70,8 @@ class DistributedGatePlanExecutor:
         environment_overrides: Optional[Mapping[str, str]] = None,
         proof_audit_sample_rate: float = 0.0,
         input_reuse_mode: str = "on",
+        use_result_cache: bool = True,
+        record_pytest_execution: bool = False,
     ) -> None:
         self.project_root = project_root.resolve()
         self.run_id = str(run_id)
@@ -87,6 +89,8 @@ class DistributedGatePlanExecutor:
             environment_overrides=self.environment_overrides,
             proof_audit_sample_rate=proof_audit_sample_rate,
             input_reuse_mode=input_reuse_mode,
+            use_result_cache=use_result_cache,
+            record_pytest_execution=record_pytest_execution,
         )
         self.key = project_key(self.project_root)
         self.environment_manifest = build_environment_manifest(self.project_root)
@@ -1099,7 +1103,10 @@ class DistributedGatePlanExecutor:
         # Operator-bound inputs and secrets are controller-local by default.
         # Do not forward them to LAN workers unless a future worker protocol
         # explicitly advertises matching named bindings and runtime digests.
-        if self.environment_overrides:
+        # Fresh recovery receipts use the controller's trusted pytest recorder.
+        # The worker protocol cannot yet attest that recorder, so keep this
+        # scoped execution in the same managed local lane as operator inputs.
+        if self.environment_overrides or self.local.record_pytest_execution:
             return self.local.run(
                 command,
                 lane=lane,

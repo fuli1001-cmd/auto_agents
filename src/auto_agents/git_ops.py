@@ -131,50 +131,41 @@ def commit_all(project_root: Path, message: str) -> str:
     return rev_process.stdout.strip()
 
 
+def repository_add_exclusion_pathspecs(
+    project_root: Path,
+    exclude_prefixes: Iterable[str],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Keep root staging topology-aware without naming ignored exclusions.
+
+    Callers must also restore/remove excluded index entries before publication,
+    since ignored paths can already be tracked or staged.
+    """
+    pathspecs = []
+    for path in normalize_repository_exclusions(exclude_prefixes):
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--no-index", "--quiet", "--", path],
+            cwd=str(project_root), env=dict(env) if env is not None else None,
+            text=True, encoding="utf-8", capture_output=True,
+        )
+        if ignored.returncode == 0:
+            continue
+        if ignored.returncode != 1:
+            raise RuntimeError(
+                ignored.stderr.strip() or ignored.stdout.strip()
+                or f"git check-ignore failed for excluded path: {path}"
+            )
+        pathspecs.append(f":(top,exclude,literal){path}")
+    return tuple(pathspecs)
+
+
 def commit_all_except(project_root: Path, message: str, exclude_prefixes: tuple[str, ...]) -> str:
     normalized_excludes = normalize_repository_exclusions(exclude_prefixes)
-    excluded_bytes = tuple(os.fsencode(prefix) for prefix in normalized_excludes)
-    # Git can reject an ignored dependency link even when it is supplied as a
-    # negative pathspec. Enumerate eligible paths instead, without following
-    # links or interpreting whitespace, newlines and pathspec metacharacters.
-    staging_sets = []
-    for listing_args, add_args in (
-        (("--cached",), ("-u",)),
-        (("--others", "--exclude-standard"), ()),
-    ):
-        listing = _git_bytes(project_root, "ls-files", "-z", *listing_args)
-        if listing.returncode != 0:
-            raise RuntimeError(
-                listing.stderr.decode("utf-8", errors="replace").strip()
-                or "git ls-files failed"
-            )
-        paths = tuple(
-            dict.fromkeys(
-                path for path in listing.stdout.split(b"\0")
-                if path and not any(
-                    path == prefix or path.startswith(prefix + b"/")
-                    for prefix in excluded_bytes
-                )
-            )
-        )
-        staging_sets.append((add_args, paths))
-    for add_args, paths in staging_sets:
-        if not paths:
-            continue
-        add_process = subprocess.run(
-            [
-                "git", "--literal-pathspecs", "add", *add_args,
-                "--pathspec-from-file=-", "--pathspec-file-nul",
-            ],
-            cwd=str(project_root),
-            input=b"\0".join(paths) + b"\0",
-            capture_output=True,
-        )
-        if add_process.returncode != 0:
-            raise RuntimeError(
-                add_process.stderr.decode("utf-8", errors="replace").strip()
-                or "git add failed"
-            )
+    exclusions = repository_add_exclusion_pathspecs(project_root, normalized_excludes)
+    add_process = _git(project_root, "add", "-A", "--", ".", *exclusions)
+    if add_process.returncode != 0:
+        raise RuntimeError(add_process.stderr.strip() or "git add failed")
 
     if normalized_excludes:
         head_process = _git(project_root, "rev-parse", "--verify", "HEAD")

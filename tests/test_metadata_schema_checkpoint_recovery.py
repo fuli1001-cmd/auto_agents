@@ -7,6 +7,7 @@ provider requests, live workflow recovery or operator repositories are used.
 from __future__ import annotations
 
 import copy
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -462,3 +463,67 @@ def test_metadata_repair_does_not_override_unproven_or_current_blockers(
         assert state.active_blocker["fingerprint"] == before["active_blocker"]["fingerprint"]
         assert state.task_failure_checkpoints == before["task_failure_checkpoints"]
         assert state.agent_attempts == before["agent_attempts"]
+
+
+@pytest.mark.parametrize("before_kind,after_kind", [
+    ("directory", "symlink"), ("symlink", "directory"),
+    ("directory", "file"), ("file", "directory"),
+])
+def test_checkpoint_preserves_path_type_replacement(
+    tmp_path: Path, before_kind: str, after_kind: str,
+) -> None:
+    root = tmp_path / "project"
+    orch = _project(root)
+    external = tmp_path / "external-lib"
+    external.mkdir()
+    (external / "old.py").write_text("EXTERNAL = 'must not be traversed'\n")
+    external_before = (external / "old.py").read_bytes()
+
+    def materialize(kind, parent, value):
+        if kind == "directory":
+            _write(parent, "lib/old.py", value)
+        elif kind == "file":
+            _write(parent, "lib", value)
+        else:
+            (parent / "lib").symlink_to("../external-lib")
+
+    materialize(before_kind, root, "before\n")
+    _write(root, ".auto-agents/state/type-test.json", "{}\n")
+    base = _commit(root)
+    if before_kind == "directory":
+        shutil.rmtree(root / "lib")
+    else:
+        (root / "lib").unlink()
+    materialize(after_kind, root, "after\n")
+    _write(root, ".auto-agents/state/type-test.json", '{"retained":true}\n')
+    task = TaskSpec("type-change", "Keep replacement", "Synthetic Git regression", [])
+    state = RunState(run_id="type-change-run", tasks=[task])
+    checkpoint = orch._preserve_failed_task_checkpoint(
+        state, task, root, {"reason": "legitimate rewind", "rewind_to_stage": "clarify"}, base_ref=base,
+    )
+    sha = checkpoint["commit_sha"]
+    assert _git(root, "rev-parse", checkpoint["ref"]).decode().strip() == sha
+    expected_mode = {"symlink": b"120000", "file": b"100644", "directory": b"040000"}[after_kind]
+    assert _git(root, "ls-tree", sha, "--", "lib").split()[0] == expected_mode
+    assert _git(root, "show", f"{sha}:.auto-agents/state/type-test.json") == b"{}\n"
+    if after_kind == "symlink":
+        assert _git(root, "show", f"{sha}:lib") == b"../external-lib"
+    restore_root = tmp_path / "restored"
+    _git(root, "worktree", "add", "--detach", str(restore_root), base)
+    try:
+        state.task_failure_checkpoints[task.task_id] = checkpoint
+        assert orch._restore_task_failure_checkpoint(state, task, restore_root) == checkpoint["ref"]
+        if after_kind == "symlink":
+            assert (restore_root / "lib").is_symlink()
+            assert str((restore_root / "lib").readlink()) == "../external-lib"
+        elif after_kind == "directory":
+            assert not (restore_root / "lib").is_symlink()
+            assert (restore_root / "lib/old.py").read_text() == "after\n"
+        else:
+            assert (restore_root / "lib").read_text() == "after\n"
+        assert _git(restore_root, "ls-files", "-z", "--", "lib") == (
+            b"lib/old.py\0" if after_kind == "directory" else b"lib\0"
+        )
+        assert (external / "old.py").read_bytes() == external_before
+    finally:
+        _git(root, "worktree", "remove", "--force", str(restore_root))

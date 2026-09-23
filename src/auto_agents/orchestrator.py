@@ -8045,11 +8045,15 @@ class Orchestrator:
                     context=context,
                     source_ref=source_ref,
                 )
-            return self._run_gate_commands_for_commands(
+            result = self._run_gate_commands_for_commands(
                 commands,
                 collect_all=collect_all,
                 context=context,
             )
+            capture = getattr(self, "_metadata_verification_capture", None)
+            if capture is not None and task is not None and capture["task_id"] == task.task_id:
+                capture["commands"].extend(result[0].commands)
+            return result
         finally:
             self._active_task_gate_metadata_task = previous
 
@@ -21200,7 +21204,11 @@ class Orchestrator:
         environment_overrides: Optional[Dict[str, str]] = None,
         execution_environment: Optional[Dict[str, str]] = None,
     ):
-        use_result_cache = bool(use_result_cache and not self._force_full_verify)
+        record_pytest_execution = bool(getattr(self, "_metadata_verification_capture", None) and not source_ref)
+        use_result_cache = bool(
+            use_result_cache and not self._force_full_verify
+            and not record_pytest_execution
+        )
         result_context_fingerprint = self._gate_result_context_fingerprint()
         if contract_fingerprint:
             result_context_fingerprint = hashlib.sha256(
@@ -21236,6 +21244,8 @@ class Orchestrator:
                 environment_overrides=operator_environment,
                 proof_audit_sample_rate=proof_audit_sample_rate,
                 input_reuse_mode=acceleration.verification_input_mode,
+                use_result_cache=use_result_cache,
+                record_pytest_execution=record_pytest_execution,
             )
         return LocalGatePlanExecutor(
             self.project_root,
@@ -21247,6 +21257,7 @@ class Orchestrator:
             result_context_fingerprint=result_context_fingerprint,
             source_ref=source_ref,
             use_result_cache=use_result_cache,
+            record_pytest_execution=record_pytest_execution,
             cache_path=self._shared_gate_cache_path,
             preempt_requested=self._gate_preempt_probe,
             environment_overrides=operator_environment,
@@ -21677,9 +21688,10 @@ class Orchestrator:
             and repaired.get("prepared_self_repair_commit") == repaired.get("self_repair_commit")
             and repaired.get("category") == "diagnostic_evidence_reference_binding_gap"
         )
+        metadata_ready = self._metadata_checkpoint_verification_handoff(state) is not None
         if (state.last_recovery_route.get("outcome") not in {
                 "iteration_plan_scope_reconciled", "provider_reference_review_repaired"}
-                and not diagnostic_ready
+                and not diagnostic_ready and not metadata_ready
                 or state.status in {"blocked", "paused", "waiting_user"} or state.active_blocker):
             return
         spec_value = str(state.resume_context.get("spec_file", "")).strip()
@@ -32909,7 +32921,79 @@ class Orchestrator:
             ignored.extend(["README.md", ".gitignore"])
         return (".auto-agents/", *ignored)
 
+    @staticmethod
+    def _metadata_checkpoint_verification_handoff(
+        state: Optional[RunState], task: Optional[TaskSpec] = None,
+    ) -> Optional[Dict[str, object]]:
+        if state is None or state.active_blocker:
+            return None
+        receipt = state.last_recovery_route.get("metadata_checkpoint_repair", {})
+        repaired = receipt.get("repaired_blocker", {})
+        if (
+            receipt.get("outcome") != "verification_ready"
+            or receipt.get("run_id") != state.run_id
+            or receipt.get("workflow_id") != state.resume_context.get("workflow_id")
+            or repaired.get("category") != "metadata_schema_false_positive_and_checkpoint_failure"
+            or not repaired.get("self_repair_commit")
+            or (task is not None and (receipt.get("task_id") != task.task_id
+                or receipt.get("verify_retry_epoch") != task.verify_retry_epoch))
+        ):
+            return None
+        return receipt
+
     def _run_task_verify(
+        self,
+        task: Optional[TaskSpec] = None,
+        *,
+        state: Optional[RunState] = None,
+    ) -> Dict[str, object]:
+        handoff = self._metadata_checkpoint_verification_handoff(state, task)
+        if task is None or handoff is None or handoff.get("verification_receipt"):
+            return self._run_task_verify_current(task, state=state)
+        assert state is not None
+        verification_id = uuid.uuid4().hex
+        entry = {
+            "verification_id": verification_id,
+            "run_id": state.run_id,
+            "workflow_id": state.resume_context["workflow_id"],
+            "task_id": task.task_id,
+            "repair_commit": handoff["repaired_blocker"]["self_repair_commit"],
+            "candidate_fingerprint": self._worktree_fingerprint_excluding_agent_instructions(),
+            "verify_retry_epoch": task.verify_retry_epoch,
+            "verification_refs": list(task.verification_refs),
+            "engine_runtime": self._auto_agents_runtime_identity(),
+            "started_at": utc_now_iso(),
+        }
+        handoff["verification_entry"] = entry
+        save_run_state(self.project_root, state)
+        self.reporter.event("task.verification.entered", entry)
+        previous = getattr(self, "_metadata_verification_capture", None)
+        capture = {"task_id": task.task_id, "commands": []}
+        self._metadata_verification_capture = capture
+        try:
+            result = self._run_task_verify_current(task, state=state)
+        finally:
+            self._metadata_verification_capture = previous
+        fields = (
+            "command", "ok", "returncode", "job_id", "worker_id", "backend",
+            "cached", "proof_ref", "executed_tests", "artifacts", "duration_seconds",
+            "termination_reason", "cleanup_incomplete", "infrastructure_error",
+        )
+        receipt = {
+            **entry, "completed_at": utc_now_iso(), "ok": bool(result.get("ok")),
+            "reason": self._redacted_verification_command_evidence(str(result.get("reason", ""))),
+            "commands": [{key: copy.deepcopy(getattr(command, key)) for key in fields}
+                         for command in capture["commands"]],
+            "candidate_unchanged": entry["candidate_fingerprint"] == self._worktree_fingerprint_excluding_agent_instructions(),
+        }
+        # This is an observation of actual managed results, never a task-success
+        # decision. Normal verification, review and publication still follow.
+        handoff["verification_receipt"] = receipt
+        save_run_state(self.project_root, state)
+        self.reporter.event("task.verification.completed", receipt)
+        return result
+
+    def _run_task_verify_current(
         self,
         task: Optional[TaskSpec] = None,
         *,

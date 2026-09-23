@@ -1,6 +1,7 @@
 """Trusted pytest launcher and phase recorder; never loaded from a candidate."""
 import json
 from pathlib import Path
+import shlex
 import sys
 import time
 if __package__:
@@ -9,6 +10,36 @@ if __package__:
 else:
     from verification_inputs import InputObserver
     from verification_dependencies import exception_dependencies, detect_verification_dependencies
+
+
+def prepare_execution_receipts(command, checkout, scratch, environment):
+    """Instrument retained Python pytest invocations without changing selectors."""
+    from .execution_binding import test_invocations, RunnerContextError
+    replacements, reports = [], []
+    offset = 0
+    for invocation in test_invocations(command, environment=environment):
+        if invocation.runner != 'pytest':
+            continue
+        if invocation.targets is None or invocation.launcher[-2:] != ('-m', 'pytest'):
+            raise RunnerContextError('execution_receipt', 'fresh pytest receipt requires a Python module launcher', invocation.raw)
+        start = command.index(invocation.raw, offset)
+        end = start + invocation.option_offset
+        offset = start + len(invocation.raw)
+        report = scratch / f'pytest-execution-{len(reports)}.json'
+        launcher = []
+        for token in invocation.launcher[:-2]:
+            if '=' in token and token.split('=', 1)[0].isidentifier():
+                name, value = token.split('=', 1)
+                launcher.append(name + '=' + shlex.quote(value))
+            else:
+                launcher.append(shlex.quote(token))
+        launcher.extend(shlex.quote(str(value)) for value in
+                        (Path(__file__).resolve(), checkout / invocation.cwd, report))
+        replacements.append((start, end, ' '.join(launcher) + ' '))
+        reports.append(report)
+    for start, end, replacement in reversed(replacements):
+        command = command[:start] + replacement + command[end:]
+    return command, reports
 
 
 class Recorder:
