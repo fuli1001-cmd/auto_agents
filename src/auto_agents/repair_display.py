@@ -65,6 +65,12 @@ def observation(job, subscriber, language='zh'):
         error = str((job.get('result') or {}).get('error', ''))
         if 'Insufficient disk space' in error:
             label = ('磁盘空间不足；清理空间后重新运行以继续', 'Disk space is low; free space and rerun to continue')
+        elif 'recovery_proof_incomplete' in error or '恢复验证证据不完整' in error:
+            label = ('原任务恢复证据不完整；更新验证控制器后重试',
+                     'Task recovery evidence is incomplete; update the verifier and retry')
+        elif 'no verified progress' in error:
+            label = ('连续修正未取得新的验证进展；已停止自动修复，候选已保留',
+                     'No new verified progress; automatic repair stopped, candidate retained')
         else:
             label = ('修复受阻；进度已保留，需处理阻塞后继续', 'Repair blocked; progress saved, resolve the blocker to continue')
     elif 'cancelled' in (state, workflow):

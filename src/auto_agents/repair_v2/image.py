@@ -110,7 +110,7 @@ def _tool_image(root, python, driver, *, codex_binary=None):
                  'sort', 'uniq', 'wc', 'cut', 'tr', 'sleep', 'timeout', 'true', 'false', 'id', 'uname',
                  'which', 'tar', 'gzip', 'xargs', 'diff', 'date', 'ps', 'kill', 'unshare', 'mount',
                  'umount', 'ip', 'ss', 'curl', 'ldd', 'openssl', 'dirname', 'basename', 'printf',
-                 'du', 'df', 'mktemp', 'tee', 'ln', 'rmdir', 'expr', 'rg', 'strace'):
+                 'du', 'df', 'mktemp', 'tee', 'ln', 'rmdir', 'expr', 'rg', 'strace', 'ffmpeg', 'ffprobe'):
         source = next((Path(p) / name for p in ('/usr/bin', '/usr/sbin', '/bin', '/sbin')
                        if (Path(p) / name).is_file()), None)
         if source is None and shutil.which(name): source = Path(shutil.which(name))
@@ -191,7 +191,11 @@ def _tool_image(root, python, driver, *, codex_binary=None):
             copy_file(dependency)
     for pattern in ('libseccomp.so*', 'libnss_*.so*', 'libresolv.so*'):
         for source in Path('/lib/x86_64-linux-gnu').glob(pattern): copy_file(source)
-    for source in ('/etc/ssl/certs', '/usr/share/git-core', '/usr/lib/git-core', '/usr/share/zoneinfo'):
+    # Media-capable projects can initialize local renderers even in otherwise
+    # text-only tests. Include installed public font data in the content-bound
+    # image instead of changing application code to tolerate a missing runtime.
+    for source in ('/etc/ssl/certs', '/usr/share/git-core', '/usr/lib/git-core', '/usr/share/zoneinfo',
+                   '/usr/share/fonts', '/usr/local/share/fonts'):
         tree(source)
     for source in ('/etc/nsswitch.conf', '/etc/services', '/etc/protocols', '/etc/os-release', '/usr/lib/ssl/openssl.cnf'):
         copy_file(source)

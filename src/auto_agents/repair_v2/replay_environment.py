@@ -20,6 +20,56 @@ class EnvironmentUnavailable(RepairBlocked):
         super().__init__('verification_infrastructure', message)
 
 
+def run_commands(target, invocation):
+    """Discover environment inputs from the bound ready task, never old sessions."""
+    from ..execution_binding import test_invocations, RunnerContextError
+    target = Path(target).resolve()
+    def read(relative):
+        path = target / relative
+        if path.is_symlink() or not path.resolve().is_relative_to(target):
+            raise EnvironmentUnavailable('保留的验证配置离开了冻结现场。')
+        return json.loads(path.read_text()) if path.is_file() else {}
+    state = read('.auto-agents/state/run_state.json')
+    context = state.get('resume_context', {})
+    if (not invocation.get('run_id') or state.get('run_id') != invocation['run_id']
+            or invocation.get('workflow_id') and context.get('workflow_id') != invocation['workflow_id']):
+        return []
+    workflow_id = context.get('workflow_id', '')
+    if not isinstance(workflow_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', workflow_id):
+        return []
+    workflow = read(f'.auto-agents/state/workflows/{workflow_id}/workflow.json')
+    bound_run = {'kind': 'run', 'native_id': invocation['run_id']}
+    if workflow.get('root') != bound_run or workflow.get('active_frame') != bound_run:
+        return []
+    ready = context.get('implementation_ready_tasks', {})
+    references = {ref for task in state.get('tasks', [])
+                  if task.get('status') == 'in_progress' and ready.get(task.get('task_id')) is True
+                  for ref in task.get('verification_refs', []) if isinstance(ref, str)}
+    if not references:
+        return []
+    gates = read('.auto-agents/config.json').get('gates', {})
+    plan = read('.auto-agents/state/task_plan.json')
+    declared = [*gates.get('commands', []), *plan.get('verification_commands', [])]
+    from ..gates import command_from_verification_step
+    from ..models import VerificationStep
+    for step in [*gates.get('steps', []), *plan.get('verification_steps', [])]:
+        if any(ref == node or ref.startswith(node + '::') or ref.startswith(node + '[')
+               for node in step.get('targets', []) for ref in references):
+            declared.append(command_from_verification_step(VerificationStep.from_dict(step), target))
+        elif step.get('command'):
+            declared.append(step['command'])
+    result = []
+    for command in dict.fromkeys(c for c in declared if isinstance(c, str) and c):
+        try:
+            calls = test_invocations(command)
+        except (ValueError, RunnerContextError):
+            continue  # The real verification guard diagnoses opaque commands.
+        if any(ref == node or ref.startswith(node + '::') or ref.startswith(node + '[')
+               for call in calls for node in (call.targets or ()) for ref in references):
+            result.append(command)
+    return result
+
+
 def commands(target, payload):
     """Only follow the retained root and its handoffs, not ambient old runs."""
     from ..execution_binding import route_sources
@@ -32,7 +82,7 @@ def commands(target, payload):
                 'failed_handoff_id', 'original_handoff_id', 'resume_handoff_id'))
             pending.append(('session', source.get('child_session_id')))
     routes(invocation.get('engine_route') or {})
-    seen, result = set(), []
+    seen, result = set(), run_commands(target, invocation) if invocation.get('run_id') else []
     workflow = invocation.get('workflow_id') or ''
     while pending:
         kind, identity = pending.pop(0)
@@ -79,6 +129,14 @@ def prefixes(command, project):
             words.pop(0)
         if words[:1] == ['cd'] and len(words) == 2:
             cwd = Path(os.path.normpath(str(cwd / words[1])))
+            continue
+        executable = Path(words[0]) if words else Path()
+        if (executable.name.startswith('python') and executable.parent.name == 'bin'
+                and executable.parent.parent.name == '.conda'):
+            prefix = Path(os.path.normpath(str(cwd / executable.parent.parent)))
+            if (not prefix.is_relative_to(project) or any(c in str(prefix) for c in ',\n\r$`~')):
+                raise EnvironmentUnavailable('隔离恢复的 Python 环境超出当前项目或路径无法安全解析。')
+            result.append(prefix)
             continue
         if len(words) < 3 or Path(words[0]).name != 'conda' or words[1] != 'run':
             continue

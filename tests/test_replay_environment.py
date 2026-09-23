@@ -100,6 +100,43 @@ def test_only_retained_owned_child_commands_supply_environment_inputs(tmp_path, 
     assert not (target / '.conda').exists()  # The frozen scene stays immutable.
 
 
+def test_ready_run_task_supplies_direct_python_environment_without_old_sessions(tmp_path, environment):
+    target = tmp_path / 'frozen'
+    state = target / '.auto-agents/state'
+    selected = './.conda/bin/python -m pytest -q tests/test_current.py::test_contract'
+    atomic_json(state / 'run_state.json', {
+        'run_id': 'run-current', 'resume_context': {'workflow_id': 'wf-current',
+            'implementation_ready_tasks': {'task-current': True}},
+        'tasks': [{'task_id': 'task-current', 'status': 'in_progress',
+                   'verification_refs': ['tests/test_current.py::test_contract']},
+                  {'task_id': 'unrelated', 'status': 'pending', 'verification_refs': ['tests/test_old.py']}]})
+    atomic_json(target / '.auto-agents/config.json', {'gates': {'commands': [selected,
+        'conda run -p /outside/.conda python -m pytest tests/test_old.py']}})
+    bound = {'kind': 'run', 'native_id': 'run-current'}
+    atomic_json(state / 'workflows/wf-current/workflow.json', {'root': bound, 'active_frame': bound})
+    atomic_json(state / 'sessions/old/session_state.json', {'workflow_id': 'old',
+        'fix_verify_command': 'conda run -p /outside/.conda python -m pytest tests/test_current.py'})
+    payload = {'project': str(environment.parent), 'invocation': {'run_id': 'run-current', 'workflow_id': 'wf-current'}}
+    before = (state / 'run_state.json').read_bytes()
+    assert commands(target, payload) == [selected]
+    assert commands(target, {**payload, 'invocation': {'run_id': 'run-current'}}) == [selected]
+    assert [snapshot.prefix for snapshot in prepare(tmp_path / 'cache', target, payload)] == [environment]
+    assert (state / 'run_state.json').read_bytes() == before and not (target / '.conda').exists()
+    for invocation in [{'run_id': 'other', 'workflow_id': 'wf-current'},
+                       {'run_id': 'run-current', 'workflow_id': 'other'}]:
+        assert commands(target, {**payload, 'invocation': invocation}) == []
+
+
+@pytest.mark.parametrize('command', [
+    './.conda/bin/python -B -m pytest tests/test_current.py',
+    'env FLAG=1 ./.conda/bin/python3.11 -m pytest tests/test_current.py',
+])
+def test_direct_python_prefix_is_bound_to_project(command, tmp_path):
+    assert prefixes(command, tmp_path) == [tmp_path / '.conda']
+    with pytest.raises(EnvironmentUnavailable):
+        prefixes('/outside/.conda/bin/python -m pytest tests/test_current.py', tmp_path)
+
+
 @pytest.mark.parametrize('command', [
     'conda run -p ./.conda python -m pytest',
     'env KEY=value conda run --no-capture-output --prefix=./.conda python -m pytest',

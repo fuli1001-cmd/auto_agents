@@ -10,6 +10,29 @@ from auto_agents.repair_v2.transaction import frozen_request, intent, transactio
 from auto_agents.repair_v2.types import Acceptance, RepairBlocked, RepairRequest
 
 
+def test_controller_upgrade_uses_committed_operator_source_without_resetting_transaction(tmp_path):
+    from auto_agents.repair_v2.transaction import bind_controller
+    from auto_agents.repair_v2.workspace import git
+    old, new, candidate = [tmp_path / name for name in ('old-controller', 'new-controller', 'candidate')]
+    for directory, content in ((old, 'clearance only'), (new, 'real verification and review'), (candidate, 'untrusted report')):
+        directory.mkdir()
+        git(directory, 'init', '-q')
+        (directory / 'boundary_driver.py').write_text(content)
+        git(directory, 'add', '.'); git(directory, 'commit', '-qm', content)
+    root = tmp_path / 'transaction'
+    store = Store(root)
+    store.save({'status': 'blocked', 'attempts': 4, 'calls': 9, 'plan': 'retained-plan',
+                'sessions': {'implement': 'retained-session'}, 'blocker': {'code': 'no_progress'}})
+    before = (root / 'state.json').read_bytes()
+    first = bind_controller(root, {'implementation_root': str(old), 'source_root': str(candidate)}, 'job:1')
+    upgraded = {'implementation_root': str(new), 'source_root': str(candidate)}
+    assert bind_controller(root, upgraded, 'job:1') == first
+    second = bind_controller(root, upgraded, 'job:2')
+    assert second['root'] == str(new) and second['commit'] == git(new, 'rev-parse', 'HEAD')
+    assert second['source'] != first['source']
+    assert (root / 'state.json').read_bytes() == before
+
+
 @pytest.fixture
 def legacy(tmp_path):
     config = {'root': str(tmp_path / 'control')}

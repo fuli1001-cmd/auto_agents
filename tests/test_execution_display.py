@@ -458,6 +458,16 @@ def test_repair_english_and_confirmed_handoff_finalize_without_stale_checks(repo
     assert screen.history[-1].endswith('[Engine repair] Original task resumed')
 
 
+@pytest.mark.parametrize('error,expected', [
+    ('repair made no verified progress after its bounded rediagnosis', '连续修正未取得新的验证进展'),
+    ('恢复验证证据不完整；候选已保留，需要更新验证控制器后重新检查原任务。', '原任务恢复证据不完整'),
+])
+def test_repair_blocker_displays_actionable_reason_without_internal_review_text(report, error, expected):
+    report.repair_update({**repair_job(), 'state': 'blocked', 'result': {'error': error}}, {'state': 'blocked'})
+    assert expected in history(report)
+    assert 'bounded rediagnosis' not in history(report)
+
+
 def test_each_new_verification_round_can_report_failure(report):
     setup_tasks(report)
     report.task("T1", "任务1", "verify", 1)

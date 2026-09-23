@@ -9,11 +9,16 @@ import subprocess
 
 
 DIAGNOSTIC_BINDING_CATEGORY = 'diagnostic_evidence_reference_binding_gap'
+METADATA_CHECKPOINT_CATEGORY = 'metadata_schema_false_positive_and_checkpoint_failure'
 CONTINUATION_CATEGORIES = {'iteration_plan_scope_mismatch', 'provider_reference_freshness_validity_conflation',
-                           DIAGNOSTIC_BINDING_CATEGORY}
+                           DIAGNOSTIC_BINDING_CATEGORY, METADATA_CHECKPOINT_CATEGORY}
 
 
 class ReplayEnvironmentUnavailable(RuntimeError):
+    pass
+
+
+class RecoveryProofIncomplete(RuntimeError):
     pass
 
 
@@ -38,6 +43,127 @@ def diagnostic_continuation_complete(observed, original):
         and all(row.get('run_id') == run and row.get('workflow_id') == workflow
                 for row in (observed, proof, submission, entry.get('data', {})))
     )
+
+
+def metadata_recovery_task(original):
+    ready = original.get('resume_context', {}).get('implementation_ready_tasks', {})
+    owners = [task for task in original.get('tasks', [])
+              if task.get('status') == 'in_progress' and ready.get(task.get('task_id')) is True]
+    return owners[0] if len(owners) == 1 else None
+
+
+def metadata_continuation_complete(observed, original):
+    """Require execution proof, not the preparation receipt or a cache hit."""
+    try:
+        owner = metadata_recovery_task(original)
+        if not owner:
+            return False
+        run, workflow = original['run_id'], original['resume_context']['workflow_id']
+        task_id = owner['task_id']
+        proof = observed['recovery_observation']
+        runtime = observed['engine_runtime']
+        entry = proof['implementation_entry']
+        started = proof['verification_entry']
+        completed = proof['verification_event']
+        review = proof['review_entry']
+        receipt = proof['verification_receipt']
+        refs = owner['verification_refs']
+        events = (entry, started, completed)
+        if not (
+            observed.get('ok') is True and proof.get('ok') is True
+            and runtime.get('ok') is True and runtime.get('commit')
+            and proof.get('implementation_entered') is True
+            and proof.get('verification_completed') is True
+            and proof.get('retained_constraints') is True and proof.get('entry_event_ref')
+            and proof.get('review_entered') is True
+            and proof.get('event_order') == [event['event_id'] for event in (*events, review)]
+            and len(set(proof['event_order'])) == 4
+            and review.get('type') == 'task.started' and review.get('subject_id') == run
+            and review.get('data', {}).get('task_id') == task_id
+            and review.get('data', {}).get('action') == 'review'
+            and entry.get('type') == 'implementation.entered'
+            and started.get('type') == 'task.verification.entered'
+            and completed.get('type') == 'task.verification.completed'
+            and all(event.get('event_id') and event.get('subject_id') == run for event in events)
+            and all(row.get('run_id') == run and row.get('workflow_id') == workflow
+                    for row in (observed, proof, receipt, *(event['data'] for event in events)))
+            and all(row.get('task_id') == task_id for row in (proof, receipt, started['data'], completed['data']))
+            and receipt == completed['data']
+            and receipt.get('verification_id') == started['data'].get('verification_id')
+            and receipt.get('verification_id') and receipt.get('started_at') and receipt.get('completed_at')
+            and receipt.get('candidate_fingerprint') == started['data'].get('candidate_fingerprint')
+            and receipt.get('candidate_fingerprint') and receipt.get('candidate_unchanged') is True
+            and receipt.get('repair_commit') == runtime['commit']
+            and all(event['data']['engine_runtime']['repository_head'] == runtime['commit'] for event in events)
+            and receipt.get('verify_retry_epoch') == owner.get('verify_retry_epoch', 0)
+            and receipt.get('verification_refs') == refs and refs
+            and receipt.get('ok') is True
+        ):
+            return False
+        commands = receipt['commands']
+        if not commands or not all(
+            command.get('ok') is True and command.get('returncode') == 0
+            and command.get('cached') is False and command.get('job_id') and command.get('proof_ref')
+            and not command.get('termination_reason') and not command.get('cleanup_incomplete')
+            and not command.get('infrastructure_error')
+            for command in commands
+        ):
+            return False
+        reports = proof['execution_reports']
+        if not reports:
+            return False
+        executed = set()
+        for report in reports:
+            matching = [command for command in commands if command.get('job_id') == report.get('job_id')
+                        and command.get('proof_ref') == report.get('proof_ref')
+                        and command.get('artifacts', {}).get(report.get('path')) == report.get('sha256')]
+            if (len(matching) != 1 or not report.get('sha256') or not report.get('path')
+                    or not isinstance(report.get('passed'), list)
+                    or not set(report['passed']).issubset(matching[0].get('executed_tests', []))):
+                return False
+            executed.update(report['passed'])
+        return all(any(node == ref or node.startswith(ref + '[') for node in executed) for ref in refs)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def publish_metadata_execution_reports(target, output, observed):
+    """Retain proof bytes outside the disposable target before it is removed."""
+    for report in observed['recovery_observation']['execution_reports']:
+        source = target / report['path']
+        data = source.read_bytes()
+        if hashlib.sha256(data).hexdigest() != report['sha256']:
+            raise RuntimeError('managed verification report changed before publication')
+        relative = Path('verification-reports') / report['job_id'] / source.name
+        if relative.is_absolute() or '..' in relative.parts:
+            raise RuntimeError('invalid verification report publication path')
+        destination = output / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix('.tmp')
+        with temporary.open('wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(destination)
+        report['published_path'] = relative.as_posix()
+
+
+def metadata_execution_reports_published(observed, output):
+    try:
+        reports = observed['recovery_observation']['execution_reports']
+        if not reports:
+            return False
+        for report in reports:
+            relative = Path(report['published_path'])
+            path = output / relative
+            if (relative.is_absolute() or '..' in relative.parts
+                    or not relative.as_posix().startswith('verification-reports/')
+                    or path.is_symlink() or not path.resolve().is_relative_to(output.resolve())
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != report['sha256']):
+                return False
+        return True
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
 
 
 def check_environments(request):
@@ -114,6 +240,10 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
     The caller retains its provider fence and disposable original project. No
     workflow stage, admission guard or task loader is replaced by this observer.
     """
+    if original.active_blocker.get('category') == METADATA_CHECKPOINT_CATEGORY:
+        return observe_metadata_checkpoint_continuation(
+            orchestrator, original, original_plan, request, runtime, frozen_inputs,
+        )
     from auto_agents.config import load_run_state, load_task_plan, requirements_trace_path, task_plan_path
     from auto_agents.workflow_chain import WorkflowStore
     from auto_agents.workflow_runtime import WorkflowCoordinator
@@ -313,6 +443,147 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
     }
 
 
+def observe_metadata_checkpoint_continuation(orchestrator, original, original_plan, request, runtime, frozen_inputs):
+    """Observe real managed verification and review entry before any model call."""
+    from auto_agents.config import load_run_state, load_task_plan
+    from auto_agents.workflow_chain import WorkflowStore
+    from auto_agents.workflow_runtime import WorkflowCoordinator
+
+    class VerificationObserved(BaseException):
+        pass
+
+    class VerificationFailed(BaseException):
+        def __init__(self, receipt, event):
+            self.receipt, self.event = receipt, event
+
+    target = orchestrator.project_root
+    original_dict = original.to_dict()
+    owner = metadata_recovery_task(original_dict)
+    workflow_id = original.resume_context.get('workflow_id')
+    if (not owner or not workflow_id or request.get('invocation', {}).get('run_id') != original.run_id
+            or request.get('invocation', {}).get('workflow_id', workflow_id) != workflow_id
+            or not runtime.get('ok') or runtime.get('commit') != request['commit']):
+        raise RuntimeError('metadata recovery lacks the bound workflow, task or runtime')
+    workflow = WorkflowStore(target).load(workflow_id)
+    expected_root = {'kind': 'run', 'native_id': original.run_id}
+    if workflow.root.to_dict() != expected_root or workflow.active_frame.to_dict() != expected_root:
+        raise RuntimeError('metadata recovery workflow is not positioned at the original run')
+    prepared = load_run_state(target)
+    handoff = prepared.last_recovery_route.get('metadata_checkpoint_repair', {})
+    if (handoff.get('outcome') != 'verification_ready' or handoff.get('task_id') != owner['task_id']
+            or handoff.get('run_id') != original.run_id or handoff.get('workflow_id') != workflow_id
+            or handoff.get('repaired_blocker', {}).get('self_repair_commit') != request['commit']
+            or prepared.active_blocker or prepared.pending_approval or prepared.active_input_request_id
+            or prepared.pending_input_requests or run_input_hashes(target, original) != frozen_inputs):
+        raise RuntimeError('metadata recovery handoff is missing, stale or awaiting input')
+    # The probe observes all ordinary admissions. It does not substitute a gate,
+    # task loader, new workflow or fabricated command result.
+    event_path = target / '.auto-agents/runs' / original.run_id / 'events.jsonl'
+    offset = event_path.stat().st_size if event_path.exists() else 0
+    emit_event = orchestrator.reporter.event
+
+    def observe(kind, data, **options):
+        emit_event(kind, data, **options)
+        if (kind in {'task.verification.completed', 'task.verification.preflight_failed'}
+                and data.get('task_id') == owner['task_id']
+                and (data.get('ok') is not True or any(
+                    not command.get('ok') or command.get('returncode') != 0
+                    for command in data.get('commands', [])))):
+            # Retain the real gate failure instead of entering an implementation
+            # retry and hiding it behind the offline provider fence.
+            raise VerificationFailed(data, kind)
+        if (kind == 'task.started' and data.get('action') == 'review'
+                and data.get('task_id') == owner['task_id']):
+            raise VerificationObserved()
+
+    orchestrator.reporter.event = observe
+    try:
+        try:
+            WorkflowCoordinator(orchestrator).resume_workflow(workflow_id)
+        except VerificationObserved:
+            pass
+        except VerificationFailed as failure:
+            return {'ok': False, 'run_id': original.run_id, 'workflow_id': workflow_id,
+                    'engine_runtime': runtime,
+                    'recovery_observation': {
+                        'ok': False, 'task_id': owner['task_id'], 'run_id': original.run_id,
+                        'workflow_id': workflow_id,
+                        'verification_completed': failure.event == 'task.verification.completed',
+                        'verification_preflight_failed': failure.event == 'task.verification.preflight_failed',
+                        'verification_receipt': failure.receipt,
+                        'error': 'Original task managed verification failed',
+                    }}
+    finally:
+        orchestrator.reporter.event = emit_event
+    state = load_run_state(target)
+    events = [json.loads(line) for line in event_path.read_bytes()[offset:].splitlines()] if event_path.exists() else []
+    kinds = ('implementation.entered', 'task.verification.entered', 'task.verification.completed', 'task.started')
+    selected = []
+    for kind in kinds:
+        matches = [event for event in events if event.get('type') == kind
+                   and (kind == 'implementation.entered' or event.get('data', {}).get('task_id') == owner['task_id'])
+                   and (kind != 'task.started' or event.get('data', {}).get('action') == 'review')]
+        if len(matches) != 1:
+            raise RuntimeError('original task did not produce one fresh ' + kind + ' event')
+        selected.append(matches[0])
+    if [events.index(event) for event in selected] != sorted(events.index(event) for event in selected):
+        raise RuntimeError('verification evidence precedes original workflow entry')
+    receipt = state.last_recovery_route.get('metadata_checkpoint_repair', {}).get('verification_receipt')
+    execution_reports = []
+    for command in (receipt or {}).get('commands', []):
+        for relative, checksum in command.get('artifacts', {}).items():
+            if not Path(relative).name.startswith('pytest-execution-'):
+                continue
+            path = target / relative
+            if (Path(relative).is_absolute() or '..' in Path(relative).parts or path.is_symlink()
+                    or not relative.startswith('.auto-agents/runs/')
+                    or not path.resolve().is_relative_to(target.resolve())
+                    or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != checksum):
+                raise RuntimeError('managed pytest execution report is missing or changed')
+            payload = json.loads(path.read_text())
+            if payload.get('version') != 2 or not isinstance(payload.get('passed'), list):
+                raise RuntimeError('managed pytest execution report is invalid')
+            execution_reports.append({'path': relative, 'sha256': checksum, 'passed': payload['passed'],
+                                      'job_id': command['job_id'], 'proof_ref': command['proof_ref']})
+    plan = load_task_plan(target)
+    current_tasks = {task.task_id: task for task in state.tasks}
+    preserved = (
+        run_input_hashes(target, original) == frozen_inputs
+        and run_plan_contract(plan) == run_plan_contract(original_plan)
+        and state.agent_attempts == original.agent_attempts
+        and state.localized_blockers == original.localized_blockers
+        and state.run_id == original.run_id and state.resume_context.get('workflow_id') == workflow_id
+        and [task.task_id for task in state.tasks] == [task.task_id for task in original.tasks]
+        and not state.active_blocker and state.current_stage == 'implement'
+        and all(current_tasks[task.task_id].verify_history[:len(task.verify_history)] == task.verify_history
+                and current_tasks[task.task_id].review_history == task.review_history for task in original.tasks)
+        and all(state.task_failure_checkpoints.get(key) == value for key, value in original.task_failure_checkpoints.items()
+                if key != owner['task_id'])
+        and state.last_recovery_route['metadata_checkpoint_repair'].get('superseded_checkpoint')
+                == original.task_failure_checkpoints.get(owner['task_id'])
+        and current_tasks[owner['task_id']].status == 'in_progress' and not current_tasks[owner['task_id']].commit_sha
+    )
+    observed = {
+        'ok': True, 'run_id': state.run_id, 'workflow_id': workflow_id,
+        'status': state.status, 'current_stage': state.current_stage, 'engine_runtime': runtime,
+        'recovery_observation': {
+            'ok': True, 'boundary_kind': 'managed_verification', 'run_id': state.run_id,
+            'workflow_id': workflow_id, 'task_id': owner['task_id'], 'retained_constraints': preserved,
+            'implementation_entered': True, 'implementation_entry': selected[0],
+            'verification_completed': True, 'verification_entry': selected[1], 'verification_event': selected[2],
+            'review_entered': True, 'review_entry': selected[3],
+            'verification_receipt': receipt, 'event_order': [event['event_id'] for event in selected],
+            'execution_reports': execution_reports,
+            'entry_event_ref': str(event_path.relative_to(target)),
+            'spec_sha256': frozen_inputs['spec_sha256'],
+            'requirements_trace_sha256': frozen_inputs['requirements_trace_sha256'],
+        },
+    }
+    if not metadata_continuation_complete(observed, original_dict):
+        raise RecoveryProofIncomplete('original task lacks complete fresh verification and review-entry proof')
+    return observed
+
+
 def main():
     home = Path(os.environ['HOME'])
     home.mkdir(parents=True, exist_ok=True)
@@ -372,6 +643,10 @@ def main():
         except FileNotFoundError as error:
             raise ReplayEnvironmentUnavailable('retained continuation input is absent: ' + str(error)) from error
         orchestrator = Orchestrator(target)
+        if before.get('category') == METADATA_CHECKPOINT_CATEGORY:
+            # Only execution scratch is relocated. The retained configuration,
+            # commands, selectors and isolation checks remain authoritative.
+            orchestrator.config.gates.isolation.worktree_root = '/tmp/repair-gate-worktrees'
         def forbidden(*args, **kwargs):
             raise RuntimeError('offline boundary verification must not invoke providers')
         orchestrator._call_with_failover = forbidden
@@ -406,6 +681,8 @@ def main():
             observed.update(observe_run_continuation(
                 orchestrator, original, original_plan, request, runtime, frozen_inputs, submission=submission
             ))
+            if observed.get('ok') and before.get('category') == METADATA_CHECKPOINT_CATEGORY:
+                publish_metadata_execution_reports(target, Path('/result'), observed)
         emit(observed)
         return
     # Explicit engine-only repairs have no project session to resume. Their
@@ -420,6 +697,9 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as error:
+        import traceback
         emit({'ok': False, 'error': str(error), 'error_type': type(error).__name__,
+              'traceback': traceback.format_exc(),
+              'proof_incomplete': isinstance(error, RecoveryProofIncomplete),
               'infrastructure': isinstance(error, ReplayEnvironmentUnavailable)})
         raise SystemExit(1)

@@ -17,6 +17,7 @@ def recovery_evidence(controller, identity):
         cases.append({
             'ok': case.get('ok'), 'snapshot': case.get('snapshot'),
             'target_digest': case.get('target'), 'runtime': case.get('runtime'),
+            'proof_directory': case.get('proof_directory'),
             'route_consumed': observed.get('route_consumed'),
             'error': observed.get('error'),
             'run_id': observed.get('run_id'),
@@ -33,6 +34,10 @@ def recovery_evidence(controller, identity):
                 'continuation_status', 'prerequisites', 'provider_admission', 'entry_event_ref', 'spec_sha256',
                 'accepted_plan_sha256', 'requirements_trace_sha256', 'accepted_task_ids',
                 'oracle_proof_count', 'verification_step_count', 'submission_receipt',
+                'task_id', 'verification_completed', 'verification_entry', 'verification_event',
+                'review_entered', 'review_entry',
+                'verification_receipt', 'event_order',
+                'execution_reports',
                 'task_scope', 'ok')},
         })
     return {'artifact': reference, 'ok': report.get('ok'), 'snapshot': identity,

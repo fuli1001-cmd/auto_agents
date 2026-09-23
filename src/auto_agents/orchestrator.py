@@ -8045,11 +8045,15 @@ class Orchestrator:
                     context=context,
                     source_ref=source_ref,
                 )
-            return self._run_gate_commands_for_commands(
+            result = self._run_gate_commands_for_commands(
                 commands,
                 collect_all=collect_all,
                 context=context,
             )
+            capture = getattr(self, "_metadata_verification_capture", None)
+            if capture is not None and task is not None and capture["task_id"] == task.task_id:
+                capture["commands"].extend(result[0].commands)
+            return result
         finally:
             self._active_task_gate_metadata_task = previous
 
@@ -16216,7 +16220,123 @@ class Orchestrator:
         state.last_error = ""
         return True
 
+    def _resume_metadata_checkpoint_repair(self, state: RunState) -> bool:
+        """Return a proven ready candidate to verification after engine repair.
+
+        A failed Git add may have staged the candidate before rejecting an
+        ignored exclusion. That index-only change does not invalidate the
+        retained content, but an older unavailable checkpoint must not override
+        the newer implementation-ready attempt.
+        """
+        blocker = state.active_blocker or {}
+        if (
+            state.status != "pending"
+            or state.current_stage != "implement"
+            or blocker.get("owner") != "auto_agents"
+            or blocker.get("category") != "metadata_schema_false_positive_and_checkpoint_failure"
+            or blocker.get("status") != "retrying"
+            or not str(blocker.get("self_repair_commit", "")).strip()
+            or not state.resume_context.get("workflow_id")
+            or state.pending_approval
+            or state.active_input_request_id
+            or state.pending_input_requests
+            or self._active_checkpoint_ownership_records(state)
+        ):
+            return False
+        ready = self._implementation_ready_markers(state)
+        owners = [task for task in state.tasks
+                  if task.status == "in_progress" and ready.get(task.task_id) is True]
+        if len(owners) != 1:
+            return False
+        task = owners[0]
+        if blocker.get("task_id") not in (None, "", task.task_id):
+            return False
+        record = self._retained_worktree_ownership_records(state).get(task.task_id, {})
+        exclusions = self._parallel_commit_exclude_prefixes()
+        paths = sorted(path for path in self._changed_paths_excluding_agent_instructions()
+                       if not repository_path_is_excluded(path, exclusions))
+        current_head = head_ref(self.project_root)
+        if (
+            not paths
+            or record.get("owner_task_id") != task.task_id
+            or set(record.get("changed_paths", [])) != set(paths)
+            or not current_head
+            or self._task_attempt_base_ref(state, task) != current_head
+        ):
+            return False
+        failure_snapshot = blocker.get("checkpoint", {})
+        exact_failure_candidate = bool(
+            isinstance(failure_snapshot, dict)
+            and failure_snapshot.get("head") == current_head
+            and failure_snapshot.get("stage") == "implement"
+            and failure_snapshot.get("worktree") == worktree_fingerprint(self.project_root)
+        )
+        path_fingerprints = self._retained_worktree_path_fingerprints(paths)
+        retained_content_matches = bool(
+            record.get("head_ref") == current_head
+            and record.get("path_fingerprints") == path_fingerprints
+        )
+        if not (exact_failure_candidate or retained_content_matches):
+            return False
+        if self._persistence_contract_issue(task):
+            return False
+        checkpoint = state.task_failure_checkpoints.get(task.task_id)
+        if checkpoint is not None and (
+            not isinstance(checkpoint, dict)
+            or checkpoint.get("task_id") != task.task_id
+            or checkpoint.get("status") != "unavailable"
+            or checkpoint.get("ref")
+            or checkpoint.get("has_candidate_changes")
+            or type(checkpoint.get("verify_retry_epoch")) is not int
+            or checkpoint["verify_retry_epoch"] >= task.verify_retry_epoch
+        ):
+            return False
+
+        receipt = {
+            "outcome": "verification_ready",
+            "run_id": state.run_id,
+            "workflow_id": state.resume_context["workflow_id"],
+            "task_id": task.task_id,
+            "verify_retry_epoch": task.verify_retry_epoch,
+            "repaired_blocker": copy.deepcopy(blocker),
+            "superseded_checkpoint": copy.deepcopy(checkpoint),
+            "previous_review_cache": copy.deepcopy(state.task_review_cache.get(task.task_id)),
+            "candidate_head": current_head,
+            "candidate_paths": paths,
+            "candidate_path_fingerprints": path_fingerprints,
+            "persistence_guard": "passed",
+            "prepared_at": utc_now_iso(),
+        }
+        # Preserve historical evidence in the handoff before removing only the
+        # obsolete failure projection. No task counters or proof history reset.
+        state.last_recovery_route = {
+            **state.last_recovery_route,
+            "metadata_checkpoint_repair": receipt,
+        }
+        state.task_failure_checkpoints.pop(task.task_id, None)
+        state.task_review_cache.pop(task.task_id, None)
+        state.active_blocker = {}
+        state.last_error = ""
+        save_run_state(self.project_root, state)
+        return True
+
     def _resume_blocked_run(self, state: RunState) -> bool:
+        if (state.active_blocker or {}).get("category") == "metadata_schema_false_positive_and_checkpoint_failure":
+            if self._resume_metadata_checkpoint_repair(state):
+                return True
+            blocker = state.active_blocker
+            if (state.status == "pending" and blocker.get("owner") == "auto_agents"
+                    and blocker.get("status") == "retrying"):
+                # mark_self_repair_applied opens a pending run. An unproven
+                # handoff must not fall through into implementation from there.
+                blocker["status"] = "blocked"
+                blocker["resume_error"] = (
+                    "retained implementation ownership, checkpoint age or "
+                    "persistence guard could not be revalidated"
+                )
+                state.status = "blocked"
+                state.last_error = str(blocker.get("reason", blocker["resume_error"]))
+            return False
         if self._legacy_applied_checkpoint_records(state):
             canonical_tasks = self._load_implementation_tasks(state)
             return self._prepare_legacy_checkpoint_owner_continuation(
@@ -21084,7 +21204,11 @@ class Orchestrator:
         environment_overrides: Optional[Dict[str, str]] = None,
         execution_environment: Optional[Dict[str, str]] = None,
     ):
-        use_result_cache = bool(use_result_cache and not self._force_full_verify)
+        record_pytest_execution = bool(getattr(self, "_metadata_verification_capture", None) and not source_ref)
+        use_result_cache = bool(
+            use_result_cache and not self._force_full_verify
+            and not record_pytest_execution
+        )
         result_context_fingerprint = self._gate_result_context_fingerprint()
         if contract_fingerprint:
             result_context_fingerprint = hashlib.sha256(
@@ -21120,6 +21244,8 @@ class Orchestrator:
                 environment_overrides=operator_environment,
                 proof_audit_sample_rate=proof_audit_sample_rate,
                 input_reuse_mode=acceleration.verification_input_mode,
+                use_result_cache=use_result_cache,
+                record_pytest_execution=record_pytest_execution,
             )
         return LocalGatePlanExecutor(
             self.project_root,
@@ -21131,6 +21257,7 @@ class Orchestrator:
             result_context_fingerprint=result_context_fingerprint,
             source_ref=source_ref,
             use_result_cache=use_result_cache,
+            record_pytest_execution=record_pytest_execution,
             cache_path=self._shared_gate_cache_path,
             preempt_requested=self._gate_preempt_probe,
             environment_overrides=operator_environment,
@@ -21561,9 +21688,10 @@ class Orchestrator:
             and repaired.get("prepared_self_repair_commit") == repaired.get("self_repair_commit")
             and repaired.get("category") == "diagnostic_evidence_reference_binding_gap"
         )
+        metadata_ready = self._metadata_checkpoint_verification_handoff(state) is not None
         if (state.last_recovery_route.get("outcome") not in {
                 "iteration_plan_scope_reconciled", "provider_reference_review_repaired"}
-                and not diagnostic_ready
+                and not diagnostic_ready and not metadata_ready
                 or state.status in {"blocked", "paused", "waiting_user"} or state.active_blocker):
             return
         spec_value = str(state.resume_context.get("spec_file", "")).strip()
@@ -32793,7 +32921,81 @@ class Orchestrator:
             ignored.extend(["README.md", ".gitignore"])
         return (".auto-agents/", *ignored)
 
+    @staticmethod
+    def _metadata_checkpoint_verification_handoff(
+        state: Optional[RunState], task: Optional[TaskSpec] = None,
+    ) -> Optional[Dict[str, object]]:
+        if state is None or state.active_blocker:
+            return None
+        receipt = state.last_recovery_route.get("metadata_checkpoint_repair", {})
+        repaired = receipt.get("repaired_blocker", {})
+        if (
+            receipt.get("outcome") != "verification_ready"
+            or receipt.get("run_id") != state.run_id
+            or receipt.get("workflow_id") != state.resume_context.get("workflow_id")
+            or repaired.get("category") != "metadata_schema_false_positive_and_checkpoint_failure"
+            or not repaired.get("self_repair_commit")
+            or (task is not None and (receipt.get("task_id") != task.task_id
+                or receipt.get("verify_retry_epoch") != task.verify_retry_epoch))
+        ):
+            return None
+        return receipt
+
     def _run_task_verify(
+        self,
+        task: Optional[TaskSpec] = None,
+        *,
+        state: Optional[RunState] = None,
+    ) -> Dict[str, object]:
+        handoff = self._metadata_checkpoint_verification_handoff(state, task)
+        if task is None or handoff is None or handoff.get("verification_receipt"):
+            return self._run_task_verify_current(task, state=state)
+        assert state is not None
+        verification_id = uuid.uuid4().hex
+        entry = {
+            "verification_id": verification_id,
+            "run_id": state.run_id,
+            "workflow_id": state.resume_context["workflow_id"],
+            "task_id": task.task_id,
+            "repair_commit": handoff["repaired_blocker"]["self_repair_commit"],
+            "candidate_fingerprint": self._worktree_fingerprint_excluding_agent_instructions(),
+            "verify_retry_epoch": task.verify_retry_epoch,
+            "verification_refs": list(task.verification_refs),
+            "engine_runtime": self._auto_agents_runtime_identity(),
+            "started_at": utc_now_iso(),
+        }
+        handoff["verification_entry"] = entry
+        save_run_state(self.project_root, state)
+        self.reporter.event("task.verification.entered", entry)
+        previous = getattr(self, "_metadata_verification_capture", None)
+        capture = {"task_id": task.task_id, "commands": []}
+        self._metadata_verification_capture = capture
+        try:
+            result = self._run_task_verify_current(task, state=state)
+        finally:
+            self._metadata_verification_capture = previous
+        fields = (
+            "command", "ok", "returncode", "job_id", "worker_id", "backend",
+            "cached", "proof_ref", "executed_tests", "artifacts", "duration_seconds",
+            "termination_reason", "cleanup_incomplete", "infrastructure_error",
+        )
+        receipt = {
+            **entry, "completed_at": utc_now_iso(), "ok": bool(result.get("ok")),
+            "reason": self._redacted_verification_command_evidence(str(result.get("reason", ""))),
+            "diagnostic": (self._redacted_verification_command_evidence(str(result.get("raw_output", ""))[-12000:])
+                           if not result.get("ok") else ""),
+            "commands": [{key: copy.deepcopy(getattr(command, key)) for key in fields}
+                         for command in capture["commands"]],
+            "candidate_unchanged": entry["candidate_fingerprint"] == self._worktree_fingerprint_excluding_agent_instructions(),
+        }
+        # This is an observation of actual managed results, never a task-success
+        # decision. Normal verification, review and publication still follow.
+        handoff["verification_receipt"] = receipt
+        save_run_state(self.project_root, state)
+        self.reporter.event("task.verification.completed", receipt)
+        return result
+
+    def _run_task_verify_current(
         self,
         task: Optional[TaskSpec] = None,
         *,
@@ -41811,6 +42013,13 @@ class Orchestrator:
             quick_failure = self._quick_verify_failure_details(task_commands if task_commands else None)
             if quick_failure:
                 last_reason, retryable = quick_failure
+                if self._metadata_checkpoint_verification_handoff(state, task) is not None:
+                    self.reporter.event('task.verification.preflight_failed', {
+                        'ok': False, 'run_id': state.run_id,
+                        'workflow_id': state.resume_context.get('workflow_id'),
+                        'task_id': task.task_id, 'reason': last_reason,
+                        'engine_runtime': self._auto_agents_runtime_identity(),
+                    })
                 failure_ids = self._normalize_verify_failure_ids([], last_reason)
                 quick_provenance = self._task_verification_failure_provenance(
                     task,

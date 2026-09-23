@@ -460,7 +460,11 @@ class DockerVerifier:
                 atomic_json(output / 'request.json', {**payload, 'commit': git(source, 'rev-parse', 'HEAD'),
                                                      'replay_environments': [item.describe() for item in environments],
                                                      '_replay_project': str(project_path)})
-                profile = 'session' if payload.get('invocation', {}).get('session_id') else 'standard'
+                # This run recovery executes managed verification, which uses
+                # the same nested user/mount namespaces as session recovery.
+                managed_run = (retained_run.get('active_blocker', {}).get('category')
+                               == 'metadata_schema_false_positive_and_checkpoint_failure')
+                profile = 'session' if payload.get('invocation', {}).get('session_id') or managed_run else 'standard'
                 command = ['docker', 'run', '--init', '--name', name, *labels(self.root, identity, kind='verification'), '--network', 'none', '--read-only',
                     '--user', f'{os.getuid()}:{os.getgid()}', *REPLAY_ISOLATION[profile],
                     '--memory', '1g', '--pids-limit', '512',
@@ -487,6 +491,7 @@ class DockerVerifier:
                     observed = json.loads((output / 'boundary.json').read_text())
                     if not isinstance(observed, dict) or not isinstance(observed.get('ok'), bool):
                         raise ValueError('invalid boundary report')
+                    proof_incomplete = observed.get('proof_incomplete') is True
                     if (observed['ok'] and retained_run.get('active_blocker', {}).get('category')
                             == 'diagnostic_evidence_reference_binding_gap'):
                         from .boundary_driver import diagnostic_continuation_complete
@@ -494,6 +499,14 @@ class DockerVerifier:
                             proof_incomplete = True
                             observed = {**observed, 'ok': False,
                                 'error': 'Trusted recovery harness omitted required submission or implementation-entry proof.'}
+                    if (observed['ok'] and retained_run.get('active_blocker', {}).get('category')
+                            == 'metadata_schema_false_positive_and_checkpoint_failure'):
+                        from .boundary_driver import metadata_continuation_complete, metadata_execution_reports_published
+                        if (not metadata_continuation_complete(observed, retained_run)
+                                or not metadata_execution_reports_published(observed, output)):
+                            proof_incomplete = True
+                            observed = {**observed, 'ok': False,
+                                'error': 'Trusted recovery harness omitted bound task entry or fresh managed-verification proof.'}
                 except (OSError, ValueError):
                     observed = {'ok': False, 'infrastructure': True,
                                 'error': '隔离恢复未产生有效验证结果，已停止自动代码修复。',
@@ -504,6 +517,8 @@ class DockerVerifier:
                 result = {'ok': code == 0 and observed.get('ok') is True and before == after,
                           'snapshot': snapshot_id, 'target': before, 'runtime': self.runtime,
                           'observed': observed, 'output': str(base / 'output.log'), 'returncode': code}
+                if retained_run.get('active_blocker', {}).get('category') == 'metadata_schema_false_positive_and_checkpoint_failure':
+                    result['proof_directory'] = str(output)
                 result['isolation_profile'] = profile
                 result['environment_inputs'] = [item.describe() for item in environments]
                 if proof_incomplete:

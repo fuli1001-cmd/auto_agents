@@ -29,6 +29,7 @@ from .gate_result_cache import GateResultCache
 from .gate_timing import GateTimingStore
 from .git_ops import (
     normalize_repository_exclusions,
+    repository_add_exclusion_pathspecs,
     repository_path_is_excluded,
 )
 from .process_supervision import run_supervised_shell_command
@@ -166,33 +167,9 @@ class GateSnapshotManager:
         exclusions so dependency links and runtime surfaces are never staged.
         """
 
-        pathspecs: list[str] = []
-        for path in self.excluded_paths:
-            ignored = subprocess.run(
-                [
-                    "git",
-                    "check-ignore",
-                    "--no-index",
-                    "--quiet",
-                    "--",
-                    path,
-                ],
-                cwd=str(self.project_root),
-                env=dict(env),
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-            )
-            if ignored.returncode == 0:
-                continue
-            if ignored.returncode != 1:
-                raise RuntimeError(
-                    ignored.stderr.strip()
-                    or ignored.stdout.strip()
-                    or f"git check-ignore failed for excluded path: {path}"
-                )
-            pathspecs.append(f":(top,exclude,literal){path}")
-        return tuple(pathspecs)
+        return repository_add_exclusion_pathspecs(
+            self.project_root, self.excluded_paths, env=env,
+        )
 
     def create(self, *, paths: Optional[Sequence[str]] = None) -> GateSourceSnapshot:
         git_dir = _run_git(
@@ -1076,6 +1053,7 @@ class LocalGatePlanExecutor:
         result_context_fingerprint: str = "",
         source_ref: str = "",
         use_result_cache: bool = True,
+        record_pytest_execution: bool = False,
         cache_path: Optional[Path] = None,
         preempt_requested: Optional[Callable[[], bool]] = None,
         environment_overrides: Optional[Mapping[str, str]] = None,
@@ -1114,6 +1092,7 @@ class LocalGatePlanExecutor:
         self.worker_id = worker_id
         self.source_ref = str(source_ref).strip()
         self.use_result_cache = bool(use_result_cache)
+        self.record_pytest_execution = bool(record_pytest_execution)
         self.preempt_requested = preempt_requested
         self.environment_overrides = dict(environment_overrides or {})
         from types import MappingProxyType
@@ -1562,6 +1541,13 @@ class LocalGatePlanExecutor:
             prepare_retained = getattr(self, 'prepare_retained_command', None)
             if prepare_retained is not None:
                 compiled, retained_sources = prepare_retained(compiled, sandbox, runtime_root)
+            pytest_reports = []
+            if self.record_pytest_execution:
+                from .verification_pytest import prepare_execution_receipts
+                compiled, pytest_reports = prepare_execution_receipts(
+                    compiled, sandbox, runtime_root, merged_environment,
+                )
+                retained_sources = [*retained_sources, Path(__file__).resolve().parent]
             traced_command = isolated_command(compiled)
             from .verification_input_trace import TraceCustody, owner_identity
             trace_requested = result_cache_scope in {"observed_inputs", "auto"}
@@ -1719,6 +1705,28 @@ class LocalGatePlanExecutor:
                     "not_checked",
                 ),
             )
+            if pytest_reports:
+                try:
+                    for index, report in enumerate(pytest_reports):
+                        payload = json.loads(report.read_text())
+                        passed = payload['passed']
+                        if not isinstance(passed, list) or not all(isinstance(node, str) for node in passed):
+                            raise ValueError('invalid pytest execution nodes')
+                        result.executed_tests.extend(passed)
+                        result.test_timings.extend(payload.get('slowest', []))
+                        relative = f'.auto-agents/runs/{self.plan_id}/gate-artifacts/{job_id}/pytest-execution-{index}.json'
+                        destination = self.project_root / relative
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = destination.with_suffix('.tmp')
+                        shutil.copy2(report, temporary)
+                        os.replace(temporary, destination)
+                        with destination.open('rb') as durable:
+                            os.fsync(durable.fileno())
+                        result.artifacts[relative] = _sha256(destination)
+                except (OSError, ValueError, KeyError) as error:
+                    result.ok = False
+                    result.returncode = result.returncode or 1
+                    result.stderr += f'\npytest execution receipt unavailable: {error}'
             from .gates import reject_empty_vitest_selection
             reject_empty_vitest_selection(result, sandbox)
             if trace_custody is not None and trace_requested and result.ok:
