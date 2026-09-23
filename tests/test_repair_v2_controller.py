@@ -601,3 +601,23 @@ def test_acceptance_runs_previous_counterexamples_first_without_omitting_tests(j
     assert set(ordered) == set(units) and len(ordered) == len(units)
     runner.state['failures'] = []
     assert runner.prioritize_failures(units) == units
+
+
+def test_committed_copy_fix_rechecks_execution_failure_without_new_implementation(job):
+    from auto_agents.repair_v2.source_refresh import prepare
+    runner = controller(job)
+    assert runner.run()['status'] == 'ready'
+    before_calls = list(runner.driver.calls)
+    attempts = runner.state['attempts']
+    runner.checkpoint(status='blocked', phase='validate', failures=[],
+                      blocker={'code': 'execution_failed', 'message': 'copy failed on transient Git metadata'})
+    repository = runner.workspace.source
+    (repository / 'copy_fix.py').write_text('exclude_transient_git_locks = True\n')
+    git(repository, 'add', 'copy_fix.py')
+    git(repository, 'commit', '-qm', 'correct source copy')
+    runner.resume_token = 'explicit-source-upgrade'
+    assert prepare(runner, repository, git(repository, 'rev-parse', 'HEAD'))
+    assert runner.run()['status'] == 'ready'
+    assert runner.state['attempts'] == attempts
+    assert runner.driver.calls[len(before_calls):] == [('review', 'reviewer')]
+    assert (Path(runner.state['snapshot_path']) / 'copy_fix.py').exists()

@@ -12,13 +12,20 @@ from ..storage_admission import RESERVE_BYTES
 _copy_lock = threading.Lock()
 
 
+def _git_lock(root, path):
+    """Git's transient metadata locks are never part of a source snapshot."""
+    path = Path(path)
+    return path.name.endswith('.lock') and path.is_relative_to(Path(root) / '.git')
+
+
 def tree_bytes(root):
     """Estimate copied bytes without traversing links or reading file contents."""
     total = 0
-    for parent, _, files in os.walk(root, followlinks=False):
+    for parent, directories, files in os.walk(root, followlinks=False):
+        directories[:] = [name for name in directories if not _git_lock(root, Path(parent) / name)]
         for name in files:
             path = Path(parent) / name
-            if not path.is_symlink():
+            if not _git_lock(root, path) and not path.is_symlink():
                 total += path.stat().st_size
     return total
 
@@ -39,7 +46,13 @@ def disposable_source(source, destination, *, cleanup=lambda: True):
         # not all spend the same observed free bytes at once.
         with _copy_lock:
             require_space(destination, tree_bytes(source))
-            shutil.copytree(source, destination, symlinks=True)
+            # Concurrent read-only Git commands may refresh the index. Copying
+            # their lock can race its removal or strand a stale lock in a shard.
+            # Filter only this repository's metadata; source lockfiles and
+            # missing ordinary inputs still follow the normal copy/error path.
+            shutil.copytree(source, destination, symlinks=True,
+                            ignore=lambda parent, names: [name for name in names
+                                if _git_lock(source, Path(parent) / name)])
         yield destination
     finally:
         if cleanup() and destination.is_dir() and not destination.is_symlink():

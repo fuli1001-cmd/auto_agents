@@ -181,3 +181,121 @@ def test_initial_merge_conflict_remains_in_one_candidate_for_implementation(tmp_
     assert not git(candidate, 'diff', '--name-only', '--diff-filter=U')
     for parent in (git(retained, 'rev-parse', 'HEAD'), git(source, 'rev-parse', 'HEAD')):
         git(candidate, 'merge-base', '--is-ancestor', parent, 'HEAD')
+
+
+@pytest.mark.parametrize('disappears', [False, True])
+def test_disposable_git_copy_ignores_transient_locks_and_keeps_repository_semantics(tmp_path, monkeypatch, disappears):
+    import shutil
+    source = tmp_path / 'snapshot'
+    source.mkdir()
+    git(source, 'init', '-q')
+    (source / 'source.py').write_text('original\n')
+    (source / 'Cargo.lock').write_text('tracked dependency lock\n')
+    nested = source / 'fixtures/.git'
+    nested.mkdir(parents=True)
+    (nested / 'example.lock').write_text('fixture content\n')
+    git(source, 'add', '.')
+    git(source, 'commit', '-qm', 'frozen source')
+    commit = git(source, 'rev-parse', 'HEAD')
+    expected = source_identity(source)
+    locks = [source / '.git/index.lock', source / '.git/HEAD.lock', source / '.git/refs/heads/next.lock']
+    for path in locks:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('live Git operation\n')
+    copyfile = shutil.copyfile
+    def race(src, dst, **kwargs):
+        if disappears and Path(src) == locks[0]:
+            locks[0].unlink()  # Git finishes between enumeration and copying.
+        return copyfile(src, dst, **kwargs)
+    monkeypatch.setattr(shutil, 'copyfile', race)
+    destination = tmp_path / 'execution/source'
+    with disposable_source(source, destination):
+        assert source_identity(destination) == expected
+        assert git(destination, 'rev-parse', 'HEAD') == commit
+        assert git(destination, 'show', 'HEAD:Cargo.lock') == 'tracked dependency lock'
+        assert (destination / 'fixtures/.git/example.lock').read_text() == 'fixture content\n'
+        for path in locks:
+            assert not (destination / path.relative_to(source)).exists()
+        # A copied stale lock must not block Git operations in the private copy.
+        (destination / 'source.py').write_text('private test changes\n')
+        git(destination, 'add', 'source.py')
+        git(destination, 'commit', '-qm', 'test-local commit')
+    assert source_identity(source) == expected and git(source, 'rev-parse', 'HEAD') == commit
+    assert not destination.exists()
+
+
+def test_size_admission_does_not_stat_a_disappearing_git_lock(tmp_path, monkeypatch):
+    from auto_agents.repair_v2.storage import tree_bytes
+    source = tmp_path / 'snapshot'
+    (source / '.git').mkdir(parents=True)
+    (source / 'code.py').write_bytes(b'code')
+    (source / '.git/index').write_bytes(b'index')
+    lock = source / '.git/index.lock'
+    lock.write_bytes(b'transient')
+    stat = Path.stat
+    def race(path, *args, **kwargs):
+        if path == lock:
+            lock.unlink(missing_ok=True)
+        return stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'stat', race)
+    assert tree_bytes(source) == len(b'codeindex')
+
+
+def test_disposable_copy_does_not_hide_a_missing_source_lockfile(tmp_path, monkeypatch):
+    import shutil
+    source = tmp_path / 'snapshot'
+    source.mkdir()
+    lockfile = source / 'Cargo.lock'
+    lockfile.write_text('required input')
+    copyfile = shutil.copyfile
+    def race(src, dst, **kwargs):
+        if Path(src) == lockfile:
+            lockfile.unlink()
+        return copyfile(src, dst, **kwargs)
+    monkeypatch.setattr(shutil, 'copyfile', race)
+    destination = tmp_path / 'execution/source'
+    with pytest.raises(shutil.Error):
+        with disposable_source(source, destination):
+            pytest.fail('an incomplete source copy was admitted')
+    assert not destination.exists()
+
+
+def test_parallel_copies_survive_continuous_git_lock_churn(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    source = tmp_path / 'snapshot'
+    source.mkdir()
+    git(source, 'init', '-q')
+    (source / 'code.py').write_text('immutable source\n')
+    git(source, 'add', '.')
+    git(source, 'commit', '-qm', 'source')
+    expected = source_identity(source)
+    commit = git(source, 'rev-parse', 'HEAD')
+    stopped, started = threading.Event(), threading.Event()
+    lock = source / '.git/index.lock'
+    def refresh():
+        try:
+            while not stopped.is_set():
+                lock.write_text('temporary index refresh')
+                started.set()
+                lock.unlink(missing_ok=True)
+        finally:
+            lock.unlink(missing_ok=True)
+    worker = threading.Thread(target=refresh)
+    worker.start()
+    try:
+        assert started.wait(2)
+        def copy(number):
+            target = tmp_path / str(number) / 'source'
+            with disposable_source(source, target):
+                assert not (target / '.git/index.lock').exists()
+                assert source_identity(target) == expected
+                assert git(target, 'rev-parse', 'HEAD') == commit
+            assert not target.exists()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(copy, range(16)))
+    finally:
+        stopped.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert source_identity(source) == expected
