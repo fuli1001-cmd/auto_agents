@@ -34,7 +34,7 @@ def prepare_execution_receipts(command, checkout, scratch, environment):
             else:
                 launcher.append(shlex.quote(token))
         launcher.extend(shlex.quote(str(value)) for value in
-                        (Path(__file__).resolve(), checkout / invocation.cwd, report))
+                        (Path(__file__).resolve(), '--module-invocation', checkout / invocation.cwd, report))
         replacements.append((start, end, ' '.join(launcher) + ' '))
         reports.append(report)
     for start, end, replacement in reversed(replacements):
@@ -110,8 +110,20 @@ class Recorder:
 
 
 def main():
-    root, output, *arguments = sys.argv[1:]
-    sys.path.insert(0, str(Path(root) / "src"))
+    arguments = sys.argv[1:]
+    module_invocation = arguments[:1] == ['--module-invocation']
+    if module_invocation:
+        arguments = arguments[1:]
+    root, output, *arguments = arguments
+    if module_invocation:
+        # Trusted recorder dependencies were imported above from this script's
+        # directory. Restore the original `python -m pytest` import path before
+        # importing pytest or any project code; do not inject an undeclared src/.
+        if not getattr(sys.flags, 'safe_path', False):
+            sys.path[0] = str(Path.cwd())
+    else:
+        # Preserve the existing explicit launcher contract for its other users.
+        sys.path.insert(0, str(Path(root) / "src"))
     # Verification belongs to this repository, never a parent directory's
     # pytest/conftest configuration in a transient checkout hierarchy.
     arguments.extend(["--rootdir=" + root, "--confcutdir=" + root])

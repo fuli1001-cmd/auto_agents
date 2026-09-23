@@ -1,6 +1,9 @@
 """Fresh verification evidence, distinct from readiness and synthetic routing."""
 import copy
 import json
+import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -27,8 +30,9 @@ def test_saved_workflow_produces_real_managed_verification_receipt(tmp_path):
     _write(root, 'spec.md', '# Synthetic independent iteration\nVerify the retained candidate.\n')
     _write(root, 'app.py', 'VALUE = 1\n')
     _write(root, 'tests/test_candidate.py',
+           "import app\n"
            "from pathlib import Path\n"
-           "def test_contract():\n    assert Path('app.py').read_text() == 'VALUE = 2\\n'\n"
+           "def test_contract():\n    assert Path('app.py').read_text() == 'VALUE = 2\\n'\n    assert app.VALUE == 2\n"
            "def test_second_contract():\n    assert Path('spec.md').is_file()\n")
     _write(root, '.auto-agents/state/sessions/stopped/session_state.json', '{"status":"stopped"}\n')
     # Use the image interpreter through the project's declared environment
@@ -212,3 +216,58 @@ def test_metadata_verifier_rejects_incomplete_recovery_receipts(defect):
     elif defect == 'no_report': proof['execution_reports'] = []
     elif defect == 'wrong_report_hash': proof['execution_reports'][0]['sha256'] = 'b' * 64
     assert not metadata_continuation_complete(observed, original)
+
+
+@pytest.mark.parametrize('layout', ['module', 'package', 'root_precedence', 'src_not_on_path'])
+@pytest.mark.parametrize('import_mode', ['prepend', 'importlib'])
+def test_instrumented_pytest_preserves_module_import_path(tmp_path, layout, import_mode):
+    from auto_agents.verification_pytest import prepare_execution_receipts
+
+    root = tmp_path / 'project'
+    root.mkdir()
+    if layout == 'package':
+        _write(root, 'app/__init__.py', "VALUE = 'root'\n")
+    elif layout != 'src_not_on_path':
+        _write(root, 'app.py', "VALUE = 'root'\n")
+    if layout in {'root_precedence', 'src_not_on_path'}:
+        _write(root, 'src/app.py', "VALUE = 'src'\n")
+    if layout == 'src_not_on_path':
+        test = ("import pytest\n"
+                "def test_import_contract():\n"
+                "    with pytest.raises(ModuleNotFoundError):\n"
+                "        import app\n")
+    else:
+        test = "import app\ndef test_import_contract():\n    assert app.VALUE == 'root'\n"
+    _write(root, 'tests/test_app.py', test)
+    environment = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONPATH': '', 'PYTEST_ADDOPTS': ''}
+    command = shlex.join([sys.executable, '-m', 'pytest', '-p', 'no:cacheprovider', '-q',
+                          '--import-mode=' + import_mode, '--rootdir=' + str(root),
+                          '--confcutdir=' + str(root), '-c', '/dev/null', 'tests/test_app.py'])
+    baseline = subprocess.run(command, cwd=root, env=environment, shell=True, capture_output=True, text=True)
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    scratch = tmp_path / 'receipts'
+    scratch.mkdir()
+    instrumented, reports = prepare_execution_receipts(command, root, scratch, environment)
+    observed = subprocess.run(instrumented, cwd=root, env=environment, shell=True, capture_output=True, text=True)
+    assert observed.returncode == 0, observed.stdout + observed.stderr
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text())
+    assert report['passed'] == ['tests/test_app.py::test_import_contract']
+    assert report['failures'] == []
+
+
+def test_retained_workflow_clearance_is_not_fresh_verification():
+    # The supplied controller counterexample, not a fabricated successful replay.
+    original = {
+        'run_id': '82288622684f',
+        'resume_context': {'workflow_id': 'wf-cea9506a7499',
+                           'implementation_ready_tasks': {'task-pp-07': True}},
+        'tasks': [{'task_id': 'task-pp-07', 'status': 'in_progress', 'verify_retry_epoch': 1,
+                   'verification_refs': [
+                       'tests/test_text_protocol_boundary_api.py::TextProtocolBoundaryTests::test_req_284_planning_progress_wire_is_positive_typed_and_deduplicated',
+                       'tests/test_text_protocol_boundary_api.py::TextProtocolBoundaryTests::test_req_284_planning_safety_body_precedes_http_without_unchanged_retry',
+                   ]}],
+    }
+    report = {'ok': True, 'run_id': '82288622684f', 'status': 'pending',
+              'same_blocker': False, 'remaining_blocked': []}
+    assert not metadata_continuation_complete(report, original)
