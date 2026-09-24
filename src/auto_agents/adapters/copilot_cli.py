@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 from dataclasses import replace
-from functools import lru_cache
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -23,18 +21,11 @@ from ..prompting.runtime import observed_model_metadata
 from ..supervision import ProgressDecoder
 
 
-# Default directory for Copilot CLI profile config dirs.
-# Each profile is a subdirectory containing settings that
-# ``copilot --config-dir`` understands.
-DEFAULT_PROFILES_ROOT = Path.home() / ".copilot" / "profiles"
-
-
-@lru_cache(maxsize=16)
-def _copilot_cli_supports_image_attachments(executable: str) -> bool:
+def _copilot_cli_supports_image_attachments(executable: str, env=None) -> bool:
     """Probe the configured CLI without starting an authenticated model turn."""
     try:
         from ..verification_sandbox import provider_probe_command
-        command, options = provider_probe_command([executable, "--help"])
+        command, options = provider_probe_command([executable, "--help"], env=env)
         result = subprocess.run(
             command,
             capture_output=True,
@@ -48,6 +39,11 @@ def _copilot_cli_supports_image_attachments(executable: str) -> bool:
         return False
     help_text = f"{result.stdout}\n{result.stderr}"
     return result.returncode == 0 and "--attachment" in help_text
+
+
+# Retain the cache management interface used by callers of the previous probe.
+# Environment-specific probes intentionally do not retain credential-bearing maps.
+_copilot_cli_supports_image_attachments.cache_clear = lambda: None
 
 
 class CopilotProgressDecoder(ProgressDecoder):
@@ -131,13 +127,14 @@ class CopilotCliAdapter(AgentAdapter):
         self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
-        return shutil.which(self.config.binary) is not None
+        return self.available_binary()
 
     def supports_image_attachments(self) -> bool:
-        executable = shutil.which(self.config.binary)
+        env = self.environment()
+        executable = shutil.which(self.config.binary, path=env.get("PATH"))
         if executable is None:
             return False
-        return _copilot_cli_supports_image_attachments(executable)
+        return _copilot_cli_supports_image_attachments(executable, env)
 
     def run(self, request: AgentRequest) -> AgentResult:
         request = self.prepare_request(request)
@@ -146,9 +143,7 @@ class CopilotCliAdapter(AgentAdapter):
         # Clear stale output so a reused output_path doesn't mask fresh results.
         write_text(request.output_path, "")
 
-        env = dict(os.environ)
-        env["AUTO_AGENTS_STAGE"] = request.stage
-        env["AUTO_AGENTS_EFFORT"] = request.effort
+        env = self.environment(request)
 
         # Copilot accepts --attachment only with a non-interactive -p prompt.
         # Preserve the configured stdin transport for ordinary text-only calls.
@@ -307,7 +302,8 @@ class CopilotCliAdapter(AgentAdapter):
         candidate = Path(profile).expanduser()
         if candidate.is_absolute():
             return candidate
-        base = Path(os.environ["COPILOT_HOME"]) / "profiles" if os.environ.get("COPILOT_HOME") else DEFAULT_PROFILES_ROOT
+        env = self.environment()
+        base = Path(env["COPILOT_HOME"]) / "profiles" if env.get("COPILOT_HOME") else Path(env.get("HOME", str(Path.home()))) / ".copilot" / "profiles"
         return base / profile
 
     def _has_tool_permission_flag(self) -> bool:

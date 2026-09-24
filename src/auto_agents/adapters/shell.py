@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -97,7 +95,7 @@ class ShellAdapter(AgentAdapter):
         self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
-        return shutil.which(self.config.binary) is not None
+        return self.available_binary()
 
     def run(self, request: AgentRequest) -> AgentResult:
         request = self.prepare_request(request)
@@ -116,9 +114,7 @@ class ShellAdapter(AgentAdapter):
                 returncode=2,
             )
         command = [self.config.binary] + self.config.extra_args
-        env = dict(os.environ)
-        env["AUTO_AGENTS_STAGE"] = request.stage
-        env["AUTO_AGENTS_EFFORT"] = request.effort
+        env = self.environment(request)
         env["AUTO_AGENTS_OUTPUT_PATH"] = str(request.output_path)
         progress_path = (
             request.progress_report_path.with_suffix(".progress.jsonl")

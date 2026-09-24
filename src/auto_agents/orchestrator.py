@@ -44283,6 +44283,7 @@ class Orchestrator:
 
     def _build_adapter_for_provider(self, provider_kind: str):
         prov = self.config.providers[provider_kind]
+        prov.provider_name = provider_kind
         if prov.kind == "codex":
             return CodexAdapter(prov, self.config.execution.smart_timeout)
         if prov.kind == "claude-code":

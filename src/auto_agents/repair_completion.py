@@ -157,13 +157,16 @@ def _reviewer_context(runner, workspace):
     if selected is None:
         return [provider, effort]
     root = Path(workspace).resolve()
-    values = _settings_values(selected, SimpleNamespace(cwd=root, effort=effort), dict(os.environ))
+    from .provider_environment import effective_environment
+    selected.provider_name = provider
+    effective_env = effective_environment(selected)
+    values = _settings_values(selected, SimpleNamespace(cwd=root, effort=effort), effective_env)
     # Missing ancestor config paths carry no settings. Recreated checkout names
     # must not invalidate an identical local configuration; new ancestor files do.
     values['files'] = [(('<workspace>/' + str(Path(path).relative_to(root)))
                          if Path(path).is_relative_to(root) else path, fingerprint)
                        for path, fingerprint in values['files'] if Path(path).exists()]
-    return [provider, selected.kind, binary_identity(selected.binary), values]
+    return [provider, selected.kind, binary_identity(selected.binary, effective_env), values]
 
 
 def snapshot(workspace):

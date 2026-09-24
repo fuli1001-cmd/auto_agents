@@ -72,23 +72,36 @@ class AgentSandbox:
     Model endpoints use the configured proxy through Docker's host gateway.
     Verification runs separately without networking or provider credentials.
     """
-    def __init__(self, root, image, *, kind='codex', evidence=None):
+    def __init__(self, root, image, *, kind='codex', evidence=None, provider_name='', environment=None, binding=''):
         self.root, self.image, self.kind = Path(root), image, kind
+        self.provider_name = provider_name
+        self._environment = None if environment is None else dict(environment)
+        self.binding = binding
         self.evidence = Path(evidence).resolve() if evidence is not None else None
         self.recovery_evidence = None
+
+    @property
+    def environment(self):
+        return dict(os.environ) if self._environment is None else self._environment
+
+    @environment.setter
+    def environment(self, values):
+        self._environment = dict(values)
 
     def home(self, role):
         from .storage import require_space
         from .store import atomic_json
         path = self.root / ('reviewer' if role == 'review' else 'writer')
         marker = path / 'native-home.json'
+        identity = {'version': 3, 'kind': self.kind, 'provider': self.provider_name,
+                    'environment_binding': self.binding}
         if marker.is_file():
-            if json.loads(marker.read_text()) != {'version': 2, 'kind': self.kind}:
+            if json.loads(marker.read_text()) != identity:
                 raise RepairBlocked('provider_configuration', 'native session provider changed')
             return path
         require_space(path)
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
-        original = Path.home()
+        original = Path(self.environment.get('HOME', str(Path.home())))
         # Exact inputs only. profiles/ also contains native session databases,
         # transcripts and logs; recursive copying amplifies them every phase.
         names = {
@@ -100,12 +113,16 @@ class AgentSandbox:
         }.get(self.kind)
         if names is None:
             raise RepairBlocked('provider_unsupported', self.kind)
+        if self.kind == 'codex':
+            profile_home = Path(self.environment.get('CODEX_HOME') or original / '.codex').expanduser()
+            names.extend('.codex/' + entry.name for entry in profile_home.glob('*.config.toml')
+                         if entry.is_file() and not entry.is_symlink())
         for name in names:
             source, dest = original / name, path / name
             override = {'.codex': 'CODEX_HOME', '.claude': 'CLAUDE_CONFIG_DIR',
                         '.copilot': 'COPILOT_HOME'}.get(Path(name).parts[0])
-            if override and os.environ.get(override):
-                source = Path(os.environ[override]).expanduser() / Path(*Path(name).parts[1:])
+            if override and self.environment.get(override):
+                source = Path(self.environment[override]).expanduser() / Path(*Path(name).parts[1:])
             if not source.is_file(): continue
             if source.is_symlink() or any(p.is_symlink() for p in source.parents if p != original and original in p.parents):
                 raise RepairBlocked('provider_configuration', 'native configuration must not traverse a link: ' + name)
@@ -127,7 +144,7 @@ class AgentSandbox:
             else:
                 shutil.copyfile(source, dest)
             dest.chmod(0o600)
-        atomic_json(marker, {'version': 2, 'kind': self.kind})
+        atomic_json(marker, identity)
         return path
 
     @contextmanager
@@ -158,7 +175,7 @@ class AgentSandbox:
             mounts = set()
             selected = {'codex': None, 'claude-code': 'claude', 'copilot-cli': 'copilot', 'antigravity': 'agy'}[self.kind]
             if selected:
-                found = shutil.which(selected)
+                found = shutil.which(selected, path=self.environment.get('PATH'))
                 if found:
                     found = Path(found)
                     # Bind the selected executable, not its enclosing HOME/bin or
@@ -168,22 +185,31 @@ class AgentSandbox:
                 argv += ['--mount', 'type=bind,src=' + str(path.resolve()) + ',dst=' + str(path) + ',readonly']
             if self.kind == 'antigravity':
                 for leaf in ('bin', 'builtin'):
-                    public = Path.home() / '.gemini/antigravity-cli' / leaf
+                    public = Path(self.environment.get('HOME', str(Path.home()))) / '.gemini/antigravity-cli' / leaf
                     if public.is_dir() and not public.is_symlink():
                         argv += ['--mount', f'type=bind,src={public},dst=/agent-home/.gemini/antigravity-cli/{leaf},readonly']
+            native_home = {'codex': ('CODEX_HOME', '/agent-home/.codex'),
+                           'claude-code': ('CLAUDE_CONFIG_DIR', '/agent-home/.claude'),
+                           'copilot-cli': ('COPILOT_HOME', '/agent-home/.copilot')}.get(self.kind)
+            if native_home:
+                argv += ['-e', native_home[0] + '=' + native_home[1]]
             # Keep the image's pinned Python/toolchain PATH. Native drivers
             # invoke their selected CLI by absolute path; host CLI directories
             # must not replace the verification environment inside the image.
             # A provider must not receive another provider's account credentials.
-            prefixes = {'codex': ('OPENAI_',), 'claude-code': ('ANTHROPIC_',),
+            prefixes = {'codex': ('OPENAI_', 'CODEX_'), 'claude-code': ('ANTHROPIC_',),
                         'copilot-cli': ('COPILOT_',), 'antigravity': ('GOOGLE_', 'GEMINI_', 'ANTIGRAVITY_')}[self.kind]
             extra = set(credential_names)
+            extra.update(getattr(self, 'configured_environment_keys', ()))
+            extra.difference_update({'HOME', 'PATH', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'COPILOT_HOME'})
             if self.kind == 'copilot-cli': extra.update(('GH_TOKEN', 'GITHUB_TOKEN'))
             if self.kind == 'claude-code': extra.add('CLAUDE_CODE_OAUTH_TOKEN')
-            for key in os.environ:
+            for key in self.environment:
+                if key in {'HOME', 'PATH', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'COPILOT_HOME'}:
+                    continue
                 proxy = key.lower() in ('http_proxy', 'https_proxy', 'no_proxy', 'all_proxy')
                 if key.startswith(prefixes) or key in extra or proxy:
-                    value = os.environ[key]
+                    value = self.environment[key]
                     if (proxy and key.lower() != 'no_proxy') or key.lower().endswith('base_url'):
                         value = bridge_url(value)
                     if key.lower() == 'no_proxy': value += ',host.docker.internal'
@@ -200,8 +226,16 @@ class NativeDriver:
     def __init__(self, config, sandbox, *, effort='max', review_effort=None, timeout=1800):
         self.config, self.sandbox, self.effort, self.timeout = config, sandbox, effort, timeout
         self.review_effort = review_effort or effort
-        self.binary = shutil.which(config.binary)
-        if sandbox is not None: sandbox.kind = config.kind
+        from ..provider_environment import effective_environment, environment_binding
+        self.environment = effective_environment(config)
+        self.binding = environment_binding(config)
+        self.binary = shutil.which(config.binary, path=self.environment.get('PATH'))
+        if sandbox is not None:
+            sandbox.kind = config.kind
+            sandbox.provider_name = config.provider_name
+            sandbox.environment = self.environment
+            sandbox.binding = self.binding
+            sandbox.configured_environment_keys = set(config.environment)
         if not self.binary: raise RepairBlocked('provider_missing', config.binary + ' is unavailable')
         if config.kind not in ('codex', 'claude-code', 'copilot-cli', 'antigravity'):
             raise RepairBlocked('provider_unsupported', 'V2 has no native driver for ' + config.kind)
@@ -221,7 +255,8 @@ class NativeDriver:
             for chunk in iter(lambda: stream.read(1024 * 1024), b''): value.update(chunk)
         model, settings = self.selected()
         # Hash transport/model semantics, never persist native credentials.
-        return digest({'kind': self.config.kind, 'binary': value.hexdigest(), 'model': model,
+        return digest({'kind': self.config.kind, 'provider': self.config.provider_name,
+                       'environment_binding': self.binding, 'binary': value.hexdigest(), 'model': model,
                        'settings': settings, 'arguments': self.config.extra_args, 'effort': self.effort,
                        'review': self.selected('review'), 'review_effort': self.review_effort})
 
@@ -245,7 +280,8 @@ class NativeDriver:
         from ..prompting.runtime import last_option, _toml_overrides
         explicit_model = last_option(self.config.extra_args, '--model', '-m')
         if self.config.kind == 'codex':
-            home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+            home = Path(self.environment.get('CODEX_HOME') or
+                        Path(self.environment.get('HOME', str(Path.home()))) / '.codex')
             profile = last_option(self.config.extra_args, '--profile', '-p') or profile
             values = {**read_toml('/etc/codex/config.toml'), **read_toml(home / 'config.toml')}
             values.update(values.get('profiles', {}).get(profile, {}))

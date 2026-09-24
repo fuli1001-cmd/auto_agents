@@ -149,14 +149,14 @@ def _check_metadata_launch(launch, python, scratch, protected, *, cwd, env=None,
         raise ConfinementPreflightError(diagnostic) from error
 
 
-def provider_probe_command(argv):
+def provider_probe_command(argv, *, env=None):
     # Capability probes execute the same provider binary as a writer. Keep
     # them within the active boundary even when no AgentRequest is accepted.
     boundary = _active_writer_boundary.get()
     if boundary is None:
-        return argv, {}
-    command, env = boundary.dispatch(argv, dict(os.environ), boundary.root)
-    return command, {'cwd': boundary.root, 'env': env}
+        return argv, {'env': dict(os.environ if env is None else env)} if env is not None else {}
+    command, dispatched_env = boundary.dispatch(argv, dict(os.environ if env is None else env), boundary.root)
+    return command, {'cwd': boundary.root, 'env': dispatched_env}
 
 def landlock_abi():
     libc = ctypes.CDLL(None, use_errno=True)

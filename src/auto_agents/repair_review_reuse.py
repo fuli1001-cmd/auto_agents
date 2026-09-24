@@ -18,8 +18,11 @@ def reviewer_policy(runner, root):
         return [provider, effort]
     try:
         from .prompting.runtime import _settings_fingerprint, binary_identity
-        return [provider, effort, selected.kind, binary_identity(selected.binary),
-                _settings_fingerprint(selected, SimpleNamespace(cwd=Path(root), effort=effort), dict(os.environ))]
+        from .provider_environment import effective_environment
+        selected.provider_name = provider
+        effective_env = effective_environment(selected)
+        return [provider, effort, selected.kind, binary_identity(selected.binary, effective_env),
+                _settings_fingerprint(selected, SimpleNamespace(cwd=Path(root), effort=effort), effective_env)]
     except (OSError, ValueError, TypeError, AttributeError):
         return None  # Unknown review policy cannot authorize reuse.
 

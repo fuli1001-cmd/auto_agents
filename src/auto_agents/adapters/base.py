@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import time
 import traceback
@@ -21,11 +22,23 @@ from ..artifact_runtime import capture_output
 
 
 class AgentAdapter(ABC):
+    def environment(self, request: Optional[AgentRequest] = None) -> Dict[str, str]:
+        from ..provider_environment import effective_environment
+        env = effective_environment(self.config)
+        if request is not None:
+            env["AUTO_AGENTS_STAGE"] = request.stage
+            env["AUTO_AGENTS_EFFORT"] = request.effort
+        return env
+
+    def available_binary(self) -> bool:
+        env = self.environment()
+        return shutil.which(self.config.binary, path=env.get("PATH")) is not None
+
     def describe_runtime(self, request: AgentRequest):
         from ..prompting import ProviderRuntime
         from ..prompting.runtime import resolve_runtime
         config = getattr(self, "config", None)
-        return resolve_runtime(config, request) if config is not None else ProviderRuntime()
+        return resolve_runtime(config, request, env=self.environment(request)) if config is not None else ProviderRuntime()
 
     def prepare_request(self, request: AgentRequest) -> AgentRequest:
         from ..prompting import prepare_request

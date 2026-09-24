@@ -1811,6 +1811,16 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 errors.append(
                     f"providers.{provider_name}.progress_protocol must be a string"
                 )
+            environment = provider.get("environment", {})
+            if not isinstance(environment, dict):
+                errors.append(f"providers.{provider_name}.environment must be an object")
+            else:
+                for key, value in environment.items():
+                    if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                            or key.startswith("AUTO_AGENTS_")):
+                        errors.append(f"providers.{provider_name}.environment has an invalid or reserved variable name")
+                    if value is not None and not isinstance(value, str):
+                        errors.append(f"providers.{provider_name}.environment values must be strings or null")
 
     active_provider = payload.get("active_provider")
     if not isinstance(active_provider, str) or not active_provider.strip():

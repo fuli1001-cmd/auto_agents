@@ -21,7 +21,19 @@
     },
     "providers": {
       "type": "object",
-      "required": ["codex", "copilot-cli"],
+      "minProperties": 1,
+      "patternProperties": {
+        "^.+$": {
+          "type": "object",
+          "properties": {
+            "environment": {
+              "type": "object",
+              "propertyNames": {"pattern": "^(?!AUTO_AGENTS_)[A-Za-z_][A-Za-z0-9_]*$"},
+              "additionalProperties": {"type": ["string", "null"]}
+            }
+          }
+        }
+      },
       "properties": {
         "codex": {
           "type": "object",

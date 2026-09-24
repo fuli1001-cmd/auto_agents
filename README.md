@@ -543,6 +543,44 @@ Adapters map those labels to provider-specific controls through the `profile_map
 For Codex this maps to native config profiles: `balanced`, `deep`, and `max`.
 All model configuration lives in Codex's own config files, and the project config only carries the profile name mapping.
 
+Each entry in `providers` may also define an `environment` object. A string sets
+that variable for the provider process; `null` removes an inherited variable.
+The same environment is used for executable discovery, capability probes, native
+settings and instruction resolution, execution, and session recovery. The
+controller's `AUTO_AGENTS_*` variables are reserved. Omit `environment` to keep
+the existing inherited environment. Do not put API keys or other secrets in
+project config; use a private credential store or operator-managed environment.
+
+For two ChatGPT-authenticated Codex accounts, configure two provider entries
+with `kind: "codex"`, each with its own `CODEX_HOME`:
+
+```json
+{
+  "providers": {
+    "codex-main": {
+      "kind": "codex", "binary": "codex",
+      "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
+      "extra_args": [], "cwd_flag": "-C", "prompt_via_stdin": true,
+      "output_flag": "-o", "subscription_tier": "default",
+      "environment": {"CODEX_HOME": "/home/fuli/.codex", "OPENAI_API_KEY": null, "CODEX_API_KEY": null}
+    },
+    "codex-fuli0110": {
+      "kind": "codex", "binary": "codex",
+      "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
+      "extra_args": [], "cwd_flag": "-C", "prompt_via_stdin": true,
+      "output_flag": "-o", "subscription_tier": "default",
+      "environment": {"CODEX_HOME": "/home/fuli/.codex-fuli0110", "OPENAI_API_KEY": null, "CODEX_API_KEY": null}
+    }
+  },
+  "active_provider": "codex-main"
+}
+```
+
+Both homes must contain the profiles named in their `profile_map`. Native
+sessions are bound to the provider entry and its environment; changing the
+binding starts a fresh session. This facility also supports other CLI kinds,
+such as `CLAUDE_CONFIG_DIR` or `COPILOT_HOME` per provider entry.
+
 ### Copilot CLI
 
 Copilot CLI uses the same minimal-config pattern. Each profile name in `profile_map` corresponds to

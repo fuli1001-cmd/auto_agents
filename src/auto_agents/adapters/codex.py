@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import shutil
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -121,7 +119,7 @@ class CodexAdapter(AgentAdapter):
         self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
-        return shutil.which(self.config.binary) is not None
+        return self.available_binary()
 
     def supports_image_attachments(self) -> bool:
         return True
@@ -163,9 +161,7 @@ class CodexAdapter(AgentAdapter):
         if request.resume_session_id:
             command.extend([request.resume_session_id, "-"])
 
-        env = dict(os.environ)
-        env["AUTO_AGENTS_STAGE"] = request.stage
-        env["AUTO_AGENTS_EFFORT"] = request.effort
+        env = self.environment(request)
 
         # Wrap the stream callback to parse codex JSON lines in real-time,
         # forwarding only visible agent messages (not raw JSON).

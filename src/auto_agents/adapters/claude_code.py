@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import shutil
 from dataclasses import replace
 from typing import Callable, List, Optional, Tuple
 
@@ -200,7 +198,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
-        return shutil.which(self.config.binary) is not None
+        return self.available_binary()
 
     def supports_image_attachments(self) -> bool:
         return True
@@ -212,9 +210,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         # Clear stale output so a reused output_path cannot mask fresh results.
         write_text(request.output_path, "")
 
-        env = dict(os.environ)
-        env["AUTO_AGENTS_STAGE"] = request.stage
-        env["AUTO_AGENTS_EFFORT"] = request.effort
+        env = self.environment(request)
 
         prompt = self._effective_prompt(request)
         if self.config.prompt_via_stdin:

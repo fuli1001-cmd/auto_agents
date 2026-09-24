@@ -284,9 +284,13 @@ class ProviderConfig:
     subscription_tier: str = "default"
     vision: str = "auto"
     progress_protocol: str = ""
+    environment: Dict[str, Optional[str]] = field(default_factory=dict)
+    # Runtime identity; the project config key is its source of truth.
+    provider_name: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProviderConfig":
+        from .provider_environment import validate_environment
         kind = str(data.get("kind", "codex"))
         timeout_default = (
             DEFAULT_CLAUDE_CODE_TIMEOUT_SECONDS
@@ -326,11 +330,12 @@ class ProviderConfig:
             subscription_tier=str(data.get("subscription_tier", "default")),
             vision=str(data.get("vision", "auto")),
             progress_protocol=str(data.get("progress_protocol", "")),
+            environment=validate_environment(data.get("environment", {})),
         )
 
     def to_dict(self) -> Dict[str, object]:
         return {key: value for key, value in asdict(self).items()
-                if key not in {"timeout_seconds", "idle_timeout_seconds"}}
+                if key not in {"timeout_seconds", "idle_timeout_seconds", "provider_name"}}
 
     @staticmethod
     def _timeout_seconds_from_dict(data: Dict[str, object], timeout_default: int) -> int:
@@ -1651,6 +1656,8 @@ class ProjectConfig:
             for kind, raw in providers_payload.items()
             if isinstance(raw, dict)
         }
+        for name, provider in providers.items():
+            provider.provider_name = name
         if active_provider not in providers:
             raise ValueError(
                 f"Invalid config format: active_provider '{active_provider}' is not defined in providers. "
@@ -1724,6 +1731,7 @@ class ProjectConfig:
             raise ValueError(
                 f"Configured active_provider '{self.active_provider}' is missing from providers."
             )
+        provider.provider_name = self.active_provider
         return provider
 
     def set_active_provider(self, provider_kind: str) -> None:

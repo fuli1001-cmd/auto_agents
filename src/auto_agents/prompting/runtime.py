@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import subprocess
-from functools import lru_cache
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -34,12 +33,11 @@ def last_option(args: Sequence[str], *names: str) -> str:
     return value
 
 
-@lru_cache(maxsize=32)
-def _probe(path: str, mtime: int, size: int) -> tuple[str, tuple[str, ...]]:
+def _probe(path: str, mtime: int, size: int, env: Mapping[str, str] | None = None) -> tuple[str, tuple[str, ...]]:
     def call(flag):
         try:
             from ..verification_sandbox import provider_probe_command
-            command, options = provider_probe_command([path, flag])
+            command, options = provider_probe_command([path, flag], env=env)
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     text=True, timeout=5, check=False, **options)
             return result.stdout[:100000] if result.returncode == 0 else ""
@@ -55,19 +53,19 @@ def _probe(path: str, mtime: int, size: int) -> tuple[str, tuple[str, ...]]:
     return match.group(0) if match else "", flags
 
 
-def cli_capabilities(binary: str) -> tuple[str, tuple[str, ...]]:
-    path = shutil.which(binary)
+def cli_capabilities(binary: str, env: Mapping[str, str] | None = None) -> tuple[str, tuple[str, ...]]:
+    path = shutil.which(binary, path=env.get("PATH")) if env is not None else shutil.which(binary)
     if not path:
         return "", ()
     try:
         stat = Path(path).stat()
-        return _probe(path, stat.st_mtime_ns, stat.st_size)
+        return _probe(path, stat.st_mtime_ns, stat.st_size, env)
     except OSError:
         return "", ()
 
 
-def binary_identity(binary: str) -> str:
-    executable = shutil.which(binary)
+def binary_identity(binary: str, env: Mapping[str, str] | None = None) -> str:
+    executable = shutil.which(binary, path=env.get("PATH")) if env is not None else shutil.which(binary)
     if not executable:
         return ""
     try:
@@ -126,7 +124,7 @@ def _codex(config, request, env, capabilities):
     args = list(config.extra_args)
     overrides = _toml_overrides(args)
     explicit = last_option(args, "--model", "-m") or overrides.get("model", "")
-    home = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+    home = Path(env.get("CODEX_HOME") or Path(env.get("HOME", str(Path.home()))) / ".codex")
     system = read_config(Path("/etc/codex/config.toml"))
     user = read_config(home / "config.toml")
     effective = {**system, **user}
@@ -184,7 +182,7 @@ def _claude(config, request, env):
     args = list(config.extra_args)
     explicit = last_option(args, "--model") or config.profile_map.get(request.effort, "")
     effective, settings_env = {}, {}
-    home = Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    home = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME", str(Path.home()))) / ".claude")
     sources = last_option(args, "--setting-sources")
     allowed = sources.split(",") if sources else ["user", "project", "local"]
     locations = [("user", home / "settings.json")]
@@ -228,13 +226,13 @@ def _settings_values(config, request, env):
     roots = _root_chain(request.cwd)
     paths = []
     if config.kind == "codex":
-        home = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+        home = Path(env.get("CODEX_HOME") or Path(env.get("HOME", str(Path.home()))) / ".codex")
         paths = [Path("/etc/codex/config.toml"), home / "config.toml"]
         if profile:
             paths.append(home / (profile + ".config.toml"))
         paths.extend(root / ".codex/config.toml" for root in roots)
     elif config.kind == "claude-code":
-        home = Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        home = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME", str(Path.home()))) / ".claude")
         paths = [home / "settings.json", Path("/etc/claude-code/managed-settings.json")]
         for root in roots:
             paths.extend((root / ".claude/settings.json", root / ".claude/settings.local.json"))
@@ -242,7 +240,7 @@ def _settings_values(config, request, env):
         if extra and not extra.lstrip().startswith("{"):
             paths.append(Path(extra) if Path(extra).is_absolute() else request.cwd / extra)
     elif config.kind == "copilot-cli":
-        home = Path(env.get("COPILOT_HOME") or Path.home() / ".copilot")
+        home = Path(env.get("COPILOT_HOME") or Path(env.get("HOME", str(Path.home()))) / ".copilot")
         directory = last_option(args, "--config-dir")
         selected = Path(directory) if directory else (Path(profile) if Path(profile).is_absolute() else home / "profiles" / profile)
         if not directory and not profile:
@@ -252,7 +250,7 @@ def _settings_values(config, request, env):
             selected = request.cwd / selected
         paths = [selected / "config.json", selected / "settings.json"]
     elif config.kind == "antigravity":
-        paths = [Path.home() / ".gemini/antigravity-cli/settings.json"]
+        paths = [Path(env.get("HOME", str(Path.home()))) / ".gemini/antigravity-cli/settings.json"]
     values = []
     for path in paths:
         try:
@@ -260,11 +258,13 @@ def _settings_values(config, request, env):
         except FileNotFoundError:
             content = b"missing"
         values.append((str(path), hashlib.sha256(content).hexdigest()))
-    selected_env = {key: value for key, value in env.items() if key.startswith(
+    selected_env = {key: digest(value) for key, value in env.items() if key.startswith(
         ("CODEX_", "CLAUDE_", "ANTHROPIC_", "COPILOT_", "GEMINI_", "OPENAI_")
     ) and key not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"}}
+    from ..provider_environment import environment_binding
     return {"files": values, "args": args, "profile": profile,
-            "effort": request.effort, "env": selected_env}
+            "effort": request.effort, "env": selected_env,
+            "provider_binding": environment_binding(config)}
 
 
 def _settings_fingerprint(config, request, env) -> str:
@@ -274,7 +274,7 @@ def _settings_fingerprint(config, request, env) -> str:
 def _settings_components(values):
     components = {'file:' + path: fingerprint for path, fingerprint in values['files']}
     components.update({'env:' + key: digest(value) for key, value in values['env'].items()})
-    components.update({key: digest(json.dumps(values[key], sort_keys=True)) for key in ('args', 'profile', 'effort')})
+    components.update({key: digest(json.dumps(values[key], sort_keys=True)) for key in ('args', 'profile', 'effort', 'provider_binding')})
     return components
 
 
@@ -282,8 +282,11 @@ def resolve_runtime(config, request, *, env: Mapping[str, str] | None = None,
                     probe: bool = True) -> ProviderRuntime:
     env = dict(os.environ if env is None else env)
     if config.kind not in {"codex", "claude-code", "copilot-cli", "antigravity"}:
-        return ProviderRuntime(provider=config.kind, resolution_source="custom-provider")
-    version, capabilities = cli_capabilities(config.binary) if probe else ("", ())
+        from ..provider_environment import environment_binding
+        return ProviderRuntime(provider=config.kind, resolution_source="custom-provider",
+                               settings_fingerprint=environment_binding(config),
+                               settings_components={"provider_binding": environment_binding(config)})
+    version, capabilities = cli_capabilities(config.binary, env) if probe else ("", ())
     provider = config.kind
     try:
         if provider == "codex":
@@ -295,7 +298,7 @@ def resolve_runtime(config, request, *, env: Mapping[str, str] | None = None,
             source = "cli"
             if not model:
                 profile = config.profile_map.get(request.effort, "")
-                home = Path(env.get("COPILOT_HOME") or Path.home() / ".copilot")
+                home = Path(env.get("COPILOT_HOME") or Path(env.get("HOME", str(Path.home()))) / ".copilot")
                 config_dir = last_option(config.extra_args, "--config-dir")
                 path = Path(config_dir) if config_dir else (Path(profile) if Path(profile).is_absolute() else home / "profiles" / profile)
                 path = path.expanduser()
@@ -309,7 +312,7 @@ def resolve_runtime(config, request, *, env: Mapping[str, str] | None = None,
             explicit = last_option(config.extra_args, "--model")
             source = "cli" if explicit else "profile"
             if not model:
-                model = str(read_config(Path.home() / ".gemini/antigravity-cli/settings.json").get("model", ""))
+                model = str(read_config(Path(env.get("HOME", str(Path.home()))) / ".gemini/antigravity-cli/settings.json").get("model", ""))
                 source = "native-settings"
             resolved = model.lower()
             resolved = re.sub(r"\s*\([^)]*\)\s*$", "", resolved).replace(" ", "-")
@@ -326,8 +329,10 @@ def resolve_runtime(config, request, *, env: Mapping[str, str] | None = None,
     except (ValueError, OSError, TypeError, AttributeError):
         settings, source = "", "unreadable-or-unsupported-config"
         components = {}
+    from .core import instruction_fingerprint
     return ProviderRuntime(provider, version, model, resolved, source, capabilities,
-                           binary_identity(config.binary) if probe else "", settings, components)
+                           binary_identity(config.binary, env) if probe else "", settings, components,
+                           instruction_fingerprint(request.cwd, provider, env))
 
 
 def observed_model_metadata(request, stdout: str) -> dict:

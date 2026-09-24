@@ -153,8 +153,9 @@ def _components(request, root, accepted, workspace, python):
     images.maintain()
     from .diagnostic_evidence import prepare
     evidence, evidence_context = prepare(root, json.loads((root / 'original-payload.json').read_text()))
+    selected.provider_name = provider
     sandbox = AgentSandbox(root / 'provider-state', verifier.image, evidence=evidence)
-    driver = NativeDriver(configured.providers[provider], sandbox,
+    driver = NativeDriver(selected, sandbox,
                           effort=configured.efforts.get('self_repair', 'deep'),
                           review_effort=configured.efforts.get('self_repair_review', 'max'))
     driver.evidence_context = evidence_context

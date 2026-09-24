@@ -1,8 +1,6 @@
 import hashlib
 import json
-import os
 import re
-import shutil
 import sqlite3
 from pathlib import Path
 from typing import List, Optional
@@ -28,8 +26,9 @@ _TOOL_STEP_TYPES = {8, 9, 21}
 
 
 class AntigravityProgressDecoder(ProgressDecoder):
-    def __init__(self, log_path: Path) -> None:
+    def __init__(self, log_path: Path, settings_path: Optional[Path] = None) -> None:
         self.log_path = log_path
+        self.settings_path = settings_path
         self.offset = 0
         self.session_id = ""
         self.step_snapshot: dict[int, tuple[int, int, str]] = {}
@@ -60,7 +59,7 @@ class AntigravityProgressDecoder(ProgressDecoder):
         return events
 
     def _poll_steps(self) -> List[AgentProgressEvent]:
-        database = SETTINGS_PATH.parent / "conversations" / f"{self.session_id}.db"
+        database = (self.settings_path or SETTINGS_PATH).parent / "conversations" / f"{self.session_id}.db"
         if not database.is_file():
             return []
         try:
@@ -164,7 +163,7 @@ class AntigravityAdapter(AgentAdapter):
         self.smart_timeout = smart_timeout or SmartTimeoutConfig()
 
     def available(self) -> bool:
-        return shutil.which(self.config.binary) is not None
+        return self.available_binary()
 
     def run(self, request: AgentRequest) -> AgentResult:
         request = self.prepare_request(request)
@@ -174,18 +173,17 @@ class AntigravityAdapter(AgentAdapter):
         command = self._build_command(request, log_path=log_path)
         write_text(request.output_path, "")
 
-        env = dict(os.environ)
-        env["AUTO_AGENTS_STAGE"] = request.stage
-        env["AUTO_AGENTS_EFFORT"] = request.effort
+        env = self.environment(request)
+        settings_path = Path(env.get("HOME", str(Path.home()))) / ".gemini" / "antigravity-cli" / "settings.json"
 
         # 动态修改 settings.json 改变模型选择
         original_content: Optional[str] = None
         target_model = last_option(self.config.extra_args, "--model") or self.config.profile_map.get(request.effort)
         
-        if target_model and not self._uses_native_model_flag() and SETTINGS_PATH.parent.exists():
+        if target_model and not self._uses_native_model_flag() and settings_path.parent.exists():
             try:
-                if SETTINGS_PATH.is_file():
-                    original_content = read_text(SETTINGS_PATH)
+                if settings_path.is_file():
+                    original_content = read_text(settings_path)
                     try:
                         settings_data = json.loads(original_content)
                     except json.JSONDecodeError:
@@ -194,7 +192,7 @@ class AntigravityAdapter(AgentAdapter):
                     settings_data = {}
                 
                 settings_data["model"] = target_model
-                SETTINGS_PATH.write_text(
+                settings_path.write_text(
                     json.dumps(settings_data, indent=2, ensure_ascii=False),
                     encoding="utf-8"
                 )
@@ -212,7 +210,7 @@ class AntigravityAdapter(AgentAdapter):
                 stdin_input="",
                 smart_timeout=self.smart_timeout,
                 progress_decoder=(
-                    AntigravityProgressDecoder(log_path)
+                    AntigravityProgressDecoder(log_path, settings_path)
                     if log_path is not None
                     else None
                 ),
@@ -223,7 +221,7 @@ class AntigravityAdapter(AgentAdapter):
             # 还原 settings.json
             if original_content is not None:
                 try:
-                    SETTINGS_PATH.write_text(original_content, encoding="utf-8")
+                    settings_path.write_text(original_content, encoding="utf-8")
                 except Exception:
                     pass
 
@@ -292,7 +290,7 @@ class AntigravityAdapter(AgentAdapter):
         return command
 
     def _uses_native_model_flag(self) -> bool:
-        return bool(last_option(self.config.extra_args, "--model")) or "--model" in cli_capabilities(self.config.binary)[1]
+        return bool(last_option(self.config.extra_args, "--model")) or "--model" in cli_capabilities(self.config.binary, self.environment())[1]
 
     @staticmethod
     def _progress_log_path(request: AgentRequest) -> Path:

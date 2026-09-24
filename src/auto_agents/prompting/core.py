@@ -92,6 +92,7 @@ class ProviderRuntime:
     binary_identity: str = ""
     settings_fingerprint: str = ""
     settings_components: dict = field(default_factory=dict)
+    instructions_hash: str = ""
 
 
 READ_ONLY = frozenset({
@@ -284,7 +285,9 @@ def policy_fingerprint() -> str:
                             for name in ("core.py", "profiles.py")))
 
 
-def instruction_fingerprint(root: Path, provider: str = "") -> str:
+def instruction_fingerprint(root: Path, provider: str = "", env: Mapping[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    user_home = Path(env.get("HOME", str(Path.home())))
     paths = [root / name for name in ("AGENTS.md", "AGENTS.override.md", "CLAUDE.md", ".claude/CLAUDE.md", ".github/copilot-instructions.md",
                                       ".auto-agents/project-rules.normalized.json", ".auto-agents/project-rules.agent.md")]
     for directory in (".github/instructions", ".claude/rules", ".agents/rules", ".agent/rules"):
@@ -293,20 +296,20 @@ def instruction_fingerprint(root: Path, provider: str = "") -> str:
             paths.extend(sorted(path.rglob("*.md")))
     # Hash standard native global guidance without exposing its contents in diagnostics.
     if provider in {"", "codex"}:
-        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        home = Path(env.get("CODEX_HOME") or user_home / ".codex")
         paths.extend(home / name for name in ("AGENTS.md", "AGENTS.override.md"))
     if provider in {"", "claude-code"}:
-        home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+        home = Path(env.get("CLAUDE_CONFIG_DIR") or user_home / ".claude")
         paths.append(home / "CLAUDE.md")
         if (home / "rules").is_dir():
             paths.extend(sorted((home / "rules").rglob("*.md")))
     if provider in {"", "copilot-cli"}:
-        home = Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot")
+        home = Path(env.get("COPILOT_HOME") or user_home / ".copilot")
         paths.append(home / "copilot-instructions.md")
         if (home / "instructions").is_dir():
             paths.extend(sorted((home / "instructions").rglob("*.instructions.md")))
     if provider in {"", "antigravity"}:
-        paths.append(Path.home() / ".gemini/GEMINI.md")
+        paths.append(user_home / ".gemini/GEMINI.md")
     values = []
     for path in paths:
         label = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
@@ -350,7 +353,7 @@ def prepare_request(request: Any, runtime: ProviderRuntime) -> Any:
             "Task JSON", "Bound requirements", "Plan migration contract", "Task status migration contract",
         }],
     }, sort_keys=True, ensure_ascii=False))
-    metadata["instructions_hash"] = instruction_fingerprint(request.cwd, runtime.provider)
+    metadata["instructions_hash"] = runtime.instructions_hash or instruction_fingerprint(request.cwd, runtime.provider)
     compatibility = {key: metadata[key] for key in (
         "policy_hash", "contract_hash", "instructions_hash", "purpose", "model_profile", "provider",
         "cli_version", "binary_identity", "configured_model", "resolved_model", "output_contract_version", "sandbox_mode",
