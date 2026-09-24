@@ -4,7 +4,10 @@ from unittest.mock import patch
 
 from auto_agents.adapters.codex import CodexAdapter
 from auto_agents.adapters.shell import ShellAdapter
+from auto_agents.cli import build_parser
+from auto_agents.config import load_project_config, save_project_config
 from auto_agents.models import AgentRequest, ProjectConfig, ProviderConfig, SMART_TIMEOUT_PROGRESS_PROTOCOL
+from auto_agents.orchestrator import Orchestrator
 from auto_agents.prompting.core import PromptBlock, PromptSpec, prepare_request
 from auto_agents.prompting.runtime import resolve_runtime
 from auto_agents.provider_environment import effective_environment
@@ -100,6 +103,29 @@ def test_environment_config_round_trip_and_validation():
     assert loaded.providers["codex-a"].provider_name == "codex-a"
     payload["providers"]["codex-a"]["environment"]["AUTO_AGENTS_STAGE"] = "wrong"
     assert any("environment" in error for error in validate_project_config_payload(payload))
+
+
+def test_cli_selects_configured_account_alias_and_rejects_unknown_alias(tmp_path):
+    for command in ("run", "fix", "collab", "provider-resolve"):
+        parsed = build_parser().parse_args([command, "--project", str(tmp_path),
+                                            "--provider", "codex-second"])
+        assert parsed.provider == "codex-second"
+    Orchestrator.init_project(tmp_path / "project", "project")
+    config = load_project_config(tmp_path / "project")
+    config.providers["codex-second"] = ProviderConfig(
+        kind="codex", environment={"CODEX_HOME": "/account/second"})
+    save_project_config(tmp_path / "project", config)
+    orchestrator = Orchestrator(tmp_path / "project")
+    orchestrator._set_active_provider("codex-second")
+    selected = load_project_config(tmp_path / "project")
+    assert selected.active_provider == "codex-second"
+    assert selected.provider.environment["CODEX_HOME"] == "/account/second"
+    try:
+        orchestrator._set_active_provider("unconfigured-account")
+    except ValueError as error:
+        assert "Configured providers" in str(error)
+    else:
+        raise AssertionError("an unknown provider alias was silently created")
 
 
 def test_repair_sandbox_copies_selected_account_and_rejects_account_switch(tmp_path):

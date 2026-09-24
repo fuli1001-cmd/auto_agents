@@ -44885,6 +44885,9 @@ class Orchestrator:
             self._current_provider = provider_kind
             return
         if provider_kind not in self.config.providers:
+            if provider_kind not in SUPPORTED_PROVIDER_KINDS:
+                supported = ", ".join(sorted(self.config.providers))
+                raise ValueError(f"Unsupported provider '{provider_kind}'. Configured providers: {supported}")
             self.config.providers[provider_kind] = default_provider_config(provider_kind)
         self.config.set_active_provider(provider_kind)
         self._current_provider = provider_kind

@@ -35,7 +35,6 @@ from .config import (
     save_project_config,
     task_plan_path,
 )
-from .config import supported_provider_kinds
 from .env import load_dotenv
 from .io_utils import read_json, write_json
 from .notifications import (
@@ -2148,8 +2147,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--provider",
-        choices=supported_provider_kinds(),
-        help="Override provider for this run and persist it as the new default provider.",
+        help="Use a configured provider entry by name and persist it as the new default.",
     )
     run_parser.add_argument(
         "--doc-language",
@@ -2415,8 +2413,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fix_parser.add_argument(
         "--provider",
-        choices=supported_provider_kinds(),
-        help="Override provider for this session.",
+        help="Use a configured provider entry by name for this session.",
     )
     fix_parser.add_argument(
         "--print-agent-output",
@@ -2455,8 +2452,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collab_parser.add_argument(
         "--provider",
-        choices=supported_provider_kinds(),
-        help="Override provider for this session.",
+        help="Use a configured provider entry by name for this session.",
     )
     collab_parser.add_argument(
         "--print-agent-output",
@@ -2582,8 +2578,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     provider_resolve_parser.add_argument(
         "--provider",
-        choices=supported_provider_kinds(),
-        help="Override provider for this session.",
+        help="Use a configured provider entry by name for this session.",
     )
     provider_resolve_parser.add_argument(
         "--print-agent-output",
