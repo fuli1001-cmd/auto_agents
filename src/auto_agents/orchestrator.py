@@ -33664,6 +33664,15 @@ class Orchestrator:
             "raw_log_path": raw_log_path,
             "comparable_failures": extraction.comparable,
             "proof_evidence": proof_evidence,
+            "managed_verification_passed": verify_gate.ok,
+            "passed_verification_commands": [
+                result.command for result in verify_gate.commands if result.ok
+            ],
+            "published_artifacts": sorted({
+                path
+                for result in verify_gate.commands
+                for path in result.artifacts
+            }),
             "baseline_not_applicable_commands": list(
                 baseline_not_applicable_commands
             ),
@@ -39127,6 +39136,51 @@ class Orchestrator:
             lines.append("Failed refs: " + ", ".join(failed_refs))
         return "\n".join(lines)
 
+    @staticmethod
+    def _managed_oracle_proof_retry_evidence(
+        task: TaskSpec,
+        verify_result: Mapping[str, object],
+    ) -> str:
+        """Give proof retries the result of the verifier that just ran."""
+
+        if not bool(verify_result.get("ok")) or not bool(
+            verify_result.get("managed_verification_passed")
+        ):
+            return ""
+        commands = [
+            str(command).strip()
+            for command in verify_result.get("passed_verification_commands", []) or []
+            if str(command).strip()
+        ]
+        artifacts = [
+            str(path).strip()
+            for path in verify_result.get("published_artifacts", []) or []
+            if str(path).strip()
+        ]
+        lines = [
+            "The current orchestrator-managed verification passed after the last "
+            "implementation call. Use this result when updating requirement_proofs."
+        ]
+        if commands:
+            lines.append("Passed managed commands: " + "; ".join(commands[:8]))
+        required_artifacts = {
+            str(ref).strip()
+            for proof in task.requirement_proofs
+            if isinstance(proof, dict)
+            for ref in proof.get("evidence_refs", []) or []
+            if str(ref).strip() in artifacts
+        }
+        if required_artifacts:
+            lines.append(
+                "Published current-run proof artifacts: "
+                + ", ".join(sorted(required_artifacts))
+            )
+        elif artifacts:
+            lines.append(
+                "Published managed artifacts: " + ", ".join(artifacts[:8])
+            )
+        return "\n".join(lines)
+
     def _build_review_context(
         self,
         verify_reason: str = "",
@@ -42471,6 +42525,9 @@ class Orchestrator:
                     feedback = self._format_retry_feedback(
                         "oracle_proof_gate",
                         reason=last_reason,
+                        verification_summary=self._managed_oracle_proof_retry_evidence(
+                            task, verify_result
+                        ),
                         proof_evidence_summary=self._format_proof_evidence_summary(
                             verify_result.get("proof_evidence")
                             if isinstance(verify_result.get("proof_evidence"), dict)

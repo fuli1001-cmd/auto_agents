@@ -303,6 +303,43 @@ class ProjectRunLockTests(unittest.TestCase):
 
 
 class ProjectValidationTests(unittest.TestCase):
+    def test_oracle_proof_retry_reports_current_managed_verification(self) -> None:
+        task = TaskSpec(
+            task_id="task-proof",
+            title="Proof task",
+            description="desc",
+            acceptance=["proof"],
+            requirement_proofs=[{
+                "requirement_id": "REQ-1",
+                "oracle_index": 1,
+                "status": "planned",
+                "evidence_refs": [
+                    "tests/test_boundary.py::test_boundary",
+                    ".tmp-tests/proof/current.json",
+                ],
+            }],
+        )
+        evidence = {
+            "ok": True,
+            "managed_verification_passed": True,
+            "passed_verification_commands": [
+                "pytest -q tests/test_boundary.py::test_boundary"
+            ],
+            "published_artifacts": [".tmp-tests/proof/current.json"],
+        }
+
+        summary = Orchestrator._managed_oracle_proof_retry_evidence(task, evidence)
+
+        self.assertIn("orchestrator-managed verification passed", summary)
+        self.assertIn("pytest -q tests/test_boundary.py::test_boundary", summary)
+        self.assertIn("Published current-run proof artifacts: .tmp-tests/proof/current.json", summary)
+        self.assertEqual(
+            Orchestrator._managed_oracle_proof_retry_evidence(
+                task, {**evidence, "managed_verification_passed": False}
+            ),
+            "",
+        )
+
     def test_installed_health_control_ignore_reopens_only_matching_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
