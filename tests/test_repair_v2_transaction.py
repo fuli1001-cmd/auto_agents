@@ -6,8 +6,27 @@ from unittest.mock import patch
 import pytest
 
 from auto_agents.repair_v2.store import Store, atomic_json, digest
+from auto_agents.repair_v2.controller import Controller
 from auto_agents.repair_v2.transaction import frozen_request, intent, transaction_root
 from auto_agents.repair_v2.types import Acceptance, RepairBlocked, RepairRequest
+
+
+def test_switch_between_codex_profiles_discards_the_old_native_session(tmp_path):
+    store = Store(tmp_path / 'transaction')
+    atomic_json(store.root / 'original-payload.json', {'provider': 'codex-fuli0110'})
+    store.save({'revision': 0, 'session_provider': 'codex',
+                'sessions': {'plan': 'old-profile-session'},
+                'plan': 'retained-plan', 'attempts': 1})
+    driver = SimpleNamespace(config=SimpleNamespace(kind='codex', provider_name='codex'))
+    runner = Controller(None, store, None, driver, None, units=lambda _: [])
+    runner.state = store.load()
+
+    runner.prepare_provider_session()
+
+    state = store.load()
+    assert state['sessions'] == {}
+    assert state['session_provider_name'] == 'codex'
+    assert state['plan'] == 'retained-plan' and state['attempts'] == 1
 
 
 def test_controller_upgrade_uses_committed_operator_source_without_resetting_transaction(tmp_path):

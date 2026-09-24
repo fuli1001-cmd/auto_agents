@@ -89,7 +89,9 @@ _MESSAGES = {
     "verification.finished": ("验证结束：已结束 {completed}/{total} 项，通过 {passed}，失败 {failed}，取消 {cancelled}", "Verification finished: {completed}/{total}; passed {passed}, failed {failed}, cancelled {cancelled}"),
     "invocation.stopped": ("本次执行已结束，仍有待办任务", "This invocation has ended; work remains"),
     "release.pending": ("前台流程已完成；后台完整验证尚未完成", "Foreground workflow completed; background release verification is still pending"),
-    "provider.recovering": ("服务调用暂未成功，正在切换恢复方式", "The provider call did not succeed; trying another recovery route"),
+    "provider.current": ("当前使用的 provider：{provider}", "Current provider: {provider}"),
+    "provider.recovering": ("provider {provider} 调用失败：{reason}；正在尝试备用 provider", "Provider {provider} failed: {reason}; trying another provider"),
+    "provider.unavailable": ("provider {provider} 调用失败：{reason}；没有可用的备用 provider", "Provider {provider} failed: {reason}; no alternate provider is available"),
     "stage.retry": ("正在重试{stage}，第 {attempt} 次尝试", "Retrying {stage}, attempt {attempt}"),
     "clock": ("本次执行时间：{date}", "Invocation time: {date}"),
     "verify.passed": ("最终验收通过", "Final verification passed"),
@@ -128,7 +130,8 @@ def _concise_message(kind: str, message: str, language: str) -> str:
             return '当前状态：恢复受阻' if zh else 'Status: Recovery blocked'
         return '当前状态：正在恢复任务' if zh else 'Status: Recovering the task'
     if kind.startswith(('verification.', 'verify.', 'stage.', 'task.', 'plan.')) or kind in {
-        'heartbeat', 'run.resumed', 'invocation.stopped', 'release.pending', 'provider.recovering',
+        'heartbeat', 'run.resumed', 'invocation.stopped', 'release.pending',
+        'provider.current', 'provider.recovering', 'provider.unavailable',
     }:
         return message
     return ''
@@ -737,6 +740,19 @@ class Reporter:
         pair = _MESSAGES.get(kind)
         if not pair:
             return str(values.get("message", kind))
+        if kind in {"provider.recovering", "provider.unavailable"}:
+            reasons = {
+                "quota": ("额度已用尽", "usage quota exhausted"),
+                "rate_limit": ("请求频率受限", "rate limited"),
+                "capacity": ("模型容量暂不可用", "model capacity unavailable"),
+                "timeout": ("调用超时或停滞", "call timed out or stalled"),
+                "connection": ("连接中断", "connection failed"),
+                "protocol": ("服务协议错误", "provider protocol error"),
+                "unavailable": ("服务不可用", "provider unavailable"),
+                "provider_error": ("服务调用异常", "provider call error"),
+            }
+            reason = reasons.get(str(values.get("category", "")), reasons["provider_error"])
+            values = {**values, "reason": reason[0 if self.language == "zh" else 1]}
         return pair[0 if self.language == "zh" else 1].format(**values)
 
     def _presentation(self, kind: str, data: Mapping[str, object], message: str, task_id: str):

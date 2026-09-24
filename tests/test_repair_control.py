@@ -937,6 +937,8 @@ def test_foreground_observes_terminal_result_after_registration_cleanup(
     autonomy = SimpleNamespace(mode="max", to_dict=lambda: {"mode": "max"})
     orchestrator = SimpleNamespace(
         _repair_registration=attached,
+        _last_successful_provider="codex",
+        _current_provider="codex-fuli0110",
         config=SimpleNamespace(execution=SimpleNamespace(autonomy=autonomy)),
         record_run_blocker=lambda **kwargs: None,
     )
@@ -952,6 +954,7 @@ def test_foreground_observes_terminal_result_after_registration_cleanup(
         assert len(calls) <= 3, "foreground did not stop after the terminal result"
         response = supervisor.dispatch({**request, "version": 1, "_peer_pid": os.getpid()}, [])
         if request["op"] == "submit":
+            assert request["payload"]["provider"] == "codex"
             if reattach:
                 supervisor.store.transition(response["job"], "repairing")
                 supervisor.registrations.clear()  # Active work survives controller restart.
@@ -977,7 +980,8 @@ def test_foreground_observes_terminal_result_after_registration_cleanup(
     previous_term = signal.getsignal(signal.SIGTERM)
     result = repair_client.submit_and_wait(
         tmp_path, orchestrator, RuntimeError("engine failed"),
-        SelfRepairDecision(True, fingerprint="failure"), SimpleNamespace(command="run"), SimpleNamespace(),
+        SelfRepairDecision(True, fingerprint="failure"),
+        SimpleNamespace(command="run", provider="codex-fuli0110"), SimpleNamespace(),
     )
     assert result == exit_code
     assert calls == ["submit", "status"] + (["status"] if reattach else [])

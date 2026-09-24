@@ -83,6 +83,22 @@ class Controller:
         with self.state_lock:
             self.store.transition(self.state, **updates)
 
+    def prepare_provider_session(self):
+        config = getattr(self.driver, 'config', None)
+        kind = getattr(config, 'kind', 'test')
+        provider = getattr(config, 'provider_name', '') or kind
+        previous = self.state.get('session_provider_name')
+        if not previous:
+            previous = self.state.get('session_provider')
+            original = self.store.root / 'original-payload.json'
+            if original.is_file() and not original.is_symlink():
+                payload = json.loads(original.read_text())
+                if isinstance(payload, dict):
+                    previous = payload.get('provider') or previous
+        if previous not in (None, provider):
+            self.checkpoint(sessions={})
+        self.checkpoint(session_provider=kind, session_provider_name=provider)
+
     def phase(self, name):
         self.checkpoint(phase=name)
         total = self.state.get('attempts', 0)
@@ -748,10 +764,7 @@ class Controller:
                         self.plan(root, scope_only=bool(self.state.get('plan')))
                     resolve_conflicts(self, root)
                 probe_refreshed(self)
-                provider = getattr(getattr(self.driver, 'config', None), 'kind', 'test')
-                if self.state.get('session_provider') not in (None, provider):
-                    self.checkpoint(sessions={})
-                self.checkpoint(session_provider=provider)
+                self.prepare_provider_session()
                 if recover_review:
                     self.recover_cancelled_review(root)
                 if recover_timeout and not self.state.get('source_refreshed'):

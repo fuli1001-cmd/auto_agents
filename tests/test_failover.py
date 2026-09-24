@@ -13,9 +13,12 @@ from auto_agents.models import (
     AgentRequest,
     AgentResult,
     AgentTermination,
+    RunState,
     SmartTimeoutConfig,
 )
+from auto_agents.config import save_run_state
 from auto_agents.orchestrator import Orchestrator, _FAILOVER_PATTERN
+from auto_agents.reporting import Reporter
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +300,91 @@ class TestFailoverProviderOrder(unittest.TestCase):
 
 
 class TestCallWithFailover(unittest.TestCase):
+    def test_resumed_run_prefers_its_last_successful_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "spec.md"
+            spec.write_text("same run")
+            state = RunState("run-1", status="blocked")
+            state.resume_context["spec_file"] = str(spec)
+            save_run_state(root, state)
+            providers = {"codex-fuli0110": {}, "codex": {}}
+            first = _stub_orchestrator(providers, "codex-fuli0110", {})
+            first.project_root = root
+            request = _make_request()
+            request.usage_context = {"workflow_kind": "run"}
+            first._remember_successful_provider("codex", request)
+
+            resumed = _stub_orchestrator(providers, "codex-fuli0110", {})
+            resumed.project_root = root
+            resumed._restore_run_provider_selection(state, spec)
+            self.assertEqual(resumed._last_successful_provider, "codex")
+            self.assertEqual(resumed._current_provider, "codex")
+
+            other = _stub_orchestrator(providers, "codex-fuli0110", {})
+            other.project_root = root
+            other._restore_run_provider_selection(state, root / "other-spec.md")
+            self.assertIsNone(other._last_successful_provider)
+
+    def test_legacy_run_restores_successful_fallback_from_its_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / "spec.md"
+            spec.write_text("same run")
+            state = RunState("run-1", status="blocked")
+            state.resume_context["spec_file"] = str(spec)
+            save_run_state(root, state)
+            event_path = root / ".auto-agents" / "runs" / "run-1" / "events.jsonl"
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            events = [
+                {"type": "diagnostic.message", "message": "[failover] using provider=codex",
+                 "data": {"logger": "auto_agents.run.1"}},
+                {"type": "diagnostic.message", "message":
+                 "[agent:review-task] completed ok=true returncode=0 provider=codex model=deep",
+                 "data": {"logger": "auto_agents.run.1"}},
+            ]
+            event_path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            resumed = _stub_orchestrator(
+                {"codex-fuli0110": {}, "codex": {}}, "codex-fuli0110", {},
+            )
+            resumed.project_root = root
+
+            resumed._restore_run_provider_selection(state, spec)
+
+            self.assertEqual(resumed._last_successful_provider, "codex")
+            self.assertEqual(resumed._current_provider, "codex")
+
+    def test_quota_failover_reports_reason_and_current_provider_in_order(self):
+        quota = _make_result(
+            ok=False,
+            returncode=-1,
+            stderr='provider supervision: provider error\n{"message":"usageLimitExceeded"}',
+            summary="",
+            termination=AgentTermination(reason="provider_error"),
+        )
+        stub = _stub_orchestrator(
+            {"codex-fuli0110": {}, "codex": {}}, "codex-fuli0110",
+            {"codex-fuli0110": _FakeAdapter(quota), "codex": _FakeAdapter(_make_result())},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = Reporter(Path(tmp), io.StringIO(), language="zh")
+            reporter.bind("run", "provider-switch")
+            stub.reporter = reporter
+            try:
+                stub._announce_provider("codex-fuli0110", force=True)
+                self.assertTrue(stub._call_with_failover(_make_request()).ok)
+                messages = [line.split(" ", 1)[1] for line in
+                            (reporter.root / "user.log").read_text().splitlines()]
+            finally:
+                reporter.close()
+
+        self.assertEqual(messages, [
+            "当前使用的 provider：codex-fuli0110",
+            "provider codex-fuli0110 调用失败：额度已用尽；正在尝试备用 provider",
+            "当前使用的 provider：codex",
+        ])
+        self.assertEqual(Orchestrator._failover_error_category(quota), "quota")
+
     def test_local_execution_limits_do_not_resume_failover_or_cool_down(self):
         for reason in ("timed_out", "safety_ceiling", "execution_budget_exhausted"):
             for stage in ("prototype", "self_repair_reviewer", "implement"):

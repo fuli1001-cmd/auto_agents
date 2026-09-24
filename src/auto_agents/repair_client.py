@@ -634,7 +634,10 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                "repair_case": repair_case.to_dict() if repair_case else None,
                "invocation": invocation, "boundary": boundary,
                "environment": digest([sys.version, sys.executable, orchestrator.config.execution.autonomy.to_dict()]),
-               "provider": getattr(args, "provider", None) or getattr(orchestrator, "_current_provider", None) or getattr(orchestrator.config, "active_provider", None),
+               "provider": (getattr(orchestrator, "_last_successful_provider", None)
+                            or getattr(orchestrator, "_current_provider", None)
+                            or getattr(args, "provider", None)
+                            or getattr(orchestrator.config, "active_provider", None)),
                "autonomy": getattr(args, "autonomy", None) or orchestrator.config.execution.autonomy.mode,
                "resume_argv": argv}
     if retained:
@@ -697,6 +700,10 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
             from .reporting import find_reporter
             reporter = find_reporter(project)
             if reporter is not None:
+                if job not in announced:
+                    repair_provider = str(response["job"].get("payload", {}).get("provider") or "").strip()
+                    if repair_provider:
+                        reporter.emit("provider.current", provider=repair_provider)
                 reporter.repair_update(response['job'], subscriber)
             if response['job'].get('state') == 'skipped' and response['job'].get('result', {}).get('return_goal'):
                 from .scope_decisions import resume_original

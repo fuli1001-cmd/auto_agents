@@ -545,7 +545,7 @@ _FAILOVER_RATE_PATTERN = re.compile(
     r"rate.limit|\b429\b|too many requests|throttl", re.IGNORECASE
 )
 _FAILOVER_EXPLICIT_QUOTA_PATTERN = re.compile(
-    r"individual quota|quota\s+(?:reached|exhausted)|usage.limit",
+    r"individual quota|quota\s+(?:reached|exhausted)|usage.?limit",
     re.IGNORECASE,
 )
 _FAILOVER_CONNECTION_PATTERN = re.compile(
@@ -708,6 +708,7 @@ class Orchestrator:
         self._failed_providers: Set[str] = set()
         self._provider_health: Dict[str, _ProviderHealth] = {}
         self._current_provider: str = self.config.active_provider
+        self._reported_provider: Optional[str] = None
         self._repo_map_builder: Optional[RepoMapBuilder] = None
         self._last_repo_map_result: Optional[RepoMapResult] = None
         self._task_proof_evidence_cache: Dict[Tuple[str, str], Dict[str, object]] = {}
@@ -3530,6 +3531,7 @@ class Orchestrator:
             )
             if self._normalize_legacy_execution_recovery_task_id_collisions(state):
                 save_run_state(self.project_root, state)
+            self._restore_run_provider_selection(state, spec_file)
             runtime_identity = self._auto_agents_runtime_identity()
             if state.resume_context.get("auto_agents_runtime") != runtime_identity:
                 state.resume_context["auto_agents_runtime"] = runtime_identity
@@ -3557,6 +3559,10 @@ class Orchestrator:
                 state.workflow_version = 2
                 save_run_state(self.project_root, state)
             self._attach_run_logger(state.run_id)
+            self._announce_provider(
+                self._last_successful_provider or self.config.active_provider,
+                force=True,
+            )
             self._start_health_supervision(state)
             resolved_spec_file = spec_file.expanduser().resolve()
             self._active_spec_file = resolved_spec_file
@@ -43126,7 +43132,7 @@ class Orchestrator:
                 ],
             ]
         last_result: Optional[AgentResult] = None
-        for kind in provider_order:
+        for index, kind in enumerate(provider_order):
             adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
             available_fn = getattr(adapter, "available", None)
             if available_fn is not None and not available_fn():
@@ -43154,6 +43160,7 @@ class Orchestrator:
                 attempt_id=stage_key,
             )
             self._current_provider = kind
+            self._announce_provider(kind)
             with log_timing(self.logger, f"agent:{stage_key} provider={kind}"):
                 result = self._run_provider_with_smart_recovery(adapter, request, kind)
             self._emit_agent_output(stage_key, result)
@@ -43173,6 +43180,11 @@ class Orchestrator:
                 health.category,
                 label,
                 max(0, int(health.next_probe_at - self._provider_now())),
+            )
+            self.reporter.emit(
+                "provider.recovering" if index + 1 < len(provider_order) else "provider.unavailable",
+                provider=kind,
+                category=health.category,
             )
         return last_result
 
@@ -44207,20 +44219,27 @@ class Orchestrator:
     @staticmethod
     def _failover_error_category(result: AgentResult) -> str:
         termination = result.termination
+        text = result.stderr or result.summary or ""
         if termination is not None:
             reason = termination.reason.lower()
             if reason in LOCAL_EXECUTION_LIMITS:
                 return "execution_limit"
+            if _FAILOVER_EXPLICIT_QUOTA_PATTERN.search(text):
+                return "quota"
+            if _FAILOVER_RATE_PATTERN.search(text):
+                return "rate_limit"
+            if _FAILOVER_CAPACITY_PATTERN.search(text):
+                return "capacity"
             if any(token in reason for token in ("timeout", "stall", "idle", "ceiling", "loop")):
                 return "timeout"
             if reason == "provider_error":
-                text = result.stderr or result.summary or ""
+                if _FAILOVER_TIMEOUT_PATTERN.search(text):
+                    return "timeout"
                 if _FAILOVER_CONNECTION_PATTERN.search(text):
                     return "connection"
                 if _FAILOVER_PROTOCOL_PATTERN.search(text):
                     return "protocol"
                 return "provider_error"
-        text = result.stderr or result.summary or ""
         if _FAILOVER_EXPLICIT_QUOTA_PATTERN.search(text):
             return "quota"
         if _FAILOVER_RATE_PATTERN.search(text):
@@ -44435,6 +44454,77 @@ class Orchestrator:
         active = self.config.active_provider
         return [active] + [k for k in self.config.providers if k != active]
 
+    def _provider_selection_path(self) -> Path:
+        return run_state_path(self.project_root).parent / "provider-selection.json"
+
+    def _provider_from_retained_run_events(self, run_id: str) -> str:
+        path = run_path(self.project_root, run_id) / "events.jsonl"
+        selected = ""
+        try:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if "provider=" not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict) or event.get("type") != "diagnostic.message":
+                        continue
+                    data = event.get("data")
+                    if not isinstance(data, dict) or not str(data.get("logger", "")).startswith("auto_agents.run."):
+                        continue
+                    message = str(event.get("message", ""))
+                    match = re.search(
+                        r"^\[agent:[^]]+\] completed ok=true\b[^\n]*\bprovider=([A-Za-z0-9_.-]+)(?:\s|$)",
+                        message,
+                    ) or re.match(r"^\[failover\] using provider=([A-Za-z0-9_.-]+)$", message)
+                    if match and match.group(1) in self.config.providers:
+                        selected = match.group(1)
+        except OSError:
+            pass
+        return selected
+
+    def _restore_run_provider_selection(self, state: RunState, spec_file: Path) -> None:
+        retained_spec = str(state.resume_context.get("spec_file", ""))
+        if (state.status == "completed" or not state.run_id
+                or retained_spec != str(Path(spec_file).expanduser().resolve())):
+            return
+        saved = read_json(self._provider_selection_path(), default={})
+        provider = (str(saved.get("provider", ""))
+                    if saved.get("run_id") == state.run_id else "")
+        if not provider:
+            provider = self._provider_from_retained_run_events(state.run_id)
+        if provider in self.config.providers:
+            self._last_successful_provider = provider
+            self._current_provider = provider
+
+    def _remember_successful_provider(self, provider: str, request: AgentRequest) -> None:
+        previous = self._last_successful_provider
+        self._last_successful_provider = provider
+        context = request.usage_context or {}
+        if (previous == provider or context.get("workflow_kind") != "run"
+                or not hasattr(self, "project_root")):
+            return
+        try:
+            state = load_run_state(self.project_root)
+            if state.run_id:
+                write_json(self._provider_selection_path(), {
+                    "run_id": state.run_id,
+                    "provider": provider,
+                })
+        except (OSError, RuntimeError, ValueError) as error:
+            self.logger.warning("[provider] could not save current provider: %s", error)
+
+    def _announce_provider(self, provider: str, *, force: bool = False) -> None:
+        if not force and getattr(self, "_reported_provider", None) == provider:
+            return
+        self._reported_provider = provider
+        self.logger.info("[provider] current=%s", provider)
+        reporter = getattr(self, "reporter", None)
+        if reporter is not None:
+            reporter.emit("provider.current", provider=provider)
+
     def _build_adapter_for_provider(self, provider_kind: str):
         prov = self.config.providers[provider_kind]
         prov.provider_name = provider_kind
@@ -44505,7 +44595,7 @@ class Orchestrator:
         from .prompting.core import fresh_request
         handoffs: List[str] = []
         usage_attempts: List[Dict[str, object]] = []
-        for kind in order:
+        for index, kind in enumerate(order):
             adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
             available_fn = getattr(adapter, "available", None)
             if available_fn is not None and not available_fn():
@@ -44519,6 +44609,7 @@ class Orchestrator:
                 continue
 
             self._current_provider = kind
+            self._announce_provider(kind)
             switching = bool(handoffs) or bool(request.resume_provider and kind != request.resume_provider)
             provider_request = (
                 fresh_request(request, "provider-switch", "\n\n".join(handoffs))
@@ -44538,7 +44629,7 @@ class Orchestrator:
                 self._provider_cleanup_blocked = True
                 raise ProviderCleanupIncompleteError("Provider process cleanup incomplete; automatic execution stopped. " + result.stderr)
             if result.ok:
-                self._last_successful_provider = kind
+                self._remember_successful_provider(kind, request)
                 self._clear_provider_failure(kind)
                 if kind != self.config.active_provider:
                     self.logger.info(f"[failover] using provider={kind}")
@@ -44562,7 +44653,11 @@ class Orchestrator:
             )
             reporter = getattr(self, "reporter", None)
             if reporter is not None:
-                reporter.emit("provider.recovering")
+                reporter.emit(
+                    "provider.recovering" if index + 1 < len(order) else "provider.unavailable",
+                    provider=kind,
+                    category=health_state.category,
+                )
             last_error = result.stderr or result.summary or "unknown error"
 
         from .models import ProvidersExhaustedError
