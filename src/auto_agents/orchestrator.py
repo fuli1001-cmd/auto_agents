@@ -57,6 +57,7 @@ from .config import (
     default_provider_config,
     docs_dir,
     design_md_path,
+    ensure_auto_gitignore,
     frontend_design_docs_dir,
     frontend_design_lock_path,
     frontend_prototype_dir,
@@ -43099,6 +43100,7 @@ class Orchestrator:
         # Complete engine-owned migrations before the mutation snapshot. A
         # provider or health observer can then never be blamed for this write.
         self._prepare_project_config_for_supervision()
+        ensure_auto_gitignore(self.project_root)
         attempts = self._max_attempts(stage)
         active_run_id = run_id or (state.run_id if state is not None else load_run_state(self.project_root).run_id)
         snapshot_before = self._worktree_change_snapshot()

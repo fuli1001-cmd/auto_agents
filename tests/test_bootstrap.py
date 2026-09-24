@@ -60,7 +60,9 @@ class BootstrapTests(unittest.TestCase):
                 "state/parallel_tuning.json\nstate/release_jobs.sqlite3\n"
                 "state/release_jobs.sqlite3-shm\nstate/release_jobs.sqlite3-wal\n"
                 "state/release-worker.log\nstate/release-worker.lock\n"
-                "state/health-watch-control.json\nstate/health-watch-control.lock\n"
+                "state/health-watch-control.json\n"
+                "state/health-watch-control.json.*.tmp\n"
+                "state/health-watch-control.lock\n"
                 "state/checkpoint_blobs/\nstate/root_cause_certificates/\n"
                 "state/session-restorations/\n"
                 "state/sessions/*/prompts/\nstate/sessions/*/outputs/\n"
@@ -119,6 +121,15 @@ class BootstrapTests(unittest.TestCase):
                 ],
                 cwd=str(project_root),
             )
+            health_control_temp_ignore = subprocess.run(
+                [
+                    "git",
+                    "check-ignore",
+                    "-q",
+                    ".auto-agents/state/health-watch-control.json.1234.abcd1234.tmp",
+                ],
+                cwd=str(project_root),
+            )
             self.assertEqual(task_archive_ignore.returncode, 1)
             self.assertEqual(run_state_archive_ignore.returncode, 0)
             self.assertEqual(run_log_ignore.returncode, 0)
@@ -126,6 +137,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(session_ignore.returncode, 1)
             self.assertEqual(session_prompt_ignore.returncode, 0)
             self.assertEqual(health_control_ignore.returncode, 0)
+            self.assertEqual(health_control_temp_ignore.returncode, 0)
             gitignore = (project_root / ".gitignore").read_text(encoding="utf-8")
             self.assertIn(".env", gitignore)
             self.assertIn(".conda/", gitignore)

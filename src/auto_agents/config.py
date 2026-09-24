@@ -58,6 +58,7 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/release-worker.log",
     "state/release-worker.lock",
     "state/health-watch-control.json",
+    "state/health-watch-control.json.*.tmp",
     "state/health-watch-control.lock",
     "state/checkpoint_blobs/",
     "state/root_cause_certificates/",

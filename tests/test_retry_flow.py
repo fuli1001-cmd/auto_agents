@@ -5677,6 +5677,52 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("stage review modified files outside its ownership", str(ctx.exception))
             self.assertIn("notes.txt", str(ctx.exception))
 
+    def test_review_ignores_health_control_atomic_write_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            ignore_path = project_root / ".auto-agents" / ".gitignore"
+
+            class HealthControlTempAdapter:
+                def run(self, request):
+                    temporary = (
+                        project_root / ".auto-agents" / "state"
+                        / "health-watch-control.json.1234.abcd1234.tmp"
+                    )
+                    temporary.write_text("{}\n", encoding="utf-8")
+                    summary = "DECISION: pass\nLooks good.\n"
+                    write_text(request.output_path, summary)
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary=summary.strip(),
+                        returncode=0,
+                    )
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = HealthControlTempAdapter()
+            state = load_run_state(project_root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            ignore_path.write_text(
+                ignore_path.read_text(encoding="utf-8").replace(
+                    "state/health-watch-control.json.*.tmp\n", ""
+                ),
+                encoding="utf-8",
+            )
+            self.assertNotIn(
+                "state/health-watch-control.json.*.tmp",
+                ignore_path.read_text(encoding="utf-8"),
+            )
+
+            result = orchestrator._run_task_review(state.run_id, task)
+
+            self.assertTrue(result["ok"])
+            self.assertIn(
+                "state/health-watch-control.json.*.tmp",
+                ignore_path.read_text(encoding="utf-8"),
+            )
+
     def test_readme_proposal_stage_rejects_repository_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
