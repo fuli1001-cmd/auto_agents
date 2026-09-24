@@ -2,10 +2,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.config import load_run_state, requirements_trace_path, save_project_config, task_plan_path
+from auto_agents.config import load_run_state, load_task_plan, requirements_trace_path, save_project_config, task_plan_path
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
@@ -467,6 +468,85 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertEqual(
                 state.tasks[0].requirement_proofs[0]["evidence_refs"],
                 ["tests/test_public_api.py::test_normalized_provider_output"],
+            )
+
+    def test_passing_review_hands_off_verified_proof_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Review proof handoff",
+                description="Complete the proof after managed verification.",
+                acceptance=["The public API returns normalized provider output."],
+                status="in_progress",
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[{
+                    "requirement_id": "REQ-001",
+                    "oracle_index": 1,
+                    "acceptance_oracle": "The public API returns normalized provider output.",
+                    "status": "planned",
+                    "proof_type": "integration_test",
+                    "oracle_strength": "behavioral",
+                    "evidence_boundary": "system_boundary",
+                    "evidence_refs": ["planned evidence"],
+                    "proxy_oracles": [],
+                }],
+            )
+            write_json(requirements_trace_path(project_root), {
+                "version": 1,
+                "requirements": [{
+                    "id": "REQ-001",
+                    "text": "Return normalized provider output.",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "acceptance_oracles": ["The public API returns normalized provider output."],
+                    "oracle_type": "integration_test",
+                    "oracle_strength": "behavioral",
+                    "evidence_boundary": "system_boundary",
+                    "forbidden_proxy_oracles": [],
+                }],
+            })
+            write_json(task_plan_path(project_root), {
+                "oracle_proof_schema_version": 1,
+                "tasks": [task.to_dict()],
+            })
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            review = (
+                "Managed checks and review passed.\n"
+                "ORACLE_PROOF_UPDATES:\n"
+                "```json\n"
+                '[{"requirement_id":"REQ-001","oracle_index":1,'
+                '"status":"verified","proof_type":"integration_test",'
+                '"oracle_strength":"behavioral","evidence_boundary":"system_boundary",'
+                '"evidence_refs":["tests/test_public_api.py::test_normalized_provider_output"],'
+                '"proxy_oracles":[]}]\n'
+                "```"
+            )
+            with (
+                patch.object(orchestrator, "_run_task_verify", return_value={
+                    "ok": True, "reason": "managed checks passed",
+                    "current_failure_ids": [], "proof_evidence": {},
+                }),
+                patch.object(orchestrator, "_run_task_review", return_value={
+                    "ok": True, "review": review,
+                }),
+                patch.object(orchestrator, "_run_task_visual_judge", return_value={
+                    "ok": True, "status": "skipped", "reason": "not applicable",
+                }),
+                patch.object(orchestrator, "_build_task_verify_commands", return_value=[]),
+            ):
+                result = orchestrator._execute_task_with_retries(
+                    state, task, gate_recheck_first=True,
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(task.requirement_proofs[0]["status"], "verified")
+            self.assertEqual(
+                load_task_plan(project_root)["tasks"][0]["requirement_proofs"][0]["status"],
+                "verified",
             )
 
     def test_oracle_proof_updates_cannot_modify_unbound_proof(self) -> None:

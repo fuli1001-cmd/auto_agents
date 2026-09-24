@@ -41675,7 +41675,11 @@ class Orchestrator:
             lines = common + [
                 "Review the current uncommitted changes for correctness, regressions, and missing tests.",
                 "The Task JSON acceptance criteria and current-task requirement_proofs are in scope. A task passes only if both Task JSON and the owned requirement proof entries are satisfied.",
-                "ORACLE PROOF AUDIT: Review every current-task requirement_proofs entry. Fail unless each owned acceptance oracle has verified proof with concrete evidence_refs, the proof_type/oracle_strength/evidence_boundary meet or exceed the requirement, and proxy_oracles do not include anything listed in forbidden_proxy_oracles.",
+                "ORACLE PROOF AUDIT: Review every current-task requirement_proofs entry. Fail unless each owned acceptance oracle has verified proof with concrete evidence_refs, the proof_type/oracle_strength/evidence_boundary meet or exceed the requirement, and proxy_oracles do not include anything listed in forbidden_proxy_oracles. A planned proof can be completed by a valid ORACLE_PROOF_UPDATES block in a passing review when the current managed verification and reviewed code support it.",
+                *([PromptBlock(
+                    "If a passing review finds current evidence for still-planned owned proofs, include an ORACLE_PROOF_UPDATES JSON block after the summary. Update only existing current-task proof pairs by requirement_id and oracle_index; set status='verified' and give concrete evidence_refs, proof_type, oracle_strength, evidence_boundary, and proxy_oracles. This proposes proof metadata for auto_agents to validate and persist; do not edit task_plan.json.",
+                    kind="output",
+                )] if task.requirement_proofs else []),
                 "TEST AUDIT: Separately evaluate whether the tests truly cover the acceptance criteria "
                 "from the Task JSON. Check that tests validate observable behavior (API contracts, "
                 "input/output, side-effects) rather than internal implementation details. "
@@ -42511,6 +42515,22 @@ class Orchestrator:
                     )
             if gate_result["ok"]:
                 proof_findings = self._task_completion_proof_findings(task)
+                if proof_findings:
+                    review_updates_applied, review_update_error = (
+                        self._apply_oracle_proof_updates_from_text(
+                            task, str(gate_result["review"])
+                        )
+                    )
+                    if review_update_error:
+                        last_reason = review_update_error
+                        feedback = self._format_retry_feedback(
+                            "oracle_proof_update", reason=last_reason
+                        )
+                        continue
+                    if review_updates_applied:
+                        proof_findings = self._task_completion_proof_findings(task)
+                        if not proof_findings:
+                            self._persist_tasks(state.tasks if state.tasks else [task])
                 if proof_findings:
                     self.logger.info(
                         "[task:%s] completion-boundary decision=continue gate=oracle_proof "

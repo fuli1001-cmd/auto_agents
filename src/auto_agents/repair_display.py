@@ -98,7 +98,10 @@ def observation(job, subscriber, language='zh'):
     if 'blocked' in (state, workflow):
         terminal = True
         error = str((job.get('result') or {}).get('error', ''))
-        if 'Insufficient disk space' in error:
+        if 'usagelimitexceeded' in error.casefold() or 'usage limit' in error.casefold():
+            label = ('模型额度已用尽；额度恢复后重试修复',
+                     'Model usage limit reached; retry repair when usage resets')
+        elif 'Insufficient disk space' in error:
             label = ('磁盘空间不足；清理空间后重新运行以继续', 'Disk space is low; free space and rerun to continue')
         elif 'recovery_proof_incomplete' in error or '恢复验证证据不完整' in error:
             label = ('原任务恢复证据不完整；更新验证控制器后重试',

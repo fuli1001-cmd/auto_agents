@@ -6,6 +6,7 @@ import sys
 import pytest
 
 from auto_agents.models import CommandResult, GateResult, RunState, TaskSpec
+from auto_agents.repair_display import observation as repair_observation
 from auto_agents.reporting import GateObservation, Reporter
 
 
@@ -396,6 +397,15 @@ def test_repair_parallel_completion_and_terminal_reason(report, screen):
     assert frame(report) == ''
     assert '磁盘空间不足；清理空间后重新运行以继续' in screen.history[-1]
     assert 'hidden' not in history(report) and '/private' not in history(report)
+
+
+def test_repair_usage_limit_explains_the_blocker():
+    job = {**repair_job(), 'state': 'blocked', 'result': {
+        'error': "{'message': 'You have hit your usage limit', 'codexErrorInfo': 'usageLimitExceeded'}"
+    }}
+    result = repair_observation(job, {'state': 'blocked'})
+    assert result['terminal']
+    assert result['name'] == '模型额度已用尽；额度恢复后重试修复'
 
 
 def test_repair_plain_progress_is_periodic_and_detailed_control_stays_in_events(report, monkeypatch):
