@@ -16405,9 +16405,17 @@ class Orchestrator:
     def _resume_review_proof_handoff(self, state: RunState) -> bool:
         blocker = state.active_blocker if isinstance(state.active_blocker, dict) else {}
         checkpoint = blocker.get("checkpoint") if isinstance(blocker.get("checkpoint"), dict) else {}
+        interrupted_handoff = blocker.get("category") == "deterministic_playbook_resume_missing_environment"
+        if interrupted_handoff and (
+            state.last_recovery_route.get("outcome") != "review_proof_handoff_recheck"
+            or state.last_recovery_route.get("candidate_fingerprint") != checkpoint.get("worktree")
+        ):
+            return False
         if (state.status != "blocked" or state.current_stage != "implement"
                 or blocker.get("owner") != "auto_agents"
-                or blocker.get("category") != "review_proof_handoff_gap"
+                or blocker.get("category") not in {
+                    "review_proof_handoff_gap", "deterministic_playbook_resume_missing_environment",
+                }
                 or checkpoint.get("stage") != "implement"
                 or checkpoint.get("head") != head_ref(self.project_root)
                 or checkpoint.get("worktree") != worktree_fingerprint(self.project_root)):
@@ -16425,7 +16433,8 @@ class Orchestrator:
             return False
         candidates = [
             task for task in state.tasks
-            if task.status == "blocked" and task.task_id in state.task_review_cache
+            if task.status == ("in_progress" if interrupted_handoff else "blocked")
+            and task.task_id in state.task_review_cache
         ]
         if len(candidates) != 1:
             return False

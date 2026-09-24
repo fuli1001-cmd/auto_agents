@@ -129,7 +129,9 @@ class RetainedVerifyBaselinePlaybook:
 
 class ReviewProofHandoffPlaybook:
     name = "review_proof_handoff_recheck"
-    categories = frozenset({"review_proof_handoff_gap"})
+    categories = frozenset({
+        "review_proof_handoff_gap", "deterministic_playbook_resume_missing_environment",
+    })
 
     def probe(self, state: RunState) -> PlaybookProbe:
         blocker = state.active_blocker if isinstance(state.active_blocker, dict) else {}

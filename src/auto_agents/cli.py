@@ -1735,7 +1735,7 @@ def _try_deterministic_self_repair_playbook(
     return _run_self_repair_resume_process(
         _run_command_for_self_repair_resume(args),
         cwd=auto_agents_repo_root(),
-        env=run_lock.inherited_environment(),
+        env=run_lock.inherited_environment(os.environ),
         pass_fd=run_lock.fileno,
     )
 

@@ -127,6 +127,17 @@ class RecoveryResilienceTests(unittest.TestCase):
             self.assertEqual(task.status, "in_progress")
             self.assertEqual(task.requirement_proofs[0]["status"], "planned")
             self.assertEqual(load_task_plan(root)["tasks"][0]["status"], "in_progress")
+            state.status = "blocked"
+            state.last_error = "resume child did not start"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "deterministic_playbook_resume_missing_environment",
+                "checkpoint": {"head": head_ref(root), "worktree": fingerprint,
+                               "stage": "implement"},
+            }
+            resumed = SelfRepairPlaybookRegistry().attempt(orchestrator, state)
+            self.assertTrue(resumed.ok, resumed.reason)
+            self.assertEqual(state.status, "pending")
             with (
                 patch.object(orchestrator, "_run_task_verify", return_value={
                     "ok": True, "reason": "managed checks passed",

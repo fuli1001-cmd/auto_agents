@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -20,6 +21,7 @@ from auto_agents.cli import (
     _promote_pending_self_repairs,
     _render_run_summary,
     _run_command_for_self_repair_resume,
+    _try_deterministic_self_repair_playbook,
     build_parser,
     main,
 )
@@ -303,6 +305,42 @@ class ProjectRunLockTests(unittest.TestCase):
 
 
 class ProjectValidationTests(unittest.TestCase):
+    def test_deterministic_repair_resume_inherits_base_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            state = RunState("run-1", status="blocked")
+            orchestrator = SimpleNamespace(config=SimpleNamespace(
+                execution=SimpleNamespace(autonomy=SimpleNamespace(mode="max")),
+            ))
+            args = SimpleNamespace(command="run", project=str(project_root), autonomy=None)
+            observed = []
+
+            def inherited_environment(base):
+                observed.append(base.get("RECOVERY_SENTINEL"))
+                return {**base, "INHERITED_LOCK": "yes"}
+
+            lock = SimpleNamespace(inherited_environment=inherited_environment, fileno=7)
+            with (
+                patch.dict(os.environ, {"RECOVERY_SENTINEL": "present"}),
+                patch("auto_agents.cli.load_run_state", return_value=state),
+                patch("auto_agents.cli.SelfRepairPlaybookRegistry.attempt", return_value=SimpleNamespace(
+                    ok=True, changed=True, name="review_proof_handoff_recheck",
+                    to_dict=lambda: {"ok": True},
+                )),
+                patch("auto_agents.cli.write_json"),
+                patch("auto_agents.cli.save_run_state"),
+                patch("auto_agents.cli.notice"),
+                patch("auto_agents.cli._run_command_for_self_repair_resume", return_value=["resume"]),
+                patch("auto_agents.cli._run_self_repair_resume_process", return_value=0) as child,
+            ):
+                result = _try_deterministic_self_repair_playbook(
+                    project_root, orchestrator, args, lock,
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(observed, ["present"])
+            self.assertEqual(child.call_args.kwargs["env"]["INHERITED_LOCK"], "yes")
+
     def test_oracle_proof_retry_reports_current_managed_verification(self) -> None:
         task = TaskSpec(
             task_id="task-proof",
