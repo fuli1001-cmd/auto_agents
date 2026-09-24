@@ -30,6 +30,7 @@ from auto_agents.config import (
     auto_dir,
     config_path,
     create_session,
+    ensure_auto_gitignore,
     load_project_config,
     load_run_state,
     migrate_project_config,
@@ -41,7 +42,7 @@ from auto_agents.config import (
     save_task_plan,
     task_plan_path,
 )
-from auto_agents.git_ops import working_tree_clean
+from auto_agents.git_ops import head_ref, working_tree_clean, worktree_fingerprint
 from auto_agents.gates import GateCommandTimeoutError
 from auto_agents.health_watch import HealthSelfRepairRequired
 from auto_agents.io_utils import read_json, write_json, write_text
@@ -302,6 +303,69 @@ class ProjectRunLockTests(unittest.TestCase):
 
 
 class ProjectValidationTests(unittest.TestCase):
+    def test_installed_health_control_ignore_reopens_only_matching_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            for command in (
+                ("config", "user.email", "test@example.com"),
+                ("config", "user.name", "Test"),
+                ("add", "-A"),
+                ("commit", "-qm", "initial"),
+            ):
+                subprocess.run(["git", *command], cwd=project_root, check=True)
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            task.status = "in_progress"
+            state.tasks = [task]
+            state.status = "blocked"
+            state.current_stage = "implement"
+            state.repair_phase = "resuming"
+            blocker = {
+                "owner": "auto_agents",
+                "category": "health_control_atomic_write_ownership_race",
+                "status": "blocked",
+                "reason": (
+                    "stage review modified files outside its ownership: "
+                    ".auto-agents/state/health-watch-control.json.1234.abcd1234.tmp"
+                ),
+                "fingerprint": "race-1",
+                "checkpoint": {
+                    "stage": "implement",
+                    "head": head_ref(project_root),
+                    "worktree": worktree_fingerprint(project_root),
+                },
+            }
+            state.active_blocker = dict(blocker)
+
+            ignore_path = project_root / ".auto-agents" / ".gitignore"
+            ignore_path.write_text(
+                ignore_path.read_text(encoding="utf-8").replace(
+                    "state/health-watch-control.json.*.tmp\n", ""
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(orchestrator._resume_health_control_ignore_repair(state))
+
+            ensure_auto_gitignore(project_root)
+            state.active_blocker["checkpoint"] = {
+                **blocker["checkpoint"],
+                "head": "different-head",
+            }
+            self.assertFalse(orchestrator._resume_health_control_ignore_repair(state))
+
+            state.active_blocker = dict(blocker)
+            self.assertTrue(orchestrator._resume_health_control_ignore_repair(state))
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.tasks[0].status, "in_progress")
+            self.assertEqual(state.active_blocker, {})
+            self.assertEqual(state.repair_phase, "")
+
+            state.status = "blocked"
+            state.active_blocker = dict(blocker)
+            self.assertFalse(orchestrator._resume_health_control_ignore_repair(state))
+
     def test_pending_run_summary_surfaces_localized_blocker_and_reason(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

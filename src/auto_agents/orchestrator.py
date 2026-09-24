@@ -1657,6 +1657,79 @@ class Orchestrator:
         )
         return True
 
+    def _resume_health_control_ignore_repair(self, state: RunState) -> bool:
+        """Resume the exact review race after the installed ignore rule is proven."""
+
+        blocker = state.active_blocker if isinstance(state.active_blocker, dict) else {}
+        reason = str(blocker.get("reason", ""))
+        if (
+            state.status != "blocked"
+            or state.current_stage != "implement"
+            or blocker.get("owner") != "auto_agents"
+            or blocker.get("status") != "blocked"
+            or blocker.get("category") != "health_control_atomic_write_ownership_race"
+            or "health-watch-control.json." not in reason
+            or "review" not in reason
+            or blocker.get("self_repair_commit")
+        ):
+            return False
+        checkpoint = blocker.get("checkpoint")
+        if not isinstance(checkpoint, dict) or checkpoint.get("stage") != "implement":
+            return False
+        checkpoint_head = str(checkpoint.get("head", ""))
+        checkpoint_worktree = str(checkpoint.get("worktree", ""))
+        if (
+            not checkpoint_head
+            or checkpoint_head != head_ref(self.project_root)
+            or not checkpoint_worktree
+            or checkpoint_worktree != worktree_fingerprint(self.project_root)
+        ):
+            return False
+
+        temporary_path = ".auto-agents/state/health-watch-control.json.1234.abcd1234.tmp"
+        if any(
+            path.startswith(".auto-agents/state/health-watch-control.json.")
+            and path.endswith(".tmp")
+            for path in tracked_files(self.project_root)
+        ):
+            return False
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--", temporary_path],
+            cwd=str(self.project_root),
+            capture_output=True,
+        )
+        if ignored.returncode != 0:
+            return False
+
+        revision = self._installed_engine_revision()
+        recovery_key = (
+            "health_control_atomic_write_ownership_race:"
+            + str(blocker.get("fingerprint", ""))
+        )
+        raw_revisions = state.resume_context.get(self.INSTALLED_ENGINE_RECOVERY_CONTEXT)
+        revisions = dict(raw_revisions) if isinstance(raw_revisions, dict) else {}
+        if revisions.get(recovery_key) == revision:
+            return False
+        revisions[recovery_key] = revision
+        state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = revisions
+        state.resume_context["health_control_ignore_recovery"] = {
+            "category": "health_control_atomic_write_ownership_race",
+            "blocker_fingerprint": str(blocker.get("fingerprint", "")),
+            "engine_revision": revision,
+            "checkpoint_head": checkpoint_head,
+            "checkpoint_worktree": checkpoint_worktree,
+            "verified_ignore_path": temporary_path,
+            "recovered_at": utc_now_iso(),
+        }
+        self._clear_run_blocker(state)
+        state.repair_phase = ""
+        self.logger.info(
+            "[self-repair] resumed health-control review race after installed "
+            "ignore proof revision=%s",
+            revision.split(":", 1)[0],
+        )
+        return True
+
     def _normalize_installed_requirement_namespace_repair(
         self,
         state: RunState,
@@ -3502,6 +3575,8 @@ class Orchestrator:
                 if self._normalize_installed_requirement_namespace_repair(state):
                     save_run_state(self.project_root, state)
                 if self._prepare_installed_generic_self_repair_resume(state):
+                    save_run_state(self.project_root, state)
+                if self._resume_health_control_ignore_repair(state):
                     save_run_state(self.project_root, state)
                 if self._prepare_installed_self_repair_resume(state):
                     save_run_state(self.project_root, state)
