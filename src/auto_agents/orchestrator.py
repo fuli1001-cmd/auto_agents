@@ -16402,6 +16402,88 @@ class Orchestrator:
         save_run_state(self.project_root, state)
         return True
 
+    def _resume_review_proof_handoff(self, state: RunState) -> bool:
+        blocker = state.active_blocker if isinstance(state.active_blocker, dict) else {}
+        checkpoint = blocker.get("checkpoint") if isinstance(blocker.get("checkpoint"), dict) else {}
+        if (state.status != "blocked" or state.current_stage != "implement"
+                or blocker.get("owner") != "auto_agents"
+                or blocker.get("category") != "review_proof_handoff_gap"
+                or checkpoint.get("stage") != "implement"
+                or checkpoint.get("head") != head_ref(self.project_root)
+                or checkpoint.get("worktree") != worktree_fingerprint(self.project_root)):
+            return False
+
+        plan = load_task_plan(self.project_root)
+        planned = plan.get("tasks", []) if isinstance(plan, dict) else []
+        if (not isinstance(planned, list) or len(planned) != len(state.tasks)
+                or any(not isinstance(item, dict) for item in planned)):
+            return False
+        if any(
+            {key: value for key, value in task.to_dict().items() if key != "commit_sha"} != item
+            for task, item in zip(state.tasks, planned)
+        ):
+            return False
+        candidates = [
+            task for task in state.tasks
+            if task.status == "blocked" and task.task_id in state.task_review_cache
+        ]
+        if len(candidates) != 1:
+            return False
+        task = candidates[0]
+        review = state.task_review_cache.get(task.task_id, {})
+        if (not isinstance(review, dict) or review.get("decision") != "pass"
+                or review.get("fingerprint") != checkpoint["worktree"]
+                or review.get("prompt_policy_hash") != self._review_prompt_policy_hash()
+                or not self._implementation_ready_markers(state).get(task.task_id)):
+            return False
+        latest_verify = next(
+            (
+                entry for entry in reversed(task.verify_history)
+                if isinstance(entry, dict)
+                and self._verify_history_entry_is_in_active_retry_lifecycle(task, entry)
+            ),
+            {},
+        )
+        if (latest_verify.get("decision") != "pass"
+                or latest_verify.get("candidate_fingerprint") != checkpoint["worktree"]):
+            return False
+
+        replay = TaskSpec.from_dict(task.to_dict())
+        applied, error = self._apply_oracle_proof_updates_from_text(
+            replay, str(review.get("summary", ""))
+        )
+        if not applied or error or self._task_completion_proof_findings(replay):
+            return False
+        if len(task.requirement_proofs) != len(replay.requirement_proofs):
+            return False
+        changed = False
+        for before, after in zip(task.requirement_proofs, replay.requirement_proofs):
+            if not isinstance(before, dict) or not isinstance(after, dict):
+                return False
+            expected = {**before, "status": "verified", "proxy_oracles": before.get("proxy_oracles", [])}
+            actual = {**after, "proxy_oracles": after.get("proxy_oracles", [])}
+            if expected != actual:
+                return False
+            changed |= before.get("status") != "verified"
+        if not changed:
+            return False
+
+        # The saved candidate still needs a fresh managed gate. Leave proofs
+        # planned until the normal verify/review completion path accepts them.
+        task.status = "in_progress"
+        state.status = "pending"
+        state.active_blocker = {}
+        state.last_error = ""
+        state.last_recovery_route = {
+            **state.last_recovery_route,
+            "outcome": "review_proof_handoff_recheck",
+            "task_id": task.task_id,
+            "candidate_fingerprint": checkpoint["worktree"],
+        }
+        self._persist_tasks(state.tasks)
+        self.logger.info("[self-repair] reopening retained review proof handoff task=%s", task.task_id)
+        return True
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         if (state.active_blocker or {}).get("category") == "metadata_schema_false_positive_and_checkpoint_failure":
             if self._resume_metadata_checkpoint_repair(state):

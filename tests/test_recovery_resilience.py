@@ -12,7 +12,10 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gates import GateCommandBaselineIdentityError
-from auto_agents.config import load_run_state, save_run_state
+from auto_agents.config import (
+    load_run_state, load_task_plan, requirements_trace_path, save_run_state,
+    task_plan_path,
+)
 from auto_agents.git_ops import (
     add_worktree,
     apply_checkpoint_application as apply_checkpoint_transaction,
@@ -46,6 +49,100 @@ class RecoveryResilienceTests(unittest.TestCase):
     def _project(self, root: Path) -> Orchestrator:
         Orchestrator.init_project(root, "demo", "mock")
         return Orchestrator(root)
+
+    def test_saved_passing_review_reopens_unchanged_blocked_task_for_gate_recheck(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            write_text(root / "feature.py", "original\n")
+            commit_all(root, "baseline")
+            write_text(root / "feature.py", "candidate\n")
+            fingerprint = worktree_fingerprint(root)
+            oracle = "The public API returns the candidate."
+            write_json(requirements_trace_path(root), {
+                "version": 1,
+                "requirements": [{
+                    "id": "REQ-1", "text": oracle, "status": "active",
+                    "priority": "mandatory", "acceptance_oracles": [oracle],
+                    "oracle_type": "integration_test", "oracle_strength": "behavioral",
+                    "evidence_boundary": "system_boundary",
+                    "forbidden_proxy_oracles": [],
+                }],
+            })
+            task = TaskSpec(
+                task_id="task-proof", title="Candidate proof", description=oracle,
+                acceptance=[oracle], requirement_ids=["REQ-1"], status="blocked",
+                requirement_proofs=[{
+                    "requirement_id": "REQ-1", "oracle_index": 1,
+                    "acceptance_oracle": oracle, "status": "planned",
+                    "proof_type": "integration_test", "oracle_strength": "behavioral",
+                    "evidence_boundary": "system_boundary",
+                    "evidence_refs": ["tests/test_feature.py::test_candidate"],
+                    "proxy_oracles": [],
+                }],
+                verify_history=[{
+                    "attempt": 4, "decision": "pass",
+                    "candidate_fingerprint": fingerprint,
+                    "recovery_epoch": 0, "recovery_round": 0,
+                    "verify_retry_epoch": 0,
+                }],
+            )
+            plan_task = task.to_dict()
+            plan_task.pop("commit_sha", None)
+            write_json(task_plan_path(root), {
+                "oracle_proof_schema_version": 1, "tasks": [plan_task],
+            })
+            review = (
+                "Proof accepted.\nORACLE_PROOF_UPDATES:\n```json\n"
+                '[{"requirement_id":"REQ-1","oracle_index":1,'
+                '"status":"verified","proof_type":"integration_test",'
+                '"oracle_strength":"behavioral","evidence_boundary":"system_boundary",'
+                '"evidence_refs":["tests/test_feature.py::test_candidate"],'
+                '"proxy_oracles":[]}]\n```'
+            )
+            state = RunState(
+                run_id="run-proof", status="blocked", current_stage="implement",
+                tasks=[task], last_error="proof handoff blocked",
+                active_blocker={
+                    "owner": "auto_agents", "category": "review_proof_handoff_gap",
+                    "checkpoint": {"head": head_ref(root), "worktree": fingerprint,
+                                   "stage": "implement"},
+                },
+            )
+            state.resume_context["implementation_ready_tasks"] = {task.task_id: True}
+            state.task_review_cache[task.task_id] = {
+                "decision": "pass", "fingerprint": fingerprint,
+                "prompt_policy_hash": orchestrator._review_prompt_policy_hash(),
+                "summary": review,
+            }
+            write_text(root / "feature.py", "changed after review\n")
+            rejected = SelfRepairPlaybookRegistry().attempt(orchestrator, state)
+            self.assertFalse(rejected.ok)
+            self.assertEqual(state.status, "blocked")
+
+            write_text(root / "feature.py", "candidate\n")
+            accepted = SelfRepairPlaybookRegistry().attempt(orchestrator, state)
+            self.assertTrue(accepted.ok, accepted.reason)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(task.status, "in_progress")
+            self.assertEqual(task.requirement_proofs[0]["status"], "planned")
+            self.assertEqual(load_task_plan(root)["tasks"][0]["status"], "in_progress")
+            with (
+                patch.object(orchestrator, "_run_task_verify", return_value={
+                    "ok": True, "reason": "managed checks passed",
+                    "current_failure_ids": [], "proof_evidence": {},
+                }),
+                patch.object(orchestrator, "_run_task_review", side_effect=AssertionError("cached review should be reused")),
+                patch.object(orchestrator, "_run_task_visual_judge", return_value={
+                    "ok": True, "status": "skipped", "reason": "not applicable",
+                }),
+                patch.object(orchestrator, "_build_task_verify_commands", return_value=[]),
+            ):
+                completion = orchestrator._execute_task_with_retries(
+                    state, task, resume_existing=True,
+                )
+            self.assertTrue(completion["ok"], completion)
+            self.assertEqual(task.requirement_proofs[0]["status"], "verified")
 
     def _state_with_retained_candidate(
         self,

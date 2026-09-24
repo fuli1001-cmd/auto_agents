@@ -127,10 +127,45 @@ class RetainedVerifyBaselinePlaybook:
         )
 
 
+class ReviewProofHandoffPlaybook:
+    name = "review_proof_handoff_recheck"
+    categories = frozenset({"review_proof_handoff_gap"})
+
+    def probe(self, state: RunState) -> PlaybookProbe:
+        blocker = state.active_blocker if isinstance(state.active_blocker, dict) else {}
+        applicable = (
+            state.status == "blocked"
+            and state.current_stage == "implement"
+            and blocker.get("owner") == "auto_agents"
+            and blocker.get("category") in self.categories
+        )
+        return PlaybookProbe(
+            applicable=applicable,
+            name=self.name,
+            category=str(blocker.get("category", "")),
+            reason="recheck the retained passing review against the unchanged candidate",
+        )
+
+    def apply(self, orchestrator: object, state: RunState) -> PlaybookResult:
+        probe = self.probe(state)
+        resume = getattr(orchestrator, "_resume_review_proof_handoff", None)
+        changed = bool(probe.applicable and callable(resume) and resume(state))
+        return PlaybookResult(
+            ok=changed,
+            changed=changed,
+            name=self.name,
+            category=probe.category,
+            reason=("retained candidate is ready for managed recheck" if changed
+                    else "retained review proof handoff could not be revalidated"),
+        )
+
+
 class SelfRepairPlaybookRegistry:
     def __init__(self, playbooks: Optional[Iterable[SelfRepairPlaybook]] = None) -> None:
         self.playbooks = list(
-            playbooks if playbooks is not None else [RetainedVerifyBaselinePlaybook()]
+            playbooks if playbooks is not None else [
+                RetainedVerifyBaselinePlaybook(), ReviewProofHandoffPlaybook(),
+            ]
         )
 
     def probe(self, state: RunState) -> Optional[PlaybookProbe]:
