@@ -1007,6 +1007,8 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
     monkeypatch.setattr(repair_client.time, "sleep", lambda seconds: None)
     first, second = "223d4c02f56845e79745958a", "f28ccccd37b2469cafc6c2a7"
     problems = {first: "任务重试后进度未恢复，导致流程无法继续", second: "验证结果未正确保存，导致重复验证"}
+    resume_log = Path(config['root']) / 'jobs' / first / 'resume-workflow.log'
+    resume_log.parent.mkdir(parents=True)
     states = iter([
         (first, "repairing", "waiting", "candidate_generation", 1, 0),
         (first, "repairing", "waiting", "candidate_generation", 1, 65),
@@ -1028,6 +1030,14 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
             return {"job": first}
         assert request["op"] == "status"
         job, state, workflow, phase, candidate, elapsed = next(states)
+        if elapsed == 275:
+            resume_log.write_text('[17:54:09] （实现阶段：7/19）继续验证\n')
+        elif elapsed == 280:
+            with resume_log.open('a') as output:
+                output.write('[18:08:44] （实现阶段：8/19）继续编码\n')
+        elif elapsed == 290:
+            with resume_log.open('a') as output:
+                output.write('[18:39:54] 从实现返回计划\n')
         monkeypatch.setattr(repair_client.time, "time", lambda: 1000 + elapsed)
         progress = {"phase": phase, "candidate": candidate, "started_at": 1000} if phase else {}
         if grouped and phase:
@@ -1056,9 +1066,12 @@ def test_foreground_explains_each_problem_once_and_only_reports_progress_changes
         "Self-repair 223d4c02：第 2 轮：正在执行针对性验证",
         "Self-repair 223d4c02：代码已验证，正在检查原任务能否恢复",
         "Self-repair 223d4c02：正在恢复原任务",
+        "[17:54:09] （实现阶段：7/19）继续验证",
         "Self-repair 223d4c02：原任务已确认接管，继续运行",
+        "[18:08:44] （实现阶段：8/19）继续编码",
         f"Self-repair f28ccccd：正在修复：{problems[second]}",
         f"详细日志：{config['root']}/jobs/{second}",
+        "[18:39:54] 从实现返回计划",
         "Self-repair f28ccccd：修复受阻：修复环境依赖安装失败",
         f"详细日志：{config['root']}/jobs/{second}",
     ]

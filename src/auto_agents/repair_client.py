@@ -321,6 +321,55 @@ def _report_repair_progress(project, message):
         print(message, file=sys.stderr)
 
 
+class _ResumeOutputRelay:
+    """Follow the resumed CLI's redirected console output across status polls."""
+
+    def __init__(self):
+        self.path = None
+        self.identity = None
+        self.offset = 0
+        self.pending = b''
+
+    def drain(self, path, reporter, *, final=False):
+        path = Path(path)
+        if path != self.path:
+            self.path, self.identity, self.offset, self.pending = path, None, 0, b''
+        try:
+            with path.open('rb') as source:
+                stat = os.fstat(source.fileno())
+                identity = (stat.st_dev, stat.st_ino)
+                if identity != self.identity or source.seek(0, 2) < self.offset:
+                    self.identity, self.offset, self.pending = identity, 0, b''
+                source.seek(self.offset)
+                # Keep partial UTF-8 lines until the next poll. Bound work per
+                # active poll, but drain everything before a terminal return.
+                read = 0
+                while final or read < 1048576:
+                    chunk = source.read(65536)
+                    if not chunk:
+                        break
+                    read += len(chunk)
+                    self.offset += len(chunk)
+                    lines = (self.pending + chunk).split(b'\n')
+                    self.pending = lines.pop()
+                    for line in lines:
+                        self._show(line, reporter)
+                if final and self.pending:
+                    self._show(self.pending, reporter)
+                    self.pending = b''
+        except OSError:
+            return
+
+    @staticmethod
+    def _show(line, reporter):
+        from .diagnostic_output import plain_text, redact
+        text = redact(plain_text(line.decode('utf-8', errors='replace').rstrip('\r')))
+        if reporter is not None:
+            reporter.presenter.relay_output(text)
+        else:
+            print(text, file=sys.stderr)
+
+
 def _repair_text(value, limit=80):
     from .repair_environment_log import sanitize
     # Redact before flattening/truncating, including multiline authorization headers.
@@ -626,6 +675,7 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     announced = set()
     imported_announced = set()
     group_totals = {}
+    resume_output = _ResumeOutputRelay()
     previous_term = signal.getsignal(signal.SIGTERM)
     def interrupted(signum, frame):
         from .process_supervision import RunInterruptedError
@@ -702,6 +752,12 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
                 if not first and (status in {"blocked", "cancelled"} or subscriber["state"] in {"blocked", "cancelled"}):
                     _report_repair_progress(project, log_path)
                 last = (job, message)
+            if subscriber['state'] == 'resuming' or resume_output.path is not None:
+                resume_log = ((Path(registration['config']['root']) / 'jobs' / job /
+                               f"resume-{registration['subscriber']}.log")
+                              if subscriber['state'] == 'resuming' else resume_output.path)
+                resume_output.drain(resume_log, reporter,
+                                    final=subscriber['state'] in {'finished', 'blocked', 'cancelled'})
             if subscriber["state"] == "finished":
                 return 0
             if status in {"blocked", "cancelled"} or subscriber["state"] in {"blocked", "cancelled"}:

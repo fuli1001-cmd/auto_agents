@@ -328,6 +328,23 @@ class ConsolePresenter:
             except Exception:
                 self._stop_live()
 
+    def relay_output(self, line: str) -> None:
+        """Show output from a resumed command without writing it to its logs again."""
+        with self._lock:
+            if self._closed:
+                return
+            self._ensure_started()
+            line = redact(plain_text(line))
+            try:
+                if self._live is not None and not self._suspended:
+                    from rich.text import Text
+                    self._console.print(Text(line))
+                else:
+                    self.stream.write(line + "\n")
+                    self.stream.flush()
+            except Exception:
+                self._stop_live()
+
     def _frame(self, reporter: "Reporter") -> str:
         snapshot = reporter.snapshot
         zh = reporter.language == "zh"

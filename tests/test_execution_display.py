@@ -419,6 +419,39 @@ def test_repair_plain_progress_is_periodic_and_detailed_control_stays_in_events(
     assert '最近输出' not in frame(report) and '1/3' not in frame(report)
 
 
+def test_resumed_command_output_is_relayed_once_without_rewriting_user_log(report, tmp_path):
+    from auto_agents.repair_client import _ResumeOutputRelay
+
+    relay = _ResumeOutputRelay()
+    path = tmp_path / 'resume.log'
+    line = '[17:54:09] （实现阶段：7/19）继续验证'
+    encoded = (line + '\n').encode()
+    relay.drain(path, report)
+    path.write_bytes(encoded[:25])
+    relay.drain(path, report)
+    assert report.presenter.stream.getvalue() == ''
+    with path.open('ab') as output:
+        output.write(encoded[25:])
+    relay.drain(path, report)
+    relay.drain(path, report)
+    assert report.presenter.stream.getvalue().splitlines() == [line]
+    assert line not in history(report)
+    with path.open('ab') as output:
+        output.write(b'last line without newline')
+    relay.drain(path, report, final=True)
+    assert report.presenter.stream.getvalue().splitlines()[-1] == 'last line without newline'
+
+
+def test_resumed_command_output_uses_live_presenter(report, screen, tmp_path):
+    from auto_agents.repair_client import _ResumeOutputRelay
+
+    path = tmp_path / 'resume.log'
+    path.write_text('[17:54:09] （实现阶段：7/19）继续验证\n')
+    _ResumeOutputRelay().drain(path, report)
+    assert screen.history == ['[17:54:09] （实现阶段：7/19）继续验证']
+    assert report.presenter.stream.getvalue() == ''
+
+
 def test_repair_diagnosis_uses_actual_provider_output(report, screen, monkeypatch):
     clock = [100.0]
     monkeypatch.setattr('auto_agents.execution_display.time.monotonic', lambda: clock[0])
