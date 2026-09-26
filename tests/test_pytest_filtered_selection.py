@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from auto_agents.models import SessionState
+from auto_agents.execution_binding import RunnerContextError
 from auto_agents.repair_v2.workspace import git
 from auto_agents.session_verification import _validate_required_node_selection, SessionOwnershipError
 from auto_agents.verification_context import VerificationExecutionContext
@@ -58,6 +59,61 @@ def test_default_negative_filter_selects_owned_test_without_running_or_enabling_
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert '1 passed, 1 deselected' in completed.stdout
     assert (root / 'executed').read_text() == 'owned'
+
+
+def test_focused_fix_admits_planned_node_then_requires_candidate_selection(scene, monkeypatch):
+    root, session, state, _ = scene
+    existing = 'tests/test_owned.py::test_owned'
+    planned = 'tests/test_owned.py::TestFuture::test_new'
+    command = shlex.join([sys.executable, '-m', 'pytest', '-q', '-m', 'not real_service',
+                          existing, planned])
+    state.fix_verify_command = command
+    state.verification_binding['task_scope'] = {
+        'mode': 'focused_fix', 'task_ids': [], 'requirement_ids': [],
+        'verification_refs': [existing, planned]}
+    state.verification_binding['tasks'] = []
+    retained_revision = state.verification_binding['contract_revision']
+
+    _validate_required_node_selection(session, state, [command])
+    assert not (root / 'executed').exists()
+
+    monkeypatch.setattr('auto_agents.session_candidate.validate_receipt', lambda _state: None)
+    monkeypatch.setattr('auto_agents.session_source.validate_checkout', lambda *_args: None)
+    state.candidate_custody = {'checkout': str(root),
+                               'receipt': {'source_revision': retained_revision}}
+    with pytest.raises(RunnerContextError, match='retained pytest selection failed'):
+        _validate_required_node_selection(session, state, [command])
+    source = (root / 'tests/test_owned.py').read_text()
+    (root / 'tests/test_owned.py').write_text(source + '\nclass TestFuture:\n'
+        '    def test_new(self): pass\n')
+    retain(root, state)
+    state.candidate_custody['receipt']['source_revision'] = state.verification_binding['contract_revision']
+    # The retained source remains the initial commit; the candidate is a new
+    # committed snapshot whose exact node must collect under the same filter.
+    state.verification_binding['contract_revision'] = retained_revision
+    _validate_required_node_selection(session, state, [command])
+
+    (root / 'tests/test_owned.py').write_text(source + '\nclass TestFuture:\n'
+        '    @pytest.mark.real_service\n'
+        '    def test_new(self): pass\n')
+    retain(root, state)
+    state.candidate_custody['receipt']['source_revision'] = git(root, 'rev-parse', 'HEAD')
+    state.verification_binding['contract_revision'] = retained_revision
+    with pytest.raises(SessionOwnershipError, match='lacks unfiltered executable evidence'):
+        _validate_required_node_selection(session, state, [command])
+    assert not (root / 'executed').exists()
+
+
+def test_task_owned_fix_cannot_provisionally_admit_missing_node(scene):
+    root, session, state, _ = scene
+    existing = 'tests/test_owned.py::test_owned'
+    missing = 'tests/test_owned.py::TestFuture::test_new'
+    command = shlex.join([sys.executable, '-m', 'pytest', '-q', '-m', 'not real_service',
+                          existing, missing])
+    state.verification_binding['tasks'][0]['verification_refs'] = [existing, missing]
+    with pytest.raises(RunnerContextError, match='retained pytest selection failed'):
+        _validate_required_node_selection(session, state, [command])
+    assert not (root / 'executed').exists()
 
 
 @pytest.mark.parametrize('source', ['configuration', 'environment', 'command', 'hook', 'parameters'])

@@ -1374,6 +1374,8 @@ def _validate_required_node_selection(session, state, commands):
     covered = set()
     rejected = {ref: [] for ref in refs}
     unparsed = []
+    focused = binding.get('task_scope', {}).get('mode') == 'focused_fix'
+    candidate = focused and bool(state.candidate_custody.get('receipt'))
     for command in commands:
         if len(covered) == len(refs):
             break
@@ -1420,11 +1422,20 @@ def _validate_required_node_selection(session, state, commands):
                         restricted = _pytest_selection_restricted(selection_args)
                         excluded = (None if restricted else _pytest_discovery_excludes(selection_args, ref,
                             directory=absolute != selected, collection_root=selected, source_path=absolute))
+                        provisional = False
                         if restricted and not _pytest_selection_restricted(selection_args, allow_expressions=True):
                             from .pytest_selection import selected_nodes
-                            collected, deselected = selected_nodes(session, state, invocation)
+                            exact = set(invocation.repository_targets)
+                            pending = sorted(set(refs) & exact) if focused and not candidate else []
+                            observation = selected_nodes(session, state, invocation,
+                                **({'candidate': True} if candidate else
+                                   {'expected_missing': pending} if pending else {}))
+                            collected, deselected = observation[:2]
+                            missing = observation[2] if len(observation) == 3 else ()
                             matches = lambda item: item == ref or item.startswith(ref + '[')
-                            restricted = not any(map(matches, collected)) or any(map(matches, deselected))
+                            provisional = ref in missing and ref in exact
+                            restricted = (not (any(map(matches, collected)) or provisional)
+                                          or any(map(matches, deselected)))
                             excluded = restricted
                         if not restricted and not excluded:
                             covered.add(ref)
