@@ -551,6 +551,11 @@ class TerminalEvidenceCollector:
         diagnosis_id = uuid.uuid4().hex[:12]
         root = run_path(self.target_root, run_id) / "root-cause" / diagnosis_id
         root.mkdir(parents=True, exist_ok=True)
+        from .artifact_runtime import track
+        owner = ({'session_id': run_id[len('session-'):]} if run_id.startswith('session-')
+                 else {'run_id': run_id})
+        track(root, 'evidence', project=self.target_root,
+              metadata={'workflow_artifact': 1, 'diagnosis_id': diagnosis_id, **owner})
         payload: Dict[str, object] = {
             "schema_version": ROOT_CAUSE_SCHEMA_VERSION,
             "diagnosis_id": diagnosis_id,

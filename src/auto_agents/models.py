@@ -1975,9 +1975,11 @@ class SessionState:
     verification_binding: Dict[str, object] = field(default_factory=dict)
     candidate_paths: Dict[str, str] = field(default_factory=dict)
     candidate_custody: Dict[str, object] = field(default_factory=dict)
+    candidate_archive: Dict[str, object] = field(default_factory=dict)
     proof_review: Dict[str, object] = field(default_factory=dict)
     acceptance_execution: Dict[str, object] = field(default_factory=dict)
     source_descriptor: Dict[str, object] = field(default_factory=dict)
+    source_archive: Dict[str, object] = field(default_factory=dict)
     verification_diagnostics: Dict[str, object] = field(default_factory=dict)
     mode: str = "fix"
     status: str = "conversing"
@@ -2035,9 +2037,11 @@ class SessionState:
             verification_binding=dict(data.get("verification_binding", {})),
             candidate_paths=dict(data.get("candidate_paths", {})),
             candidate_custody=dict(data.get("candidate_custody", {})),
+            candidate_archive=dict(data.get("candidate_archive", {})),
             proof_review=dict(data.get("proof_review", {})),
             acceptance_execution=dict(data.get("acceptance_execution", {})),
             source_descriptor=dict(data.get("source_descriptor", {})),
+            source_archive=dict(data.get("source_archive", {})),
             verification_diagnostics=dict(data.get("verification_diagnostics", {})),
             mode=str(data.get("mode", "fix")),
             status=str(data.get("status", "conversing")),
@@ -2126,9 +2130,11 @@ class SessionState:
             "verification_binding": dict(self.verification_binding),
             "candidate_paths": dict(self.candidate_paths),
             "candidate_custody": dict(self.candidate_custody),
+            "candidate_archive": dict(self.candidate_archive),
             "proof_review": dict(self.proof_review),
             "acceptance_execution": dict(self.acceptance_execution),
             "source_descriptor": dict(self.source_descriptor),
+            "source_archive": dict(self.source_archive),
             "verification_diagnostics": dict(self.verification_diagnostics),
             "mode": self.mode,
             "status": self.status,

@@ -44,6 +44,10 @@ def freeze_target(project: Path, experiment_root: Path, invocation: dict) -> tup
             "schema_version": 1, "target_sha256": digest, "invocation": invocation,
         })
         os.replace(temporary, root)
+        from .artifact_runtime import track
+        track(root, 'recovery', project=project,
+              metadata={'workflow_artifact': 1,
+                        **{key: invocation[key] for key in ('session_id', 'run_id') if invocation.get(key)}})
         return root / "target", digest
     finally:
         if temporary.exists():

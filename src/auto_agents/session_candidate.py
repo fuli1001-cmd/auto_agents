@@ -121,11 +121,12 @@ def _clone(source, revision, destination):
 
 
 def _runtime_checkout(root, state, source, revision):
-    from .session_source import register_checkout
+    from .session_source import register_checkout, track_checkout
     runtime = Path(tempfile.gettempdir()).resolve()
     if runtime.is_relative_to(Path(root).resolve()):
         raise ownership_error(state, 'candidate runtime storage must be outside the shared repository')
     destination = Path(tempfile.mkdtemp(prefix='auto-agents-candidate-', dir=runtime)) / 'project'
+    track_checkout(root, state, destination)
     revision = _clone(source, revision, destination)
     register_checkout(root, state, destination)
     return destination, revision

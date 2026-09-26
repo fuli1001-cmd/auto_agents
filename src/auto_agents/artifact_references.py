@@ -103,7 +103,9 @@ def referenced_file(project, artifact):
     state = root / ".auto-agents/state"
     deadline = time.monotonic() + 0.3
     fields = {"path", "source_path", "log_path", "evidence_refs", "verification_refs", "artifacts",
-              "diagnostic_attachments", "proof_ref", "result_ref", "last_child_result_ref", "baseline_git_ref"}
+              "diagnostic_attachments", "proof_ref", "result_ref", "last_child_result_ref", "baseline_git_ref",
+              "checkout", "candidate_custody", "candidate_delivery", "source_descriptor",
+              "checkpoint", "checkpoint_path", "workspace", "source_root", "target_root"}
 
     def matches(value):
         if isinstance(value, str):
@@ -126,6 +128,9 @@ def referenced_file(project, artifact):
     paths = [state / "run_state.json"]
     paths.extend((state / "sessions").glob("*/session_state.json"))
     paths.extend((state / "handoffs").glob("*.json"))
+    paths.extend((state / "sources").glob("*.json"))
+    paths.extend((state / "workflows").glob("*/workflow.json"))
+    paths.extend((root / ".auto-agents/runs").glob("*/repair-cases/*.json"))
     for path in paths:
         if time.monotonic() >= deadline:
             return "unknown_reference: evidence scan budget exhausted"
@@ -155,10 +160,18 @@ def protection(row):
                     return "referenced_proof_blob"
         project = metadata.get("project")
         if project:
+            if metadata.get("candidate_lifecycle"):
+                from .artifact_workflow import candidate_protection
+                return candidate_protection(row)
+            if metadata.get('workflow_artifact'):
+                from .artifact_workflow import owner_protection
+                reason = owner_protection(metadata)
+                if reason:
+                    return reason
             reason = project_protection(project, recovery=row["kind"] in {"recovery", "evidence", "log", "worktree", "environment"})
             if reason:
                 return reason
-            if row["kind"] in {"log", "evidence", "recovery"}:
+            if row["kind"] in {"log", "evidence", "recovery", "worktree"}:
                 reason = referenced_file(project, row["path"])
                 if reason:
                     return reason
@@ -247,7 +260,7 @@ def protection(row):
 
 
 @contextlib.contextmanager
-def deletion_guard(row):
+def deletion_guard(row, *, store=None):
     with contextlib.ExitStack() as stack:
         metadata = row["metadata"]
         locks = []
@@ -262,6 +275,10 @@ def deletion_guard(row):
             path.parent.mkdir(parents=True, exist_ok=True)
             handle = stack.enter_context(path.open("a+"))
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if metadata.get('candidate_lifecycle'):
+            from .artifact_workflow import candidate_repair_guard
+            from .artifact_store import ArtifactStore
+            stack.enter_context(candidate_repair_guard(store or ArtifactStore(), row))
         if metadata.get("proof_database"):
             db = stack.enter_context(contextlib.closing(sqlite3.connect(Path(metadata["proof_database"]).as_uri() + "?mode=rw", uri=True, timeout=0.1)))
             db.execute("BEGIN IMMEDIATE")

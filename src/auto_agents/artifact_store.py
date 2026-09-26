@@ -341,12 +341,18 @@ class ArtifactStore:
             return "permanent"
         if row["pin"]:
             return "pinned: " + row["pin"]
-        if row["references"]:
+        if row["references"] and not row['metadata'].get('candidate_lifecycle'):
             return "referenced: " + ", ".join(row["references"])
         if any(alive(x) for x in row["leases"]):
             return "active_process"
         from .artifact_references import protection
-        return protection(row)
+        reason = protection(row)
+        if reason:
+            return reason
+        if row['metadata'].get('candidate_lifecycle'):
+            from .artifact_workflow import repair_candidate_protection
+            return repair_candidate_protection(self, row)
+        return ''
 
     def classify(self, row, now, pressure=False):
         if row.get("schema_version", 1) != 1:
@@ -367,6 +373,8 @@ class ArtifactStore:
                     return "eligible"
                 return "eligible" if now >= row.get("purge_after", now + DAY) else "quarantine_grace"
             ttl = self.policy()["ttl"][row["kind"]]
+            if row['metadata'].get('candidate_lifecycle'):
+                ttl = 0  # Completed, delivered candidates have no remaining consumer.
             if row.get("failed") and row["kind"] in {"evidence", "log"}:
                 ttl = 30 * DAY
             if pressure and row["kind"] in {"cache", "environment"}:
@@ -377,6 +385,10 @@ class ArtifactStore:
             return "unknown: " + str(error)
 
     def _reconcile(self, row):
+        if row['state'] in {'live', 'released'}:
+            from .artifact_workflow import adopt_registered_candidate
+            if adopt_registered_candidate(row):
+                self._save(row, 'candidate_custody_reconciled')
         if row["state"] not in {"quarantining", "quarantined", "deleting"}:
             return
         original = Path(row["path"])
@@ -490,7 +502,7 @@ class ArtifactStore:
                         results.append({"id": row["id"], "result": "skipped", "reason": reason})
                         continue
                     from .artifact_references import deletion_guard
-                    with deletion_guard(row):
+                    with deletion_guard(row, store=self):
                         self._delete(row, deadline)
                     results.append({"id": row["id"], "result": row["state"],
                                     "freed_bytes": row["bytes"] if row["state"] == "deleted" else 0})
@@ -501,6 +513,12 @@ class ArtifactStore:
                 "budget_exhausted": time.monotonic() >= deadline}
 
     def _delete(self, row, deadline, *, immediate=False):
+        if row['metadata'].get('candidate_lifecycle'):
+            from .artifact_workflow import retire_candidate
+            with _parent_fd(row, row.get('trash') or row['path']):
+                retire_candidate(row, deadline)
+            self._save(row, 'candidate_delivery_retained')
+            immediate = True
         if row["kind"] == "worktree":
             from .artifact_references import remove_worktree
             remove_worktree(row)
@@ -546,7 +564,7 @@ class ArtifactStore:
                 return {**result, 'result': 'absent' if reason in ('deleted', 'missing') else 'retained'}
             from .artifact_references import deletion_guard
             try:
-                with deletion_guard(row):
+                with deletion_guard(row, store=self):
                     self._delete(row, deadline, immediate=True)
                 return {**result, 'result': 'deleted', 'freed_bytes': row['bytes']}
             except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:

@@ -223,7 +223,8 @@ def create_repair_checkpoint(
     manifest = root / "manifest.json"
     _atomic_json(manifest, manifest_payload)
     from .artifact_runtime import track
-    track(root, "recovery", project=project)
+    track(root, "recovery", project=project,
+          metadata={'workflow_artifact': 1, 'run_id': run_id, 'case_id': case_id})
     return manifest
 
 

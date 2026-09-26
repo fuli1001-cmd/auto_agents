@@ -19,7 +19,7 @@ from .artifact_store import ArtifactStore, process_identity, storage_root
 _context = contextvars.ContextVar("artifact_context", default=None)
 _owned = set()
 _acquired = {}
-_warned = False
+_warned = set()
 _pending_diagnostics = []
 _timer = None
 _timer_lock = threading.Lock()
@@ -73,9 +73,12 @@ def track(path, kind="scratch", *, project=None, scope=None, metadata=None, refe
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
         # Sandboxed producers may not own the host registry. Their enclosing
         # registered sandbox retains ownership; never broaden write permission.
-        if not _warned:
-            _warned = True
-            message = f"Storage tracking unavailable; unregistered artifacts will be retained: {error}"
+        warning_key = (str(Path(path).absolute()), kind, str(error))
+        if not isinstance(_warned, set):
+            _warned = set()
+        if warning_key not in _warned:
+            _warned.add(warning_key)
+            message = f"Storage tracking unavailable for {Path(path).absolute()} ({kind}); unregistered artifacts will be retained: {error}"
             from .reporting import find_reporter
             reporter = find_reporter(project)
             if reporter is not None:
@@ -148,7 +151,13 @@ def worker_scope(function):
 atexit.register(release_owned, True)
 
 
-def schedule():
+def workflow_completed():
+    context = _context.get()
+    if context is not None:
+        context['workflow_completed'] = True
+
+
+def schedule(*, completed=False):
     """Only enqueue/spawn here; no directory scan in the caller's event loop."""
     if not enabled() or os.environ.get("AUTO_AGENTS_STORAGE_MAINTENANCE") == "off":
         return
@@ -167,7 +176,7 @@ def schedule():
     try:
         with store.locked(), store.connect(True) as db:
             previous = db.execute("SELECT data FROM maintenance WHERE key='scheduled'").fetchone()
-            if previous and time.time() - json.loads(previous[0])["time"] < 3600:
+            if not completed and previous and time.time() - json.loads(previous[0])["time"] < 3600:
                 return
             db.execute("INSERT OR REPLACE INTO maintenance VALUES('scheduled',?)", (json.dumps({"time": time.time()}),))
         environment = dict(os.environ)
@@ -194,5 +203,5 @@ def command_context(project=None):
         yield
     finally:
         release_owned()
-        schedule()
+        schedule(completed=bool((_context.get() or {}).get('workflow_completed')))
         _context.reset(token)

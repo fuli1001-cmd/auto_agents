@@ -461,6 +461,10 @@ class Session:
         session_id = existing.session_id
         if existing.mode != self.mode:
             raise ValueError(f"session {session_id} is {existing.mode}, not {self.mode}")
+        from .artifact_workflow import archived_session
+        if archived_session(self.project_root, existing):
+            self._print(f"Session {session_id} is already completed.")
+            return existing
         if not self._retain_resume_authority(existing):
             return existing
         if (existing.status == "completed" and not existing.parent_handoff_id

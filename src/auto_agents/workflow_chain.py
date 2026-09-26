@@ -591,6 +591,8 @@ class WorkflowStore:
         self.append_event(snapshot, "workflow_terminal", details={"status": status})
         if status == "completed":
             self.clear_active(snapshot.workflow_id)
+            from .artifact_runtime import workflow_completed
+            workflow_completed()
 
     def resumable(self) -> List[WorkflowSnapshot]:
         candidates: List[WorkflowSnapshot] = []

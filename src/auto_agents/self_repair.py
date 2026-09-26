@@ -8619,6 +8619,11 @@ class AutoAgentsSelfRepairRunner:
         prompt_path = root / "prompt.txt"
         output_path = root / "output.md"
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        from .artifact_runtime import track
+        invocation = getattr(self, '_invocation_context', {})
+        track(root, 'evidence', project=self.target_project_root,
+              metadata={'workflow_artifact': 1,
+                        **{key: invocation[key] for key in ('session_id', 'run_id') if invocation.get(key)}})
         return prompt_path, output_path
 
     def _build_prompt(

@@ -14,8 +14,14 @@ def register_checkout(root, state, checkout):
     record = {'repository': str(Path(root).resolve()), 'session_id': state.session_id,
               'checkout': str(checkout), 'device': info.st_dev, 'inode': info.st_ino}
     atomic_json(Path(root) / '.auto-agents/state/custody' / (fingerprint(str(checkout)) + '.json'), record)
+    track_checkout(root, state, checkout)
+
+
+def track_checkout(root, state, checkout):
     from .artifact_runtime import track
-    track(checkout.parent, 'recovery', project=root,
+    return track(Path(checkout).parent, 'recovery', project=root,
+          metadata={'candidate_lifecycle': 1, 'session_id': state.session_id,
+                    'workflow_id': state.workflow_id, 'checkout': str(checkout)},
           reference='session:' + str(Path(root).resolve()) + ':' + state.session_id)
 
 

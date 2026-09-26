@@ -299,6 +299,9 @@ class WorkflowCoordinator:
             raise ValueError(
                 f"session {session_id} is {state.mode}, not {session.mode}"
             )
+        from .artifact_workflow import archived_session
+        if archived_session(self.project_root, state):
+            return state
         authority_valid = session._retain_resume_authority(state)
         registration = getattr(self.orch, '_repair_registration', None)
         if authority_valid and registration and state.workflow_id:
@@ -620,6 +623,11 @@ class WorkflowCoordinator:
 
     def resume_workflow(self, workflow_id: str):
         snapshot = self.store.load(workflow_id)
+        if snapshot.status == 'completed' and snapshot.root.kind != 'run':
+            from .artifact_workflow import archived_session
+            state = load_session_state(self.project_root, snapshot.root.native_id)
+            if archived_session(self.project_root, state):
+                return state
         self.store.activate(workflow_id)
         self._reconcile_open_operations(snapshot)
         self.store.begin_resume(snapshot)

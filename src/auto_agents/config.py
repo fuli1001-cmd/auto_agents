@@ -825,7 +825,8 @@ def run_artifact_paths(project_root: Path, run_id: str, stage: str) -> Tuple[Pat
     output_path.parent.mkdir(parents=True, exist_ok=True)
     from .artifact_runtime import track
     for directory in (prompt_path.parent, output_path.parent):
-        track(directory, "evidence", project=project_root)
+        track(directory, "evidence", project=project_root,
+              metadata={'workflow_artifact': 1, 'run_id': run_id})
     return prompt_path, output_path
 
 
@@ -869,7 +870,8 @@ def session_artifact_paths(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     from .artifact_runtime import track
     for directory in (prompt_path.parent, output_path.parent):
-        track(directory, "evidence", project=project_root)
+        track(directory, "evidence", project=project_root,
+              metadata={'workflow_artifact': 1, 'session_id': session_id})
     return prompt_path, output_path
 
 
