@@ -39,6 +39,24 @@ def resumable_blocker(state):
             and not state.active_handoff_id)
 
 
+def begin_recovery(session, state, *, automatic=False):
+    """Return to diagnosis once per blocked acceptance, retaining evidence/budget."""
+    if not resumable_blocker(state):
+        return False
+    saved = state.acceptance_execution
+    if automatic and (saved.get('recovery_started')
+                      or session._should_stop(state, 'acceptance recovery')):
+        return False
+    if automatic:
+        saved['recovery_started'] = True
+    state.status, state.resolution, state.resume_phase = 'executing', '', ''
+    state.execution_log.append({'action': 'acceptance_recovery_started',
+        'result': 'Inspect retained acceptance evidence before any new execution',
+        'timestamp': session._now()})
+    session._save(state)
+    return True
+
+
 def is_request(target, payload):
     return target == 'acceptance' or (target == 'run' and
         payload.get('spec_seed', {}).get('scope') == 'existing_behavior_real_acceptance_only')

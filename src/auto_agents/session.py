@@ -121,6 +121,16 @@ _GOAL_ENVIRONMENT = re.compile(
     re.MULTILINE,
 )
 _ROUTE_WORKFLOW = re.compile(r"^ROUTE_WORKFLOW\s+v1:\s*(\{.*\})\s*$", re.MULTILINE)
+_WORKFLOW_ROUTE_INSTRUCTIONS = (
+    'Route format: ROUTE_WORKFLOW v1: '
+    '{"target":"fix","reason":"Existing defect","summary":"Repair the observed defect",'
+    '"issue_seed":{"summary":"Repair the observed defect","reproduction":["Describe the failing action"],'
+    '"verification_scope":{"mode":"focused_fix"},"verification_command":"Describe the focused verification command"}}. '
+    'The colon after v1 is required. Emit one complete JSON object on a single line and exactly one route marker. '
+    'For acceptance use ROUTE_WORKFLOW v1: {"target":"acceptance","reason":"Verify existing behavior",'
+    '"spec_seed":{"steps":["Execute the original acceptance goal"]}}. '
+    'Replace example values with the diagnosed action.'
+)
 _FIX_DISPOSITION = re.compile(r"^FIX_DISPOSITION\s+v1:\s*(\{.*\})\s*$", re.MULTILINE)
 _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
 _COMMIT_MESSAGE = re.compile(r"^COMMIT_MESSAGE:\s*(.+)$", re.MULTILINE)
@@ -1603,6 +1613,14 @@ class Session:
                 version="v1",
                 label="ROUTE_WORKFLOW v1",
             )
+        if route is None and not error and re.search(r'^\s*ROUTE_WORKFLOW\b', reply, re.MULTILINE):
+            error = (
+                'Invalid workflow route format. The colon after v1 is required. '
+                'Emit exactly one complete line: ROUTE_WORKFLOW v1: '
+                '{"target":"acceptance","reason":"Execute existing behavior",'
+                '"spec_seed":{"steps":["Inspect the existing product"]}}. '
+                'Use the target and seed appropriate to the diagnosed next action.'
+            )
         return route, error
 
     @staticmethod
@@ -2634,9 +2652,11 @@ class Session:
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
         if state.acceptance_execution and state.acceptance_execution.get('phase') not in {'blocked', 'completed'}:
-            from .session_acceptance import drive
+            from .session_acceptance import begin_recovery, drive
             self._current_state = state
-            return drive(self, state)
+            state = drive(self, state)
+            begin_recovery(self, state, automatic=True)
+            return state
         if not self._goal_environment_confirmed(state):
             state.status = "conversing"
             state.execution_log.append(
@@ -3570,6 +3590,7 @@ class Session:
             lines.extend(
                 [
                     PromptBlock("- Never output FIX_DISPOSITION in collab mode; that protocol belongs to the child fix workflow.", kind="output"),
+                    PromptBlock(_WORKFLOW_ROUTE_INSTRUCTIONS, kind="output"),
                     "- If an existing-behavior defect is already clear, output one single-line ROUTE_WORKFLOW v1 marker with target='fix', reason, summary, and issue_seed.",
                     "- Use issue_seed task_id/task_ids or requirement_ids as task authority only when taking responsibility for those tasks. For a focused existing-behavior fix that does not adopt planned work, set verification_scope={\"mode\":\"focused_fix\"}; requirement_ids then express association only. Retain a concrete targeted verification command. Never invent task ownership or adopt another workflow's work.",
                     "- If a missing capability or requirements, architecture, or persistence change is already clear, output one single-line ROUTE_WORKFLOW v1 marker with target='run', reason, summary, and spec_seed.",
@@ -3859,7 +3880,7 @@ class Session:
 
         if state.acceptance_execution.get('phase') == 'blocked':
             lines.extend([
-                'The previous acceptance is blocked. Inspect its saved evidence and identify a concrete recovery before routing another acceptance attempt. Do not repeat generation or paid operations during diagnosis; preserve existing project IDs, results, receipts and budgets.',
+                'The previous acceptance is blocked. Inspect its saved evidence and identify a concrete recovery before routing another acceptance attempt. For an existing product or configuration defect, route target="fix" with reproduction evidence and a focused verification command; after the child returns, inspect its result and route target="acceptance" to verify the original goal. Retry acceptance only after identifying how the blocker was resolved; do not repeat an unchanged failed operation. Do not repeat generation or paid operations during diagnosis; preserve existing project IDs, results, receipts and budgets.',
                 ContextBlock(json.dumps(state.acceptance_execution, ensure_ascii=False),
                              'Blocked acceptance evidence'),
             ])
@@ -3906,7 +3927,7 @@ class Session:
             "If this is a Python project, inspect using its existing project-local conda env at ./.conda. Route missing runtime dependencies through the owning workflow.",
             "Do not modify .auto-agents state files.",
             "",
-            PromptBlock("ROUTE_WORKFLOW v1 must be valid JSON on one line and must be the only route marker in the response.", kind="output"),
+            PromptBlock(_WORKFLOW_ROUTE_INSTRUCTIONS, kind="output"),
         ])
         return compose_prompt(lines, purpose="collab")
 

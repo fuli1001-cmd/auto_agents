@@ -33,7 +33,9 @@ def setup_acceptance(tmp_path, monkeypatch, *, legacy=False, outcome='passed', a
     def provider(self, request):
         calls.append(request.purpose)
         if request.purpose == 'collab':
-            reply = route
+            current = load_session_state(root, state.session_id)
+            reply = ('GOAL_ACHIEVED: Observed the existing value'
+                     if current.acceptance_execution.get('phase') == 'blocked' else route)
         elif request.purpose == 'acceptance_execute':
             assert request.sandbox_mode == 'workspace-write'
             directory = request.cwd / '.auto-agents/state/sessions/accept/acceptance'
@@ -271,11 +273,11 @@ def test_blocked_acceptance_resume_diagnoses_before_retry_and_retains_evidence(t
     assert main([*argv, '--project', str(root), '--no-health-watch']) == 0
     result = load_session_state(root, state.session_id)
     assert result.status == 'completed'
-    assert calls == ['acceptance_execute', 'collab', 'acceptance_execute', 'acceptance_review']
+    assert calls == ['acceptance_execute', 'collab', 'collab', 'acceptance_execute', 'acceptance_review']
     assert (prior / 'observation.txt').read_bytes() == prior_bytes
     assert {p: (root / p).read_bytes() for p in protected} == protected
     assert main([*argv, '--project', str(root), '--no-health-watch']) == 0
-    assert len(calls) == 4
+    assert len(calls) == 5
 
 
 def test_acceptance_recovery_does_not_reopen_ownership_blocker(tmp_path, monkeypatch):
@@ -285,7 +287,7 @@ def test_acceptance_recovery_does_not_reopen_ownership_blocker(tmp_path, monkeyp
     save_session_state(root, result)
     resumed = Session(Orchestrator(root), mode='collab', auto_approve=True).resume(state.session_id)
     assert resumed.status == 'blocked' and resumed.resolution == 'verification_ownership'
-    assert calls == ['acceptance_execute']
+    assert calls == ['acceptance_execute', 'collab']
 
 
 @pytest.mark.parametrize('outcome', ['blocked', 'passed'])
@@ -305,3 +307,120 @@ def test_acceptance_recovery_cannot_replace_evidence_review_with_completion_mark
     assert resumed.acceptance_execution == saved
     assert resumed.execution_log[-1]['action'] == 'acceptance_completion_rejected'
     assert calls[-1] == 'collab'
+
+
+def test_blocked_acceptance_routes_fix_and_rechecks_delivered_candidate_without_restart(tmp_path, monkeypatch):
+    from auto_agents.cli import main
+    from test_engine_child_recovery import configure_local_writer, REAL_PROVIDER_CALL
+
+    root, state, calls, protected = setup_acceptance(tmp_path, monkeypatch)
+    child = load_session_state(root, 'owned-child')
+    configure_local_writer(root, child, "Path('value.py').write_text('VALUE = 1\\n')")
+    prior = root / '.auto-agents/state/sessions/accept/acceptance'
+    verify = './.conda/bin/python -m pytest -q tests/test_owned.py::test_owned'
+    issue = {'summary': 'Repair the observed value', 'reproduction': ['Observe VALUE = 0'],
+             'expected': 'VALUE = 1', 'actual': 'VALUE = 0',
+             'verification_scope': {'mode': 'focused_fix'}, 'verification_command': verify}
+    acceptance_count = 0
+    def provider(self, request):
+        nonlocal acceptance_count
+        calls.append(request.purpose)
+        current = load_session_state(root, state.session_id)
+        if request.purpose == 'collab':
+            if not current.acceptance_execution or current.last_child_result_ref:
+                if current.last_child_result_ref:
+                    assert request.cwd != root
+                    assert (request.cwd / 'value.py').read_text() == 'VALUE = 1\n'
+                    assert current.acceptance_execution['result']['status'] == 'blocked'
+                    assert (prior / 'observation.txt').read_text() == 'VALUE = 0\n'
+                reply = 'ROUTE_WORKFLOW v1: ' + json.dumps({'target': 'acceptance',
+                    'spec_seed': {'steps': ['Observe the existing value']}})
+            else:
+                assert current.acceptance_execution['result']['status'] == 'blocked'
+                assert current.acceptance_execution['recovery_started'] is True
+                assert current.current_attempt == 3 and current.attempts_since_progress == 3
+                assert current.attempt_epoch == 1
+                assert 'route target="fix"' in request.prompt
+                reply = 'ROUTE_WORKFLOW v1: ' + json.dumps({'target': 'fix', 'issue_seed': issue})
+        elif request.purpose == 'fix_converse':
+            reply = 'FIX_DISPOSITION v1: ' + json.dumps({'decision': 'fix', **issue})
+        elif request.purpose == 'fix':
+            assert request.cwd != root
+            return REAL_PROVIDER_CALL(self, request)
+        elif request.purpose == 'acceptance_execute':
+            acceptance_count += 1
+            saved = current.acceptance_execution
+            directory = Path(saved['directory'])
+            value = (request.cwd / 'value.py').read_text()
+            if acceptance_count == 1:
+                assert value == 'VALUE = 0\n'
+            else:
+                assert acceptance_count == 2 and value == 'VALUE = 1\n'
+                assert saved['inputs']['prior_evidence_directories'] == [str(prior)]
+                assert directory != prior
+            (directory / 'observation.txt').write_text(value)
+            reply = json.dumps({'status': 'blocked' if acceptance_count == 1 else 'passed',
+                                'summary': 'Observed value 0' if acceptance_count == 1 else 'Observed value 1',
+                                'evidence': ['observation.txt']})
+        else:
+            assert request.purpose == 'acceptance_review'
+            reply = json.dumps({'approved': True, 'reason': 'Actual observation proves value 1'})
+        return AgentResult(True, [], request.output_path, summary=reply)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
+    monkeypatch.setattr(Orchestrator, '_prompt_user', lambda *a, **kw: pytest.fail('unexpected approval'))
+    argv = ['collab', '--project', str(root), '--session', state.session_id, '--auto-approve', '--no-health-watch']
+    assert main(argv) == 0
+    result = load_session_state(root, state.session_id)
+    assert result.status == 'completed'
+    assert calls == ['collab', 'acceptance_execute', 'collab', 'fix_converse', 'fix',
+                     'collab', 'acceptance_execute', 'acceptance_review']
+    assert (prior / 'observation.txt').read_text() == 'VALUE = 0\n'
+    assert sum(row['action'] == 'acceptance_recovery_started' for row in result.execution_log) == 1
+    assert {p: (root / p).read_bytes() for p in protected} == protected
+    assert main(argv) == 0
+    assert len(calls) == 8
+
+
+def test_repeated_acceptance_blockers_consume_existing_budget(tmp_path, monkeypatch):
+    root, state, calls, protected = setup_acceptance(tmp_path, monkeypatch, legacy=True)
+    state.hard_ceiling = 5
+    save_session_state(root, state)
+    directories = []
+    def provider(self, request):
+        calls.append(request.purpose)
+        current = load_session_state(root, state.session_id)
+        if request.purpose == 'collab':
+            assert current.acceptance_execution['phase'] == 'blocked'
+            reply = 'ROUTE_WORKFLOW v1: ' + json.dumps({'target': 'acceptance',
+                'spec_seed': {'steps': ['Recheck the existing goal']}})
+        else:
+            assert request.purpose == 'acceptance_execute'
+            directory = Path(current.acceptance_execution['directory'])
+            directories.append(directory)
+            (directory / 'blocker.txt').write_text('Still blocked')
+            reply = json.dumps({'status': 'blocked', 'summary': 'Still blocked', 'evidence': ['blocker.txt']})
+        return AgentResult(True, [], request.output_path, summary=reply)
+    monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
+    result = Session(Orchestrator(root), mode='collab', auto_approve=True).resume(state.session_id)
+    assert result.status == 'blocked' and result.resolution == 'acceptance_blocked'
+    assert result.attempts_since_progress == result.current_attempt == 5
+    assert len(calls) == 5 and calls.count('acceptance_execute') == 3
+    assert len(set(directories)) == 3
+    assert all((directory / 'blocker.txt').read_text() == 'Still blocked' for directory in directories)
+    assert {p: (root / p).read_bytes() for p in protected} == protected
+
+
+@pytest.mark.parametrize('reply', [
+    'ROUTE_WORKFLOW v1 {"target":"acceptance","spec_seed":{"steps":["Inspect"]}}',
+    'ROUTE_WORKFLOW v1: {"target":"acceptance",',
+])
+def test_malformed_route_gets_complete_format_feedback(tmp_path, monkeypatch, reply):
+    root, state, _, _ = setup_acceptance(tmp_path, monkeypatch)
+    session = Session(Orchestrator(root), mode='collab')
+    routed, error = session._route_collab_workflow_reply(state, reply)
+    assert routed is None and 'colon after v1 is required' in error
+    assert 'ROUTE_WORKFLOW v1: {' in error
+    assert not state.active_handoff_id and not state.acceptance_execution
+    for prompt in (session._build_collab_prompt(state, ''), session._build_converse_prompt(state)):
+        assert 'The colon after v1 is required' in prompt
+        assert 'ROUTE_WORKFLOW v1: {"target":"acceptance"' in prompt

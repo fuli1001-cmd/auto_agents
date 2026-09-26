@@ -797,16 +797,11 @@ class WorkflowCoordinator:
             return state
         session._coordinator = self
         session._coordinator_managed = True
-        from .session_acceptance import resumable_blocker
-        if resumable_blocker(state):
-            # Explicit resume returns to diagnosis with the failed result intact.
-            # Never replay acceptance execution or reset its budget here.
-            state.status, state.resolution, state.resume_phase = 'executing', '', ''
-            state.execution_log.append({'action': 'acceptance_recovery_started',
-                'result': 'Inspect retained acceptance evidence before any new execution',
-                'timestamp': parent_session_now()})
-            save_session_state(self.project_root, state)
-        elif state.status == "failed":
+        from .session_acceptance import begin_recovery
+        # Explicit resume shares the automatic diagnosis boundary without
+        # replaying acceptance execution or resetting its budget.
+        begin_recovery(session, state)
+        if state.status == "failed":
             session._invalidate_provider_continuations(
                 state,
                 reason="failed session started a fresh durable resume boundary",

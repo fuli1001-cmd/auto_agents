@@ -1959,9 +1959,16 @@ the browser"):
 3. **Return** — completed children return to collab with their commit range, changed paths, proof
    summary, and failure evidence. A fix may itself route to run and returns through fix before collab
    continues.
+   An existing-behavior acceptance that reports a blocker returns to collab diagnosis automatically
+   within the remaining attempt budget. Collab routes product/configuration defects to `fix`, then
+   reruns acceptance after checking the child result. Recovery retains project IDs, receipts,
+   prior evidence and spending limits; an unchanged failed operation must not be repeated.
 4. **Complete** — `GOAL_ACHIEVED` verifies the entire workflow lineage, including already-committed
    child paths, and still asks for user confirmation. Collab never implements or commits a product
    fix itself.
+
+Routing responses use one complete line: `ROUTE_WORKFLOW v1: {"target":"acceptance","spec_seed":{"steps":["Verify the original goal"]}}`.
+The colon after `v1` is required. Malformed markers receive explicit format feedback.
 
 ```bash
 python3 -m auto_agents collab --project /tmp/demo
