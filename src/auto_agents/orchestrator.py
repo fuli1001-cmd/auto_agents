@@ -44944,7 +44944,8 @@ class Orchestrator:
         previous = self._last_successful_provider
         self._last_successful_provider = provider
         context = request.usage_context or {}
-        if (previous == provider or context.get("workflow_kind") != "run"
+        if (request.purpose == "diagnosis" or previous == provider
+                or context.get("workflow_kind") != "run"
                 or not hasattr(self, "project_root")):
             return
         try:
@@ -44998,7 +44999,11 @@ class Orchestrator:
         if getattr(self, "_provider_cleanup_blocked", False):
             raise ProviderCleanupIncompleteError("Provider cleanup incomplete; this workflow cannot start another provider call.")
         context = request.usage_context
-        if not context and hasattr(self, "project_root"):
+        invocation = getattr(self, "_invocation_context", {}) or {}
+        if (not context and hasattr(self, "project_root")
+                and request.purpose != "diagnosis"
+                and invocation.get("command") not in {"fix", "collab", "provider-resolve"}
+                and not invocation.get("session_id")):
             state = load_run_state(self.project_root)
             context = {"project_root": str(self.project_root), "workflow_kind": "run", "subject_id": state.run_id}
         request = replace(request, logical_call_id=request.logical_call_id or uuid.uuid4().hex, usage_context=context)

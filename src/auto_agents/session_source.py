@@ -38,6 +38,7 @@ def validate_checkout(root, state, checkout, *, owner_id=None):
 
 def _identity(root, state, handoff):
     from .session_candidate import _git, validate_receipt, completed_delivery
+    from .gate_execution import discover_dependency_links
     from .session_verification import fingerprint, ownership_error, product_path
     custody = state.candidate_custody
     source = Path(custody['checkout'])
@@ -49,6 +50,19 @@ def _identity(root, state, handoff):
         raise ownership_error(state, 'source revision does not match retained custody')
     changes = set(_git(source, 'diff', '--name-only', '-z', 'HEAD').split('\0'))
     changes.update(_git(source, 'ls-files', '--others', '--exclude-standard', '-z').split('\0'))
+    tracked = set(_git(source, 'ls-files', '-z').split('\0'))
+    # The checkout installs links to the source repository's dependency
+    # directories. Admit only those exact, untracked links; a changed link or
+    # an ordinary product edit must still prevent a handoff.
+    for relative, expected in discover_dependency_links(root).items():
+        if relative not in changes or relative in tracked:
+            continue
+        link = source / relative
+        try:
+            if link.is_symlink() and link.readlink() == expected:
+                changes.discard(relative)
+        except OSError:
+            pass
     if custody.get('delivered_revision'):
         completed_delivery(state)
     elif any(path and product_path(path) for path in changes):
