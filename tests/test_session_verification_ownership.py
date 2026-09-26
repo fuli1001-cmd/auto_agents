@@ -1371,6 +1371,42 @@ def test_public_resume_before_first_baseline_uses_child_history(tmp_path, monkey
         assert head_ref(root) == before_head
 
 
+@pytest.mark.parametrize('legacy', [False, True])
+def test_focused_fix_without_retained_task_plan_reenters_original_child(tmp_path, legacy):
+    from auto_agents.config import load_task_plan
+    from test_focused_fix_scope import focused_scene
+    from test_multilayer_engine_recovery import replay
+
+    root, child, store, original, engine = focused_scene(tmp_path, legacy)
+    ambient_plan = load_task_plan(root)
+    git(root, 'rm', '.auto-agents/state/task_plan.json')
+    git(root, 'commit', '-m', 'retain a revision without a development task plan')
+    revision = head_ref(root)
+    child.baseline_git_ref = child.baseline_head_ref = child.lineage_head_ref = revision
+    child.execution_log[-1]['result'] = 'retained task plan ownership is unavailable'
+    original.payload['head_before'] = revision
+    store.save_handoff(original)
+    save_session_state(root, child)
+    # A later ambient plan is unrelated and must not supply missing history.
+    save_task_plan(root, ambient_plan)
+    before = {p: (root / p).read_bytes() for p in ('.auto-agents/state/task_plan.json',
+                                                '.auto-agents/config.json', 'value.py', 'foreign.py')}
+    report = replay(root, engine.payload, tmp_path)
+    assert report['ok'], report
+    saved = load_session_state(root, child.session_id)
+    assert saved.verification_binding['contract_revision'] == revision
+    assert saved.verification_binding['plan'] == {}
+    assert saved.verification_binding['tasks'] == []
+    assert saved.verification_binding['required_proof_ids'] == ['owned.contract']
+    observation = report['recovery_observation']
+    assert observation['boundary_kind'] == 'implementation'
+    assert observation['boundary_session_id'] == child.session_id
+    assert observation['original_handoff_id'] == original.handoff_id
+    assert observation['preflight_rechecked'] and observation['retained_constraints']
+    assert saved.execution_log[:len(child.execution_log)] == child.execution_log
+    assert {p: (root / p).read_bytes() for p in before} == before
+
+
 @pytest.mark.parametrize('source', ['legacy', 'explicit_fix'])
 @pytest.mark.parametrize('target', ['implicit', 'directory', 'implicit_config', 'implicit_override',
                                     'implicit_toml', 'implicit_pyproject', 'implicit_addopts',

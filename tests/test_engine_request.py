@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from auto_agents.repair_client import EngineRepairRequired, triage_engine_request
-from auto_agents.repair_contract import EngineRequestContract, prepare_contract, with_request_contract
+from auto_agents.repair_contract import EngineRequestContract, obligations, prepare_contract, with_request_contract
 from auto_agents.repair_control import Store, digest, git
 from test_repair_control import configuration, make_remote
 
@@ -149,6 +149,55 @@ def test_request_contract_never_claims_diagnosis_or_approval(tmp_path):
     with pytest.raises(ValueError, match="does not match"):
         with_request_contract({"invocation": {"engine_route": route(tmp_path / "different")}},
                               {"request_contract": contract.to_dict()})
+
+
+@pytest.mark.parametrize('nested', [False, True])
+def test_scope_recovery_check_supplies_retained_engine_acceptance_without_rewriting_route(tmp_path, nested):
+    from auto_agents.repair_v2.migration import request_from_payload
+
+    recovery = ('Focused fixes without task adoption pass preflight when the historical plan is absent; '
+                'adopted tasks still require their retained plan, then resume the original child.')
+    request = {'target_repository': str(tmp_path / 'engine'),
+               'issue_seed': {'summary': 'Repair focused fix history binding',
+                              'failed_handoff_id': 'hf-original'}}
+    (request['issue_seed'] if nested else request)['necessity'] = {
+        'decision': 'required', 'blocked_step': 'Product fix preflight',
+        'consequence': 'Original acceptance cannot proceed', 'recovery_check': recovery}
+    before = json.dumps(request, sort_keys=True)
+    payload = {'base': 'engine-base', 'invocation': {'engine_route': request}, 'provider': 'codex'}
+    migrated = request_from_payload(payload, 'retained-request')
+    assert [item.description for item in migrated.acceptance] == [recovery]
+    assert migrated.invocation['engine_route'] == request
+    checks = [{'obligation': recovery,
+               'nodeids': ['tests/test_session_verification_ownership.py::test_focused_fix_without_retained_task_plan_reenters_original_child'],
+               'reason': 'Plan the regression and preservation checks; this is not proof of repair.'}]
+    orch = SimpleNamespace(config=SimpleNamespace(efforts={}), _set_active_provider=lambda p: None,
+        _call_with_failover=lambda agent: SimpleNamespace(ok=True, summary=json.dumps({'checks': checks})))
+    with patch('auto_agents.orchestrator.Orchestrator', return_value=orch):
+        contract = prepare_contract(payload, 'engine-base', tmp_path, tmp_path, tmp_path)
+    assert contract.final.expected_postconditions == [recovery]
+    assert contract.final.verdict == 'UNVERIFIED' and not contract.to_dict()['repair_approved']
+    assert EngineRequestContract.from_dict(contract.to_dict(), request).checks == checks
+    assert json.dumps(request, sort_keys=True) == before
+
+
+@pytest.mark.parametrize('necessity', [None, {}, {'decision': 'required', 'recovery_check': ''},
+    {'decision': 'required', 'recovery_check': ['not a scope check']},
+    {'decision': 'needs_user', 'recovery_check': 'An unapproved goal change'},
+    {'decision': 'skip', 'recovery_check': 'Unrelated work'}])
+def test_engine_request_still_requires_explicit_acceptance(necessity):
+    with pytest.raises(ValueError, match='no explicit acceptance obligations'):
+        obligations({'issue_seed': {'summary': 'A summary is not acceptance',
+                                    'verification_command': 'python -m pytest'}, 'necessity': necessity})
+
+
+def test_explicit_engine_obligations_keep_existing_contract_compatibility(tmp_path):
+    request = route(tmp_path / 'engine')
+    data = contract_data(request)
+    request['necessity'] = {'decision': 'required', 'recovery_check': 'Restore the original child'}
+    data['route_digest'] = digest(request)
+    assert obligations(request) == request['issue_seed']['required_behavior']
+    assert EngineRequestContract.from_dict(data, request).checks == data['checks']
 
 
 @pytest.mark.parametrize("invalid", ["omitted", "rewritten", "shell", "outside", "flag", "diagnostic"])

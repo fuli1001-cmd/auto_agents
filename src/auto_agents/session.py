@@ -3909,6 +3909,7 @@ class Session:
             "9. Never implement, fix, commit, or edit target-project code in collab; route product changes to fix or run, and runtime acceptance operations to acceptance",
             "10. Repository selection, implementation scope, test strategy, safe migration, engine self-repair, commits, and workflow recovery are internal decisions. Never ask the user to choose or authorize them.",
             "11. Every proposed engine repair must include necessity:{decision:required|needs_user|insufficient|skip, blocked_step, consequence, evidence_refs, recovery_check}. "
+            "Include issue_seed.required_behavior as a nonempty list of concrete acceptance obligations covering the repair and preservation of existing protections. "
             "Judge this in the current diagnosis and reuse prior valid evidence. Tie it to the original user goal; "
             "ignore unrelated old problems and suggestions entirely, do not list or route them. "
             "For an actual change of user goal/new unrequested product requirements or resuming another user-stopped "

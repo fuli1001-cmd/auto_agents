@@ -57,6 +57,17 @@ def obligations(route):
             if isinstance(values, list):
                 result.extend(value.strip() for value in values if isinstance(value, str) and value.strip())
     if not result:
+        # Older diagnostic routes express the acceptance obligation through
+        # the required scope proposal. Preserve its exact text and route
+        # digest; it still needs independently mapped checks and proof.
+        for seed in route_sources(route):
+            necessity = seed.get('necessity')
+            if not isinstance(necessity, dict) or necessity.get('decision') != 'required':
+                continue
+            recovery = necessity.get('recovery_check')
+            if isinstance(recovery, str) and recovery.strip():
+                result.append(recovery.strip())
+    if not result:
         raise ValueError("engine request has no explicit acceptance obligations")
     return list(dict.fromkeys(result))
 

@@ -293,8 +293,19 @@ def _bind_session(session, state) -> None:
                 cwd=source_root, capture_output=True, text=True,
             )
             if result.returncode and path == task_plan_path(root):
-                raise ownership_error(state, 'retained task plan ownership is unavailable',
-                                      task_scope=task_scope, contract_revision=revision)
+                # A focused fix owns its explicit verification targets, not
+                # planned tasks. Older revisions may legitimately have no
+                # task plan; a failed read alone does not establish absence.
+                missing_plan = False
+                if task_scope.get('mode') == 'focused_fix':
+                    tree = subprocess.run(
+                        ['git', 'ls-tree', revision, '--', path.relative_to(root).as_posix()],
+                        cwd=source_root, capture_output=True, text=True,
+                    )
+                    missing_plan = tree.returncode == 0 and not tree.stdout.strip()
+                if not missing_plan:
+                    raise ownership_error(state, 'retained task plan ownership is unavailable',
+                                          task_scope=task_scope, contract_revision=revision)
             if result.returncode and path != config_path(root):
                 payloads.append({})
                 continue

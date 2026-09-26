@@ -112,3 +112,19 @@ def test_issue_materialization_preserves_association_mode(tmp_path):
     IssueBriefBuilder(root, child.session_id).materialize(original.payload['issue_seed'])
     session = Session(Orchestrator(root), mode='fix', auto_approve=True)
     assert _task_scope(session, child)['mode'] == 'focused_fix'
+
+
+def test_focused_fix_cannot_treat_unreadable_retained_plan_as_absent(tmp_path, monkeypatch):
+    import subprocess
+    import auto_agents.session_verification as verification
+
+    root, child, _, _, _ = focused_scene(tmp_path)
+    run = verification.subprocess.run
+    def unreadable(command, *args, **kwargs):
+        if command[:2] == ['git', 'show'] and command[-1].endswith(':.auto-agents/state/task_plan.json'):
+            return subprocess.CompletedProcess(command, 128, '', 'unable to read retained blob')
+        return run(command, *args, **kwargs)
+    monkeypatch.setattr(verification.subprocess, 'run', unreadable)
+    with pytest.raises(SessionOwnershipError, match='retained task plan ownership is unavailable'):
+        bind_session(Session(Orchestrator(root), mode='fix', auto_approve=True), child)
+    assert not child.verification_binding and child.current_attempt == 0
