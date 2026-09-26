@@ -3,8 +3,8 @@ from __future__ import annotations
 
 
 PHASES = {
-    'plan': ('计划', 'Planning'),
-    'implement': ('编码', 'Coding'),
+    'plan': ('制定工具修复方案', 'Planning the tool repair'),
+    'implement': ('修复工具问题', 'Fixing the tool issue'),
     'audit': ('检查测试完整性', 'Checking test preservation'),
     'artifact': ('准备验证环境', 'Preparing verification'),
     'environment_preparation': ('准备环境', 'Preparing environment'),
@@ -20,11 +20,11 @@ PHASES = {
     'deliver': ('应用修复', 'Applying repair'),
     'source_conflicts': ('整合修复代码', 'Integrating repair'),
     'source_recheck': ('复核原有问题', 'Rechecking the original failure'),
-    'request_contract_planning': ('规划检查', 'Planning checks'),
+    'request_contract_planning': ('明确修复完成的标准', 'Defining what a successful repair must prove'),
     'request_contract_ready': ('准备修复', 'Preparing repair'),
-    'candidate_generation': ('编码', 'Coding'),
+    'candidate_generation': ('修复工具问题', 'Fixing the tool issue'),
     'candidate_correction': ('修正代码', 'Correcting code'),
-    'repair_design': ('计划', 'Planning'),
+    'repair_design': ('制定工具修复方案', 'Planning the tool repair'),
     'contract_reanalysis': ('重新规划', 'Replanning'),
     'focused_verification': ('针对性验证', 'Focused verification'),
     'validating_focused_tests': ('针对性验证', 'Focused verification'),
@@ -109,6 +109,9 @@ def observation(job, subscriber, language='zh'):
         elif 'no verified progress' in error or 'no_progress' in error:
             label = ('连续修正未取得新的验证进展；已停止自动修复，候选已保留',
                      'No new verified progress; automatic repair stopped, candidate retained')
+        elif 'no explicit acceptance obligations' in error:
+            label = ('缺少明确的修复完成标准；需要补全后继续',
+                     'Repair completion criteria are missing; define them before continuing')
         else:
             label = ('修复受阻；进度已保留，需处理阻塞后继续', 'Repair blocked; progress saved, resolve the blocker to continue')
     elif 'cancelled' in (state, workflow):
@@ -128,7 +131,7 @@ def observation(job, subscriber, language='zh'):
     elif state == 'queued':
         label = ('等待开始修复', 'Waiting to start repair')
     else:
-        label = PHASES.get(phase, ('处理修复', 'Working on repair'))
+        label = PHASES.get(phase, ('准备处理工具问题', 'Preparing to resolve the tool issue'))
         if phase.startswith('review_'):
             label = ('审查', 'Review')
         if phase == 'validate':
@@ -141,7 +144,7 @@ def observation(job, subscriber, language='zh'):
             label = (f'验收未通过：{summary}（{count}项）',
                      f'Acceptance failed: {summary} ({count} findings)')
         elif phase == 'implement' and (progress.get('correcting') or progress.get('attempt', 0) > 0):
-            label = ('继续编码：修正上一轮未通过项', 'Coding: correcting the previous attempt')
+            label = ('继续修复工具问题，处理上次检查发现的问题', 'Continuing the tool fix after the previous checks')
         elif phase == 'plan' and progress.get('replans', 0):
             label = ('重新规划：调整修复方案', 'Replanning: revising the repair')
     name = label[0 if zh else 1]

@@ -383,7 +383,7 @@ def _repair_problem(payload):
         for seed in (route.get("issue_seed"), route.get("spec_seed"), route):
             if not isinstance(seed, dict):
                 continue
-            for key in ("summary", "title", "scope", "required_behavior", "requirements"):
+            for key in ("user_summary", "summary", "title", "scope", "required_behavior", "requirements"):
                 value = seed.get(key)
                 if isinstance(value, list):
                     value = "；".join(item for item in value if isinstance(item, str))

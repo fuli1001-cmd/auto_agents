@@ -548,7 +548,7 @@ class Session:
             reporter.bind(self.mode, state.session_id, goal=state.goal, workflow_id=state.workflow_id)
             self._print_agent_output = self._print_agent_output or reporter.presenter.raw_output
             self.orch._print_agent_output = self._print_agent_output
-            reporter.observe_session(state)
+            reporter.observe_session(state, control_root=getattr(self, '_custody_control_root', self.project_root))
             attach_run_file_logger(self.orch.logger, reporter.root / "run.log")
         active_phase = (
             state.status if state.status in {"conversing", "executing"} else ""
@@ -1500,6 +1500,7 @@ class Session:
                 for key in (
                     "summary",
                     "reason",
+                    "user_summary",
                     "expected",
                     "actual",
                     "evidence_refs",
@@ -1632,6 +1633,8 @@ class Session:
             raise ValueError('ROUTE_WORKFLOW v1 issue_seed must be a JSON object.')
         seed = dict(raw)
         seed.setdefault('summary', str(route.get('summary', '')))
+        if isinstance(route.get('user_summary'), str) and route['user_summary'].strip():
+            seed.setdefault('user_summary', route['user_summary'].strip())
         seed.setdefault('reason', str(route.get('reason', '')))
         payload = {'issue_seed': seed}
         if 'target_repository' in route:
@@ -1706,6 +1709,8 @@ class Session:
                     "spec_seed JSON object."
                 )
             payload = {"spec_seed": dict(raw_spec_seed)}
+            if isinstance(route.get('user_summary'), str) and route['user_summary'].strip():
+                payload['spec_seed'].setdefault('user_summary', route['user_summary'].strip())
 
         if "target_repository" in route:
             payload["target_repository"] = route["target_repository"]
@@ -3570,6 +3575,7 @@ class Session:
             lines.extend([
                 "- This clarification/classification phase is read-only. Do not modify files, create generated artifacts, or run mutating commands.",
                 "- Classify the work and put the disposition in the final response before any implementation begins.",
+                "- Include user_summary: one brief sentence explaining the specific problem being fixed, in the project's documentation language, for a nontechnical user. Avoid paths, commands, IDs, protocol names and internal implementation details. This display description does not change the repair scope.",
                 "- decision='fix' only for a bounded defect against existing behavior; include summary, reason, reproduction, expected, actual, evidence_refs, affected_contracts, verification_command, and persistence_change.",
                 "- decision='run_iteration' when resolution needs new public capability, changed requirements, architecture expansion, or a persistence-model change; include reason and spec_seed with title, goal, gap, capability, acceptance, non_goals, evidence, and open_decisions.",
                 "- decision='not_bug' for expected/configuration/user-misunderstanding cases, decision='need_user' with question when evidence is insufficient, or decision='resume_child' with resume_handoff_id for a prior routed child.",
@@ -3907,6 +3913,7 @@ class Session:
             "7. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
             "8. Provide a brief diagnostic status update",
             "9. Never implement, fix, commit, or edit target-project code in collab; route product changes to fix or run, and runtime acceptance operations to acceptance",
+            "Include user_summary on every route: one brief sentence in the project's documentation language explaining the specific problem or acceptance goal for a nontechnical user. For an engine repair describe what prevents the automation from continuing. Avoid paths, commands, IDs, protocol names and internal implementation details. This display description does not change the repair scope.",
             "10. Repository selection, implementation scope, test strategy, safe migration, engine self-repair, commits, and workflow recovery are internal decisions. Never ask the user to choose or authorize them.",
             "11. Every proposed engine repair must include necessity:{decision:required|needs_user|insufficient|skip, blocked_step, consequence, evidence_refs, recovery_check}. "
             "Include issue_seed.required_behavior as a nonempty list of concrete acceptance obligations covering the repair and preservation of existing protections. "
@@ -4113,6 +4120,10 @@ class Session:
         try:
             from .session_candidate import candidate_request
             with candidate_request(self, state, request) as scoped_request:
+                reporter = getattr(self.orch, 'reporter', None)
+                announce = getattr(reporter, 'session_action', None)
+                if request.purpose == 'fix' and callable(announce):
+                    announce('fix')
                 result: AgentResult = self.orch._call_with_failover(scoped_request)
                 self._candidate_writer_result = {"ok": result.ok, "reply": (result.summary or result.stdout).strip()}
                 if result.cleanup_incomplete:
@@ -5685,7 +5696,7 @@ class Session:
             publish(state)
         reporter = getattr(self.orch, "reporter", None)
         if reporter is not None:
-            reporter.observe_session(state)
+            reporter.observe_session(state, control_root=control_root)
 
     def _check_health_action(self) -> None:
         pending = getattr(self._health_runtime, "pending_session_action", None)

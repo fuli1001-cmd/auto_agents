@@ -443,6 +443,7 @@ def test_acceptance_blocker_is_visible_once_across_private_and_control_reporters
     private = Reporter(tmp_path / 'private', stream, language='zh', presenter=control.presenter)
     reason = ('FastAPI 启动失败：SCHEMA_DATABASE_MISSING' if resolution == 'acceptance_blocked'
               else '未提供实际播放或抽帧证据')
+    readable = ('后端服务 启动失败：所需数据尚未准备好' if resolution == 'acceptance_blocked' else reason)
     state = SessionState('accept', mode='collab', status='blocked', resolution=resolution,
         acceptance_execution={'phase': 'blocked', 'result': {'summary': 'Execution claimed success'}, 'review': {'reason': reason}})
     if resolution == 'acceptance_blocked':
@@ -452,8 +453,9 @@ def test_acceptance_blocker_is_visible_once_across_private_and_control_reporters
             reporter.bind('collab', state.session_id)
             reporter.observe_session(state)
             reporter.observe_session(state)
-            assert reason in (reporter.root / 'user.log').read_text()
-        assert stream.getvalue().count(reason) == 1
+            assert readable in (reporter.root / 'user.log').read_text()
+            assert any(e['data'].get('reason') == reason for e in events(reporter))
+        assert stream.getvalue().count(readable) == 1
         assert 'Execution claimed success' not in stream.getvalue()
     finally:
         private.close()
@@ -632,3 +634,189 @@ def test_repair_log_location_does_not_replace_terminal_blocked_status(report):
     assert lines[-1].endswith('当前状态：恢复受阻')
     assert '正在恢复任务' not in lines[-1]
     assert events(reporter)[-1]['message'] == '详细日志：/private/repair/job'
+
+
+@pytest.mark.parametrize('language', ['zh', 'en'])
+def test_collab_fix_acceptance_timeline_names_the_problem_without_changing_state(tmp_path, language):
+    from auto_agents.models import SessionState
+    from auto_agents.workflow_chain import IssueBriefBuilder
+
+    stream = io.StringIO()
+    reporter = Reporter(tmp_path, stream, language=language)
+    detail = '分镜修正后仍有镜头衔接问题' if language == 'zh' else 'Storyboard correction still breaks shot continuity'
+    seed = {'summary': 'technical summary focused_fix /private/code.py hf-123456abcdef',
+            'user_summary': detail, 'verification_scope': {'mode': 'focused_fix'}}
+    directory = tmp_path / '.auto-agents/state/handoffs'
+    directory.mkdir(parents=True)
+    handoff = directory / 'hf-example.json'
+    handoff.write_text(json.dumps({'target': 'fix', 'payload': {'issue_seed': seed},
+                                   'result': {'status': 'completed'}}))
+    parent = SessionState('parent', mode='collab', status='executing',
+        acceptance_execution={'phase': 'blocked', 'result': {'status': 'blocked'}})
+    reporter.bind('collab', 'parent')
+    reporter.observe_session(parent)
+    parent.status, parent.active_handoff_id = 'waiting_child', 'hf-example'
+    reporter.observe_session(parent)
+    IssueBriefBuilder(tmp_path, 'child').materialize(seed)
+    child = SessionState('child', mode='fix', status='conversing')
+    try:
+        with reporter.preserve_subject():
+            reporter.bind('fix', child.session_id)
+            for status in ('conversing', 'executing'):
+                child.status = status
+                before = child.to_dict()
+                reporter.observe_session(child)
+                reporter.observe_session(child)
+                assert child.to_dict() == before
+            reporter.session_action('fix')
+            reporter.emit('verification.started', context='candidate')
+            child.status = 'completed'
+            reporter.observe_session(child)
+        parent.status, parent.active_handoff_id = 'executing', ''
+        parent.return_phase, parent.last_child_result_ref = 'after_child', str(handoff)
+        reporter.observe_session(parent)
+        parent.return_phase = ''
+        for phase in ('pending', 'executing', 'reviewing'):
+            parent.acceptance_execution['phase'] = phase
+            reporter.observe_session(parent)
+            reporter.observe_session(parent)
+        value = stream.getvalue()
+        labels = (['分析验收失败的原因', '开始修复项目问题', '分析项目问题，确认修复方案',
+                   '准备修复项目问题', '正在修复项目问题', '检查修复效果', '项目问题已修复',
+                   '检查修复结果，准备继续验收', '通过实际操作验收现有功能', '检查验收结果是否满足目标']
+                  if language == 'zh' else
+                  ['Investigating why acceptance failed', 'Starting a project fix',
+                   'Investigating the project issue and planning a fix', 'Preparing a project fix',
+                   'Fixing the project issue', 'Checking the project fix', 'Project issue fixed',
+                   'Checking the fix before continuing acceptance',
+                   'Checking existing behavior through actual use', 'Checking whether acceptance proves the goal'])
+        positions = [value.index(label) for label in labels]
+        assert positions == sorted(positions)
+        assert value.count(labels[1]) == 1, 'returning from a child must not announce another fix'
+        assert value.count(labels[-2]) == 1, 'persistence within the same acceptance step must stay quiet'
+        for label in labels[1:7]:
+            assert label + (':' if language == 'en' else '：') + (' ' if language == 'en' else '') + detail in value
+        assert 'focused_fix' not in value and '/private/' not in value and 'hf-' not in value
+        assert not (tmp_path / '.auto-agents/state/run_state.json').exists()
+    finally:
+        reporter.close()
+
+
+@pytest.mark.parametrize('started', [False, True])
+def test_fix_preflight_blocker_explains_whether_project_repair_started(tmp_path, started):
+    from auto_agents.models import SessionState
+    from auto_agents.workflow_chain import IssueBriefBuilder
+
+    stream = io.StringIO()
+    reporter = Reporter(tmp_path, stream, language='zh')
+    IssueBriefBuilder(tmp_path, 'child').materialize({'summary': '分镜衔接不正确'})
+    state = SessionState('child', mode='fix', status='blocked', resolution='verification_ownership',
+        current_attempt=1 if started else 0,
+        execution_log=[{'action': 'execution_preflight_blocked', 'failure_kind': 'verification_ownership',
+                        'retry_fix': False, 'result': 'retained task plan ownership is unavailable'}])
+    try:
+        reporter.bind('fix', state.session_id)
+        reporter.observe_session(state)
+        value = stream.getvalue()
+        assert '项目修复受阻：分镜衔接不正确' in value
+        if started:
+            assert '修复无法继续' in value and '尚未进入项目修复' not in value
+        else:
+            assert '尚未进入项目修复' in value
+        assert 'verification_ownership' not in value and 'task plan' not in value
+    finally:
+        reporter.close()
+
+
+def test_engine_repair_displays_the_issue_through_all_steps_and_repeated_polls(report):
+    from auto_agents.repair_client import EngineRepairRequired
+
+    reporter, stream = report
+    detail = '修复流程因缺少任务记录而无法开始'
+    route = {'issue_seed': {'summary': 'focused_fix /private/file.py hf-123456abcdef', 'user_summary': detail}}
+    reporter.exception(EngineRepairRequired(route))
+    reporter.emit('repair.request_accepted')
+    job = {'id': 'private-job', 'generation': 1, 'state': 'repairing',
+           'payload': {'invocation': {'engine_route': route}}}
+    before = json.dumps(job, sort_keys=True)
+    for index, phase in enumerate(('plan', 'implement', 'validate')):
+        observed = {**job, 'display': {'phase': phase, 'sequence': index + 1}}
+        reporter.repair_update(observed, {'state': 'waiting'})
+        reporter.repair_update(observed, {'state': 'waiting'})
+    reporter.repair_update({**job, 'state': 'blocked',
+        'result': {'error': 'ValueError: engine request has no explicit acceptance obligations'}}, {'state': 'blocked'})
+    value = stream.getvalue()
+    assert '准备修复自动化工具：' + detail in value
+    for label in ('制定工具修复方案', '修复工具问题', '验证'):
+        assert value.count('自动化工具修复：' + label + '；问题：' + detail) == 1
+    assert '缺少明确的修复完成标准' in value
+    assert 'private-job' not in value and 'focused_fix' not in value and '/private/' not in value
+    assert json.dumps(job, sort_keys=True) == before
+
+
+def test_user_summary_survives_fix_routing_and_issue_materialization(tmp_path):
+    from auto_agents.session import Session
+    from auto_agents.workflow_chain import IssueBriefBuilder
+
+    route = {'summary': 'technical explanation', 'user_summary': '分镜修正未解决镜头衔接问题',
+             'issue_seed': {'verification_scope': {'mode': 'focused_fix'},
+                            'verification_command': 'python -m pytest tests/test_story.py::test_continuity'}}
+    payload = Session._fix_workflow_payload(route)
+    IssueBriefBuilder(tmp_path, 'child').materialize(payload['issue_seed'])
+    issue = json.loads((tmp_path / '.auto-agents/state/sessions/child/issue.json').read_text())
+    assert issue['user_summary'] == route['user_summary']
+    assert issue['verification_scope'] == route['issue_seed']['verification_scope']
+    assert issue['verification_command'] == route['issue_seed']['verification_command']
+
+
+def test_private_fix_keeps_control_problem_and_does_not_repeat_the_action(tmp_path):
+    from auto_agents.models import SessionState
+    from auto_agents.workflow_chain import IssueBriefBuilder
+
+    stream = io.StringIO()
+    control = Reporter(tmp_path / 'control', stream, language='zh')
+    private = Reporter(tmp_path / 'private', stream, language='zh', presenter=control.presenter)
+    detail = '分镜修正未解决镜头衔接问题'
+    IssueBriefBuilder(control.project_root, 'child').materialize({'user_summary': detail})
+    state = SessionState('child', mode='fix', status='executing')
+    try:
+        for reporter in (control, private):
+            reporter.bind('fix', state.session_id)
+            reporter.observe_session(state, control_root=control.project_root)
+            assert detail in (reporter.root / 'user.log').read_text()
+        assert stream.getvalue().count('准备修复项目问题：' + detail) == 1
+        private.session_action('fix')
+        private.emit('verification.started', context='candidate')
+        private.event('verification.interrupted', {}, audience='user', message='验证中断')
+        assert '正在修复项目问题：' + detail in stream.getvalue()
+        assert '修复效果检查未完成：' + detail in stream.getvalue()
+    finally:
+        private.close()
+        control.close()
+
+
+def test_resuming_a_fix_displays_the_original_problem_not_the_wrapper(tmp_path):
+    from auto_agents.models import SessionState
+
+    stream = io.StringIO()
+    reporter = Reporter(tmp_path, stream, language='zh')
+    root = tmp_path / '.auto-agents/state/handoffs'
+    root.mkdir(parents=True)
+    (root / 'hf-original.json').write_text(json.dumps({'target': 'fix',
+        'payload': {'issue_seed': {'user_summary': '分镜修正未解决镜头衔接问题'}}}))
+    (root / 'hf-resume.json').write_text(json.dumps({'target': 'resume',
+        'payload': {'resume_handoff_id': 'hf-original'}}))
+    (root / 'hf-engine-return.json').write_text(json.dumps({'target': 'fix',
+        'payload': {'issue_seed': {'original_handoff_id': 'hf-resume',
+                                 'summary': 'technical engine verification_ownership'}}}))
+    try:
+        reporter.bind('collab', 'parent')
+        state = SessionState('parent', mode='collab', status='waiting_child', active_handoff_id='hf-engine-return')
+        before = state.to_dict()
+        reporter.observe_session(state)
+        value = stream.getvalue()
+        assert '继续修复项目问题：分镜修正未解决镜头衔接问题' in value
+        assert 'technical engine' not in value and 'hf-' not in value
+        assert state.to_dict() == before
+    finally:
+        reporter.close()

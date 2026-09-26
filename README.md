@@ -1313,6 +1313,14 @@ messages follow `docs.language`; Agent replies remain verbatim. Questions and co
 visible in concise mode. Session commands (`collab`, `fix`, `provider-resolve`) print their full
 state JSON only in debug mode; other structured command results remain on stdout for scripts.
 
+Session progress names the work in plain language: goal clarification, failure diagnosis,
+starting a project fix, checking the fix, executing acceptance, and reviewing the observed result.
+Project fixes and automation tool repairs include a short description of the problem being handled.
+Preparation is distinct from actual repair work, and a blocked prerequisite says that repair has
+not started. Returning from a child reports the next action instead of announcing the same fix again.
+New routes supply a brief `user_summary` for display; older sessions use their saved issue description.
+These descriptions do not change task authority, verification requirements, or recovery decisions.
+
 Diagnostics are collected even in concise mode and can be found through `diagnostics.json`:
 
 - Runs use `.auto-agents/runs/<run_id>/`; sessions use
