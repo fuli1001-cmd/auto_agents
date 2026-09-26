@@ -31,6 +31,7 @@ def recovery_evidence(controller, identity):
                 'parent_budget', 'child_budget', 'parent_constraints_preserved',
                 'child_constraints_preserved', 'retained_constraints', 'diagnostic_provider_calls',
                 'run_id', 'implementation_entry', 'continuation_entry', 'implementation_entered',
+                'child_request_entry', 'provider_lock_sha256',
                 'continuation_status', 'prerequisites', 'provider_admission', 'entry_event_ref', 'spec_sha256',
                 'accepted_plan_sha256', 'requirements_trace_sha256', 'accepted_task_ids',
                 'oracle_proof_count', 'verification_step_count', 'submission_receipt',

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -16,12 +17,16 @@ _ENGINE_SOURCE_ROOT = Path(
 ).resolve()
 sys.path.insert(0, str(_ENGINE_SOURCE_ROOT))
 
-from auto_agents.config import load_run_state, save_run_state
+from auto_agents.config import load_run_state, load_task_plan, save_run_state
 from auto_agents.git_ops import commit_all
 from auto_agents.io_utils import read_json, write_json, write_text
 from auto_agents.models import CommandResult, GateResult, RunState, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.repair_cases import RepairCase, RepairCaseStore
+from auto_agents.repair_v2.boundary_driver import (
+    RecoveryProofIncomplete, observe_run_continuation, run_input_hashes,
+)
+from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
 
 
 class _ProviderRoutingFixture:
@@ -1473,4 +1478,563 @@ def test_provider_rewind_separates_route_evidence_from_refresh_documents(
         assert resumed_state.current_stage == "provider_research"
         assert "review_route_reclassifications" not in (
             resumed_state.resume_context
+        )
+
+
+def test_review_cited_accepted_provider_reference_keeps_implementation_owner(
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "demo"
+        Orchestrator.init_project(root, "demo", "mock")
+        orchestrator = Orchestrator(root)
+        reference = ".auto-agents/docs/provider_references/apimart_seedance_video.md"
+        other_reference = (
+            ".auto-agents/docs/provider_references/volcengine_ark_seedance_video.md"
+        )
+        lock_path = root / ".auto-agents/state/provider_references.lock.json"
+        write_text(root / reference, "# Accepted provider contract\n")
+        write_text(root / other_reference, "# Other accepted provider contract\n")
+        write_json(
+            root / ".auto-agents/state/requirements_trace.json",
+            {
+                "requirements": [{
+                    "id": "REQ-296",
+                    "status": "active",
+                    "external_docs_required": True,
+                    "provider_references": [reference, other_reference],
+                }],
+            },
+        )
+        write_json(lock_path, {
+            "version": 1,
+            "references": {"apimart": {
+                "path": reference,
+                "status": "assumption_approved",
+            }, "volcengine": {
+                "path": other_reference,
+                "status": "verified",
+            }},
+        })
+        with patch.dict(os.environ, {
+            "GIT_AUTHOR_NAME": "Test Author",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test Author",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        }):
+            commit_all(root, "accepted provider contract")
+        original_lock = lock_path.read_bytes()
+        review = (
+            "验收标准 1、2 未满足。"
+            f"[public_video.py]({root / 'app/application/public_video.py'}:2028) "
+            "在 pending 时直接返回，没有先检查安全拒绝信号；这违反 "
+            f"[APIMart provider reference]({root / reference}:129) 的合同。"
+            "新增测试未覆盖该冲突响应。"
+        )
+        task = TaskSpec(
+            task_id="fix-rejection",
+            title="Fix full verification failure",
+            description="",
+            acceptance=[],
+            status="pending",
+            review_summary=review,
+        )
+        state = RunState(
+            run_id="review-routing",
+            status="pending",
+            current_stage="implement",
+            tasks=[task],
+        )
+
+        assert Orchestrator._review_feedback_rewind_stage(review) == ""
+        assert orchestrator._provider_reference_paths_from_review(review) == {
+            reference
+        }
+        contract_then_code_change = (
+            f"[APIMart contract]({root / reference}:129) requires the "
+            "public_video.py polling branch to be fixed."
+        )
+        assert (
+            Orchestrator._review_feedback_rewind_stage(
+                contract_then_code_change
+            ) == ""
+        )
+        assert orchestrator._handle_review_stage_rewind(
+            state,
+            task,
+            [task],
+            {"review": review, "route_source": "review_feedback"},
+            "provider_research",
+        ) is None
+        assert orchestrator._handle_review_stage_rewind(
+            state,
+            task,
+            [task],
+            {
+                "review": review,
+                "rewind_reason": (
+                    "review feedback points to provider_research-owned artifact"
+                ),
+            },
+            "provider_research",
+        ) is None
+        assert task.status == "pending"
+        assert state.current_stage == "implement"
+        assert lock_path.read_bytes() == original_lock
+
+        document_defect = (
+            f"[APIMart provider reference]({root / reference}:129) "
+            "lacks rule-level provenance and must be updated."
+        )
+        assert (
+            Orchestrator._review_feedback_rewind_stage(document_defect)
+            == "provider_research"
+        )
+        assert orchestrator._provider_reference_paths_from_review(
+            document_defect
+        ) == {reference}
+        incorrect_rule = (
+            f"[APIMart provider reference]({root / reference}:129) "
+            "has an incorrect safety rule."
+        )
+        assert (
+            Orchestrator._review_feedback_rewind_stage(incorrect_rule)
+            == "provider_research"
+        )
+        assert orchestrator._provider_reference_paths_from_review(
+            incorrect_rule
+        ) == {reference}
+        lock_defect = (
+            f"[provider lock]({lock_path}) incorrectly marks "
+            f"[APIMart provider reference]({root / reference}:129) verified."
+        )
+        assert (
+            Orchestrator._review_feedback_rewind_stage(lock_defect)
+            == "provider_research"
+        )
+        assert orchestrator._provider_reference_paths_from_review(
+            lock_defect
+        ) == {reference}
+        lock_only_defect = (
+            f"[provider lock]({lock_path}) incorrectly approves APIMart."
+        )
+        assert (
+            Orchestrator._review_feedback_rewind_stage(lock_only_defect)
+            == "provider_research"
+        )
+        assert orchestrator._provider_reference_paths_from_review(
+            lock_only_defect
+        ) == {reference}
+        assert not orchestrator._provider_reference_paths_from_review(
+            "[foreign lock](evil/.auto-agents/state/"
+            "provider_references.lock.json) incorrectly approves APIMart."
+        )
+        outside_reference = (
+            f"[outside]({root.parent / 'other' / reference}:129) "
+            "lacks provenance."
+        )
+        assert not orchestrator._provider_reference_paths_from_review(
+            outside_reference
+        )
+        assert not orchestrator._provider_reference_paths_from_review(
+            f"REQ-296 says evil/{reference} lacks provenance."
+        )
+        assert not orchestrator._provider_reference_paths_from_review(
+            f"REQ-296 says {root / 'nested/..' / reference} lacks provenance."
+        )
+
+        rewound = orchestrator._handle_review_stage_rewind(
+            state,
+            task,
+            [task],
+            {
+                "review": document_defect,
+                "route_source": "review_feedback",
+            },
+            "provider_research",
+        )
+        assert rewound is state
+        assert state.current_stage == "provider_research"
+        assert read_json(lock_path)["references"]["apimart"]["status"] == (
+            "needs_refresh"
+        )
+        assert read_json(lock_path)["references"]["volcengine"]["status"] == (
+            "verified"
+        )
+
+        incorrect_task = TaskSpec(
+            task_id="fix-incorrect-rule-review",
+            title="Correct a provider document rule",
+            description="",
+            acceptance=[],
+            status="pending",
+        )
+        incorrect_state = RunState(
+            run_id="incorrect-rule-routing",
+            status="pending",
+            current_stage="implement",
+            tasks=[incorrect_task],
+        )
+        assert orchestrator._handle_review_stage_rewind(
+            incorrect_state,
+            incorrect_task,
+            [incorrect_task],
+            {"review": incorrect_rule, "route_source": "review_feedback"},
+            "provider_research",
+        ) is incorrect_state
+        assert incorrect_state.current_stage == "provider_research"
+        assert read_json(lock_path)["references"]["apimart"]["status"] == (
+            "needs_refresh"
+        )
+        assert read_json(lock_path)["references"]["volcengine"]["status"] == (
+            "verified"
+        )
+
+        lock_task = TaskSpec(
+            task_id="fix-lock-review",
+            title="Refresh defective provider lock entry",
+            description="",
+            acceptance=[],
+            status="pending",
+        )
+        lock_state = RunState(
+            run_id="lock-review-routing",
+            status="pending",
+            current_stage="implement",
+            tasks=[lock_task],
+        )
+        assert orchestrator._handle_review_stage_rewind(
+            lock_state,
+            lock_task,
+            [lock_task],
+            {"review": lock_only_defect, "route_source": "review_feedback"},
+            "provider_research",
+        ) is lock_state
+        assert lock_state.current_stage == "provider_research"
+        assert read_json(lock_path)["references"]["apimart"]["status"] == (
+            "needs_refresh"
+        )
+        assert read_json(lock_path)["references"]["volcengine"]["status"] == (
+            "verified"
+        )
+
+
+def test_review_misroute_resume_without_incident_returns_to_implementation(
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "demo"
+        Orchestrator.init_project(root, "demo", "mock")
+        orchestrator = Orchestrator(root)
+        spec = root / "specs/2026-09-21-iter-01-planning-progress-aware-recovery.md"
+        reference = ".auto-agents/docs/provider_references/apimart_seedance_video.md"
+        lock_path = root / ".auto-agents/state/provider_references.lock.json"
+        write_text(spec, "# Current iteration\n")
+        write_text(root / reference, "# Accepted provider contract\n")
+        write_json(
+            root / ".auto-agents/state/requirements_trace.json",
+            {
+                "requirements": [{
+                    "id": "REQ-296",
+                    "status": "active",
+                    "external_docs_required": True,
+                    "provider_references": [reference],
+                }],
+            },
+        )
+        write_json(lock_path, {
+            "version": 1,
+            "references": {"apimart": {
+                "path": reference,
+                "status": "assumption_approved",
+            }},
+        })
+        with patch.dict(os.environ, {
+            "GIT_AUTHOR_NAME": "Test Author",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test Author",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        }):
+            commit_all(root, "retained run baseline")
+        original_lock = lock_path.read_bytes()
+        review = (
+            f"[public_video.py]({root / 'app/application/public_video.py'}:2028) "
+            "在 pending 或 processing 时直接返回，没有先检查安全拒绝信号；"
+            f"这违反 [APIMart provider reference]({root / reference}:129) 的合同。"
+        )
+        done = TaskSpec(
+            task_id="task-pp-10",
+            title="Completed storyboard work",
+            description="",
+            acceptance=[],
+            status="done",
+        )
+        pending = TaskSpec(
+            task_id="fix-rejection-1790340098365",
+            title="Fix full verification failure",
+            description="",
+            acceptance=["Feedback is fully addressed"],
+            status="pending",
+            task_origin="stage_recovery",
+            review_summary=review,
+            review_history=[{"attempt": 1, "summary": review}],
+        )
+        state = load_run_state(root)
+        state.run_id = "82288622684f"
+        state.status = "blocked"
+        state.current_stage = "provider_research"
+        state.rejected_stage = "provider_research"
+        state.rejection_reason = (
+            "review feedback points to provider_research-owned artifact\n\n"
+            f"Review feedback:\n{review}\n\n"
+            "Pre-rewind incident: .auto-agents/runs/82288622684f/"
+            "recovery_incidents/missing.json"
+        )
+        state.last_error = "recovery loop orchestration no-op"
+        state.active_blocker = {
+            "owner": "auto_agents",
+            "category": "review_citation_misrouted_to_provider_research",
+            "status": "blocked",
+        }
+        state.stage_summaries = {
+            "clarify": "done",
+            "prototype": "Skipped",
+            "design": "done",
+            "plan": "done",
+        }
+        state.tasks = [done, pending]
+        rejected_checkpoint = {
+            "task_id": pending.task_id,
+            "status": "recoverable",
+            "has_candidate_changes": True,
+            "ref": "refs/auto-agents/runs/82288622684f/failed-tasks/"
+            "fix-rejection-1790340098365/epoch-0",
+            "changed_paths": ["app/application/public_video.py"],
+        }
+        unrelated_checkpoint = {
+            "task_id": done.task_id,
+            "status": "unavailable",
+            "ref": "",
+        }
+        state.task_failure_checkpoints = {
+            pending.task_id: rejected_checkpoint,
+            done.task_id: unrelated_checkpoint,
+        }
+        rejected_ownership = {
+            "owner_task_id": pending.task_id,
+            "source": "implementation_ready",
+        }
+        unrelated_ownership = {
+            "owner_task_id": done.task_id,
+            "source": "implementation_ready",
+        }
+        state.resume_context["retained_worktree_ownership"] = {
+            pending.task_id: rejected_ownership,
+            done.task_id: unrelated_ownership,
+        }
+        state.resume_context["spec_file"] = str(spec.resolve())
+        workflow = WorkflowStore(root).create_root(WorkflowRef("run", state.run_id))
+        state.resume_context["workflow_id"] = workflow.workflow_id
+        state.resume_context["provider_recovery_contract_receipts"] = {
+            "request_id": "retained"
+        }
+        saved_blocker = state.active_blocker
+        state.active_blocker = {
+            "owner": "auto_agents",
+            "category": "unrelated_blocker",
+            "status": "blocked",
+        }
+        assert not orchestrator._normalize_review_feedback_provider_misroute_resume(
+            state
+        )
+        assert state.current_stage == "provider_research"
+        state.active_blocker = saved_blocker
+        orchestrator._persist_tasks(state.tasks)
+        save_run_state(root, state)
+        retained_boundary_state = load_run_state(root)
+
+        with patch.dict(os.environ, {
+            "GIT_AUTHOR_NAME": "Test Author",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test Author",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        }), patch.object(
+            orchestrator,
+            "_run_provider_research",
+            side_effect=AssertionError("accepted provider research must be reused"),
+        ):
+            resumed = orchestrator.run(
+                spec_file=spec,
+                auto_approve=True,
+                allow_dirty_tree=True,
+                skip_validate=True,
+                max_tasks=0,
+            )
+        assert resumed.run_id == "82288622684f"
+        assert resumed.status == "pending"
+        assert resumed.current_stage == "implement"
+        assert resumed.rejected_stage == ""
+        assert resumed.active_blocker == {}
+        assert resumed.last_error == ""
+        assert done.status == "done"
+        assert pending.status == "pending"
+        assert pending.review_summary == review
+        assert pending.review_history == [{"attempt": 1, "summary": review}]
+        assert resumed.resume_context["provider_recovery_contract_receipts"] == {
+            "request_id": "retained"
+        }
+        assert lock_path.read_bytes() == original_lock
+        assert not (
+            root / ".auto-agents/runs/82288622684f/recovery_incidents/missing.json"
+        ).exists()
+
+        receipts = dict(
+            resumed.resume_context["review_route_reclassifications"]
+        )
+        assert len(receipts) == 1
+        receipt = next(iter(receipts.values()))
+        assert receipt["rejected_candidate_checkpoint"] == rejected_checkpoint
+        assert receipt["rejected_worktree_ownership"] == rejected_ownership
+        assert pending.task_id not in resumed.task_failure_checkpoints
+        assert resumed.task_failure_checkpoints[done.task_id] == (
+            unrelated_checkpoint
+        )
+        assert pending.task_id not in resumed.resume_context[
+            "retained_worktree_ownership"
+        ]
+        assert resumed.resume_context["retained_worktree_ownership"][
+            done.task_id
+        ] == unrelated_ownership
+        assert not orchestrator._should_resume_task(resumed, pending)
+
+        with patch.dict(os.environ, {
+            "GIT_AUTHOR_NAME": "Test Author",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test Author",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        }), patch.object(
+            orchestrator,
+            "_run_provider_research",
+            side_effect=AssertionError("accepted provider research must be reused"),
+        ):
+            again = orchestrator.run(
+                spec_file=spec,
+                auto_approve=True,
+                allow_dirty_tree=True,
+                skip_validate=True,
+                max_tasks=0,
+            )
+        assert again.run_id == resumed.run_id
+        assert again.current_stage == "implement"
+        assert again.resume_context["review_route_reclassifications"] == (
+            receipts
+        )
+        assert lock_path.read_bytes() == original_lock
+
+        # The pinned original-boundary replay calls these two methods directly;
+        # it does not enter run() before checking whether the blocker changed.
+        save_run_state(root, retained_boundary_state)
+        orchestrator._persist_tasks(retained_boundary_state.tasks)
+        before = dict(retained_boundary_state.active_blocker)
+        with patch.object(
+            orchestrator,
+            "_call_with_failover",
+            side_effect=AssertionError("offline resume must not call providers"),
+        ) as provider:
+            marked = orchestrator.mark_self_repair_applied(
+                "synthetic-approved-engine"
+            )
+            changed = orchestrator._resume_blocked_run(marked)
+        save_run_state(root, marked)
+        provider.assert_not_called()
+        after = marked.active_blocker or {}
+        same_blocker = bool(
+            after and any(
+                after.get(key) and after.get(key) == before.get(key)
+                for key in ("fingerprint", "category")
+            )
+        )
+        assert changed
+        assert not same_blocker
+        assert marked.status == "pending"
+        assert marked.current_stage == "implement"
+        assert marked.run_id == retained_boundary_state.run_id
+        assert marked.active_blocker == {}
+        assert marked.last_error == ""
+        assert [task.task_id for task in marked.tasks] == [
+            done.task_id,
+            pending.task_id,
+        ]
+        assert marked.tasks[-1].status == "pending"
+        assert marked.tasks[-1].review_summary == review
+        assert pending.task_id not in marked.task_failure_checkpoints
+        assert marked.task_failure_checkpoints[done.task_id] == (
+            unrelated_checkpoint
+        )
+        assert lock_path.read_bytes() == original_lock
+        assert not (
+            root / ".auto-agents/runs/82288622684f/recovery_incidents/missing.json"
+        ).exists()
+
+        runtime = {
+            "ok": True,
+            "commit": orchestrator._auto_agents_runtime_identity()["repository_head"],
+        }
+        frozen_inputs = run_input_hashes(root, retained_boundary_state)
+        original_plan = load_task_plan(root)
+        events_path = root / ".auto-agents/runs/82288622684f/events.jsonl"
+        assert not any(
+            json.loads(line)["type"] == "task.implementation.requested"
+            for line in events_path.read_text().splitlines()
+        )
+        with patch.dict(os.environ, {
+            "GIT_AUTHOR_NAME": "Test Author",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test Author",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        }), patch("auto_agents.orchestrator.ensure_repo"), patch.object(
+            orchestrator, "_ensure_preconditions"
+        ), patch.object(
+            orchestrator, "_call_with_failover",
+            side_effect=AssertionError("offline child entry must not contact providers"),
+        ) as provider:
+            budget_limited = load_run_state(root)
+            budget_limited.resume_context["max_tasks"] = 0
+            save_run_state(root, budget_limited)
+            with pytest.raises(RecoveryProofIncomplete, match="did not enter"):
+                observe_run_continuation(
+                    orchestrator,
+                    retained_boundary_state,
+                    original_plan,
+                    {"commit": runtime["commit"], "invocation": {"run_id": state.run_id}},
+                    runtime,
+                    frozen_inputs,
+                )
+            save_run_state(root, marked)
+            orchestrator._persist_tasks(marked.tasks)
+            proof = observe_run_continuation(
+                orchestrator,
+                retained_boundary_state,
+                original_plan,
+                {"commit": runtime["commit"], "invocation": {"run_id": state.run_id}},
+                runtime,
+                frozen_inputs,
+            )
+        provider.assert_not_called()
+        receipt = proof["recovery_observation"]
+        assert receipt["task_id"] == pending.task_id
+        assert receipt["boundary_kind"] == "child_implementation_request"
+        assert receipt["implementation_entry"]["data"]["recovery_task_id"] == pending.task_id
+        child_request = receipt["child_request_entry"]
+        assert child_request["data"]["task_id"] == pending.task_id
+        assert child_request["data"]["stage_key"] == f"implement-{pending.task_id}"
+        assert child_request["data"]["prompt_sha256"]
+        events = [json.loads(line) for line in events_path.read_text().splitlines()]
+        assert any(
+            event["type"] == "implementation.entered"
+            and event == receipt["implementation_entry"]
+            for event in events
+        )
+        assert any(
+            event["type"] == "task.implementation.requested"
+            and event == child_request
+            for event in events
         )

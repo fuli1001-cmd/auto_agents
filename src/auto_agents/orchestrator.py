@@ -2281,6 +2281,148 @@ class Orchestrator:
         self._persist_tasks(state.tasks)
         return True
 
+    def _normalize_review_feedback_provider_misroute_resume(
+        self,
+        state: RunState,
+    ) -> bool:
+        """Reopen an implementation review misrouted to resolved research.
+
+        Older review rewinds may have lost their incident file during checkout
+        reset. The retained task review and accepted lock are enough to repair
+        this specific route without resetting the checkout or the task plan.
+        """
+
+        if (
+            state.status not in {"blocked", "failed", "pending"}
+            or state.current_stage != "provider_research"
+            or state.rejected_stage != "provider_research"
+            or "provider_research" in state.stage_summaries
+            or "Review feedback:" not in state.rejection_reason
+            or (
+                state.active_blocker
+                and str(state.active_blocker.get("category", ""))
+                not in {
+                    "review_citation_misrouted_to_provider_research",
+                    "provider_research_false_ownership_rewind",
+                }
+            )
+        ):
+            return False
+        review = state.rejection_reason.split("Review feedback:", 1)[1]
+        review = review.split("Pre-rewind incident:", 1)[0].strip()
+        if (
+            not review
+            or self._review_feedback_rewind_stage(review)
+            == "provider_research"
+            or not any(
+                self._forbidden_pattern_owner_stage({"path": path})
+                == "implement"
+                for path in self._review_feedback_paths(review)
+            )
+        ):
+            return False
+        matching_tasks = [
+            task
+            for task in state.tasks
+            if task.status != "done"
+            and (
+                task.review_summary.strip() == review
+                or any(
+                    isinstance(entry, dict)
+                    and str(entry.get("summary", "")).strip() == review
+                    for entry in task.review_history
+                )
+            )
+        ]
+        if len(matching_tasks) != 1:
+            return False
+        task = matching_tasks[0]
+        references = self._provider_reference_paths_from_review(review)
+        if not references:
+            return False
+        trace = load_requirements_trace(self.project_root)
+        lock = load_provider_references_lock(self.project_root)
+        if any(
+            not self._is_resolved_provider_reference_status(
+                provider_reference_effective_status(lock, trace, reference)
+            )
+            for reference in references
+        ):
+            # An actual unresolved or changed lock still belongs to the
+            # provider route. Without an incident baseline, never overwrite it.
+            return False
+
+        receipt_id = "review-feedback-" + hashlib.sha256(
+            f"{state.run_id}:{task.task_id}:{review}".encode("utf-8")
+        ).hexdigest()[:16]
+        receipts_payload = state.resume_context.get(
+            "review_route_reclassifications", {}
+        )
+        receipts = (
+            dict(receipts_payload)
+            if isinstance(receipts_payload, dict)
+            else {}
+        )
+        if receipt_id in receipts:
+            return False
+
+        # The checkpoint is the candidate that this review rejected. Keep its
+        # full record and Git ref as evidence, but remove its active replay
+        # pointer so the pending task must perform a fresh implementation pass.
+        rejected_checkpoint = state.task_failure_checkpoints.pop(
+            task.task_id, None
+        )
+        ownership_records = self._retained_worktree_ownership_records(state)
+        rejected_ownership = ownership_records.pop(task.task_id, None)
+        if rejected_ownership is not None:
+            if ownership_records:
+                state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = (
+                    ownership_records
+                )
+            else:
+                state.resume_context.pop(
+                    _RETAINED_WORKTREE_OWNERSHIP_CONTEXT, None
+                )
+
+        task.status = "pending"
+        task.commit_sha = ""
+        self._begin_fresh_verify_retry_lifecycle(task)
+        self._clear_implementation_ready_marker(state, task)
+        self._clear_stale_implementation_resume_markers(
+            state, task_ids=[task.task_id]
+        )
+        state.task_review_cache.pop(task.task_id, None)
+        state.stage_summaries["provider_research"] = (
+            "Reused the accepted provider reference after an "
+            "implementation-owned review citation was misrouted."
+        )
+        self._rewind_state_from_stage(state, "implement")
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        state.active_blocker = {}
+        state.last_error = ""
+        receipts[receipt_id] = {
+            "reclassified_at": utc_now_iso(),
+            "from_stage": "provider_research",
+            "to_stage": "implement",
+            "task_id": task.task_id,
+            "provider_reference_paths": sorted(references),
+            "rejected_candidate_checkpoint": copy.deepcopy(rejected_checkpoint),
+            "rejected_worktree_ownership": copy.deepcopy(rejected_ownership),
+        }
+        state.resume_context["review_route_reclassifications"] = receipts
+        state.last_recovery_route = {
+            "task_id": task.task_id,
+            "outcome": "route_reclassified",
+            "failure_kind": "review_feedback",
+            "reason": "review identifies an implementation defect under an accepted provider contract",
+            "from_stage": "provider_research",
+            "to_stage": "implement",
+            "incident_id": "",
+        }
+        self._persist_tasks(state.tasks)
+        return True
+
     @staticmethod
     def _is_requirements_audit_recovery_task(task: Optional[TaskSpec]) -> bool:
         if task is None:
@@ -6423,13 +6565,125 @@ class Orchestrator:
         if not active_paths:
             return set()
         found: Set[str] = set()
-        for match in re.finditer(
-            r"(?:^|[^\w./-])(\.auto-agents/docs/provider_references/[^\s`'\"\])}:;,]+\.md)",
-            review_text or "",
-        ):
-            normalized = self._normalize_relative_artifact_path(match.group(1))
-            if normalized in active_paths:
-                found.add(normalized)
+        # Review feedback commonly uses absolute Markdown links with a line
+        # suffix. Resolve those against this project before admitting a lock
+        # entry as a refresh target; a matching suffix in another repository
+        # must not refresh this project's accepted reference.
+        citation_pattern = re.compile(
+            r"(?P<path>(?:/[^\s`'\"()\[\]{}<>]+/|\./)?"
+            r"\.auto-agents/docs/provider_references/"
+            r"[^\s`'\"()\[\]{}<>:;,]+\.md)(?::\d+)?"
+        )
+        saw_citation = False
+        for match in citation_pattern.finditer(review_text or ""):
+            raw_path = match.group("path")
+            saw_citation = True
+            if any(part in {".", ".."} for part in Path(raw_path).parts):
+                continue
+            if (
+                not raw_path.startswith(("/", "./"))
+                and match.start() > 0
+                and (review_text or "")[match.start() - 1] in
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-"
+            ):
+                continue
+            if raw_path.startswith("/"):
+                try:
+                    normalized = str(
+                        Path(raw_path).resolve().relative_to(
+                            self.project_root.resolve()
+                        )
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
+            else:
+                normalized = self._normalize_relative_artifact_path(raw_path)
+            canonical = self._canonical_provider_reference_document_path(
+                normalized
+            )
+            if canonical in active_paths:
+                found.add(canonical)
+
+        # A cited document is more precise than a requirement that may name
+        # several providers. Do not broaden a targeted refresh to all of them.
+        if saw_citation:
+            return found
+
+        lock_pattern = re.compile(
+            r"(?P<path>(?:/[^\s`'\"()\[\]{}<>]+/|\./)?"
+            r"\.auto-agents/state/provider_references\.lock\.json)(?::\d+)?"
+        )
+        saw_lock_citation = False
+        lock_cited = False
+        for match in lock_pattern.finditer(review_text or ""):
+            raw_path = match.group("path")
+            saw_lock_citation = True
+            if any(part in {".", ".."} for part in Path(raw_path).parts):
+                continue
+            if (
+                not raw_path.startswith(("/", "./"))
+                and match.start() > 0
+                and (review_text or "")[match.start() - 1] in
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-"
+            ):
+                continue
+            if raw_path.startswith("/"):
+                try:
+                    normalized = str(
+                        Path(raw_path).resolve().relative_to(
+                            self.project_root.resolve()
+                        )
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
+            else:
+                normalized = self._normalize_relative_artifact_path(raw_path)
+            if self._canonical_provider_reference_lock_path(normalized):
+                lock_cited = True
+        if saw_lock_citation:
+            if not lock_cited:
+                return set()
+            lock = load_provider_references_lock(self.project_root)
+            entries = lock.get("references", {})
+            if not isinstance(entries, dict):
+                return set()
+            searchable_review = " " + re.sub(
+                r"[^a-z0-9]+", " ", review_text.lower()
+            ).strip() + " "
+            candidates: Set[str] = set()
+            for key, entry in entries.items():
+                if not isinstance(entry, dict):
+                    continue
+                reference = self._canonical_provider_reference_document_path(
+                    entry.get("path")
+                )
+                if reference not in active_paths:
+                    continue
+                stem = Path(reference).stem
+                names = (str(key), stem)
+                if any(
+                    " " + re.sub(r"[^a-z0-9]+", " ", name.lower()).strip() + " "
+                    in searchable_review
+                    for name in names
+                ):
+                    candidates.add(reference)
+            if not candidates:
+                # A provider name alone is sufficient only when it identifies
+                # exactly one active locked document.
+                prefixes = {
+                    reference: Path(reference).stem.split("_", 1)[0]
+                    for reference in active_paths
+                }
+                candidates = {
+                    reference
+                    for reference, prefix in prefixes.items()
+                    if len(prefix) >= 5
+                    and list(prefixes.values()).count(prefix) == 1
+                    and f" {prefix} " in searchable_review
+                }
+            if len(candidates) == 1:
+                return candidates
+            return set()
 
         req_ids = {
             match.group(0).upper()
@@ -16494,6 +16748,11 @@ class Orchestrator:
         return True
 
     def _resume_blocked_run(self, state: RunState) -> bool:
+        # The trusted recovery boundary enters here directly after
+        # mark_self_repair_applied(), without going through run(). Reclassify
+        # a retained review misroute before generic blocker handling.
+        if self._normalize_review_feedback_provider_misroute_resume(state):
+            return True
         if (state.active_blocker or {}).get("category") == "metadata_schema_false_positive_and_checkpoint_failure":
             if self._resume_metadata_checkpoint_repair(state):
                 return True
@@ -21850,7 +22109,7 @@ class Orchestrator:
         return "\n".join(lines)
 
     def _record_iteration_plan_continuation(self, state: RunState, stage: str, **details: object) -> None:
-        """Persist the actual next boundary reached after scoped planning recovery."""
+        """Persist the next admitted stage after a retained recovery route."""
         diagnostic = state.last_recovery_route.get("diagnostic_evidence_repair", {})
         repaired = diagnostic.get("repaired_blocker", {})
         diagnostic_ready = bool(
@@ -21862,9 +22121,21 @@ class Orchestrator:
             and repaired.get("category") == "diagnostic_evidence_reference_binding_gap"
         )
         metadata_ready = self._metadata_checkpoint_verification_handoff(state) is not None
+        review_route = state.last_recovery_route
+        review_retry_ready = bool(
+            review_route.get("outcome") == "route_reclassified"
+            and review_route.get("failure_kind") == "review_feedback"
+            and review_route.get("to_stage") == "implement"
+            and any(
+                task.task_id == review_route.get("task_id")
+                and task.status == "pending"
+                for task in state.tasks
+            )
+        )
         if (state.last_recovery_route.get("outcome") not in {
                 "iteration_plan_scope_reconciled", "provider_reference_review_repaired"}
                 and not diagnostic_ready and not metadata_ready
+                and not review_retry_ready
                 or state.status in {"blocked", "paused", "waiting_user"} or state.active_blocker):
             return
         spec_value = str(state.resume_context.get("spec_file", "")).strip()
@@ -21887,6 +22158,7 @@ class Orchestrator:
             "plan_sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
             "task_ids": [task.task_id for task in state.tasks],
             "pending_task_ids": [task.task_id for task in state.tasks if task.status == "pending"],
+            **({"recovery_task_id": review_route["task_id"]} if review_retry_ready else {}),
             "agent_attempts": dict(state.agent_attempts),
             "engine_runtime": self._auto_agents_runtime_identity(),
             **details,
@@ -32820,6 +33092,28 @@ class Orchestrator:
         if target_stage not in STAGE_ORDER or STAGE_ORDER.index(target_stage) >= STAGE_ORDER.index("implement"):
             return None
 
+        if (
+            target_stage == "provider_research"
+            and (
+                str(gate_result.get("route_source", "")) == "review_feedback"
+                or str(gate_result.get("rewind_reason", "")).startswith(
+                    "review feedback points to provider_research-owned artifact"
+                )
+            )
+        ):
+            review_text = str(gate_result.get("review", ""))
+            references = self._provider_reference_paths_from_review(review_text)
+            if (
+                self._review_feedback_rewind_stage(review_text)
+                != "provider_research"
+                or not references
+            ):
+                # This guard precedes the incident write and hard reset. A
+                # stale or ambiguous review route remains an implementation
+                # failure with its current candidate intact.
+                return None
+            gate_result["provider_reference_paths"] = sorted(references)
+
         attempt_base_ref = self._task_attempt_base_ref(state, task)
         baseline_ref = (
             attempt_base_ref
@@ -37658,6 +37952,7 @@ class Orchestrator:
                 "parallel_task_path_history",
                 "evidence_preflight_routes",
                 "provider_recovery_contract_receipts",
+                "review_route_reclassifications",
                 "restarted_blocked_run_id",
                 "auto_agents_runtime",
                 "workflow_id",
@@ -39544,9 +39839,42 @@ class Orchestrator:
     @classmethod
     def _review_feedback_rewind_stage(cls, text: str) -> str:
         owners: Set[str] = set()
-        for path in cls._review_feedback_paths(text):
+        if not text:
+            return ""
+        path_pattern = re.compile(
+            r"((?:\.?[\w.-]+/)+[^\s`'\"()]+\.(?:py|md|json|toml|ya?ml|tsx?|jsx?))"
+        )
+        defect_pattern = re.compile(
+            r"\b(?:lacks?|missing|stale|incorrect(?:ly)?|wrong(?:ly)?|invalid|"
+            r"contradicts?|must\s+be\s+(?:updated|changed|fixed|corrected)|"
+            r"needs?\s+(?:updat(?:e|ing)|correction|refresh))\b|"
+            r"缺少|有误|错误|过期|不完整|不准确|矛盾|"
+            r"(?:需(?:要)?|必须|应)(?:更新|修正|补充)",
+            flags=re.IGNORECASE,
+        )
+        for match in path_pattern.finditer(text):
+            path = cls._normalize_audit_blocker_path(
+                match.group(1).strip().rstrip(".,):;")
+            )
             owner = cls._forbidden_pattern_owner_stage({"path": path})
-            if owner in {"clarify", "prototype", "design", "plan", "provider_research"}:
+            if owner not in {"clarify", "prototype", "design", "plan", "provider_research"}:
+                continue
+            # A citation of an upstream contract is evidence, not proof that
+            # the contract itself needs editing. Require an explicit defect
+            # attached to that artifact before rewinding a reviewed task.
+            clause = re.split(
+                r"[。.!?\n]", text[match.end() : match.end() + 180],
+                maxsplit=1,
+            )[0]
+            clause = re.sub(
+                r"^\s*(?::\d+)?[)`\]}\s]*(?:(?:still|is|itself)\s+|"
+                r"has\s+(?:an?\s+)?|"
+                r"仍(?:然)?\s*|本身\s*)?",
+                "",
+                clause,
+                flags=re.IGNORECASE,
+            )
+            if defect_pattern.match(clause):
                 owners.add(owner)
         if len(owners) == 1:
             return next(iter(owners))
@@ -42706,6 +43034,13 @@ class Orchestrator:
             })
 
             rewind_stage = self._review_feedback_rewind_stage(last_review)
+            provider_reference_paths: List[str] = []
+            if rewind_stage == "provider_research":
+                provider_reference_paths = sorted(
+                    self._provider_reference_paths_from_review(last_review)
+                )
+                if not provider_reference_paths:
+                    rewind_stage = ""
             if rewind_stage:
                 return {
                     "ok": False,
@@ -42714,6 +43049,8 @@ class Orchestrator:
                     "failure_ids": list(last_failure_ids),
                     "rewind_to_stage": rewind_stage,
                     "expected_owner_stage": rewind_stage,
+                    "route_source": "review_feedback",
+                    "provider_reference_paths": provider_reference_paths,
                     "rewind_reason": (
                         f"review feedback points to {rewind_stage}-owned artifact; "
                         "rewinding to the owning stage"
@@ -43450,6 +43787,19 @@ class Orchestrator:
                             *request.prompt_spec.blocks,
                             PromptBlock("Workflow policy for new decisions (this invocation already authorizes its stage-permitted task actions): " + json.dumps(policy, sort_keys=True), "stage.authorization"),
                         )))
+                if stage == "implement" and state is not None and stage_key.startswith("implement-"):
+                    # This event is after the child request has been built and
+                    # task admission has succeeded. Recovery probes can stop
+                    # here before any external provider call.
+                    self.reporter.event("task.implementation.requested", {
+                        "run_id": active_run_id,
+                        "workflow_id": str(state.resume_context.get("workflow_id", "")),
+                        "task_id": stage_key.removeprefix("implement-"),
+                        "stage_key": stage_key,
+                        "attempt_id": request.attempt_id,
+                        "prompt_sha256": hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+                        "engine_runtime": self._auto_agents_runtime_identity(),
+                    })
                 with log_timing(self.logger, f"agent:{artifact_stage} attempt={attempt}"):
                     result = self._call_with_failover(request)
                 if result.cleanup_incomplete:

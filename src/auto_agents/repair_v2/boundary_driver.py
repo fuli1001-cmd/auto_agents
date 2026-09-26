@@ -10,8 +10,10 @@ import subprocess
 
 DIAGNOSTIC_BINDING_CATEGORY = 'diagnostic_evidence_reference_binding_gap'
 METADATA_CHECKPOINT_CATEGORY = 'metadata_schema_false_positive_and_checkpoint_failure'
+REVIEW_MISROUTE_CATEGORY = 'review_citation_misrouted_to_provider_research'
 CONTINUATION_CATEGORIES = {'iteration_plan_scope_mismatch', 'provider_reference_freshness_validity_conflation',
-                           DIAGNOSTIC_BINDING_CATEGORY, METADATA_CHECKPOINT_CATEGORY}
+                           DIAGNOSTIC_BINDING_CATEGORY, METADATA_CHECKPOINT_CATEGORY,
+                           REVIEW_MISROUTE_CATEGORY}
 
 
 class ReplayEnvironmentUnavailable(RuntimeError):
@@ -233,6 +235,100 @@ def run_input_hashes(target, original):
     }
 
 
+def observe_review_misroute_continuation(orchestrator, original, original_plan, request, runtime, frozen_inputs):
+    """Prove the retained child reaches a constructed implementation request."""
+    from auto_agents.config import (load_run_state, load_task_plan,
+                                    provider_references_lock_path, requirements_trace_path)
+    from auto_agents.workflow_runtime import WorkflowCoordinator
+
+    class ChildRequestObserved(BaseException):
+        pass
+
+    target = orchestrator.project_root
+    workflow_id = original.resume_context['workflow_id']
+    pending = [task.task_id for task in original.tasks if task.status == 'pending']
+    if (len(pending) != 1 or request.get('invocation', {}).get('run_id') != original.run_id
+            or runtime.get('ok') is not True or runtime.get('commit') != request.get('commit')):
+        raise RecoveryProofIncomplete('retained review recovery lacks a unique pending child')
+    task_id = pending[0]
+    lock_path = provider_references_lock_path(target)
+    lock_before = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    event_path = target / '.auto-agents/runs' / original.run_id / 'events.jsonl'
+    offset = event_path.stat().st_size if event_path.exists() else 0
+    emit_event = orchestrator.reporter.event
+
+    def observe(kind, data, **options):
+        emit_event(kind, data, **options)
+        if kind == 'task.implementation.requested' and data.get('task_id') == task_id:
+            raise ChildRequestObserved()
+
+    orchestrator.reporter.event = observe
+    try:
+        try:
+            WorkflowCoordinator(orchestrator).resume_workflow(workflow_id)
+        except ChildRequestObserved:
+            pass
+    finally:
+        orchestrator.reporter.event = emit_event
+
+    state = load_run_state(target)
+    plan = load_task_plan(target)
+    events = ([json.loads(line) for line in event_path.read_bytes()[offset:].splitlines()]
+              if event_path.exists() else [])
+    stage_entries = [event for event in events if event.get('type') == 'implementation.entered']
+    requests = [event for event in events if event.get('type') == 'task.implementation.requested'
+                and event.get('data', {}).get('task_id') == task_id]
+    if len(stage_entries) != 1 or len(requests) != 1:
+        raise RecoveryProofIncomplete('retained child did not enter an implementation request')
+    stage_entry, child_request = stage_entries[0], requests[0]
+    data = child_request.get('data', {})
+    current = next((task for task in state.tasks if task.task_id == task_id), None)
+    if not (
+        events.index(stage_entry) < events.index(child_request)
+        and stage_entry.get('subject_id') == original.run_id
+        and stage_entry.get('data', {}).get('recovery_task_id') == task_id
+        and stage_entry.get('data', {}).get('engine_runtime', {}).get('repository_head') == runtime['commit']
+        and child_request.get('subject_id') == original.run_id
+        and child_request.get('stage_id') == 'implement'
+        and data.get('run_id') == original.run_id
+        and data.get('workflow_id') == workflow_id
+        and data.get('task_id') == task_id
+        and data.get('stage_key') == f'implement-{task_id}'
+        and data.get('attempt_id', '').startswith(f'implement-{task_id}')
+        and data.get('prompt_sha256')
+        and data.get('engine_runtime', {}).get('repository_head') == runtime.get('commit')
+        and state.run_id == original.run_id
+        and state.resume_context.get('workflow_id') == workflow_id
+        and state.current_stage == 'implement'
+        and state.status not in {'blocked', 'failed', 'paused', 'waiting_user'}
+        and not state.active_blocker
+        and current is not None and current.status == 'in_progress'
+        and state.last_recovery_route.get('outcome') == 'route_reclassified'
+        and state.last_recovery_route.get('task_id') == task_id
+        and run_plan_contract(plan) == run_plan_contract(original_plan)
+        and hashlib.sha256(lock_path.read_bytes()).hexdigest() == lock_before
+        and run_input_hashes(target, original) == frozen_inputs
+        and state.agent_attempts == original.agent_attempts
+        and hashlib.sha256(requirements_trace_path(target).read_bytes()).hexdigest()
+            == frozen_inputs['requirements_trace_sha256']
+    ):
+        raise RecoveryProofIncomplete('retained child request failed identity or preservation checks')
+    return {
+        'ok': True, 'run_id': state.run_id, 'workflow_id': workflow_id,
+        'status': state.status, 'current_stage': state.current_stage,
+        'engine_runtime': runtime,
+        'recovery_observation': {
+            'ok': True, 'boundary_kind': 'child_implementation_request',
+            'run_id': state.run_id, 'workflow_id': workflow_id, 'task_id': task_id,
+            'implementation_entered': True, 'implementation_entry': stage_entry,
+            'child_request_entry': child_request,
+            'entry_event_ref': str(event_path.relative_to(target)),
+            'retained_constraints': True,
+            'provider_lock_sha256': lock_before,
+        },
+    }
+
+
 def observe_run_continuation(orchestrator, original, original_plan, request, runtime, frozen_inputs,
                              submission=None):
     """Observe the retained workflow at implementation or its next real prerequisite.
@@ -242,6 +338,10 @@ def observe_run_continuation(orchestrator, original, original_plan, request, run
     """
     if original.active_blocker.get('category') == METADATA_CHECKPOINT_CATEGORY:
         return observe_metadata_checkpoint_continuation(
+            orchestrator, original, original_plan, request, runtime, frozen_inputs,
+        )
+    if original.active_blocker.get('category') == REVIEW_MISROUTE_CATEGORY:
+        return observe_review_misroute_continuation(
             orchestrator, original, original_plan, request, runtime, frozen_inputs,
         )
     from auto_agents.config import load_run_state, load_task_plan, requirements_trace_path, task_plan_path
