@@ -5,6 +5,17 @@ import pytest
 from auto_agents.recovery import KernelStore
 
 
+def test_disabled_control_never_discovers_operator_installation(monkeypatch):
+    from auto_agents.recovery.authority import installation_root
+
+    monkeypatch.delenv('AUTO_AGENTS_RECOVERY_CONTROL', raising=False)
+    monkeypatch.setenv('AUTO_AGENTS_REPAIR_CONTROL_DISABLED', '1')
+    def unexpected_discovery():
+        pytest.fail('Disabled control must not discover the operator installation')
+    monkeypatch.setattr('auto_agents.repair_control.operator_root', unexpected_discovery)
+    assert installation_root() is None
+
+
 @pytest.mark.parametrize('arguments,target', [(['collab','--project','/project','--session','original'],'active'),
                                               (['repair','upgrade','--runtime','/candidate'],'trusted')])
 def test_existing_console_launcher_selects_a_fresh_runtime(tmp_path,monkeypatch,arguments,target):

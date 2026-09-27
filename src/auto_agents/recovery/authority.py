@@ -38,6 +38,7 @@ def save_model(path, model):
 def installation_root():
     explicit = os.environ.get('AUTO_AGENTS_RECOVERY_CONTROL')
     if explicit: return Path(explicit).resolve()
+    if os.environ.get('AUTO_AGENTS_REPAIR_CONTROL_DISABLED') == '1': return None
     configured = os.environ.get('AUTO_AGENTS_REPAIR_CONTROL_CONFIG')
     if configured and Path(configured).is_file():
         return Path(json.loads(Path(configured).read_text())['root']).resolve()
