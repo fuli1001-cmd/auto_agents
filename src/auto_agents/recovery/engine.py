@@ -240,7 +240,7 @@ def submit(store, project, orchestrator, payload, args, run_lock):
     from ..root_cause import RootCauseCoordinator
     from ..repair_v2.store import atomic_json, Store as ArtifactStore
     from ..repair_v2.evidence import dissociate
-    from ..diagnostic_replay import copy_submission_evidence
+    from ..repair_v2.diagnostic_replay import copy_submission_evidence
     from .native import context
     invocation = payload['invocation']
     native = invocation.get('session_id') or invocation.get('run_id')

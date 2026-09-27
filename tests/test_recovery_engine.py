@@ -1,5 +1,6 @@
 """Engine repair routing uses actual kernel transitions and deterministic effects."""
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,6 +8,17 @@ from auto_agents.recovery import Evidence, KernelError, Outcome, OutcomeKind
 from auto_agents.recovery.engine import EngineRunner
 from auto_agents.recovery.model import digest
 from test_recovery_kernel import scene
+
+
+def test_submit_loads_real_dependencies_before_checking_task_admission(tmp_path):
+    """Exercise the lazy-import entrypoint, not only the injected effect runner."""
+    from auto_agents.recovery.engine import submit
+
+    with pytest.raises(KernelError) as failure:
+        submit(None, tmp_path, SimpleNamespace(),
+               {'invocation': {'command': 'collab', 'session_id': 'retained'}},
+               SimpleNamespace(command='collab'), None)
+    assert failure.value.code == 'kernel_binding'
 
 
 class Effects:
