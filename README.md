@@ -1315,10 +1315,16 @@ state JSON only in debug mode; other structured command results remain on stdout
 
 Session progress names the work in plain language: goal clarification, failure diagnosis,
 starting a project fix, checking the fix, executing acceptance, and reviewing the observed result.
-Project fixes and automation tool repairs include a short description of the problem being handled.
+Stage names use brackets, such as `[修复]`, `[验收]`, and `[自修复]` (`[Self-repair]` in English).
+Project fixes and self-repair announce the problem once at the start; later lines show only progress.
+The same console suppresses duplicate descriptions during private checkout handoffs and polling.
+A fresh command shows the explanation again so a resumed console is understandable on its own.
 Preparation is distinct from actual repair work, and a blocked prerequisite says that repair has
 not started. Returning from a child reports the next action instead of announcing the same fix again.
-New routes supply a brief `user_summary` for display; older sessions use their saved issue description.
+New routes and diagnoses supply a brief `user_summary` describing the user-visible symptom and impact,
+with a confirmed cause only when known. Older records use readable saved descriptions or conservative
+explanations of known failure families. Technical implementation titles are not rewritten word by word;
+if no reliable explanation is available, the display says that the cause still needs investigation.
 These descriptions do not change task authority, verification requirements, or recovery decisions.
 
 Diagnostics are collected even in concise mode and can be found through `diagnostics.json`:

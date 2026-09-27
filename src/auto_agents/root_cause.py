@@ -93,9 +93,12 @@ class RootCauseReport:
     verification_commands: List[str] = field(default_factory=list)
     resume_strategy: str = ""
     necessity: Dict[str, object] = field(default_factory=dict)
+    user_summary: str = ''
 
     def to_dict(self) -> Dict[str, object]:
         payload = asdict(self)
+        if not self.user_summary:
+            payload.pop('user_summary', None)
         payload["safe_to_attempt"] = self.effective_safe_to_attempt
         payload["schema_version"] = ROOT_CAUSE_SCHEMA_VERSION
         return payload
@@ -131,6 +134,7 @@ class RootCauseReport:
             ]
             return cls(
                 role=role,
+                user_summary=payload.get('user_summary', '').strip() if isinstance(payload.get('user_summary'), str) else '',
                 verdict=(
                     "AGREE"
                     if role == "reviewer"
@@ -199,6 +203,7 @@ class RootCauseReport:
             raise ValueError("root-cause report requires causal_chain and evidence")
         return cls(
             role=role,
+            user_summary=payload.get('user_summary', '').strip() if isinstance(payload.get('user_summary'), str) else '',
             necessity=dict(payload.get('necessity') or {}),
             verdict=verdict,
             owner=owner,
@@ -1462,6 +1467,7 @@ class RootCauseCoordinator:
             "failure_scope": self.repair_case.failure_scope if self.repair_case is not None else "run",
             "human_boundary": False,
             "causal_chain": ["cause -> mechanism -> terminal symptom"],
+            "user_summary": "one brief sentence describing the observed problem and its impact for the user",
             "evidence": [
                 {
                     "kind": "source|runtime|git|test",
@@ -1541,6 +1547,7 @@ class RootCauseCoordinator:
                 "observable run-health boundary that a candidate must cross. Empty or "
                 "activity-only postconditions cannot approve self-repair.",
                 "Return exactly one JSON object matching this schema:",
+                "For user_summary, describe what the user cannot do and the confirmed reason, in the project's documentation language. Write one short sentence for someone unfamiliar with the code. Describe the problem, not an implementation plan. Avoid paths, identifiers, ownership/binding jargon and speculative causes; replacing jargon word by word is insufficient. This display field grants no authorization or completion credit.",
                 json.dumps(schema, ensure_ascii=False, indent=2),
                 "PRIOR_REPORTS:",
                 json.dumps(_report_payload(prior), ensure_ascii=False, indent=2),

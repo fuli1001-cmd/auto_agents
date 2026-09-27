@@ -78,7 +78,7 @@ def test_plain_log_matches_requested_task_and_action_transcript(report):
     report.task("T5", "按历史最佳纠正规划", "implement", 2)
     messages = [line.split(" ", 1)[1] for line in history(report).splitlines()]
     assert messages == [
-        "（实现阶段：5/19）T5：按历史最佳纠正规划", "    编码", "    验证",
+        "[实现]：5/19 T5：按历史最佳纠正规划", "    编码", "    验证",
         "    审查", "    审查未通过", "    编码",
     ]
     assert state.status == "pending"
@@ -158,14 +158,14 @@ def test_parallel_ordinals_progress_and_output_ages_are_independent(report, tmp_
         value = frame(report).splitlines()
         assert "T5 · 验证" in value[0] and "1/2" in value[0] and "最近输出 12 秒前" in value[0]
         assert "T6 · 验证" in value[1] and "0/5" in value[1] and "最近输出 2 秒前" in value[1]
-        assert "（实现阶段：5/19）T5" in history(report)
-        assert "（实现阶段：6/19）T6" in history(report)
+        assert "[实现]：5/19 T5" in history(report)
+        assert "[实现]：6/19 T6" in history(report)
         first.task("T5", "恢复策略", "verify", 2)
         current = GateObservation(None, first, 4)
         one.finish(GateResult(ok=True, commands=[result()], summary="late"))
         assert "0/4" in frame(report) and "0/5" in frame(report)
         assert not current.view.finished
-        assert history(report).count("（实现阶段：5/19）") == 1
+        assert history(report).count("[实现]：5/19 ") == 1
     finally:
         first.close()
         second.close()
@@ -174,11 +174,11 @@ def test_parallel_ordinals_progress_and_output_ages_are_independent(report, tmp_
 def test_plan_reorder_changes_ordinal_without_using_completed_count(report):
     state = setup_tasks(report)
     report.task("T2", "任务2", "implement", 1)
-    assert "（实现阶段：2/2）T2" in history(report)
+    assert "[实现]：2/2 T2" in history(report)
     state.tasks.reverse()
     report.observe_run(state)
     report.task("T2", "任务2", "review", 1)
-    assert "（实现阶段：1/2）T2" in history(report)
+    assert "[实现]：1/2 T2" in history(report)
 
 
 def test_rewind_invalidates_old_workers_actions_and_output(report, tmp_path):
@@ -289,7 +289,7 @@ def test_recovery_uses_an_action_line(report):
     state.status = "blocked"
     report.observe_run(state)
     report.repair("diagnosing")
-    assert "自动化工具修复：定位故障原因" in frame(report)
+    assert "[自修复] 定位故障原因" in frame(report)
     assert "正在修复 auto_agents" not in frame(report)
 
 
@@ -330,14 +330,14 @@ def test_nested_subject_finalizes_child_and_resumes_parent_action(report, screen
     assert "编码" in screen.frame and "验收" not in screen.frame
     assert report.snapshot.subject == "progress"
     assert sum(line.endswith("    编码") for line in screen.history) == 1
-    assert sum(line.endswith("    验收") for line in screen.history) == 1
+    assert sum(line.endswith("[验收] 开始") for line in screen.history) == 1
 
 
 def test_recovery_replaces_task_action_instead_of_leaving_it_active(report):
     setup_tasks(report)
     report.task("T1", "任务1", "implement", 1)
     report.repair("diagnosing")
-    assert "自动化工具修复：定位故障原因" in frame(report) and "编码" not in frame(report)
+    assert "[自修复] 定位故障原因" in frame(report) and "编码" not in frame(report)
 
 
 @pytest.mark.parametrize('eligible', [False, True])
@@ -347,9 +347,9 @@ def test_diagnosis_decision_finalizes_live_action_before_cli_summary(report, scr
     report.emit('repair.eligible' if eligible else 'repair.not_eligible')
     assert frame(report) == ''
     assert report.snapshot.repair == ''
-    assert screen.history[-2].endswith('自动化工具修复：定位故障原因')
+    assert screen.history[-2].endswith('[自修复] 定位故障原因')
     assert '最近输出' not in screen.history[-2]
-    assert ('准备修复' if eligible else '本次未启动工具修复') in screen.history[-1]
+    assert ('准备修复' if eligible else '本次未启动修复') in screen.history[-1]
     assert '正在恢复任务' not in history(report)
     before = list(screen.history)
     report.presenter.close()
@@ -370,15 +370,15 @@ def test_repair_live_output_ages_without_renewing_on_poll_and_finalizes(report, 
     report.repair_update(job, subscriber)
     clock[0] += 3
     report.repair_update(job, subscriber)
-    assert '自动化工具修复：修复工具问题 | 最近输出 3 秒前' in frame(report)
+    assert '[自修复] 修复中 | 最近输出 3 秒前' in frame(report)
     clock[0] += 7
     report.repair_update(job, subscriber)
     assert '最近输出 10 秒前' in frame(report)
-    assert history(report).count('自动化工具修复：修复工具问题') == 1
+    assert history(report).count('[自修复] 修复中') == 1
     report.repair_update(repair_job('validate', sequence=2, review_running=True, checks={'completed': 1, 'total': 4}), subscriber)
-    assert screen.history[-1].endswith('自动化工具修复：修复工具问题')
+    assert screen.history[-1].endswith('[自修复] 修复中')
     assert '最近输出' not in screen.history[-1]
-    assert '自动化工具修复：验证与审查 | [███░░░░░░░░░] 1/4' in frame(report)
+    assert '[自修复] 验证与审查 | [███░░░░░░░░░] 1/4' in frame(report)
     assert '最近输出' not in frame(report)
     assert 'private-job' not in history(report)
 
@@ -387,10 +387,10 @@ def test_repair_parallel_completion_and_terminal_reason(report, screen):
     subscriber = {'state': 'waiting'}
     report.repair_update(repair_job('validate', checks={'completed': 2, 'total': 4}, review_running=True), subscriber)
     report.repair_update(repair_job('validate', checks={'completed': 2, 'total': 4}, review_finished=True), subscriber)
-    assert '自动化工具修复：验证 |' in frame(report)
+    assert '[自修复] 验证 |' in frame(report)
     assert '验证与审查' in screen.history[-1]
     report.repair_update(repair_job('validate', checks_finished=True, review_running=True), subscriber)
-    assert '自动化工具修复：审查' in frame(report) and '/4' not in frame(report)
+    assert '[自修复] 审查' in frame(report) and '/4' not in frame(report)
     job = {**repair_job(), 'state': 'blocked', 'result': {
         'error': 'Insufficient disk space at /private/path: password=hidden'}}
     report.repair_update(job, {'state': 'blocked'})
@@ -434,7 +434,7 @@ def test_resumed_command_output_is_relayed_once_without_rewriting_user_log(repor
 
     relay = _ResumeOutputRelay()
     path = tmp_path / 'resume.log'
-    line = '[17:54:09] （实现阶段：7/19）继续验证'
+    line = '[17:54:09] [实现]：7/19 继续验证'
     encoded = (line + '\n').encode()
     relay.drain(path, report)
     path.write_bytes(encoded[:25])
@@ -456,9 +456,9 @@ def test_resumed_command_output_uses_live_presenter(report, screen, tmp_path):
     from auto_agents.repair_client import _ResumeOutputRelay
 
     path = tmp_path / 'resume.log'
-    path.write_text('[17:54:09] （实现阶段：7/19）继续验证\n')
+    path.write_text('[17:54:09] [实现]：7/19 继续验证\n')
     _ResumeOutputRelay().drain(path, report)
-    assert screen.history == ['[17:54:09] （实现阶段：7/19）继续验证']
+    assert screen.history == ['[17:54:09] [实现]：7/19 继续验证']
     assert report.presenter.stream.getvalue() == ''
 
 
@@ -470,10 +470,10 @@ def test_repair_diagnosis_uses_actual_provider_output(report, screen, monkeypatc
     capture.start(['provider'], {}, provider='codex', capture_mode='live')
     capture('stdout', 'actual diagnosis output')
     clock[0] += 4
-    assert '自动化工具修复：定位故障原因 | 最近输出 4 秒前' in frame(report)
+    assert '[自修复] 定位故障原因 | 最近输出 4 秒前' in frame(report)
     capture.finish(returncode=0)
     report.repair_update(repair_job('plan'), {'state': 'waiting'})
-    assert screen.history[-1].endswith('自动化工具修复：定位故障原因')
+    assert screen.history[-1].endswith('[自修复] 定位故障原因')
     assert '最近输出' not in frame(report)
 
 
@@ -483,8 +483,8 @@ def test_repair_short_actions_between_polls_are_not_lost(report):
         {'phase': 'implement', 'sequence': 10}, {'phase': 'audit', 'sequence': 11},
         {'phase': 'boundary_preflight', 'sequence': 12}, {'phase': 'validate', 'sequence': 13},
     ]), {'state': 'waiting'})
-    assert [line.split('自动化工具修复：')[1] for line in history(report).splitlines()] == [
-        '修复工具问题', '检查测试完整性', '检查任务恢复', '验证']
+    assert [line.split('[自修复] ')[1] for line in history(report).splitlines()] == [
+        '修复中', '检查测试完整性', '检查任务恢复', '验证']
 
 
 def test_repair_display_can_resume_old_worker_and_keep_health_state_unchanged(report, tmp_path):
@@ -498,7 +498,7 @@ def test_repair_display_can_resume_old_worker_and_keep_health_state_unchanged(re
     # Older retained workers supply item events rather than agent_output.
     store.event(identity, 'agent_progress', {'role': 'implement', 'event': 'item/completed'})
     report.repair_update(store.job(identity, include_progress=True), {'state': 'waiting'})
-    assert '修复工具问题 | 最近输出' in frame(report)
+    assert '修复中 | 最近输出' in frame(report)
     stamp = report.display.output_times['']
     store.event(identity, 'agent_progress', {'role': 'implement', 'event': 'thread/status/changed'})
     report.repair_update(store.job(identity, include_progress=True), {'state': 'waiting'})
@@ -509,12 +509,12 @@ def test_repair_display_can_resume_old_worker_and_keep_health_state_unchanged(re
 def test_repair_english_and_confirmed_handoff_finalize_without_stale_checks(report, screen):
     report.language = 'en'
     report.repair_update(repair_job('plan'), {'state': 'waiting'})
-    assert 'Automation tool repair: Planning the tool repair' in frame(report)
+    assert '[Self-repair] Planning the repair' in frame(report)
     job = {**repair_job(), 'state': 'completed'}
     report.repair_update(job, {'state': 'resuming', 'payload': {'recovery_confirmed': {
         'job': job['id'], 'generation': job['generation']}}})
     assert frame(report) == ''
-    assert screen.history[-1].endswith('Automation tool repair: Original task resumed')
+    assert screen.history[-1].endswith('[Self-repair] Original task resumed')
 
 
 @pytest.mark.parametrize('error,expected', [
@@ -581,8 +581,8 @@ def test_repair_retries_and_terminal_failure_survive_one_poll(report, tmp_path):
     job = store.job(identity, include_progress=True)
     report.repair_update(job, {'state': 'blocked'})
     value = history(report)
-    expected = ['第1轮 · 修复工具问题', '第1轮 · 验收未通过：原任务恢复证据不足',
-                '重新规划：调整修复方案', '第2轮 · 继续修复工具问题，处理上次检查发现的问题',
+    expected = ['第1轮 · 修复中', '第1轮 · 验收未通过：原任务恢复证据不足',
+                '重新规划：调整修复方案', '第2轮 · 继续修复上次检查发现的问题',
                 '第2轮 · 验收未通过：原任务恢复证据不足', '连续修正未取得新的验证进展']
     positions = [value.index(label) for label in expected]
     assert positions == sorted(positions)
@@ -601,7 +601,7 @@ def test_repair_first_poll_marks_history_and_keeps_current_counts(report):
             {'phase': 'audit', 'sequence': 2, 'attempt': 1},
             {'phase': 'validate', 'sequence': 3, 'attempt': 1},
         ]), {'state': 'waiting'})
-    assert '历史记录 · 第1轮 · 修复工具问题' in history(report)
+    assert '历史记录 · 第1轮 · 修复中' in history(report)
     assert '第1轮 · 验证与审查 |' in frame(report)
     assert '4/169' in frame(report)
     assert '历史记录' not in frame(report)
