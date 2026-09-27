@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+from .workflow_display import USER_SUMMARY_INSTRUCTION
 from .authorization import (
     WorkflowAuthorizationPolicy,
     authorization_policy_for_state,
@@ -3575,7 +3576,7 @@ class Session:
             lines.extend([
                 "- This clarification/classification phase is read-only. Do not modify files, create generated artifacts, or run mutating commands.",
                 "- Classify the work and put the disposition in the final response before any implementation begins.",
-                "- Include user_summary: one brief sentence explaining the specific problem being fixed, in the project's documentation language, for a nontechnical user. Avoid paths, commands, IDs, protocol names and internal implementation details. This display description does not change the repair scope.",
+                USER_SUMMARY_INSTRUCTION,
                 "- decision='fix' only for a bounded defect against existing behavior; include summary, reason, reproduction, expected, actual, evidence_refs, affected_contracts, verification_command, and persistence_change.",
                 "- decision='run_iteration' when resolution needs new public capability, changed requirements, architecture expansion, or a persistence-model change; include reason and spec_seed with title, goal, gap, capability, acceptance, non_goals, evidence, and open_decisions.",
                 "- decision='not_bug' for expected/configuration/user-misunderstanding cases, decision='need_user' with question when evidence is insufficient, or decision='resume_child' with resume_handoff_id for a prior routed child.",
@@ -3913,7 +3914,7 @@ class Session:
             "7. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
             "8. Provide a brief diagnostic status update",
             "9. Never implement, fix, commit, or edit target-project code in collab; route product changes to fix or run, and runtime acceptance operations to acceptance",
-            "Include user_summary on every route: one brief sentence in the project's documentation language explaining the specific problem or acceptance goal for a nontechnical user. For an engine repair describe what prevents the automation from continuing. Avoid paths, commands, IDs, protocol names and internal implementation details. This display description does not change the repair scope.",
+            USER_SUMMARY_INSTRUCTION,
             "10. Repository selection, implementation scope, test strategy, safe migration, engine self-repair, commits, and workflow recovery are internal decisions. Never ask the user to choose or authorize them.",
             "11. Every proposed engine repair must include necessity:{decision:required|needs_user|insufficient|skip, blocked_step, consequence, evidence_refs, recovery_check}. "
             "Include issue_seed.required_behavior as a nonempty list of concrete acceptance obligations covering the repair and preservation of existing protections. "

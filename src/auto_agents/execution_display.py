@@ -100,7 +100,7 @@ class ActionLine:
 
     @property
     def message(self) -> str:
-        if self.repair:
+        if self.repair or self.name.startswith('['):
             return text(self.name)
         context = f"{text(self.task_id)} · " if self.contextual and self.task_id else ""
         return "    " + context + text(self.name)

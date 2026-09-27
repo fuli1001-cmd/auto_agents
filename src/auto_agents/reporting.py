@@ -315,7 +315,7 @@ class ConsolePresenter:
                 and message.startswith('    ')
                 and getattr(self, '_last_notice_reporter', reporter) is not reporter)
             if (not debug and self.mode != 'debug'
-                    and (message.startswith(('当前状态：', 'Status:')) or repeated_session_action)
+                    and (message.startswith(('当前状态：', 'Status:', '[')) or repeated_session_action)
                     and notice == getattr(self, '_last_notice', None)):
                 return
             self._last_notice = notice
@@ -497,6 +497,8 @@ class Reporter:
         self._session_view = ""
         self._session_problem = ""
         self._repair_problem = ""
+        self._repair_topic = ""
+        self._problem_headings = set()
         self._persisted_stage = ""
         self._announced_plan = ""
         self._invalidated_stages: set[str] = set()
@@ -562,6 +564,7 @@ class Reporter:
             self._session_view = ""
             self._session_problem = ""
             self._repair_problem = ""
+            self._repair_topic = ""
             self._persisted_stage = ""
             self._announced_plan = ""
             self.active_tasks.clear()
@@ -604,7 +607,7 @@ class Reporter:
     def preserve_subject(self):
         saved_actions = dict(self.action_lines)
         saved_headings = dict(self._task_headings)
-        saved_session = (self._session_view, self._session_problem, self._repair_problem)
+        saved_session = (self._session_view, self._session_problem, self._repair_problem, self._repair_topic)
         previous = (self.root, self.snapshot, self._artifacts, dict(self.active_tasks), self._last_snapshot,
                     self._announced_plan, set(self._invalidated_stages), self._persisted_stage, self.display,
                     dict(self._lane_tokens))
@@ -627,7 +630,7 @@ class Reporter:
                     attach_run_file_logger(logger, root / "run.log")
                 self.presenter.focus = self
                 self._task_headings = saved_headings
-                self._session_view, self._session_problem, self._repair_problem = saved_session
+                self._session_view, self._session_problem, self._repair_problem, self._repair_topic = saved_session
                 self.event("subject.returned", {"child": str(child_root)})
                 for task_id, row in saved_actions.items():
                     if not task_id and snapshot.kind in {'collab', 'fix'} and snapshot.status == 'waiting_child':
@@ -780,9 +783,12 @@ class Reporter:
             return str(data["name"]), "start"
         if kind == "session.action":
             return str(data["name"]), "start"
+        if kind == 'workflow.problem':
+            return message, ''
         if kind == "stage.started":
             owner.presenter.finish_actions(owner)
-            return ("", "") if owner.snapshot.stage == "implement" else (str(data["stage"]), "start")
+            return (("", "") if owner.snapshot.stage == "implement" else
+                    ('[' + str(data['stage']) + '] ' + ('开始' if zh else 'Starting'), 'start'))
         if kind == "verification.started":
             name = "验证" if zh else "Verification"
             if "baseline" in str(data.get("context", "")) or "基线" in str(data.get("context", "")):
@@ -791,8 +797,7 @@ class Reporter:
                 name = (('检查项目原有状态' if zh else 'Checking the original project behavior')
                         if 'baseline' in str(data.get('context', '')) or '基线' in str(data.get('context', '')) else
                         ('检查修复效果' if zh else 'Checking the project fix'))
-                if owner._session_problem:
-                    name += ('：' if zh else ': ') + owner._session_problem
+                name = ('[修复] ' if zh else '[Fix] ') + name
             row = owner.action_lines.get(task_id)
             if row and row.name == name:
                 return "", ""
@@ -811,8 +816,7 @@ class Reporter:
             if owner.snapshot.kind == 'fix' and action == 'verify':
                 name = '修复效果检查' if zh else 'Project fix checks'
                 name += '未通过' if zh else ' failed'
-                if owner._session_problem:
-                    name += ('：' if zh else ': ') + owner._session_problem
+                name = ('[修复] ' if zh else '[Fix] ') + name
                 return name, 'finish'
             return name + ("未通过" if zh else " failed"), "finish"
         if kind in {"task.completed", "verify.passed"}:
@@ -821,33 +825,28 @@ class Reporter:
             return "", "finish" if data.get("stage_id") == owner.snapshot.stage else ""
         if kind == 'verification.interrupted' and owner.snapshot.kind == 'fix':
             name = '修复效果检查未完成' if zh else 'Project fix checks did not finish'
-            if owner._session_problem:
-                name += ('：' if zh else ': ') + owner._session_problem
+            name = ('[修复] ' if zh else '[Fix] ') + name
             return name, 'finish'
         if kind in {"task.blocked", "verification.interrupted", "verify.failed"}:
             return message, "finish"
         if kind == "repair.phase":
             name = str(data.get('phase', ''))
-            if owner._repair_problem:
-                name += ('：' if zh else ': ') + owner._repair_problem
-            return ("自动化工具修复：" if zh else "Automation tool repair: ") + name, "start"
+            return ("[自修复] " if zh else "[Self-repair] ") + name, "start"
         if kind in {'repair.request_accepted', 'repair.resume_pending'}:
-            name = (('准备修复自动化工具' if zh else 'Preparing to repair the automation tool')
+            name = (('准备开始' if zh else 'Preparing to start')
                     if kind == 'repair.request_accepted' else
                     ('工具修复已通过检查，准备继续原任务' if zh else
                      'Tool repair checked; preparing to continue the original task'))
-            if owner._repair_problem:
-                name += ('：' if zh else ': ') + owner._repair_problem
-            return name, 'start'
+            return ('[自修复] ' if zh else '[Self-repair] ') + name, 'start'
         if kind in {'repair.eligible', 'repair.not_eligible', 'diagnosis.unavailable', 'diagnosis.review_incomplete'}:
             owner.presenter.finish_actions(owner)
             owner.display = ExecutionDisplay()
             owner.snapshot.repair = ''
             if kind == 'repair.eligible':
-                return ('自动化工具修复：已找到原因，准备修复' if zh else
-                        'Automation tool repair: cause identified; preparing repair'), ''
-            return ('自动化工具检查已结束，本次未启动工具修复' if zh else
-                    'Automation tool investigation ended; no tool repair started'), ''
+                return ('[自修复] 已找到原因，准备修复' if zh else
+                        '[Self-repair] Cause identified; preparing repair'), ''
+            return ('[自修复] 检查已结束，本次未启动修复' if zh else
+                    '[Self-repair] Investigation ended; no repair started'), ''
         if kind == 'repair.action':
             return message, 'finish' if data.get('terminal') else 'start'
         if kind == 'repair.control' and getattr(owner, '_repair_display_managed', False):
@@ -863,6 +862,8 @@ class Reporter:
             return "", ""
         if kind in {"stage.rewind", "command.failed", "invocation.stopped"} or kind == "status":
             owner.presenter.finish_actions(owner)
+        if kind == 'status' and str(data.get('status', '')).startswith('['):
+            return str(data['status']), ''
         return _concise_message(kind, message, self.language), ""
 
     def event(self, kind: str, data: Mapping[str, object], *, audience: str = "debug",
@@ -875,6 +876,9 @@ class Reporter:
         output_root = owner.root if current_lane or self.root is None else self.root
         timestamp = now()
         message = plain_text(message)
+        if audience == 'user' and kind in {'repair.phase', 'repair.request_accepted', 'repair.eligible'}:
+            self._problem_heading('[自修复]' if self.language == 'zh' else '[Self-repair]', owner._repair_problem,
+                                  owner._repair_topic)
         visible, transition = "", ""
         with owner._lock:
             if owner._closed or self._closed:
@@ -897,7 +901,7 @@ class Reporter:
                 else:
                     owner._last_user_notice = notice
             name = visible
-            if visible and (transition or kind.startswith(("task.", "verification."))) and kind != "task.heading" and not kind.startswith('repair.'):
+            if visible and not visible.startswith('[') and (transition or kind.startswith(("task.", "verification."))) and kind != "task.heading" and not kind.startswith('repair.'):
                 context = display_text(task_id) + " · " if task_id and len(owner.active_tasks) > 1 else ""
                 visible = "    " + context + visible
             owner._sequence += 1
@@ -925,6 +929,12 @@ class Reporter:
                 if owner.presenter.mode == 'debug':
                     owner.presenter.show(owner, message, timestamp=timestamp, debug=audience != 'user')
                 elif visible:
+                    if kind == 'workflow.problem':
+                        seen = getattr(owner.presenter, '_problem_headings', set())
+                        key = data['console_key']
+                        if key in seen:
+                            return
+                        owner.presenter._problem_headings = seen | {key}
                     if transition == "start":
                         owner.presenter.start_action(owner, task_id, name, timestamp, repair=kind.startswith('repair.'))
                     else:
@@ -965,8 +975,9 @@ class Reporter:
         owner = self.parent or self
         route = getattr(error, 'route_payload', None)
         if isinstance(route, dict):
-            from .workflow_display import problem
+            from .workflow_display import problem, repair_topic
             owner._repair_problem = problem(route, self.language)
+            owner._repair_topic = repair_topic({'invocation': {'engine_route': route}})
         with owner._lock:
             if self._current_lane():
                 if self.lane_task:
@@ -1032,11 +1043,11 @@ class Reporter:
             if owner._task_headings.get(task_id) != signature:
                 owner.presenter.finish_action(owner, task_id)
                 owner._task_headings[task_id] = signature
-                context = f"{stage}阶段" if self.language == "zh" else stage
+                context = '[' + stage + ']'
                 if ordinal:
                     context += ("：" if self.language == "zh" else ": ") + ordinal
                 self.event("task.heading", {"task_id": task_id}, audience="user",
-                           message=f"（{context}）{display_text(task_id)}：{display_text(title)}")
+                           message=f"{context} {display_text(task_id)}：{display_text(title)}")
             owner.display.clear_task(task_id)
             owner.display.activities[task_id] = Activity(display_text(title), action, attempt)
             owner.active_tasks[task_id] = action
@@ -1143,13 +1154,14 @@ class Reporter:
         self.snapshot.stage = str(state.status)
         self.snapshot.status = str(state.status)
         from .workflow_display import session_view, summary
-        self._session_problem, label = session_view(control_root or self.project_root, state, _read_json, self.language)
+        self._session_problem, label, topic = session_view(control_root or self.project_root, state, _read_json, self.language)
         view = label
         changed = view != self._session_view
         if previous_status != self.snapshot.status or changed:
             self.presenter.finish_actions(self)
             self.display = ExecutionDisplay()
             self.active_tasks.clear()
+        self._problem_heading(label.split(']', 1)[0] + ']', self._session_problem, topic)
         if state.status not in _TERMINAL:
             if changed:
                 self.event('session.action', {'name': label, 'mode': state.mode,
@@ -1192,10 +1204,22 @@ class Reporter:
         """Announce actual repair work after its prerequisite checks pass."""
         if action != 'fix':
             return
-        name = '正在修复项目问题' if self.language == 'zh' else 'Fixing the project issue'
-        if self._session_problem:
-            name += ('：' if self.language == 'zh' else ': ') + self._session_problem
+        name = '[修复] 正在修复项目问题' if self.language == 'zh' else '[Fix] Fixing the project issue'
         self.event('session.action', {'name': name, 'mode': 'fix'}, audience='user', message=name)
+
+    @_synchronized
+    def _problem_heading(self, tag: str, detail: str, topic: str = '') -> None:
+        """Keep each log self-contained and deduplicate the shared console by topic."""
+        if not detail:
+            return
+        owner = self.parent or self
+        key = (str(owner.root), tag, topic or detail)
+        if key in owner._problem_headings:
+            return
+        owner._problem_headings.add(key)
+        console_key = hashlib.sha256((tag + '\n' + (topic or detail)).encode()).hexdigest()
+        self.event('workflow.problem', {'console_key': console_key, 'problem': detail}, audience='user',
+            message=tag + (' 问题：' if self.language == 'zh' else ' Issue: ') + detail)
 
     @_synchronized
     def repair(self, phase: str, **data: object) -> None:
@@ -1214,10 +1238,11 @@ class Reporter:
         from .repair_display import observation
         owner = self.parent or self
         owner.ensure_bound()
-        from .workflow_display import repair_problem
+        from .workflow_display import repair_problem, repair_topic
         problem = repair_problem(job.get('payload') or {}, self.language)
         if problem:
             owner._repair_problem = problem
+            owner._repair_topic = repair_topic(job.get('payload') or {}, job.get('id'))
         display = job.get('display') or {}
         source = (job.get('id'), job.get('generation'))
         prior_source, prior_sequence = getattr(owner, '_repair_display_cursor', (None, 0))
@@ -1236,20 +1261,22 @@ class Reporter:
         owner._repair_display_cursor = (source, display.get('sequence', 0))
         observed = observation(job, subscriber, self.language)
         owner._repair_display_managed = True
-        prefix = '自动化工具修复：' if self.language == 'zh' else 'Automation tool repair: '
+        prefix = '[自修复] ' if self.language == 'zh' else '[Self-repair] '
         name = observed['name']
-        if owner._repair_problem:
-            name += ('；问题：' if self.language == 'zh' else '; issue: ') + owner._repair_problem
         identity = (observed['identity'], owner._repair_problem)
         changed = identity != getattr(owner, '_repair_display_identity', None)
         if changed:
-            owner.presenter.finish_actions(owner)
+            prior = owner.action_lines.get('')
+            continuing = bool(prior and prior.name == prefix + name and not observed['terminal'])
+            if not continuing:
+                owner.presenter.finish_actions(owner)
             owner.display = ExecutionDisplay()
             owner.active_tasks.clear()
+            self._problem_heading(prefix.strip(), owner._repair_problem, owner._repair_topic)
             owner._repair_display_identity = identity
             owner.snapshot.repair = '' if observed['terminal'] else observed['name']
             self.event('repair.action', {'name': name, 'terminal': observed['terminal']},
-                       audience='user', message=prefix + name)
+                       audience='debug' if continuing else 'user', message=prefix + name)
         if observed['terminal']:
             owner.display = ExecutionDisplay()
             return

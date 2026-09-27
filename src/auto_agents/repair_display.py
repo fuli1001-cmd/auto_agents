@@ -3,8 +3,8 @@ from __future__ import annotations
 
 
 PHASES = {
-    'plan': ('制定工具修复方案', 'Planning the tool repair'),
-    'implement': ('修复工具问题', 'Fixing the tool issue'),
+    'plan': ('制定修复方案', 'Planning the repair'),
+    'implement': ('修复中', 'Applying the fix'),
     'audit': ('检查测试完整性', 'Checking test preservation'),
     'artifact': ('准备验证环境', 'Preparing verification'),
     'environment_preparation': ('准备环境', 'Preparing environment'),
@@ -22,9 +22,9 @@ PHASES = {
     'source_recheck': ('复核原有问题', 'Rechecking the original failure'),
     'request_contract_planning': ('明确修复完成的标准', 'Defining what a successful repair must prove'),
     'request_contract_ready': ('准备修复', 'Preparing repair'),
-    'candidate_generation': ('修复工具问题', 'Fixing the tool issue'),
+    'candidate_generation': ('修复中', 'Applying the fix'),
     'candidate_correction': ('修正代码', 'Correcting code'),
-    'repair_design': ('制定工具修复方案', 'Planning the tool repair'),
+    'repair_design': ('制定修复方案', 'Planning the repair'),
     'contract_reanalysis': ('重新规划', 'Replanning'),
     'focused_verification': ('针对性验证', 'Focused verification'),
     'validating_focused_tests': ('针对性验证', 'Focused verification'),
@@ -131,7 +131,7 @@ def observation(job, subscriber, language='zh'):
     elif state == 'queued':
         label = ('等待开始修复', 'Waiting to start repair')
     else:
-        label = PHASES.get(phase, ('准备处理工具问题', 'Preparing to resolve the tool issue'))
+        label = PHASES.get(phase, ('准备开始', 'Preparing to start'))
         if phase.startswith('review_'):
             label = ('审查', 'Review')
         if phase == 'validate':
@@ -144,7 +144,7 @@ def observation(job, subscriber, language='zh'):
             label = (f'验收未通过：{summary}（{count}项）',
                      f'Acceptance failed: {summary} ({count} findings)')
         elif phase == 'implement' and (progress.get('correcting') or progress.get('attempt', 0) > 0):
-            label = ('继续修复工具问题，处理上次检查发现的问题', 'Continuing the tool fix after the previous checks')
+            label = ('继续修复上次检查发现的问题', 'Continuing the fix after the previous checks')
         elif phase == 'plan' and progress.get('replans', 0):
             label = ('重新规划：调整修复方案', 'Replanning: revising the repair')
     name = label[0 if zh else 1]

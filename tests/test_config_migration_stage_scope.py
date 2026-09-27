@@ -65,6 +65,42 @@ class ConfigEditingProviderAdapter:
         )
 
 
+def test_controller_provider_selection_is_saved_after_stage_ownership_checks(tmp_path, monkeypatch):
+    root = tmp_path / 'project'
+    Orchestrator.init_project(root, 'project', 'mock')
+    orchestrator = Orchestrator(root)
+    adapter = ConfigReadingProviderAdapter(root)
+    orchestrator.adapter = adapter
+    path = orchestrator._provider_selection_path()
+    observed = []
+    snapshot = orchestrator._worktree_change_snapshot
+    def record():
+        observed.append(path.exists())
+        return snapshot()
+    monkeypatch.setattr(orchestrator, '_worktree_change_snapshot', record)
+    result = orchestrator._run_agent_with_retries(load_run_state(root), 'provider_research',
+        'provider-research-owned-selection', 'Check existing provider references.')
+    assert result.ok and adapter.calls == 1
+    assert observed and not any(observed)
+    assert read_json(path)['provider'] == 'mock'
+    assert orchestrator._last_successful_provider == 'mock'
+
+
+def test_agent_provider_selection_edit_still_fails_stage_ownership(tmp_path):
+    root = tmp_path / 'project'
+    Orchestrator.init_project(root, 'project', 'mock')
+    orchestrator = Orchestrator(root)
+    class Editing(ConfigReadingProviderAdapter):
+        def run(self, request):
+            write_json(orchestrator._provider_selection_path(), {'provider': 'agent-chosen'})
+            return super().run(request)
+    orchestrator.adapter = Editing(root)
+    with pytest.raises(RuntimeError, match='provider-selection.json'):
+        orchestrator._run_agent_with_retries(load_run_state(root), 'provider_research',
+            'provider-research-unowned-selection', 'Check existing provider references.')
+    assert read_json(orchestrator._provider_selection_path()).get('provider') != 'agent-chosen'
+
+
 def test_ordinary_config_read_does_not_persist_migration() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_root = Path(tmp) / "demo"

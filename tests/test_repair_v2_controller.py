@@ -47,6 +47,47 @@ class Verifier:
                                 failures=[] if ok else [{'unit': 'value', 'reason': 'value is not 1'}])
 
 
+def test_preflight_repair_review_retains_goal_but_owns_only_engine_recovery(job, monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from auto_agents.repair_v2.review_evidence import completion_boundary
+
+    original, store, workspace = job
+    goal = 'Generate a real video through the browser and inspect the actual frames.'
+    obligation = 'Fix preflight without task adoption, then resume product repair and browser acceptance.'
+    request = replace(original, invocation={'engine_route': {'issue_seed': {'required_behavior': [obligation]}}},
+                      acceptance=(Acceptance('value', obligation),))
+    driver = Driver()
+    runner = Controller(request, store, workspace, driver, Verifier(),
+                        units=lambda _: [ValidationUnit('value', 'python -m pytest -q tests')])
+    owner = {'workflow_id': 'retained-workflow', 'handoff_id': 'original-child'}
+    runner.scope = SimpleNamespace(context={'incident': {'phase': 'preflight', 'owner': owner},
+        'owner': {'workflow_id': 'retained-workflow'}, 'original_goal': goal}, current=lambda: None)
+    runner.context = lambda: goal + '\n' + obligation
+    monkeypatch.setattr('auto_agents.repair_v2.scope.changes', lambda *args: [])
+    prompts = []
+    run = driver.run
+    def observed(role, prompt, *args, **kwargs):
+        if role == 'review': prompts.append(prompt)
+        return run(role, prompt, *args, **kwargs)
+    driver.run = observed
+    runner.workspace.prepare()
+    identity, snapshot = runner.workspace.freeze()
+    runner.state = {'request_digest': 'retained', 'failures': [],
+                    'plan': runner.store.artifact('plan', {'text': 'Repair engine preflight only.'}),
+                    'sessions': {}, 'calls': 0}
+    boundary = completion_boundary(runner)
+    assert boundary['original_goal_completed'] is False and boundary['remaining_goal'] == goal
+    assert boundary['blocked_operation'] == owner
+    runner._review(identity, snapshot)
+    assert len(prompts) == 1 and goal in prompts[0] and obligation in prompts[0]
+    assert 'Do not require production edits or paid product operations' in prompts[0]
+    assert 'Every engine behavior, preservation check and actual child-entry proof remains mandatory' in prompts[0]
+    assert request.to_dict() == runner.request.to_dict()
+    runner.scope.context['incident']['phase'] = 'verification'
+    assert completion_boundary(runner) is None
+
+
 def controller(job, driver=None, verifier=None):
     request, store, workspace = job
     return Controller(request, store, workspace, driver or Driver(), verifier or Verifier(),

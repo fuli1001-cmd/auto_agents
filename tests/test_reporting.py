@@ -307,7 +307,7 @@ def test_live_panel_does_not_redirect_streams_and_cleans_up(tmp_path, monkeypatc
     frame = reporter.presenter._frame(reporter)
     assert '1 · 编码' in frame and '4 · 编码' in frame and '\n' in frame
     assert '权限检查' not in frame
-    assert '（实现阶段：2/5）1：权限检查' in (reporter.root / 'user.log').read_text()
+    assert '[实现]：2/5 1：权限检查' in (reporter.root / 'user.log').read_text()
     assert '本次运行' not in frame and '阶段 00:' not in frame
     assert reporter.presenter._live is not None
     reporter.presenter._live.update(Text(frame), refresh=True)
@@ -657,8 +657,9 @@ def test_collab_fix_acceptance_timeline_names_the_problem_without_changing_state
     reporter.observe_session(parent)
     parent.status, parent.active_handoff_id = 'waiting_child', 'hf-example'
     reporter.observe_session(parent)
-    IssueBriefBuilder(tmp_path, 'child').materialize(seed)
-    child = SessionState('child', mode='fix', status='conversing')
+    child_detail = '镜头之间仍然衔接不上。' if language == 'zh' else 'Adjacent shots still do not connect correctly.'
+    IssueBriefBuilder(tmp_path, 'child').materialize({**seed, 'user_summary': child_detail})
+    child = SessionState('child', mode='fix', status='conversing', parent_handoff_id='hf-example')
     try:
         with reporter.preserve_subject():
             reporter.bind('fix', child.session_id)
@@ -694,8 +695,11 @@ def test_collab_fix_acceptance_timeline_names_the_problem_without_changing_state
         assert positions == sorted(positions)
         assert value.count(labels[1]) == 1, 'returning from a child must not announce another fix'
         assert value.count(labels[-2]) == 1, 'persistence within the same acceptance step must stay quiet'
+        assert value.count(detail) == 1
+        assert child_detail not in value, 'rewording the same repair must not repeat its description'
+        assert ('[修复] 问题：' if language == 'zh' else '[Fix] Issue: ') + detail in value
         for label in labels[1:7]:
-            assert label + (':' if language == 'en' else '：') + (' ' if language == 'en' else '') + detail in value
+            assert ('[修复] ' if language == 'zh' else '[Fix] ') + label in value
         assert 'focused_fix' not in value and '/private/' not in value and 'hf-' not in value
         assert not (tmp_path / '.auto-agents/state/run_state.json').exists()
     finally:
@@ -718,7 +722,8 @@ def test_fix_preflight_blocker_explains_whether_project_repair_started(tmp_path,
         reporter.bind('fix', state.session_id)
         reporter.observe_session(state)
         value = stream.getvalue()
-        assert '项目修复受阻：分镜衔接不正确' in value
+        assert '[修复] 问题：分镜衔接不正确' in value
+        assert '[修复] 项目修复受阻' in value
         if started:
             assert '修复无法继续' in value and '尚未进入项目修复' not in value
         else:
@@ -728,7 +733,7 @@ def test_fix_preflight_blocker_explains_whether_project_repair_started(tmp_path,
         reporter.close()
 
 
-def test_engine_repair_displays_the_issue_through_all_steps_and_repeated_polls(report):
+def test_engine_repair_describes_the_issue_once_then_only_reports_progress(report):
     from auto_agents.repair_client import EngineRepairRequired
 
     reporter, stream = report
@@ -746,9 +751,10 @@ def test_engine_repair_displays_the_issue_through_all_steps_and_repeated_polls(r
     reporter.repair_update({**job, 'state': 'blocked',
         'result': {'error': 'ValueError: engine request has no explicit acceptance obligations'}}, {'state': 'blocked'})
     value = stream.getvalue()
-    assert '准备修复自动化工具：' + detail in value
-    for label in ('制定工具修复方案', '修复工具问题', '验证'):
-        assert value.count('自动化工具修复：' + label + '；问题：' + detail) == 1
+    assert value.count(detail) == 1
+    assert '[自修复] 问题：' + detail in value
+    for label in ('准备开始', '制定修复方案', '修复中', '验证'):
+        assert value.count('[自修复] ' + label) == 1
     assert '缺少明确的修复完成标准' in value
     assert 'private-job' not in value and 'focused_fix' not in value and '/private/' not in value
     assert json.dumps(job, sort_keys=True) == before
@@ -784,12 +790,13 @@ def test_private_fix_keeps_control_problem_and_does_not_repeat_the_action(tmp_pa
             reporter.bind('fix', state.session_id)
             reporter.observe_session(state, control_root=control.project_root)
             assert detail in (reporter.root / 'user.log').read_text()
-        assert stream.getvalue().count('准备修复项目问题：' + detail) == 1
+        assert stream.getvalue().count(detail) == 1
+        assert stream.getvalue().count('[修复] 准备修复项目问题') == 1
         private.session_action('fix')
         private.emit('verification.started', context='candidate')
         private.event('verification.interrupted', {}, audience='user', message='验证中断')
-        assert '正在修复项目问题：' + detail in stream.getvalue()
-        assert '修复效果检查未完成：' + detail in stream.getvalue()
+        assert '[修复] 正在修复项目问题' in stream.getvalue()
+        assert '[修复] 修复效果检查未完成' in stream.getvalue()
     finally:
         private.close()
         control.close()
@@ -815,8 +822,72 @@ def test_resuming_a_fix_displays_the_original_problem_not_the_wrapper(tmp_path):
         before = state.to_dict()
         reporter.observe_session(state)
         value = stream.getvalue()
-        assert '继续修复项目问题：分镜修正未解决镜头衔接问题' in value
+        assert '[修复] 问题：分镜修正未解决镜头衔接问题' in value
+        assert '[修复] 继续修复项目问题' in value
         assert 'technical engine' not in value and 'hf-' not in value
         assert state.to_dict() == before
     finally:
         reporter.close()
+
+
+@pytest.mark.parametrize('technical,expected', [
+    ('允许无任务归属的 focused_fix 安全处理历史提交无 task_plan.json 的情况',
+     '无法读取所需的旧任务记录，项目修复无法开始。'),
+    ('允许不接管其他任务的 局部修复 安全处理原有版本无 任务计划 的情况',
+     '无法读取所需的旧任务记录，项目修复无法开始。'),
+    ('engine request has no explicit acceptance obligations',
+     '自动修复缺少明确的完成标准，暂时无法继续。'),
+    ('SCHEMA_DATABASE_MISSING', '所需数据尚未准备好，服务无法启动。'),
+    ("ModuleNotFoundError: No module named 'renderer'", '运行所需的组件没有准备好，任务暂时无法继续。'),
+    ('usageLimitExceeded', '当前助手的使用额度已用完，任务暂时无法继续。'),
+    ('ConnectionRefusedError', '无法连接所需服务，任务暂时无法继续。'),
+    ('TimeoutError', '等待执行结果超时，任务暂时无法继续。'),
+])
+def test_legacy_problem_explains_symptom_and_impact_across_failure_families(technical, expected):
+    from auto_agents.workflow_display import repair_problem
+    assert repair_problem({'error': technical}) == expected
+    assert repair_problem({'invocation': {'engine_route': {'issue_seed': {'summary': technical}}}}) == expected
+
+
+def test_new_problem_description_is_generic_and_unknown_causes_are_not_invented():
+    from auto_agents.workflow_display import problem, repair_problem
+    description = '导出的账单缺少最后一行，金额无法核对。'
+    route = {'summary': 'repair invoice_tail invariants', 'user_summary': description}
+    assert problem(route) == description
+    assert repair_problem({'diagnosis': {'final': route}}) == description
+    assert problem({'summary': 'repair opaque_binding_handoff /private/tree'}) == '任务暂时无法继续，具体原因还需要检查。'
+    assert problem({'summary': 'repair opaque_binding_handoff',
+                    'necessity': {'consequence': '报表无法下载。'}}) == '报表无法下载。'
+
+
+def test_diagnosis_user_description_roundtrips_without_changing_the_verdict():
+    from auto_agents.root_cause import RootCauseReport
+    from test_root_cause import _report
+    raw = _report(role='investigator', verdict='ROOT_CAUSE')
+    original = RootCauseReport.from_dict(raw, role='investigator').to_dict()
+    assert 'user_summary' not in original
+    description = '恢复任务时没有还原之前的修改，导致重试失败。'
+    changed = RootCauseReport.from_dict({**raw, 'user_summary': description}, role='investigator').to_dict()
+    assert changed.pop('user_summary') == description
+    assert changed == original
+
+
+def test_repair_issue_is_announced_again_on_a_new_console_but_not_on_heartbeat(tmp_path, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr('auto_agents.reporting.time.monotonic', lambda: clock[0])
+    payload = {'invocation': {'engine_route': {'issue_seed': {'user_summary': '视频导出后无法播放。'}}}}
+    job = {'id': 'retained', 'generation': 1, 'state': 'repairing', 'payload': payload,
+           'display': {'phase': 'plan', 'sequence': 1}}
+    for _ in range(2):
+        output = io.StringIO()
+        reporter = Reporter(tmp_path, output, language='zh')
+        try:
+            reporter.bind('collab', 'session')
+            reporter.emit('repair.request_accepted')
+            reporter.repair_update(job, {'state': 'waiting'})
+            clock[0] += 61
+            reporter.repair_update(job, {'state': 'waiting'})
+            assert output.getvalue().count('视频导出后无法播放。') == 1
+            assert '[自修复] 制定修复方案' in output.getvalue()
+        finally:
+            reporter.close()

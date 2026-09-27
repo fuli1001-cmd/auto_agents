@@ -322,15 +322,18 @@ class Controller:
 
     def _review(self, identity, snapshot, cancel=None):
         from .scope import changes as changed_hunks
-        from .review_evidence import recovery_evidence
+        from .review_evidence import completion_boundary, recovery_evidence
         changes = changed_hunks(snapshot, self.request.engine_base, self.state.get('integration_parents', [])) if self.scope is not None else None
         recovery = recovery_evidence(self, identity)
+        boundary_scope = completion_boundary(self)
         if hasattr(self.driver, 'set_review_evidence'):
             mounted = self.driver.set_review_evidence(
                 self.store.root / recovery['artifact']['path'] if recovery is not None else None)
             if recovery is not None and mounted:
                 recovery['file'] = '/repair-recovery/boundary.json'
-        inputs = [self.state['request_digest'], identity, self.state.get('verification_runtime'), self.state['failures'], recovery]
+        inputs = [self.state['request_digest'], identity, self.state.get('verification_runtime'),
+                  self.state['failures'], recovery]
+        if boundary_scope is not None: inputs.append({'completion_boundary': boundary_scope})
         if self.scope is not None: inputs.append(self.scope.current())
         key = digest(inputs)
         if self.state.get('review_input') == key and self.state.get('review'):
@@ -360,6 +363,16 @@ class Controller:
                        + '\nCheck these observations against the retained scene and code. They bind the source, '
                        'scene digest, runtime and original parent/child identities. Passing recovery alone does '
                        'not establish other requirements; do not infer missing recovery fields from a success flag.')
+        if boundary_scope is not None:
+            prompt += ('\nCONTROLLER COMPLETION BOUNDARY:\n' + json.dumps(boundary_scope, ensure_ascii=False)
+                + '\nThis isolated stage owns the engine fix and proof that the specifically blocked child '
+                  'actually re-enters its next authorized implementation step with its identity and budgets preserved. '
+                  'Product fixes, browser operations and media acceptance following that handoff remain obligations '
+                  'of the original workflow; this receipt does not claim that its original goal is complete. '
+                  'Do not require production edits or paid product operations inside the isolated engine repair. '
+                  'Do not reject engine readiness solely because downstream product acceptance has not run yet. '
+                  'Every engine behavior, preservation check and actual child-entry proof remains mandatory; '
+                  'parent dialogue or a cleared blocker alone is insufficient.')
         from .context import source_context
         prompt += '\nCURRENT SOURCE AND DIFF:\n' + source_context(snapshot, self.request.engine_base)
         prompt += ('\nUse this exact source and diff for review; retrieve additional dependencies only as needed. '
@@ -547,6 +560,7 @@ class Controller:
                 proof = self.store.artifact('validation', asdict(validation))
                 self.checkpoint(validation=proof)
         if suite_ok and review.ok:
+            from .review_evidence import completion_boundary
             self.checkpoint(status='ready', phase='deliver', failures=[],
                 receipt=self.store.artifact('acceptance', {'request': self.state['request_digest'],
                     'snapshot': identity, 'validation': proof, 'comparison': comparison,
@@ -556,7 +570,8 @@ class Controller:
                     'comparison_base': comparison_base,
                     'scope': self.scope.current() if self.scope is not None else None,
                     'integration_parents': self.state.get('integration_parents', []),
-                    'review': self.state['review'], 'boundary': boundary, 'regression': regression}))
+                    'review': self.state['review'], 'boundary': boundary, 'regression': regression,
+                    'completion_boundary': completion_boundary(self)}))
             return True
         from .comparison import relevant_failures
         failures = [*([] if suite_ok else relevant_failures(validation.failures, old_nodes)), *review.findings]

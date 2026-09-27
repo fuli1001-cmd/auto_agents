@@ -8,6 +8,73 @@ from .diagnostic_output import plain_text, redact
 from .execution_binding import route_sources
 
 
+USER_SUMMARY_INSTRUCTION = (
+    'Include user_summary in the project documentation language. Write one short sentence for a '
+    'person unfamiliar with the code: what they cannot do, and the confirmed reason if known. '
+    'Describe the observed problem, not a proposed implementation or permission rule. '
+    'Do not merely replace technical words with synonyms. Omit paths, identifiers, commands, '
+    'protocols, secrets, ownership/binding jargon and speculative causes. Keep unknown causes explicitly unknown. '
+    'This sentence is for display only and grants no scope, authorization or completion credit.'
+)
+
+
+def stage(name, language='zh'):
+    labels = {'repair': ('自修复', 'Self-repair'), 'fix': ('修复', 'Fix'),
+              'collab': ('分析', 'Analysis'), 'acceptance': ('验收', 'Acceptance'),
+              'conversing': ('目标确认', 'Goal'), 'run': ('实现', 'Implementation'),
+              'resume': ('恢复', 'Resume'), 'provider_resolve': ('服务恢复', 'Service recovery')}
+    pair = labels.get(name, (name, name))
+    return '[' + pair[0 if language == 'zh' else 1] + ']'
+
+
+def _readable(value, language):
+    if not isinstance(value, str) or not value.strip():
+        return ''
+    if language == 'zh' and not re.search(r'[\u4e00-\u9fff]', value):
+        return ''
+    # Never turn an implementation title into a purported user explanation
+    # by substituting individual words. Keep such text in diagnostics instead.
+    if re.search(r'[`{}]|\b\w+_\w+\b|\b\w+(?:Error|Exception|Exceeded)\b|\b\w+\([^)]*\)|[/\\]|::|\b(?:preflight|payload|digest|handoff)\b|'
+                 r'归属|快照|预检|候选|验收合同|验证绑定|安全处理|^允许', value, re.I):
+        return ''
+    return summary(value, language, limit=64 if language == 'zh' else 140)
+
+
+def _known_problem(text, language):
+    # Translate failure families into symptom + impact, never into permission
+    # to bypass the underlying check. Unknown causes get no invented diagnosis.
+    cases = [
+        (r'retained task plan ownership is unavailable|(?:缺少|不存在|无\s*|missing[^\n]*)(?:task_plan\.json|(?:旧|历史)?任务计划)',
+         '无法读取所需的旧任务记录，项目修复无法开始。',
+         'The required earlier task records cannot be read, so the project fix cannot start.'),
+        (r'no explicit acceptance obligations|缺少[^。\n]*(?:验收要求|完成标准)',
+         '自动修复缺少明确的完成标准，暂时无法继续。',
+         'Automatic repair has no clear completion criteria and cannot continue yet.'),
+        (r'SCHEMA_DATABASE_MISSING|database does not exist',
+         '所需数据尚未准备好，服务无法启动。',
+         'Required data is not ready, so the service cannot start.'),
+        (r'ModuleNotFoundError|No module named|缺少(?:运行)?依赖',
+         '运行所需的组件没有准备好，任务暂时无法继续。',
+         'A required component is unavailable, so the task cannot continue yet.'),
+        (r'usageLimitExceeded|usage limit|额度(?:已)?(?:用完|用尽|耗尽)',
+         '当前助手的使用额度已用完，任务暂时无法继续。',
+         'The assistant has reached its usage limit, so the task cannot continue yet.'),
+        (r'ConnectionRefusedError|connection refused|连接被拒绝',
+         '无法连接所需服务，任务暂时无法继续。',
+         'A required service cannot be reached, so the task cannot continue yet.'),
+        (r'TimeoutError|timed out|响应超时',
+         '等待执行结果超时，任务暂时无法继续。',
+         'Waiting for a result timed out, so the task cannot continue yet.'),
+        (r'modified files outside its ownership|修改[^。\n]*超出[^。\n]*范围',
+         '修改范围检查未通过，任务已停止。',
+         'The changes exceeded the permitted scope, so the task stopped.'),
+    ]
+    for pattern, zh, en in cases:
+        if re.search(pattern, text, re.I):
+            return zh if language == 'zh' else en
+    return ''
+
+
 def summary(value, language='zh', limit=100):
     if not isinstance(value, str):
         return ''
@@ -35,28 +102,49 @@ def summary(value, language='zh', limit=100):
 
 def problem(payload, language='zh'):
     sources = list(route_sources(payload)) if isinstance(payload, dict) else []
-    # A deliberately written user explanation takes precedence over technical
-    # diagnosis. Older records retain their existing issue description.
-    for key in ('user_summary', 'summary', 'title'):
-        for source in reversed(sources):
-            value = summary(source.get(key), language, limit=48 if language == 'zh' else 96)
-            if value:
-                return value
+    raw = []
+    for source in reversed(sources):
+        value = _readable(source.get('user_summary'), language)
+        if value:
+            return value
+    for source in sources:
+        for key in ('summary', 'title', 'reason', 'error', 'symptom', 'reproduction', 'causal_chain'):
+            value = source.get(key, '')
+            raw.extend(value if isinstance(value, list) else [value])
+    known = _known_problem('\n'.join(item for item in raw if isinstance(item, str)), language)
+    if known:
+        return known
+    for source in sources:
+        necessity = source.get('necessity') or {}
+        for value in [source.get('summary'), source.get('title'), source.get('symptom'), source.get('reason'),
+                      necessity.get('consequence') if isinstance(necessity, dict) else None,
+                      *(source.get('causal_chain') or [])]:
+            readable = _readable(value, language)
+            if readable:
+                return readable
+    if any(isinstance(item, str) and item.strip() for item in raw):
+        return ('任务暂时无法继续，具体原因还需要检查。' if language == 'zh' else
+                'The task cannot continue yet; its cause still needs investigation.')
     return ''
 
 
 def repair_problem(payload, language='zh'):
     route = (payload.get('invocation') or {}).get('engine_route') or {}
-    value = problem(route, language)
+    value = problem({'issue_seed': route, 'error': payload.get('error', '')}, language) if route else ''
     if value:
         return value
     final = (payload.get('diagnosis') or {}).get('final') or {}
     value = problem(final, language)
-    if not value:
-        causes = final.get('causal_chain') or []
-        value = summary(next((c for c in causes if isinstance(c, str)), ''), language,
-                        limit=48 if language == 'zh' else 96)
-    return value
+    return value or problem(payload, language)
+
+
+def repair_topic(payload, job_id=''):
+    import hashlib
+    import json
+    route = (payload.get('invocation') or {}).get('engine_route')
+    if route:
+        return 'route:' + hashlib.sha256(json.dumps(route, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return 'job:' + str(job_id) if job_id else ''
 
 
 def session_view(root, state, read_json, language='zh'):
@@ -64,10 +152,12 @@ def session_view(root, state, read_json, language='zh'):
     directory = root / '.auto-agents/state'
     issue = read_json(directory / 'sessions' / state.session_id / 'issue.json')
     detail = problem(issue, language)
-    suffix = ('：' if zh else ': ') + detail if detail else ''
+    tag = stage(state.mode, language)
+    topic = getattr(state, 'parent_handoff_id', '') or state.session_id
     status, mode = state.status, state.mode
     acceptance = getattr(state, 'acceptance_execution', {}) or {}
     if status == 'waiting_child':
+        topic = state.active_handoff_id
         handoff = read_json(directory / 'handoffs' / (state.active_handoff_id + '.json'))
         target = handoff.get('target')
         continuing = False
@@ -85,8 +175,9 @@ def session_view(root, state, read_json, language='zh'):
             if not retained:
                 break
             handoff, target, continuing = retained, retained.get('target'), True
+            topic = reference
         detail = problem(handoff.get('payload') or {}, language)
-        suffix = ('：' if zh else ': ') + detail if detail else ''
+        tag = stage(target or 'resume', language)
         labels = {'fix': ('开始修复项目问题', 'Starting a project fix'),
                   'run': ('开始实现所需功能', 'Starting the required work'),
                   'resume': ('继续之前未完成的工作', 'Continuing the previous work')}
@@ -103,14 +194,16 @@ def session_view(root, state, read_json, language='zh'):
                   'waiting_user': ('项目修复需要你的帮助', 'Project fix needs your help')}
         pair = labels.get(status, ('处理项目修复', 'Working on the project fix'))
     elif mode == 'collab':
-        suffix = ''
         if status == 'conversing':
+            tag = stage('conversing', language)
             pair = ('确认这次要完成的目标', 'Clarifying the goal')
         elif status == 'executing':
             phase = acceptance.get('phase')
             if phase in {'pending', 'executing', 'waiting_user'}:
+                tag = stage('acceptance', language)
                 pair = ('通过实际操作验收现有功能', 'Checking existing behavior through actual use')
             elif phase == 'reviewing':
+                tag = stage('acceptance', language)
                 pair = ('检查验收结果是否满足目标', 'Checking whether acceptance proves the goal')
             elif getattr(state, 'return_phase', '') == 'after_child':
                 result = read_json(Path(state.last_child_result_ref)) if state.last_child_result_ref else {}
@@ -130,11 +223,10 @@ def session_view(root, state, read_json, language='zh'):
             else:
                 pair = ('分析当前问题，确定下一步', 'Investigating the issue and choosing the next step')
             detail = problem((acceptance.get('inputs') or {}).get('request') or {}, language)
-            if detail:
-                suffix = ('：' if zh else ': ') + detail
         elif status == 'completed':
             pair = ('已完成本次目标', 'Goal completed')
         elif status == 'blocked' and acceptance:
+            tag = stage('acceptance', language)
             pair = ('验收暂时无法继续', 'Acceptance cannot continue yet')
         else:
             labels = {'failed': ('本次任务未完成', 'The task did not finish'),
@@ -150,4 +242,4 @@ def session_view(root, state, read_json, language='zh'):
                   'paused': ('外部服务处理已暂停', 'External service recovery paused'),
                   'waiting_user': ('外部服务处理需要你的帮助', 'External service recovery needs your help')}
         pair = labels.get(status, ('处理外部服务问题', 'Resolving the external service issue'))
-    return detail, pair[0 if zh else 1] + suffix
+    return detail, tag + ' ' + pair[0 if zh else 1], topic
