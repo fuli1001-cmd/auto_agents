@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .recovery.authority import entry as kernel_entry
 
 import ast
 import copy
@@ -3619,6 +3620,7 @@ class Orchestrator:
         return True
 
     @reporting_scope
+    @kernel_entry
     def run(
         self,
         spec_file: Path,
@@ -3987,6 +3989,8 @@ class Orchestrator:
             self._clear_run_blocker(state)
             save_run_state(self.project_root, state)
             self._commit_if_dirty("chore: finalize run state")
+            from .recovery.native import run_completion
+            run_completion(self, state)
             return state
         except HealthSelfRepairRequired:
             health_handoff = True
@@ -33415,6 +33419,23 @@ class Orchestrator:
         *,
         state: Optional[RunState] = None,
     ) -> Dict[str, object]:
+        if state is None:
+            return self._run_task_verify_owned(task, state=state)
+        from .recovery.native import perform
+        from .recovery.model import OutcomeKind
+        return perform(self, 'verify', getattr(task, 'task_id', '') + ':' + str(getattr(task, 'verify_retry_epoch', 0)),
+            lambda: self._run_task_verify_owned(task, state=state),
+            lambda result: (OutcomeKind.SUCCESS if result.get('ok') else OutcomeKind.CANDIDATE_REJECTED
+                            if result.get('comparable_failures') else OutcomeKind.ENVIRONMENT_BLOCKED,
+                            str(result.get('reason', 'Task verification completed'))),
+            usage={'workflow_kind':'run','subject_id':state.run_id})
+
+    def _run_task_verify_owned(
+        self,
+        task: Optional[TaskSpec] = None,
+        *,
+        state: Optional[RunState] = None,
+    ) -> Dict[str, object]:
         handoff = self._metadata_checkpoint_verification_handoff(state, task)
         if task is None or handoff is None or handoff.get("verification_receipt"):
             return self._run_task_verify_current(task, state=state)
@@ -37985,6 +38006,7 @@ class Orchestrator:
             state.resume_context["previous_task_plan_archive"] = previous_task_plan_archive
         state.resume_context.update(runtime_context)
 
+    @kernel_entry
     def resume_saved_run(self) -> RunState:
         from .scope_decisions import resume_run_choice
         waiting = resume_run_choice(self)
@@ -44993,6 +45015,10 @@ class Orchestrator:
         return ShellAdapter(prov, self.config.execution.smart_timeout)
 
     def _call_with_failover(self, request: AgentRequest) -> AgentResult:
+        from .recovery.native import provider
+        return provider(self, request, self._call_with_failover_owned)
+
+    def _call_with_failover_owned(self, request: AgentRequest) -> AgentResult:
         stop_reason = request.termination_probe() if request.termination_probe is not None else ""
         if stop_reason in {"execution_budget_exhausted", "verification_environment_blocked"}:
             # An already-cancelled task must not spend another model call on a
@@ -45028,6 +45054,7 @@ class Orchestrator:
         elif (
             self.config.active_provider in health
             and request.writer_boundary is None
+            and request.usage_context.get('kernel_owned') != '1'
             and self._probe_active_provider(request)
         ):
             first = self.config.active_provider
@@ -45089,6 +45116,9 @@ class Orchestrator:
                 self._clear_provider_failure(kind)
                 if kind != self.config.active_provider:
                     self.logger.info(f"[failover] using provider={kind}")
+                return result
+
+            if request.usage_context.get('kernel_owned') == '1':
                 return result
 
             if (result.termination is not None and result.termination.reason == "verification_environment_blocked") or not self._is_failover_error(result):
@@ -45270,6 +45300,8 @@ class Orchestrator:
             if result.cleanup_incomplete:
                 self._provider_cleanup_blocked = True
                 return replace(result, ok=False)
+            if request.usage_context.get('kernel_owned') == '1':
+                return result
             missing_session = re.search(
                 r"(?im)^(?:error:\s*)?(?:no (?:saved )?(?:session|conversation|thread) found\b|"
                 r"(?:session|conversation|thread)[^\n]{0,180}(?:not found|does not exist|has expired)\b)",

@@ -1288,10 +1288,20 @@ def _auto_repair_auto_agents_and_resume(
     diagnosis=None,
     repair_case: Optional[RepairCase] = None,
 ) -> int:
+    from .recovery.model import KernelError
+    if isinstance(error, KernelError):
+        print(json.dumps({'ok': False, 'failure_kind': error.code, 'error': str(error),
+                          'diagnostic': error.details}, ensure_ascii=False), file=sys.stderr)
+        return 3
     from .repair_client import enabled as repair_control_enabled, submit_and_wait
     if repair_control_enabled():
-        return submit_and_wait(project_root, orchestrator, error, decision, args,
-                               run_lock, diagnosis, repair_case)
+        try:
+            return submit_and_wait(project_root, orchestrator, error, decision, args,
+                                   run_lock, diagnosis, repair_case)
+        except KernelError as failure:
+            print(json.dumps({'ok':False,'failure_kind':failure.code,'error':str(failure),
+                              'diagnostic':failure.details},ensure_ascii=False),file=sys.stderr)
+            return 3
     invocation = dict(getattr(orchestrator, "_invocation_context", {}) or {})
     if invocation.get("session_id") and not invocation.get("run_id"):
         return _auto_repair_session_and_resume(
@@ -2080,9 +2090,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     repair_parser = subparsers.add_parser("repair", help="Inspect and control durable engine repairs")
-    repair_parser.add_argument("repair_action", choices=("status", "resume", "cancel", "retry-publish"))
+    repair_parser.add_argument("repair_action", choices=("status", "resume", "cancel", "retry-publish", "migrate", "upgrade"))
     repair_parser.add_argument("--job", default="")
     repair_parser.add_argument("--project", default="")
+    repair_parser.add_argument("--check", action="store_true")
+    repair_parser.add_argument("--runtime", default="")
+    repair_parser.add_argument("--json", action="store_true")
     prompt_eval_parser = subparsers.add_parser(
         "prompt-eval", help="Capture prompt baselines or explicitly evaluate configured providers"
     )
@@ -2736,6 +2749,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Existing editable-install launchers still import cli.main directly.
+    from .bootstrap import select_runtime
+    select_runtime(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "verify" and args.explain:
@@ -2798,6 +2814,13 @@ def _dispatch(args) -> int:
     if args.command == "repair":
         from .repair_control import configure, ensure_supervisor, rpc
         try:
+            from .recovery.cli import maintenance
+            from .recovery.authority import installation_root
+            if args.repair_action in {'migrate','upgrade'} or installation_root() is not None:
+                managed = maintenance(args)
+                if managed is not None:
+                    print(json.dumps(managed, ensure_ascii=False, indent=2))
+                    return 0 if managed.get('ok') else 3
             config = configure(auto_agents_repo_root())
             ensure_supervisor(config)
             request = {"op": args.repair_action}

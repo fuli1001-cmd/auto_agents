@@ -799,12 +799,15 @@ def load_run_state(project_root: Path) -> RunState:
     data = read_json(run_state_path(project_root), default=None)
     if data is None or not data.get("run_id"):
         return create_run(project_root)
-    return RunState.from_dict(data)
+    from .recovery.authority import bind_model
+    return bind_model(RunState.from_dict(data), data)
 
 
 def save_run_state(project_root: Path, state: RunState) -> None:
     ensure_auto_gitignore(project_root)
-    write_json(run_state_path(project_root), state.to_dict())
+    from .recovery.authority import save_model
+    if not save_model(run_state_path(project_root), state):
+        write_json(run_state_path(project_root), state.to_dict())
     from .reporting import observe_saved_run
     observe_saved_run(project_root, state)
 
@@ -880,11 +883,20 @@ def create_session(
     mode: str,
     *,
     hard_ceiling: Optional[int] = None,
+    workflow_id: str = '',
+    parent_handoff_id: str = '',
+    session_id: Optional[str] = None,
+    persist: bool = True,
 ) -> SessionState:
-    session_id = uuid4().hex[:12]
+    if session_id is not None:
+        from .workflow_chain import _safe_component
+        session_id = _safe_component(session_id)
+    else: session_id = uuid4().hex[:12]
     now = datetime.now(timezone.utc).isoformat()
     state = SessionState(
         session_id=session_id,
+        workflow_id=workflow_id,
+        parent_handoff_id=parent_handoff_id,
         mode=mode,
         max_attempts=DEFAULT_SESSION_MAX_ATTEMPTS.get(mode, 4),
         hard_ceiling=max(
@@ -898,7 +910,7 @@ def create_session(
         created_at=now,
         updated_at=now,
     )
-    save_session_state(project_root, state)
+    if persist: save_session_state(project_root, state)
     return state
 
 
@@ -908,14 +920,16 @@ def load_session_state(project_root: Path, session_id: str) -> SessionState:
         raise FileNotFoundError(
             f"Session not found: {session_state_path(project_root, session_id)}"
         )
-    return SessionState.from_dict(data)
+    from .recovery.authority import bind_model
+    return bind_model(SessionState.from_dict(data), data)
 
 
 def save_session_state(project_root: Path, state: SessionState) -> None:
     ensure_auto_gitignore(project_root)
     path = session_state_path(project_root, state.session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_json(path, state.to_dict())
+    from .recovery.authority import save_model
+    if not save_model(path, state): write_json(path, state.to_dict())
 
 
 def _session_timestamp(value: str) -> datetime:

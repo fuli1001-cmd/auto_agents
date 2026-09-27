@@ -182,6 +182,9 @@ def execution_checkout(session, state):
     if '_call_with_failover' in previous.__dict__:
         execution._call_with_failover = previous.__dict__['_call_with_failover']
     execution.config = session.config
+    execution._kernel_project = root
+    if getattr(previous, '_kernel_subject', None):
+        execution._kernel_subject = previous._kernel_subject
     # Every validated private checkout inherits the effective configuration.
     # A collab parent consuming a child's delivery has no verification binding,
     # but its historical config is still outside the shared lifecycle lock.

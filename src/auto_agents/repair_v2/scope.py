@@ -41,7 +41,8 @@ def read_json(root, relative):
     root, path = Path(root).resolve(), Path(root) / relative
     if path.is_symlink() or not path.resolve().is_relative_to(root):
         raise RepairBlocked('scope_evidence', '范围依据引用了当前工作流以外的文件。')
-    return json.loads(path.read_text())
+    from ..io_utils import read_json as read_control_json
+    return read_control_json(path)
 
 
 def safe_id(value):
@@ -206,13 +207,23 @@ def witnesses(refs, target, source):
                     # can contain large candidate preimages; hashing them must
                     # not load or inject that payload into model context.
                     value = hashlib.sha256()
-                    with path.open('rb') as stream:
-                        before = os.fstat(stream.fileno())
-                        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-                            value.update(chunk)
-                        after = os.fstat(stream.fileno())
-                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                        raise RepairBlocked('scope_evidence', '失败证据内容已变化，不能复用旧依据。')
+                    from ..recovery.authority import read_projection, NOT_MANAGED
+                    document = read_projection(path)
+                    if document is not NOT_MANAGED and document is not None:
+                        # Frozen diagnostics hydrate the projection using this
+                        # canonical encoding. Bind the logical record, not its
+                        # disposable on-disk display wrapper.
+                        encoder = json.JSONEncoder(ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False)
+                        for chunk in encoder.iterencode(document): value.update(chunk.encode())
+                        value.update(b'\n')
+                    else:
+                        with path.open('rb') as stream:
+                            before = os.fstat(stream.fileno())
+                            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                                value.update(chunk)
+                            after = os.fstat(stream.fileno())
+                        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                            raise RepairBlocked('scope_evidence', '失败证据内容已变化，不能复用旧依据。')
                     raw, checksum = None, value.hexdigest()
                 if raw is not None and len(raw) > 4 * 1024 * 1024:
                     raise RepairBlocked('scope_evidence', '请引用更精确的失败依据。')

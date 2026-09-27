@@ -236,7 +236,8 @@ class WorkflowStore:
             if rebuilt is None:
                 raise FileNotFoundError(f"workflow not found: {workflow_id}")
             return rebuilt
-        return WorkflowSnapshot.from_dict(payload)
+        from .recovery.authority import bind_model
+        return bind_model(WorkflowSnapshot.from_dict(payload), payload)
 
     def rebuild(self, workflow_id: str) -> Optional[WorkflowSnapshot]:
         event_root = self.workflow_root(workflow_id) / "events"
@@ -295,7 +296,9 @@ class WorkflowStore:
 
     def save(self, snapshot: WorkflowSnapshot) -> None:
         snapshot.updated_at = utc_now()
-        write_json(self.snapshot_path(snapshot.workflow_id), snapshot.to_dict())
+        from .recovery.authority import save_model
+        if not save_model(self.snapshot_path(snapshot.workflow_id), snapshot):
+            write_json(self.snapshot_path(snapshot.workflow_id), snapshot.to_dict())
 
     def activate(self, workflow_id: str) -> None:
         snapshot = self.load(workflow_id)
@@ -346,6 +349,7 @@ class WorkflowStore:
         snapshot.status = durable.status
         snapshot.resume_epoch = durable.resume_epoch
         snapshot.recovery_required = durable.recovery_required
+        if hasattr(durable,'_kernel_reference'): snapshot._kernel_reference = durable._kernel_reference
         sequence = durable.event_sequence + 1
         event_id = uuid4().hex[:12]
         payload: Dict[str, object] = {
@@ -368,10 +372,13 @@ class WorkflowStore:
             / "events"
             / f"{sequence:08d}-{event_id}.json"
         )
-        write_json(event_path, payload)
-        self._index_event(snapshot.workflow_id, payload, event_path)
         snapshot.event_sequence = sequence
         snapshot.last_event_sha256 = event_sha
+        snapshot.updated_at = utc_now()
+        from .recovery.authority import append_workflow_event
+        if append_workflow_event(self.project_root,snapshot,payload,event_path): return payload
+        write_json(event_path, payload)
+        self._index_event(snapshot.workflow_id, payload, event_path)
         self.save(snapshot)
         return payload
 
@@ -408,7 +415,7 @@ class WorkflowStore:
             created_at=now,
             updated_at=now,
         )
-        write_json(path, handoff.to_dict())
+        self.save_handoff(handoff)
         snapshot.active_handoff_id = identifier
         self.save(snapshot)
         self.append_event(
@@ -423,7 +430,8 @@ class WorkflowStore:
         payload = read_json(self.handoff_path(handoff_id), default=None)
         if not isinstance(payload, dict):
             raise FileNotFoundError(f"handoff not found: {handoff_id}")
-        return WorkflowHandoff.from_dict(payload)
+        from .recovery.authority import bind_model
+        return bind_model(WorkflowHandoff.from_dict(payload), payload)
 
     def resolve_handoff_chain(self, handoff, *, workflow_id: str):
         """Read a bounded resume chain without granting or rewriting authority."""
@@ -489,7 +497,9 @@ class WorkflowStore:
 
     def save_handoff(self, handoff: WorkflowHandoff) -> None:
         handoff.updated_at = utc_now()
-        write_json(self.handoff_path(handoff.handoff_id), handoff.to_dict())
+        from .recovery.authority import save_model
+        if not save_model(self.handoff_path(handoff.handoff_id), handoff):
+            write_json(self.handoff_path(handoff.handoff_id), handoff.to_dict())
 
     def bind_child(
         self,
@@ -573,6 +583,9 @@ class WorkflowStore:
 
     def begin_resume(self, snapshot: WorkflowSnapshot) -> None:
         snapshot.__dict__.update(self.load(snapshot.workflow_id).__dict__)
+        from .recovery.authority import installed
+        if snapshot.status == 'completed' and installed(self.project_root) is not None:
+            return
         snapshot.resume_epoch += 1
         snapshot.recovery_required = False
         snapshot.status = "active"
@@ -610,6 +623,9 @@ class WorkflowStore:
         return sorted(candidates, key=lambda item: item.updated_at, reverse=True)
 
     def events(self, workflow_id: str) -> List[Dict[str, object]]:
+        from .recovery.authority import workflow_events
+        managed = workflow_events(self.project_root,workflow_id)
+        if managed is not None: return managed
         indexed = self._indexed_events(workflow_id)
         if indexed is not None:
             return indexed

@@ -77,7 +77,13 @@ def test_explicit_event_evidence_reads_large_log_without_relaxing_file_limit(sce
     child['conversation'] = [{'content': 'x' * (5 * 1024 * 1024)}]
     atomic_json(path, child)
     relative = str(path.relative_to(project))
-    with pytest.raises(RepairBlocked): witnesses([relative], project, engine)
+    # Whole-file references retain a streamed digest, not the log payload.
+    # The size boundary applies when extracting an event into model context.
+    whole = witnesses([relative], project, engine)[0]
+    assert whole['pointer'] == '' and len(whole['sha256']) == 64
+    assert witnesses([whole], project, engine) == [whole]
+    with pytest.raises(RepairBlocked):
+        witnesses([{'origin':'target','path':relative,'pointer':'/conversation/0'}], project, engine)
     row = witnesses([{'origin': 'target', 'path': relative, 'pointer': '/execution_log/0'}], project, engine)[0]
     assert row['pointer'] == '/execution_log/0'
     assert witnesses([row], project, engine) == [row]

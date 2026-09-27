@@ -1274,6 +1274,8 @@ class RootCauseCoordinator:
             symlinks=True,
             dirs_exist_ok=cloned,
         )
+        from .recovery.authority import export_snapshot
+        export_snapshot(source, destination)
         if not include_private:
             shutil.rmtree(
                 destination / ".auto-agents" / "operator",

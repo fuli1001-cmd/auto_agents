@@ -148,7 +148,13 @@ def observation(state, owner, operation):
     identity = digest([owner, state.get('session_id'), operation, phase, code, check, anchor_event])
     record = asdict(FailureIncident(identity, {**owner, 'session_id': state.get('session_id'),
         'handoff_id': operation}, phase, code, check, event, candidate, revision=revision))
-    if code in {'proof_review_required', 'proof_review_unavailable'}:
+    kernel_code = code.removeprefix('kernel_') if code.startswith('kernel_') else None
+    if kernel_code is not None:
+        record['domain'] = ({'candidate_rejected':'product','environment_blocked':'environment',
+            'protocol_invalid':'protocol','outcome_unknown':'reconciliation','ownership_conflict':'ownership',
+            'evidence_invalid':'evidence','budget_exhausted':'budget','no_progress':'budget',
+            'need_input':'input'}.get(kernel_code,'controller_state'))
+    elif code in {'proof_review_required', 'proof_review_unavailable'}:
         record['domain'] = 'proof_review'
     elif code == 'owned_verification_failed':
         record['domain'] = 'product'

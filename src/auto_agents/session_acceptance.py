@@ -282,6 +282,8 @@ def drive(session, state):
         state.status, state.resolution = 'blocked', 'acceptance_evidence_invalid'
         state.conversation.append({'role': 'orchestrator', 'content': 'Acceptance blocked: ' + str(error)})
     session._save(state)
+    from .recovery.native import acceptance
+    acceptance(session, state)
     return state
 
 

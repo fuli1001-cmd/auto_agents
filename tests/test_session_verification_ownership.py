@@ -2043,7 +2043,7 @@ def test_public_resume_requires_executable_owned_node_coverage(tmp_path, monkeyp
         # Model an authenticated older inventory that admitted this excluded
         # node. Resume must recheck it before baseline or writer admission.
         with monkeypatch.context() as old:
-            old.setattr(verification, '_validate_required_node_selection', lambda *_: None)
+            old.setattr(verification, '_validate_required_node_selection', lambda *_, **__: None)
             _binding_fixture(root, child)
         save_session_state(root, child)
         retained_binding = json.loads(json.dumps(child.verification_binding))

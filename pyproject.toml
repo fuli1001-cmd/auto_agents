@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-auto-agents = "auto_agents.cli:main"
+auto-agents = "auto_agents.bootstrap:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

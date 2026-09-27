@@ -76,6 +76,7 @@ from .persistence import (
     persistence_change_strategy,
 )
 from .performance_trace import PerformanceTrace
+from .recovery.authority import entry as kernel_entry
 from .verification_sandbox import ConfinementPreflightError
 from .session_verification import (
     SessionOwnershipError, bind_session, collection_command, diagnostic_owners,
@@ -400,6 +401,7 @@ class Session:
 
     # ── Public entry points ──────────────────────────────────────
 
+    @kernel_entry
     def start(self) -> SessionState:
         """Create a new session and drive it to completion (or interruption)."""
         if self._coordinator is None:
@@ -453,6 +455,7 @@ class Session:
             return False
         return True
 
+    @kernel_entry
     def resume(self, session_id: str) -> SessionState:
         """Resume an existing session.
 
@@ -2230,6 +2233,7 @@ class Session:
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
         from .session_candidate import execution_checkout
         from .execution_binding import ExecutionBindingError, RunnerContextError
+        from .recovery.model import KernelError
         self._current_state = state
         try:
             self._fix_verify_command_for_execution(state.fix_verify_command)
@@ -2239,6 +2243,9 @@ class Session:
                         and state.status in {"completed", "failed", "blocked", "waiting_user", "paused"}):
                     return state
                 return self._phase_fix_execute_owned(state)
+        except KernelError as error:
+            error.diagnostic = {'failure_kind': error.code, **error.details, 'retry_fix': False}
+            return self._block_execution_binding(state, error, 'kernel_' + error.code)
         except (ConfinementPreflightError, RunnerContextError) as error:
             kind = self._verification_preflight_failure(state, error)['failure_kind']
             return self._block_execution_binding(state, error, kind)
@@ -2299,6 +2306,10 @@ class Session:
                 restore_guard.cleanup()
                 raise
             except RuntimeError as exc:
+                from .recovery.model import KernelError
+                if isinstance(exc, KernelError):
+                    restore_guard.cleanup()
+                    raise
                 try:
                     record_candidate(self, state, before_snapshot)
                 except SessionOwnershipError as error:
@@ -2539,6 +2550,13 @@ class Session:
                                           current_identity=current_identity)
         if not self._ack_engine_recovery(state, 'verification', verification_identity=identity or ''):
             return state
+        from .recovery.native import review_candidate
+        review = review_candidate(self, state, verify)
+        if not review.get('ok'):
+            self._receipt_retry_feedback = str(review.get('reason', 'Independent candidate review rejected the change'))
+            state.execution_log.append({'action':'candidate_review_rejected','result':self._receipt_retry_feedback})
+            self._save(state)
+            return self._phase_fix_execute_owned(state)
         self._print("Verification passed!")
         self._run_session_persistence_action(state)
         state.status, state.resolution = 'completed', 'fixed'
@@ -4264,6 +4282,10 @@ class Session:
             return plan, commands
 
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
+        from .recovery.native import verification
+        return verification(self, scope, lambda: self._run_verify_owned(scope))
+
+    def _run_verify_owned(self, scope: str = "final") -> Dict[str, object]:
         from .execution_binding import RunnerContextError
         execution_identity = None
         publish_operation = getattr(
@@ -4766,7 +4788,7 @@ class Session:
                     if state.verification_binding and not extract_failure_info(targeted_gate).comparable:
                         return outcome(False, f"fix_verify_command has no comparable failure identity: {detail[:500]}",
                                        retry_fix=False, failure_kind="verification_inconclusive")
-                    return outcome(False, f"fix_verify_command failed: {detail[:500]}")
+                    return outcome(False, f"fix_verify_command failed: {detail[:500]}", retry_fix=True)
 
             # Layer 2: baseline-diff gate check
             if not plan.commands and not plan.parallel_groups:
@@ -4976,6 +4998,7 @@ class Session:
                         f"{len(new_failures)} new failure(s) introduced: "
                         + ", ".join(new_failures[:10])
                     ),
+                    retry_fix=True,
                 )
             return outcome(True, gate.summary)
         except (ConfinementPreflightError, RunnerContextError) as error:
@@ -5590,6 +5613,10 @@ class Session:
         return self._normalize_commit_subject(state.goal.replace("\n", " ")) or "verified update"
 
     def _git_commit(self, state: SessionState, prefix: str, reply: str = "") -> bool:
+        from .recovery.native import delivery
+        return delivery(self, state, lambda: self._git_commit_owned(state, prefix, reply))
+
+    def _git_commit_owned(self, state: SessionState, prefix: str, reply: str = "") -> bool:
         """Persist current state, then commit current changes."""
         if state.candidate_custody and self.project_root != Path(state.candidate_custody['checkout']):
             from .session_candidate import execution_checkout

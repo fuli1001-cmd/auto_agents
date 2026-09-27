@@ -8,6 +8,10 @@ from typing import Any
 
 
 def read_json(path: Path, default: Any = None) -> Any:
+    from .recovery.authority import read_projection, NOT_MANAGED
+    managed = read_projection(path)
+    if managed is not NOT_MANAGED:
+        return default if managed is None else managed
     if not path.exists():
         return default
     with path.open("r", encoding="utf-8") as handle:
@@ -15,6 +19,9 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def write_json(path: Path, data: Any) -> None:
+    from .recovery.authority import write_projection
+    if write_projection(path, data):
+        return
     payload = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     _atomic_write(path, payload)
 

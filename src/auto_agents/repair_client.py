@@ -38,6 +38,10 @@ def _remember_engine_receipt(orchestrator, payload, receipt):
 
 def engine_route(orchestrator, payload):
     """Return True only for a verified receipt; otherwise request engine repair."""
+    from .recovery.native import recovered_route
+    durable = recovered_route(orchestrator, payload)
+    if durable is not None:
+        return durable
     from .execution_binding import repository_binding_error, route_sources
     registration = getattr(orchestrator, "_repair_registration", None)
     if registration and (not any(source.get("target_repository") for source in route_sources(payload))
@@ -91,12 +95,20 @@ def triage_engine_request(orchestrator, project, error):
     from .self_repair import SelfRepairDecision, SelfRepairTriageResult
     registration = getattr(orchestrator, "_repair_registration", None)
     invocation = getattr(orchestrator, "_invocation_context", {}) or {}
+    from .recovery.authority import installed
+    kernel = installed(project)
+    if kernel is not None:
+        operator = kernel.root/'operator.json'
+        policy = json.loads(operator.read_text()) if operator.is_file() else {}
+        engine_root = Path(policy.get('source_root') or Path(__file__).resolve().parents[2])
+    else:
+        engine_root = Path(registration['config']['source_root']) if registration else None
     reason = ""
     has_target = any(source.get("target_repository") for source in route_sources(error.route_payload))
-    if not enabled() or not registration:
+    if not enabled() or not (registration or kernel):
         reason = "independent repair control is unavailable"
     elif (not has_target
-          or repository_binding_error(Path(registration["config"]["source_root"]), error.route_payload)):
+          or repository_binding_error(engine_root, error.route_payload)):
         reason = "engine request does not target the registered engine repository"
     # Authorization comes from the invocation/saved session, never the model's
     # route payload. Receiving a control signal does not grant new authority.
@@ -264,6 +276,11 @@ def retained_run_contract(orchestrator, project, error):
 
 
 def register(lock, args, orchestrator):
+    from .recovery.authority import installation_root
+    from .recovery.store import KernelStore
+    kernel_root = installation_root()
+    if kernel_root is not None and KernelStore(kernel_root, readonly=True).meta('mode') == 'active':
+        return None
     config = getattr(orchestrator, "config", None)
     execution = getattr(config, "execution", None)
     autonomy = getattr(execution, "autonomy", None)
@@ -551,7 +568,10 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     from .self_repair import auto_agents_repo_root
     from .process_supervision import ACTIVE_PROCESSES, process_group_exists
     from .execution_recovery import redact_incident_text
-    registration = getattr(orchestrator, "_repair_registration", None) or register(lock, args, orchestrator)
+    from .recovery.authority import installed
+    kernel = installed(project)
+    registration = ({'config':{'root':str(kernel.root)},'subscriber':'kernel'} if kernel else
+                    getattr(orchestrator, "_repair_registration", None) or register(lock, args, orchestrator))
     if not registration:
         raise RuntimeError("repair control unavailable: " + getattr(orchestrator, "_repair_control_error", "registration failed"))
     ACTIVE_PROCESSES.terminate_all()
@@ -663,6 +683,9 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     # The request marker deliberately is not a valid RootCauseDiagnosis. An
     # old immutable worker that cannot fetch a newer runtime must fail closed,
     # rather than treating diagnosis=None as permission for legacy repair.
+    if kernel is not None:
+        from .recovery.engine import submit
+        return submit(kernel, project, orchestrator, payload, args, lock)
     response = rpc(registration["config"], {"op": "submit", "subscriber": registration["subscriber"], "payload": payload})
     job = response["job"]
     reporter = getattr(orchestrator, 'reporter', None)

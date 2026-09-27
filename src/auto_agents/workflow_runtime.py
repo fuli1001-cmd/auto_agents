@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .recovery.authority import entry as kernel_entry
 
 import hashlib
 import json
@@ -59,13 +60,17 @@ class WorkflowCoordinator:
         self.run_lock = run_lock
         self._preserve_engine_resume_budget = False
 
-    def _create_session(self, session: object):
+    def _create_session(self, session: object, *, workflow_id='', parent_handoff_id='', session_id=None, persist=True):
         state = create_session(
             self.project_root,
             session.mode,
             hard_ceiling=session.config.execution.session_limits.for_mode(
                 session.mode
             ),
+            workflow_id=workflow_id,
+            parent_handoff_id=parent_handoff_id,
+            session_id=session_id,
+            persist=persist,
         )
 
         session._fresh_session_id = state.session_id
@@ -112,7 +117,7 @@ class WorkflowCoordinator:
             and active.root.kind == "run"
             and session.mode == "provider_resolve"
         ):
-            state = self._create_session(session)
+            state = self._create_session(session,workflow_id=active.workflow_id)
             state.workflow_id = active.workflow_id
             state.auto_approve = bool(self.auto_approve)
             self._apply_authorization_policy(state)
@@ -220,11 +225,12 @@ class WorkflowCoordinator:
                 state = load_session_state(self.project_root, child_id)
                 retained_child = True
             except FileNotFoundError:
-                state = self._create_session(session)
+                state = self._create_session(session,workflow_id=snapshot.workflow_id,parent_handoff_id=handoff.handoff_id,
+                                             session_id=child_id,persist=False)
                 handoff.payload["child_session_id"] = state.session_id
                 self.store.save_handoff(handoff)
         else:
-            state = self._create_session(session)
+            state = self._create_session(session,workflow_id=snapshot.workflow_id,parent_handoff_id=handoff.handoff_id,persist=False)
             handoff.payload["child_session_id"] = state.session_id
             self.store.save_handoff(handoff)
         if retained_child:
@@ -310,7 +316,9 @@ class WorkflowCoordinator:
             migrate(registration['config'], {'project': str(self.project_root), 'invocation': {
                 'session_id' if root.kind in {'collab', 'fix', 'provider_resolve'} else 'run_id': root.native_id}})
         engine_resume = authority_valid and self._pending_engine_resume(state, session)
-        self._preserve_engine_resume_budget = bool(engine_resume)
+        from .recovery.authority import installed
+        kernel_managed = installed(self.project_root) is not None
+        self._preserve_engine_resume_budget = bool(engine_resume or kernel_managed)
         # Retain explicitly requested policies even when missing authority
         # blocks execution. Policy persistence cannot supply that authority.
         self.auto_approve = bool(state.auto_approve if engine_resume else self.auto_approve or state.auto_approve)
@@ -638,6 +646,7 @@ class WorkflowCoordinator:
         if snapshot.active_frame and snapshot.active_frame.kind == "run":
             self.orch.reconcile_runtime_interruption(snapshot_payload)
 
+    @kernel_entry
     def resume_workflow(self, workflow_id: str):
         snapshot = self.store.load(workflow_id)
         if snapshot.status == 'completed' and snapshot.root.kind != 'run':

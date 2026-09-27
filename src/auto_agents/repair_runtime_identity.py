@@ -24,6 +24,11 @@ class RuntimeIdentityError(RuntimeError):
 
 _MODULES = {
     'auto_agents': (),
+    'auto_agents.recovery.reducer': ('decide',),
+    'auto_agents.recovery.store': ('KernelStore.apply', 'KernelStore.replay'),
+    'auto_agents.recovery.executor': ('Executor.execute', 'Executor.reconcile'),
+    'auto_agents.recovery.native': ('perform', 'review_candidate', 'recovered_route'),
+    'auto_agents.recovery.engine': ('EngineRunner.run', 'IsolatedEngineEffects.execute', 'submit'),
     'auto_agents.config': (),
     'auto_agents.orchestrator': ('Orchestrator.resume_saved_run',
         'Orchestrator._reconcile_iteration_plan_scope_repair', 'Orchestrator._task_plan_validation_errors',
@@ -73,6 +78,25 @@ def _code_at(code, names):
     return code
 
 
+def _recovery_entry_function(value, runtime):
+    """Authenticate our entry wrapper before observing its enclosed function.
+
+    Blind inspect.unwrap() would allow a replaced executor to claim another
+    function's identity through __wrapped__.
+    """
+    path = runtime / 'src/auto_agents/recovery/authority.py'
+    actual = getattr(value, '__code__', None)
+    if actual is None or Path(actual.co_filename).resolve() != path:
+        return value
+    frozen = _code_at(compile(path.read_bytes(), actual.co_filename, 'exec',
+                            dont_inherit=True, optimize=sys.flags.optimize), ['entry', 'wrapped'])
+    if actual != frozen: return value
+    captures = dict(zip(actual.co_freevars, value.__closure__ or ()))
+    method = captures.get('method')
+    enclosed = method.cell_contents if method else None
+    return enclosed if enclosed is getattr(value, '__wrapped__', None) else value
+
+
 def observe_engine(runtime, *, expected_commit=None):
     runtime = Path(runtime).resolve()
     commit = subprocess.run(['git', '-C', str(runtime), 'rev-parse', 'HEAD'],
@@ -113,6 +137,7 @@ def observe_engine(runtime, *, expected_commit=None):
                 value = module
                 for part in function.split('.'):
                     value = getattr(value, part, None)
+                value = _recovery_entry_function(value, runtime)
                 actual = getattr(value, '__code__', None)
                 # Older engines may lack a recovery entrypoint. Report that
                 # absence; the actual resume must still prove its behavior.

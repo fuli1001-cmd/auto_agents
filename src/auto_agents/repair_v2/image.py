@@ -200,7 +200,10 @@ def _tool_image(root, python, driver, *, codex_binary=None):
     for source in ('/etc/nsswitch.conf', '/etc/services', '/etc/protocols', '/etc/os-release', '/usr/lib/ssl/openssl.cnf'):
         copy_file(source)
     from . import images
-    identity = digest([records, os.getuid(), os.getgid(), images.owner(), 3])[:24]
+    from ..repair_dependencies import verification_dependency_state
+    tools = verification_dependency_state(python)
+    search_path = ':'.join([*tools.get('path_entries',[]),paths['prefix'] + '/bin','/usr/bin','/bin','/usr/sbin','/sbin'])
+    identity = digest([records, os.getuid(), os.getgid(), images.owner(), search_path, 4])[:24]
     image = 'auto-agents-verifier:v2-' + identity
     code, _ = run(['docker', 'image', 'inspect', image], timeout=15)
     if code:
@@ -217,7 +220,7 @@ def _tool_image(root, python, driver, *, codex_binary=None):
         total = sum(p.stat().st_size for key, p in sources.items()
                     if not key.startswith('@wrapper:') and records[key][0] != 'link')
         require_space(stage, total)
-        import_image(image, records, sources, generated, paths['prefix'], stage / 'build.log')
+        import_image(image, records, sources, generated, paths['prefix'], stage / 'build.log', search_path=search_path)
     code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
         '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'PYTHONDONTWRITEBYTECODE=1', image, 'python', '-c',
         'import sqlite3,ssl,bz2,lzma,ctypes,uuid,regex,pytest; print("toolchain ready")'], timeout=30)
@@ -242,12 +245,13 @@ def _tool_image(root, python, driver, *, codex_binary=None):
     return image
 
 
-def import_image(image, records, sources, generated, prefix, logfile):
+def import_image(image, records, sources, generated, prefix, logfile, *, search_path=None):
     """Stream only verified tool files into Docker; never duplicate the rootfs."""
     from .docker import run
     from . import images
+    search_path = search_path or prefix + '/bin:/usr/bin:/bin:/usr/sbin:/sbin'
     temporary = 'auto-agents-verifier:building-' + uuid.uuid4().hex
-    command = ['docker', 'import', '--change', 'ENV PATH=' + prefix + '/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    command = ['docker', 'import', '--change', 'ENV PATH=' + search_path,
                '--change', 'WORKDIR /work', '--change', 'LABEL org.auto-agents.purpose=repair-verifier-v2',
                '--change', 'LABEL org.auto-agents.registry=' + images.owner(), '-', temporary]
     class CheckedReader:

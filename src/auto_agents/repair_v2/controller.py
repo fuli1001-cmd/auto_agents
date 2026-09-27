@@ -385,12 +385,10 @@ class Controller:
                 self.store.read(self.state['review']), ensure_ascii=False)
         schema = REVIEW_SCHEMA
         if changes is not None:
-            from copy import deepcopy
-            schema = deepcopy(REVIEW_SCHEMA)
-            schema['properties']['change_coverage'] = {'type': 'array', 'items': {'type': 'object',
-                'properties': {k: {'type': 'string'} for k in ('change', 'requirement', 'reason', 'evidence')},
-                'required': ['change', 'requirement', 'reason', 'evidence'], 'additionalProperties': False}}
-            schema['required'].append('change_coverage')
+            from ..recovery.protocol import ReviewManifest
+            manifest = ReviewManifest(identity, self.request.engine_base, self.state['request_digest'],
+                                      tuple(r.identity for r in self.request.acceptance), changes)
+            schema = manifest.schema(REVIEW_SCHEMA)
             prompt += ('\nCover EVERY hunk in change_coverage:[{change,requirement,reason,evidence}]. '
                        'requirement names a frozen requirement, or repair-regression ONLY for undoing a regression '
                        'introduced by this candidate (cite the introducing change and failing check). '
@@ -401,6 +399,7 @@ class Controller:
                        'to this repair or remove them to narrow the repair scope. '
                        'Do not run another necessity investigation when the supplied evidence is complete.\n'
                        + json.dumps(changes, ensure_ascii=False))
+            prompt += '\n' + manifest.instruction()
         reply = self.agent('review', prompt, snapshot, schema=schema, cancel=cancel)
         try: result = review_result(reply.text, identity, {r.identity for r in self.request.acceptance}, changes)
         except RepairBlocked as error:
@@ -414,9 +413,11 @@ class Controller:
                     or not isinstance(original.get('findings'), list)):
                 raise error
             self.checkpoint(review_format_retries=1)
-            reply = self.agent('review', 'Correct only the result envelope of the previous review; preserve all '
+            correction = (manifest.correction(digest(reply.text), reply.text, error) if changes is not None else
+                'Correct only the result envelope of the previous review; preserve all '
                 'substantive decisions and evidence. Return the requested JSON. Problem: ' + str(error)
-                + '\nOriginal response:\n' + reply.text, snapshot, schema=schema, cancel=cancel)
+                + '\nOriginal response:\n' + reply.text)
+            reply = self.agent('review', correction, snapshot, schema=schema, cancel=cancel)
             result = review_result(reply.text, identity, {r.identity for r in self.request.acceptance}, changes)
             if ((result.ok and original['decision'] != 'APPROVE')
                     or digest(result.findings) != digest(original['findings'])):

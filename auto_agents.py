@@ -11,7 +11,7 @@ if src_path in sys.path:
     sys.path.remove(src_path)
 sys.path.insert(0, src_path)
 
-from auto_agents.cli import main
+from auto_agents.bootstrap import main
 
 
 if __name__ == "__main__":

@@ -211,6 +211,14 @@ class Store:
             db.execute("INSERT INTO events(job,kind,payload,created) VALUES(?,?,?,?)",
                        (job, kind, json.dumps(payload or {}), time.time()))
 
+    def kernel_mode(self):
+        # Legacy immutable bootstraps need only read the dispatch fence. They
+        # must not import a new execution kernel merely to finish old work.
+        with self.connect() as db:
+            try: row = db.execute("SELECT value FROM kernel_meta WHERE key='mode'").fetchone()
+            except sqlite3.OperationalError: return None
+        return json.loads(row['value']) if row else None
+
     def retained_run_repair(self, project, run_id, fingerprint):
         """Return this run's stopped contract, never a cross-project hypothesis."""
         if not run_id or not fingerprint:
@@ -882,15 +890,23 @@ class Supervisor:
         return {"ok": True, "subscriber": identity}
 
     def dispatch(self, request, fds):
+        if request.get('version') == 2:
+            from .recovery.rpc import dispatch
+            from .recovery.store import KernelStore
+            return dispatch(KernelStore(self.store.root), request)
         if request.get("version") != VERSION:
             raise RuntimeError("incompatible repair control protocol")
         op = request["op"]
+        kernel_mode = self.store.kernel_mode()
+        if kernel_mode in {'draining', 'active'} and op in {'register','submit','resume','retry-publish'}:
+            raise RuntimeError('legacy repair control is fenced; use recovery protocol 2')
         if op in {'request-decision', 'decision-status', 'answer-decision', 'detach-decision'}:
             return self.decision_dispatch(request)
         if op == "ping":
             return {"ok": True, "version": VERSION, "pid": os.getpid(), "ticks": start_ticks(os.getpid()),
                     "implementation_revision": self.config.get("implementation_revision", ""),
-                    "capabilities": ["managed-verification-v1", "unified-repair-v2"]}
+                    "capabilities": ["managed-verification-v1", "unified-repair-v2",
+                                     *(['recovery-kernel-v1'] if Path(__file__).with_name('recovery').is_dir() else [])]}
         if op.startswith("verify-"):
             return self.verification_dispatch(request)
         if op == "register":
@@ -1104,6 +1120,9 @@ class Supervisor:
                 self.stop_process(RecoveredProcess({"pid": pid, "ticks": ticks}))
 
     def tick(self):
+        if self.store.kernel_mode() == 'active':
+            self.tick_verifications()
+            return
         with self.store.connect() as db:
             ready = [row[0] for row in db.execute("SELECT id FROM jobs WHERE state='ready'")]
         for identity in ready:
@@ -1369,6 +1388,8 @@ class Supervisor:
                 self.store.publish_later(identity, detail=str(error))
 
     def launch_worker(self, identity, operation):
+        if self.store.kernel_mode() in {'draining','active'}:
+            return
         job = self.store.job(identity)
         subscribers = self.store.subscriptions(identity)
         registration = next((self.registrations[item["id"]] for item in subscribers if item["id"] in self.registrations and item["state"] != "cancelled"), None)
@@ -1412,6 +1433,8 @@ class Supervisor:
             "pid": process.pid, "ticks": start_ticks(process.pid), "generation": job["generation"], "operation": operation})
 
     def launch_resume(self, row):
+        if self.store.kernel_mode() in {'draining','active'}:
+            return
         registration = self.registrations.get(row["id"])
         if registration is None:
             with self.store.connect() as db:

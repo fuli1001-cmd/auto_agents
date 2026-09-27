@@ -12,7 +12,7 @@ from .workspace import git, inventory, source_identity
 def prepare(controller, repository, revision, *, force_check=False, locked=False):
     with nullcontext() if locked else controller.store.locked():
         state = controller.store.load()
-        if not state or state['status'] in ('waiting_user', 'skipped'):
+        if not state or state['status'] in ('waiting_user', 'skipped', 'complete'):
             return False
         if state['request_digest'] != digest(controller.request.to_dict()):
             raise RepairBlocked('request_changed', 'source refresh differs from the frozen repair contract')
