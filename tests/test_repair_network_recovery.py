@@ -43,7 +43,7 @@ def test_read_only_review_connection_recovery_is_bounded_and_preserves_session(t
     else:
         with pytest.raises(ProvidersExhaustedError) as failure_info:
             orchestrator._call_with_failover(request)
-        assert failure_info.value.category == ('connection' if outcome == 'disconnected' else 'provider_error')
+        assert failure_info.value.category == ('connection' if outcome == 'disconnected' else 'quota')
     assert adapter.calls == (1 if outcome == 'quota' else 2)
     if outcome != 'quota':
         assert adapter.requests[1].resume_session_id == 'review-session'

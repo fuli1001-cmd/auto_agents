@@ -50,6 +50,7 @@ class Verifier:
 def test_preflight_repair_review_retains_goal_but_owns_only_engine_recovery(job, monkeypatch):
     from dataclasses import replace
     from types import SimpleNamespace
+    import json
     from auto_agents.repair_v2.review_evidence import completion_boundary
 
     original, store, workspace = job
@@ -64,12 +65,19 @@ def test_preflight_repair_review_retains_goal_but_owns_only_engine_recovery(job,
     runner.scope = SimpleNamespace(context={'incident': {'phase': 'preflight', 'owner': owner},
         'owner': {'workflow_id': 'retained-workflow'}, 'original_goal': goal}, current=lambda: None)
     runner.context = lambda: goal + '\n' + obligation
-    monkeypatch.setattr('auto_agents.repair_v2.scope.changes', lambda *args: [])
+    monkeypatch.setattr('auto_agents.repair_v2.scope.changes',
+                        lambda *args: {'retained-hunk': 'diff --git a/source.py b/source.py'})
     prompts = []
     run = driver.run
     def observed(role, prompt, *args, **kwargs):
         if role == 'review': prompts.append(prompt)
-        return run(role, prompt, *args, **kwargs)
+        reply = run(role, prompt, *args, **kwargs)
+        if role == 'review':
+            answer = json.loads(reply.text)
+            answer['change_coverage'] = [{'change': 'retained-hunk', 'requirement': 'value',
+                'reason': 'restore the blocked preflight', 'evidence': 'test_value observes the repair'}]
+            return replace(reply, text=json.dumps(answer))
+        return reply
     driver.run = observed
     runner.workspace.prepare()
     identity, snapshot = runner.workspace.freeze()
@@ -83,6 +91,7 @@ def test_preflight_repair_review_retains_goal_but_owns_only_engine_recovery(job,
     assert len(prompts) == 1 and goal in prompts[0] and obligation in prompts[0]
     assert 'Do not require production edits or paid product operations' in prompts[0]
     assert 'Every engine behavior, preservation check and actual child-entry proof remains mandatory' in prompts[0]
+    assert 'retained-hunk' in prompts[0]
     assert request.to_dict() == runner.request.to_dict()
     runner.scope.context['incident']['phase'] = 'verification'
     assert completion_boundary(runner) is None

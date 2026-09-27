@@ -59,7 +59,8 @@ def test_provider_home_copies_only_selected_configuration_and_preserves_refresh(
     (original / '.codex/config.toml').write_text('model = "chosen"\n')
     history = original / '.copilot/profiles/deep/session-state'
     history.mkdir(parents=True); (history / 'unrelated.txt').write_text('never copy')
-    sandbox = AgentSandbox(tmp_path / 'private', 'image', kind='codex')
+    sandbox = AgentSandbox(tmp_path / 'private', 'image', kind='codex',
+                           environment={'HOME': str(original)})
     with patch.object(Path, 'home', return_value=original):
         home = sandbox.home('plan')
         (home / '.codex/auth.json').write_text('{"token":"refreshed"}')
@@ -74,7 +75,8 @@ def test_antigravity_native_token_without_extension_is_copied(tmp_path):
     native = original / '.gemini/antigravity-cli'; native.mkdir(parents=True)
     (native / 'antigravity-oauth-token').write_text('private-auth')
     with patch.object(Path, 'home', return_value=original):
-        home = AgentSandbox(tmp_path / 'private', 'image', kind='antigravity').home('plan')
+        home = AgentSandbox(tmp_path / 'private', 'image', kind='antigravity',
+                            environment={'HOME': str(original)}).home('plan')
     token = home / '.gemini/antigravity-cli/antigravity-oauth-token'
     assert token.read_text() == 'private-auth' and token.stat().st_mode & 0o777 == 0o600
 

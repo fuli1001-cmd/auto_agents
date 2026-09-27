@@ -3282,7 +3282,7 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(runner_calls["count"], 1)
             self.assertIn("Starting automatic auto_agents self-repair", stderr.getvalue())
-            self.assertIn("Status: Recovering the task", stderr.getvalue())
+            self.assertIn("Tool repair checked; preparing to continue the original task", stderr.getvalue())
             self.assertTrue(any(
                 "Resuming run without a new repair" in path.read_text(encoding="utf-8")
                 for path in (project_root / ".auto-agents/runs").rglob("events.jsonl")
@@ -4699,7 +4699,7 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertEqual(state.status, "paused")
             rendered = stream.getvalue()
-            self.assertIn("    Requirements", rendered)
+            self.assertIn("[Requirements] Starting", rendered)
             self.assertNotIn("provider=mock", rendered)
             self.assertIn("[stage:clarify] start provider=mock model=mock",
                           (orchestrator.reporter.root / "run.log").read_text())
@@ -5386,7 +5386,7 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(config.retries.per_stage["sync-agent-instructions"], 2)
 
     def test_copilot_cli_adapter_builds_command_with_profile_config_dir(self) -> None:
-        from auto_agents.adapters.copilot_cli import CopilotCliAdapter, DEFAULT_PROFILES_ROOT
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter
 
         config = ProviderConfig(
             kind="copilot-cli",
@@ -5401,12 +5401,13 @@ class ProjectValidationTests(unittest.TestCase):
             cwd=Path("/tmp/test"),
             output_path=Path("/tmp/test/out.md"),
         )
-        cmd = adapter._build_command(request)
+        with patch.object(adapter, "environment", return_value={"HOME": "/tmp/copilot-profile-test"}):
+            cmd = adapter._build_command(request)
         self.assertEqual(cmd[0], "copilot")
         self.assertIn("--config-dir", cmd)
         config_dir_index = cmd.index("--config-dir")
         resolved = cmd[config_dir_index + 1]
-        self.assertEqual(resolved, str(DEFAULT_PROFILES_ROOT / "deep"))
+        self.assertEqual(resolved, "/tmp/copilot-profile-test/.copilot/profiles/deep")
         self.assertIn("--allow-all", cmd)
         self.assertIn("--no-ask-user", cmd)
         self.assertIn("--no-color", cmd)

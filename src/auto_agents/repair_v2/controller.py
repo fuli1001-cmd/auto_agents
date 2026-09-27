@@ -54,7 +54,10 @@ def review_result(text, snapshot, requirements, changes=None):
             raise RepairBlocked('review_format', 'approval needs concrete test coverage for every requirement')
     change_coverage = result.get('change_coverage', [])
     if changes is not None and result['decision'] == 'APPROVE' and not findings:
-        if (not isinstance(change_coverage, list) or len(change_coverage) != len(changes)
+        # Current source may already resolve the incident with no new hunks.
+        # Requirement coverage above and recovery/validation below still apply.
+        if (not isinstance(change_coverage, list)
+                or len(change_coverage) != len(changes)
                 or any(not isinstance(row, dict) or row.get('change') not in changes
                        or row.get('requirement') not in requirements | {'repair-regression'}
                        or not str(row.get('reason', '')).strip()

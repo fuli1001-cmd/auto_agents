@@ -2598,7 +2598,14 @@ class SessionCollabFlowTests(unittest.TestCase):
                 "y",
             ]
             inputs = iter(user_inputs)
-            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+            captured = io.StringIO()
+            assistance_offsets = []
+            def respond(_prompt):
+                answer = next(inputs, "")
+                if answer == "I opened the browser and see the player":
+                    assistance_offsets.append(len(captured.getvalue()))
+                return answer
+            orchestrator = Orchestrator(project_root, user_input_fn=respond)
 
             call_count = {"n": 0}
 
@@ -2623,7 +2630,6 @@ class SessionCollabFlowTests(unittest.TestCase):
 
             orchestrator.adapter.run = mock_run
             session = Session(orchestrator, mode="collab")
-            captured = io.StringIO()
             orchestrator.reporter.presenter.stream = captured
             with redirect_stderr(captured):
                 state = session.start()
@@ -2637,9 +2643,9 @@ class SessionCollabFlowTests(unittest.TestCase):
                         if event.get("message", "").strip() == "Agent is thinking, please wait..."
                         and event.get("audience") == "user"]
             self.assertEqual(len(thinking), 3)
-            after_input = captured.getvalue().split("Status: Waiting for input", 1)
-            self.assertEqual(len(after_input), 2)
-            self.assertIn("Agent is thinking, please wait...", after_input[1])
+            self.assertEqual(len(assistance_offsets), 1)
+            self.assertIn("Agent is thinking, please wait...",
+                          captured.getvalue()[assistance_offsets[0]:])
 
     def test_collab_flow_commits_completed_session_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

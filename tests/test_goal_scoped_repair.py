@@ -135,6 +135,48 @@ def test_each_actual_diff_hunk_needs_review_coverage(tmp_path):
     assert review_result(text, 'candidate', {'video'}, {'one': 'needed'}).ok
 
 
+def test_already_corrected_source_needs_requirement_coverage_but_no_invented_hunks():
+    from auto_agents.repair_v2.controller import review_result
+    result = {'decision': 'APPROVE', 'findings': [], 'change_coverage': [],
+              'coverage': [{'requirement': 'video', 'nodes': ['tests/test_video.py::test_video']}]}
+    assert review_result(json.dumps(result), 'candidate', {'video'}, {}).ok
+    with pytest.raises(RepairBlocked):
+        review_result(json.dumps(result), 'candidate', {'video'}, {'repair': 'actual change'})
+    result['coverage'] = []
+    with pytest.raises(RepairBlocked):
+        review_result(json.dumps(result), 'candidate', {'video'}, {})
+
+
+def test_preserved_upstream_tip_cannot_hide_shared_repair_hunks(tmp_path):
+    from auto_agents.repair_v2.workspace import git
+    root = tmp_path / 'engine'; root.mkdir()
+    git(root, 'init', '-q')
+    (root / 'repair.py').write_text('value = 0\n')
+    (root / 'logging.py').write_text('message = "old"\n')
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'baseline')
+    base = git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', '-qb', 'candidate')
+    (root / 'repair.py').write_text('value = 1\n')
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'focused repair')
+    git(root, 'checkout', '-qb', 'upstream', base)
+    (root / 'repair.py').write_text('value = 1\n')
+    (root / 'recovery.py').write_text('enabled = True\n')
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'integrate repair and recovery')
+    (root / 'logging.py').write_text('message = "new"\n')
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'independent logging')
+    upstream = git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', '-q', 'candidate')
+    git(root, 'merge', '--no-edit', upstream)
+
+    scoped = changes(root, base, [upstream])
+    paths = {row.splitlines()[0] for row in scoped.values()}
+    assert (root / 'logging.py').read_text() == 'message = "new"\n'
+    assert any('repair.py' in row for row in paths)
+    assert any('recovery.py' in row for row in paths)
+    assert not any('logging.py' in row for row in paths)
+    assert len(scoped) == 2
+
+
 def test_user_choice_is_durable_explicit_and_not_repeated(scene):
     project, source, payload, proposal = scene
     ctx = context(project, payload)
