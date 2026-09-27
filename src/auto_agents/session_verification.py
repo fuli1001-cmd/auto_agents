@@ -598,7 +598,7 @@ def _validate_binding_inventory(session, state):
             *(step.command or command_from_verification_step(step, session.project_root)
               for step in gates.steps), *_legacy_commands(gates),
             binding.get('fix_verify_command', state.fix_verify_command),
-        ])
+        ], candidate=False)
 
 
 def _validate_task_authority(state):
@@ -1277,7 +1277,7 @@ def _seal_proof_sources_in_context(session, state, gates):
     _validate_required_node_selection(session, state, [
         *(step.command or command_from_verification_step(step, session.project_root) for step in gates.steps),
         *_legacy_commands(gates), state.fix_verify_command,
-    ])
+    ], candidate=False)
     binding['proof_execution_context'] = proof_context_descriptor(session, state, gates)
     binding['binding_fingerprint'] = fingerprint({key: value for key, value in binding.items()
                                                   if key != 'binding_fingerprint'})
@@ -1348,7 +1348,7 @@ def _seal_imported_pytest_sources(session, state, gates, revision):
     binding['proof_source_owners'] = source_owners
 
 
-def _validate_required_node_selection(session, state, commands):
+def _validate_required_node_selection(session, state, commands, *, candidate=None):
     """Path containment and proof labels cannot attest a deselected node.
 
     Name/marker filters require actual collection evidence from retained source.
@@ -1375,7 +1375,10 @@ def _validate_required_node_selection(session, state, commands):
     rejected = {ref: [] for ref in refs}
     unparsed = []
     focused = binding.get('task_scope', {}).get('mode') == 'focused_fix'
-    candidate = focused and bool(state.candidate_custody.get('receipt'))
+    # Binding proves retained authority; candidate selection is verified at
+    # validate_selected_contracts, where defects can become repair feedback.
+    if candidate is None:
+        candidate = focused and bool(state.candidate_custody.get('receipt'))
     for command in commands:
         if len(covered) == len(refs):
             break

@@ -1,6 +1,7 @@
 """One goal-bound necessity receipt, shared by routing, planning and review."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 
@@ -201,11 +202,19 @@ def witnesses(refs, target, source):
                     raw = json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
                     checksum = digest(value)
                 else:
-                    if path.stat().st_size > 4 * 1024 * 1024:
-                        raise RepairBlocked('scope_evidence', '请引用更精确的失败依据。')
-                    raw = path.read_bytes()
-                    checksum = hashlib.sha256(raw).hexdigest()
-                if len(raw) > 4 * 1024 * 1024:
+                    # Whole-file witnesses retain only a digest. Session files
+                    # can contain large candidate preimages; hashing them must
+                    # not load or inject that payload into model context.
+                    value = hashlib.sha256()
+                    with path.open('rb') as stream:
+                        before = os.fstat(stream.fileno())
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                            value.update(chunk)
+                        after = os.fstat(stream.fileno())
+                    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                        raise RepairBlocked('scope_evidence', '失败证据内容已变化，不能复用旧依据。')
+                    raw, checksum = None, value.hexdigest()
+                if raw is not None and len(raw) > 4 * 1024 * 1024:
                     raise RepairBlocked('scope_evidence', '请引用更精确的失败依据。')
                 if selected.get('sha256') and checksum != selected['sha256']:
                     raise RepairBlocked('scope_evidence', '失败证据内容已变化，不能复用旧依据。')

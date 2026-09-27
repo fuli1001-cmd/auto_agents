@@ -29,6 +29,32 @@ def scene(tmp_path):
     return project, source, payload, proposal
 
 
+def test_large_session_witness_streams_all_bytes_and_revalidates(scene, tmp_path, monkeypatch):
+    import hashlib
+    project, source, payload, proposal = scene
+    path = project / 'large-session.json'
+    content = json.dumps({'candidate_custody': {'preimages': 'x' * (5 * 1024 * 1024)},
+                          'execution_log': [{'result': 'candidate selection failed'}]}).encode()
+    path.write_bytes(content)
+    proposal['evidence_refs'] = [{'origin': 'target', 'path': path.name}]
+    original = Path.read_bytes
+    def bounded_read(self):
+        assert self != path, 'whole session evidence must be streamed'
+        return original(self)
+    monkeypatch.setattr(Path, 'read_bytes', bounded_read)
+    guard = ScopeGuard(tmp_path / 'scope', payload, project, source)
+    ref = guard.admit(proposal)
+    witness, = guard.store.read(ref)['witnesses']
+    assert witness['sha256'] == hashlib.sha256(content).hexdigest()
+    assert guard.current() == ref
+    with path.open('r+b') as stream:
+        stream.seek(len(content) // 2); stream.write(b'y')
+    assert guard.current() is None
+    from auto_agents.repair_v2.scope import witnesses
+    with pytest.raises(RepairBlocked, match='已变化'):
+        witnesses([{**proposal['evidence_refs'][0], 'sha256': witness['sha256']}], project, source)
+
+
 def test_necessity_receipt_reuses_evidence_but_rejects_changed_source(scene, tmp_path):
     project, source, payload, proposal = scene
     guard = ScopeGuard(tmp_path / 'scope', payload, project, source)

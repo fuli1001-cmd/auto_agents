@@ -503,6 +503,8 @@ def recover_receipt(session, state):
     from .session_verification import validate_selected_contracts
     receipt = state.candidate_custody['receipt']
     admit_fresh_materialization(state)
+    from .execution_binding import RunnerContextError
+    selection_failure = None
     with session._session_verification_config():
         plan, commands = session._verification_plan_commands()
         from .proof_amendments import ProofReviewRequired, ensure
@@ -517,11 +519,18 @@ def recover_receipt(session, state):
                 state.status, state.resolution = 'executing', ''
                 return
             validate_selected_contracts(session, state, commands, metadata=plan.metadata)
+        except RunnerContextError as error:
+            selection_failure = {'ok': False, 'reason': str(error), 'executed_commands': 0,
+                                 **session._verification_preflight_failure(state, error)}
         identity = verification_identity(session, state)
     retained = next((entry for entry in reversed(state.execution_log)
         if entry.get('action') == 'receipt_verification' and entry.get('identity') == identity
         and entry.get('verification', {}).get('execution_identity') == identity), None)
-    if retained is None:
+    if selection_failure is not None:
+        result = selection_failure
+        session._append_verification_log(state, 'inventory_migration_verify', result)
+        identity = record_verification(session, state, result, identity=identity)
+    elif retained is None:
         # Legacy pass logs and delivered revisions do not attest this inventory.
         # A changed environment reopens diagnostics for the same candidate.
         state.verification_diagnostics = {}

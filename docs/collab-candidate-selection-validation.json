@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "incident_job": "3a630f320584434aaac901d6",
+  "read_only_check": {
+    "candidate_rejected": true,
+    "prompt_contains_owned_issue_and_tests": true,
+    "scope_admitted": true,
+    "live_bound_state_unchanged": true
+  },
+  "collection": {
+    "returncode": 4,
+    "phase": "runner_discovery",
+    "missing_nodes": [
+      "tests/test_storyboard_retry_contract_regressions.py::test_semantic_patch_includes_adjacent_dependency_context"
+    ]
+  },
+  "candidate_recovery": {
+    "ok": true,
+    "candidate_preserved": true,
+    "calls_intercepted": [
+      "fix"
+    ],
+    "model_calls_executed": 0,
+    "parent_budget_preserved": true,
+    "child_budget_before": {
+      "current_attempt": 1,
+      "attempt_epoch": 0,
+      "attempts_since_progress": 1,
+      "max_attempts": 4,
+      "hard_ceiling": 15
+    },
+    "child_budget_after": {
+      "current_attempt": 2,
+      "attempt_epoch": 0,
+      "attempts_since_progress": 2,
+      "max_attempts": 4,
+      "hard_ceiling": 15
+    },
+    "missing_nodes": [
+      "tests/test_storyboard_retry_contract_regressions.py::test_semantic_patch_includes_adjacent_dependency_context"
+    ],
+    "retry_fix": true,
+    "executed_tests": 0,
+    "returncode": 0
+  },
+  "original_goal_completed": false
+}

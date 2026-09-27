@@ -7,12 +7,23 @@ import shlex
 import subprocess
 import tempfile
 
+from .execution_binding import RunnerContextError
+
+
+class CandidateSelectionError(RunnerContextError):
+    """The authenticated candidate lacks explicitly required exact nodes."""
+
 
 PLUGIN = '''import json
 from pathlib import Path
 import pytest
 
 DESELECTED = []
+COLLECTION_ERRORS = []
+
+def pytest_collectreport(report):
+    if report.failed:
+        COLLECTION_ERRORS.append(report.nodeid)
 
 def pytest_addoption(parser):
     parser.addoption('--auto-agents-selection-report')
@@ -32,7 +43,8 @@ def pytest_sessionfinish(session, exitstatus):
         return result
     Path(session.config.getoption('--auto-agents-selection-report')).write_text(
         json.dumps({'version': 1, 'exitstatus': int(exitstatus),
-                    'selected': nodes(session.items), 'deselected': nodes(DESELECTED)}))
+                    'selected': nodes(session.items), 'deselected': nodes(DESELECTED),
+                    'collection_errors': COLLECTION_ERRORS}))
 '''
 
 
@@ -116,27 +128,40 @@ def selected_nodes(session, state, invocation, *, expected_missing=(), candidate
                 result = subprocess.run(argv, cwd=checkout, env=environment,
                                         capture_output=True, text=True, timeout=60)
             missing = frozenset()
-            if result.returncode == 4 and expected_missing and not candidate:
+            try:
+                observed = json.loads(report.read_text())
+            except (OSError, ValueError):
+                observed = {}
+            valid = (observed.get('version') == 1 and observed.get('exitstatus') == result.returncode
+                     and all(isinstance(observed.get(key), list)
+                             and all(isinstance(node, str) for node in observed[key])
+                             for key in ('selected', 'deselected', 'collection_errors')))
+            eligible_missing = invocation.repository_targets if candidate else expected_missing
+            if result.returncode == 4 and eligible_missing and valid and not observed['collection_errors']:
                 expected_paths = {
                     str(checkout / ref.split('::', 1)[0]) + '::' + ref.split('::', 1)[1]: ref
-                    for ref in expected_missing if '::' in ref
+                    for ref in eligible_missing if '::' in ref
                 }
                 errors = re.findall(r'^ERROR: not found: (.+)$', result.stderr, re.MULTILINE)
                 other_errors = [line for line in result.stderr.splitlines()
                                 if line.startswith('ERROR:') and not line.startswith('ERROR: not found: ')]
                 if errors and not other_errors and all(error.strip() in expected_paths for error in errors):
                     missing = frozenset(expected_paths[error.strip()] for error in errors)
-            if result.returncode not in (0, 5) and not missing:
-                error = RunnerContextError('discovery', 'retained pytest selection failed', invocation.raw)
+            if result.returncode not in (0, 5) and (not missing or candidate):
+                kind = 'candidate_selection' if candidate and missing else 'discovery'
+                error_type = CandidateSelectionError if kind == 'candidate_selection' else RunnerContextError
+                reason = 'retained pytest selection failed'
+                if kind == 'candidate_selection':
+                    reason += '; candidate is missing required tests: ' + ', '.join(sorted(missing))
+                error = error_type(kind, reason, invocation.raw)
                 error.diagnostic.update(returncode=result.returncode,
+                    phase='runner_discovery',
                     stdout_tail=redact_incident_text(result.stdout)[-2000:],
                     stderr_tail=redact_incident_text(result.stderr)[-2000:])
+                if kind == 'candidate_selection':
+                    error.diagnostic['missing_nodes'] = sorted(missing)
                 raise error
-            observed = json.loads(report.read_text())
-            if (observed.get('version') != 1 or observed.get('exitstatus') != result.returncode
-                    or any(not isinstance(observed.get(key), list)
-                           or not all(isinstance(node, str) for node in observed[key])
-                           for key in ('selected', 'deselected'))):
+            if not valid:
                 raise ValueError('invalid pytest selection report')
             selected = (frozenset(observed['selected']), frozenset(observed['deselected']))
             if missing:

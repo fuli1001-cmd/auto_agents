@@ -2229,7 +2229,7 @@ class Session:
 
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
         from .session_candidate import execution_checkout
-        from .execution_binding import ExecutionBindingError
+        from .execution_binding import ExecutionBindingError, RunnerContextError
         self._current_state = state
         try:
             self._fix_verify_command_for_execution(state.fix_verify_command)
@@ -2239,6 +2239,9 @@ class Session:
                         and state.status in {"completed", "failed", "blocked", "waiting_user", "paused"}):
                     return state
                 return self._phase_fix_execute_owned(state)
+        except (ConfinementPreflightError, RunnerContextError) as error:
+            kind = self._verification_preflight_failure(state, error)['failure_kind']
+            return self._block_execution_binding(state, error, kind)
         except SessionOwnershipError as error:
             return self._block_execution_binding(state, error, "verification_ownership")
         except ExecutionBindingError as error:
@@ -3727,6 +3730,29 @@ class Session:
             *self._goal_contexts(state),
             "",
         ]
+        # A child can retain the broad parent goal while its classified issue
+        # lives only in controller state, outside the private source checkout.
+        control = Path(getattr(self, '_custody_control_root', self.project_root))
+        issue_path = control / '.auto-agents/state/sessions' / state.session_id / 'issue.json'
+        if issue_path.exists():
+            if issue_path.is_symlink() or not issue_path.resolve().is_relative_to(control.resolve()):
+                raise ownership_error(state, 'retained fix issue leaves its control repository')
+            try:
+                issue = json.loads(issue_path.read_text())
+            except (OSError, ValueError) as error:
+                raise ownership_error(state, 'retained fix issue is unreadable') from error
+            if (not isinstance(issue, dict)
+                    or issue.get('issue_id', 'issue-' + state.session_id) != 'issue-' + state.session_id
+                    or issue.get('source_handoff_id', state.parent_handoff_id) != state.parent_handoff_id):
+                raise ownership_error(state, 'retained fix issue belongs to another session or handoff')
+            from .workflow_chain import IssueBriefBuilder
+            brief_text = IssueBriefBuilder.render(issue)
+            lines.extend(['Owned fix issue (the deliverable for this stage):',
+                          ContextBlock(brief_text, 'Classified fix issue', 'fix-issue'), ''])
+            consolidated = brief_text + '\n' + consolidated
+        if state.fix_verify_command:
+            lines.extend(['Required verification contract; preserve these checks and add planned missing tests:',
+                          ContextBlock(state.fix_verify_command, 'Required fix verification', 'fix-verification'), ''])
         if self._goal_environment_confirmed(state):
             lines.extend([*self._goal_environment_prompt_lines(state), ""])
         if feedback:
@@ -4238,6 +4264,7 @@ class Session:
             return plan, commands
 
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
+        from .execution_binding import RunnerContextError
         execution_identity = None
         publish_operation = getattr(
             self._health_runtime, "set_active_operation", None
@@ -4264,6 +4291,9 @@ class Session:
                     state.verification_diagnostics = {key: result}
                     self._save(state)
                 return result
+        except (ConfinementPreflightError, RunnerContextError) as error:
+            return {'ok': False, 'reason': str(error), 'executed_commands': 0,
+                    **self._verification_preflight_failure(self._current_state, error)}
         except SessionOwnershipError as error:
             return {"ok": False, "reason": str(error), "retry_fix": False,
                     "failure_kind": error.diagnostic.get('failure_kind', 'verification_ownership'), "executed_commands": 0,
@@ -4272,6 +4302,24 @@ class Session:
         finally:
             if callable(publish_operation):
                 publish_operation()
+
+    def _verification_preflight_failure(self, state, error):
+        from .execution_binding import RunnerContextError
+        from .pytest_selection import CandidateSelectionError
+        command = error.diagnostic.get('command', '')
+        original = error.diagnostic.get('original_command', command)
+        owners = diagnostic_owners(state, original, proof_ids=error.diagnostic.get('proof_ids', ()))
+        retry = isinstance(error, CandidateSelectionError)
+        diagnostic = {**error.diagnostic, 'session_id': state.session_id,
+            'workflow_id': state.workflow_id,
+            'handoff_id': state.verification_binding.get('original_handoff_id', state.parent_handoff_id),
+            'contract_fingerprint': state.verification_binding.get('contract_fingerprint', ''),
+            'command': command, 'original_command': original, 'owners': owners,
+            'task_ids': sorted({owner['task_id'] for owner in owners}),
+            'requirement_ids': sorted({key for owner in owners for key in owner['requirement_ids']}),
+            'retry_fix': retry}
+        kind = 'verification_' + error.kind if isinstance(error, RunnerContextError) else 'verification_confinement'
+        return {'retry_fix': retry, 'failure_kind': kind, 'diagnostic': diagnostic}
 
     @contextlib.contextmanager
     def _session_verification_config(self):
@@ -4933,27 +4981,7 @@ class Session:
         except (ConfinementPreflightError, RunnerContextError) as error:
             if error.partial_gate_result is not None:
                 record_gate(error.partial_gate_result)
-            command = error.diagnostic.get("command", "")
-            original_command = error.diagnostic.get("original_command", command)
-            owners = diagnostic_owners(state, original_command,
-                                       proof_ids=error.diagnostic.get("proof_ids", ()))
-            diagnostic = {
-                **error.diagnostic,
-                "session_id": state.session_id,
-                "workflow_id": state.workflow_id,
-                "handoff_id": state.verification_binding.get("original_handoff_id", state.parent_handoff_id),
-                "contract_fingerprint": state.verification_binding.get("contract_fingerprint", ""),
-                "command": command,
-                "original_command": original_command,
-                "owners": owners,
-                "task_ids": sorted({owner['task_id'] for owner in owners}),
-                "requirement_ids": sorted({key for owner in owners for key in owner['requirement_ids']}),
-                "retry_fix": False,
-            }
-            kind = ("verification_" + error.kind if isinstance(error, RunnerContextError)
-                    else "verification_confinement")
-            return outcome(False, str(error), retry_fix=False,
-                           failure_kind=kind, diagnostic=diagnostic)
+            return outcome(False, str(error), **self._verification_preflight_failure(state, error))
 
     def _fix_verify_command_for_execution(self, command: str) -> str:
         from .execution_binding import validate_verification_binding
