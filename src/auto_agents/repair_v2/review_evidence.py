@@ -1,6 +1,20 @@
 """Controller-produced recovery observations supplied to independent review."""
 
 
+def completion_boundary(controller):
+    """A preflight engine repair resumes product work; it cannot finish it."""
+    scope = getattr(controller, 'scope', None)
+    context = getattr(scope, 'context', {}) or {}
+    incident = context.get('incident') or {}
+    if (not controller.request.invocation.get('engine_route')
+            or incident.get('phase') != 'preflight'):
+        return None
+    return {'kind': 'engine_preflight_recovery', 'original_goal_completed': False,
+            'owner': context.get('owner'), 'blocked_operation': incident.get('owner'),
+            'remaining_goal': context.get('original_goal'),
+            'continuation': 'Resume the original workflow to complete its product repair and acceptance.'}
+
+
 def recovery_evidence(controller, identity):
     reference = controller.state.get('boundary_preflight')
     if not reference:

@@ -45,6 +45,7 @@ from .agent_instructions import (
     write_normalized_project_rules,
 )
 from .authorization import authorization_policy_for_state
+from .provider_selection import defer_selection, retain_selection
 from .prompting import (ContextBlock, PromptBlock, PromptSpec, append_context, compose_prompt,
                         instruction_fingerprint, policy_fingerprint, prepare_request)
 from .repomap import RepoMapBuilder, RepoMapResult
@@ -43675,6 +43676,7 @@ class Orchestrator:
                 changed = True
         return changed
 
+    @defer_selection
     def _run_agent_with_retries(
         self,
         state: Optional[RunState],
@@ -44951,10 +44953,18 @@ class Orchestrator:
         try:
             state = load_run_state(self.project_root)
             if state.run_id:
-                write_json(self._provider_selection_path(), {
+                record = {
                     "run_id": state.run_id,
                     "provider": provider,
-                })
+                }
+                if not retain_selection(self, record):
+                    self._persist_provider_selection(record)
+        except (OSError, RuntimeError, ValueError) as error:
+            self.logger.warning("[provider] could not save current provider: %s", error)
+
+    def _persist_provider_selection(self, record: dict) -> None:
+        try:
+            write_json(self._provider_selection_path(), record)
         except (OSError, RuntimeError, ValueError) as error:
             self.logger.warning("[provider] could not save current provider: %s", error)
 

@@ -1407,6 +1407,33 @@ def test_focused_fix_without_retained_task_plan_reenters_original_child(tmp_path
     assert {p: (root / p).read_bytes() for p in before} == before
 
 
+def test_focused_fix_with_task_id_and_missing_retained_plan_stays_blocked(tmp_path):
+    from auto_agents.config import load_task_plan
+    from auto_agents.session_verification import bind_session, SessionOwnershipError
+    from test_focused_fix_scope import focused_scene
+
+    root, child, store, original, _ = focused_scene(tmp_path)
+    ambient_plan = load_task_plan(root)
+    git(root, 'rm', '.auto-agents/state/task_plan.json')
+    git(root, 'commit', '-m', 'retain a revision without a development task plan')
+    revision = head_ref(root)
+    child.baseline_git_ref = child.baseline_head_ref = child.lineage_head_ref = revision
+    original.payload['head_before'] = revision
+    original.payload['task_id'] = 'task-owned'
+    store.save_handoff(original)
+    save_session_state(root, child)
+    save_task_plan(root, ambient_plan)
+    before = (root / '.auto-agents/state/task_plan.json').read_bytes()
+
+    with pytest.raises(SessionOwnershipError, match='focused fix conflicts with retained task authority'):
+        bind_session(Session(Orchestrator(root), mode='fix', auto_approve=True), child)
+
+    assert child.verification_binding == {}
+    assert child.current_attempt == 0
+    assert head_ref(root) == revision
+    assert (root / '.auto-agents/state/task_plan.json').read_bytes() == before
+
+
 @pytest.mark.parametrize('source', ['legacy', 'explicit_fix'])
 @pytest.mark.parametrize('target', ['implicit', 'directory', 'implicit_config', 'implicit_override',
                                     'implicit_toml', 'implicit_pyproject', 'implicit_addopts',

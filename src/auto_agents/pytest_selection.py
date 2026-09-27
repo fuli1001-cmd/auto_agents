@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tempfile
@@ -35,7 +36,32 @@ def pytest_sessionfinish(session, exitstatus):
 '''
 
 
-def selected_nodes(session, state, invocation):
+def _without_missing_targets(invocation, missing, environment):
+    """Recollect retained nodes under the same options, omitting only absent exact targets."""
+    from .execution_binding import RunnerContextError, test_invocations
+
+    omitted = [raw for raw, reference in zip(invocation.targets, invocation.repository_targets)
+               if reference in missing]
+    words = shlex.split(invocation.raw[invocation.option_offset:])
+    if not omitted or any(words.count(target) != 1 for target in omitted):
+        raise RunnerContextError('discovery', 'missing pytest targets cannot be isolated safely', invocation.raw)
+    for target in omitted:
+        words.remove(target)
+    command = invocation.raw[:invocation.option_offset].rstrip() + ' ' + shlex.join(words)
+    parsed = test_invocations(command, environment=environment)
+    expected_args = list(invocation.arguments)
+    for target in omitted:
+        expected_args.remove(target)
+    expected_targets = tuple(ref for ref in invocation.repository_targets if ref not in missing)
+    if (len(parsed) != 1 or parsed[0].runner != 'pytest'
+            or parsed[0].cwd != invocation.cwd or parsed[0].shell_cwd != invocation.shell_cwd
+            or parsed[0].arguments != tuple(expected_args)
+            or tuple(parsed[0].repository_targets) != expected_targets):
+        raise RunnerContextError('discovery', 'retained pytest options changed during collection', invocation.raw)
+    return parsed[0]
+
+
+def selected_nodes(session, state, invocation, *, expected_missing=(), candidate=False):
     from .execution_binding import prepare_conda_prefix, prepare_dependency_scratch, RunnerContextError
     from .gate_execution import discover_dependency_links
     from .session_candidate import _clone
@@ -46,9 +72,18 @@ def selected_nodes(session, state, invocation):
 
     root = Path(getattr(session, '_retained_source_root', session.project_root))
     revision = _contract_source_revision(session, state) or 'HEAD'
+    if candidate:
+        from .session_candidate import validate_receipt
+        from .session_source import validate_checkout
+        validate_receipt(state)
+        custody = state.candidate_custody
+        root = Path(custody['checkout'])
+        validate_checkout(getattr(session, '_custody_control_root', session.project_root), state, root)
+        revision = custody['receipt']['source_revision']
+    expected_missing = frozenset(expected_missing)
     environment = dict(current_context(session, state).environment)
     key = fingerprint([str(root), revision, invocation.raw, invocation.cwd,
-                       invocation.shell_cwd, environment, PLUGIN])
+                       invocation.shell_cwd, environment, PLUGIN, sorted(expected_missing), candidate])
     cache = getattr(session, '_pytest_selection_cache', None)
     if cache is None:
         cache = session._pytest_selection_cache = {}
@@ -80,7 +115,18 @@ def selected_nodes(session, state, invocation):
                     gate_environment_overrides={'TMPDIR': str(checkout), 'TMP': str(checkout), 'TEMP': str(checkout)}) as argv:
                 result = subprocess.run(argv, cwd=checkout, env=environment,
                                         capture_output=True, text=True, timeout=60)
-            if result.returncode not in (0, 5):
+            missing = frozenset()
+            if result.returncode == 4 and expected_missing and not candidate:
+                expected_paths = {
+                    str(checkout / ref.split('::', 1)[0]) + '::' + ref.split('::', 1)[1]: ref
+                    for ref in expected_missing if '::' in ref
+                }
+                errors = re.findall(r'^ERROR: not found: (.+)$', result.stderr, re.MULTILINE)
+                other_errors = [line for line in result.stderr.splitlines()
+                                if line.startswith('ERROR:') and not line.startswith('ERROR: not found: ')]
+                if errors and not other_errors and all(error.strip() in expected_paths for error in errors):
+                    missing = frozenset(expected_paths[error.strip()] for error in errors)
+            if result.returncode not in (0, 5) and not missing:
                 error = RunnerContextError('discovery', 'retained pytest selection failed', invocation.raw)
                 error.diagnostic.update(returncode=result.returncode,
                     stdout_tail=redact_incident_text(result.stdout)[-2000:],
@@ -93,6 +139,11 @@ def selected_nodes(session, state, invocation):
                            for key in ('selected', 'deselected'))):
                 raise ValueError('invalid pytest selection report')
             selected = (frozenset(observed['selected']), frozenset(observed['deselected']))
+            if missing:
+                retained = _without_missing_targets(invocation, missing, environment)
+                selected = selected_nodes(session, state, retained)
+            if expected_missing:
+                selected = (*selected, missing)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         raise RunnerContextError('discovery', 'retained pytest selection unavailable: ' + str(error),
                                  invocation.raw) from error
