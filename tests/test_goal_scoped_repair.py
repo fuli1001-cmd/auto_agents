@@ -9,6 +9,7 @@ import pytest
 from auto_agents.repair_v2.scope import ScopeGuard, changes, context
 from auto_agents.repair_v2.store import Store, atomic_json, digest
 from auto_agents.repair_v2.types import RepairBlocked, ValidationResult
+from auto_agents.repair_v2.workspace import git
 from auto_agents.repair_v2.comparison import POLICY, accepted, signatures, unchanged, verify
 from auto_agents.scope_decisions import Decisions, choose
 from test_repair_v2_controller import job
@@ -133,6 +134,39 @@ def test_each_actual_diff_hunk_needs_review_coverage(tmp_path):
         'change_coverage': [{'change': 'one', 'requirement': 'video', 'reason': 'restore video', 'evidence': 'test_video'}]})
     with pytest.raises(RepairBlocked): review_result(text, 'candidate', {'video'}, {'one': 'needed', 'two': 'unrelated'})
     assert review_result(text, 'candidate', {'video'}, {'one': 'needed'}).ok
+    empty = json.loads(text)
+    empty['change_coverage'] = []
+    with pytest.raises(RepairBlocked): review_result(json.dumps(empty), 'candidate', {'video'}, {})
+
+
+def test_preserved_upstream_tip_cannot_hide_shared_repair_hunks(tmp_path):
+    root = tmp_path / 'engine'; root.mkdir()
+    git(root, 'init', '-q')
+    (root / 'repair.py').write_text('value = 0\n')
+    (root / 'logging.py').write_text('message = "old"\n')
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'baseline')
+    base = git(root, 'rev-parse', 'HEAD')
+
+    git(root, 'checkout', '-qb', 'candidate')
+    (root / 'repair.py').write_text('value = 1\n')
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'focused repair')
+    git(root, 'checkout', '-qb', 'upstream', base)
+    (root / 'repair.py').write_text('value = 1\n')
+    (root / 'recovery.py').write_text('enabled = True\n')
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'integrate repair and recovery')
+    (root / 'logging.py').write_text('message = "new"\n')
+    git(root, 'add', '.'); git(root, 'commit', '-qm', 'independent logging')
+    upstream = git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', '-q', 'candidate')
+    git(root, 'merge', '--no-edit', upstream)
+
+    scoped = changes(root, base, [upstream])
+    paths = {row.splitlines()[0] for row in scoped.values()}
+    assert (root / 'logging.py').read_text() == 'message = "new"\n'
+    assert any('repair.py' in row for row in paths)
+    assert any('recovery.py' in row for row in paths)
+    assert not any('logging.py' in row for row in paths)
+    assert len(scoped) == 2
 
 
 def test_user_choice_is_durable_explicit_and_not_repeated(scene):

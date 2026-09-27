@@ -301,11 +301,34 @@ def changes(snapshot, base, parents=()):
         return result
     def signature(text):
         text = re.sub(r'^index .*\n', '', text, flags=re.MULTILINE)
-        return re.sub(r'^@@ .*?@@', '@@', text, flags=re.MULTILINE)
+        return re.sub(r'^@@ .*?@@', '@@', text, flags=re.MULTILINE).rstrip('\n')
+    def diff(left, right):
+        return hunks(git(snapshot, 'diff', '--binary', '--no-ext-diff', '--unified=3',
+                         left, right, '--'))
+    def signatures(left, right):
+        return {signature(text) for text in diff(left, right).values()}
+
     inherited = set()
     for parent in parents:
         git(snapshot, 'merge-base', '--is-ancestor', parent, 'HEAD')
-        inherited.update(signature(text) for text in hunks(git(snapshot, 'diff', '--binary',
-                          '--no-ext-diff', '--unified=3', base, parent, '--')).values())
+        upstream = signatures(base, parent)
+        # Source refresh merges the preserved tip into an existing repair
+        # candidate. The upstream branch may already contain that repair. Only
+        # commits after its shared repair prefix can be excluded as independent
+        # upstream work; subtracting base..tip would hide the repair itself.
+        candidate_before = None
+        for commit in git(snapshot, 'rev-list', '--first-parent', f'{base}..HEAD').splitlines():
+            merged = git(snapshot, 'rev-list', '--parents', '-n', '1', commit).split()[1:]
+            if parent in merged[1:]:
+                candidate_before = merged[0]
+                break
+        shared = signatures(base, candidate_before) & upstream if candidate_before else set()
+        if shared:
+            for commit in git(snapshot, 'rev-list', '--first-parent', '--reverse',
+                              f'{base}..{parent}').splitlines():
+                if shared <= signatures(base, commit):
+                    upstream = signatures(commit, parent)
+                    break
+        inherited.update(upstream)
     actual = hunks(git(snapshot, 'diff', '--binary', '--no-ext-diff', '--unified=3', base, '--'))
     return {key: text for key, text in actual.items() if signature(text) not in inherited}
