@@ -37,3 +37,14 @@ def test_status_remains_available_when_adopted_artifact_is_broken(tmp_path,monke
     from auto_agents.cli import main
     assert main(['repair','status','--json']) == 0
     assert 'missing-runtime' in capsys.readouterr().out
+
+
+def test_copied_supervisor_bootstrap_advertises_its_pinned_kernel(tmp_path,monkeypatch):
+    from auto_agents import repair_control
+    implementation = Path(repair_control.__file__).resolve().parents[2]
+    supervisor = repair_control.Supervisor({'root':str(tmp_path/'control'),
+        'source_root':str(tmp_path/'source'),'implementation_root':str(implementation)})
+    monkeypatch.setattr(repair_control,'__file__',str(tmp_path/'control/bootstrap.py'))
+    response = supervisor.dispatch({'version':1,'op':'ping'},[])
+    assert 'recovery-kernel-v1' in response['capabilities']
+    assert supervisor.dispatch({'version':2,'op':'kernel-status'},[])['protocol'] == 2

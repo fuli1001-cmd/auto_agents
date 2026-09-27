@@ -906,7 +906,9 @@ class Supervisor:
             return {"ok": True, "version": VERSION, "pid": os.getpid(), "ticks": start_ticks(os.getpid()),
                     "implementation_revision": self.config.get("implementation_revision", ""),
                     "capabilities": ["managed-verification-v1", "unified-repair-v2",
-                                     *(['recovery-kernel-v1'] if Path(__file__).with_name('recovery').is_dir() else [])]}
+                                     *(['recovery-kernel-v1'] if
+                                       (Path(self.config.get('implementation_root') or self.config['source_root']) /
+                                        'src/auto_agents/recovery').is_dir() else [])]}
         if op.startswith("verify-"):
             return self.verification_dispatch(request)
         if op == "register":
