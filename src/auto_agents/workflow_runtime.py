@@ -408,6 +408,16 @@ class WorkflowCoordinator:
                 return False
             parent = load_session_state(self.project_root, snapshot.root.native_id)
         handoff_id = parent.active_handoff_id
+        if not handoff_id:
+            returned = self._returned_blocked_handoff(parent, snapshot)
+            if returned is not None:
+                original = self._resolved_handoff_chain(returned, snapshot.workflow_id)[-1]
+                from .execution_binding import repository_binding_error
+                if repository_binding_error(self.project_root, original.payload):
+                    # A failed activation still owns its child. A later parent
+                    # suggestion cannot displace that durable return before
+                    # its exact engine receipt and child binding are checked.
+                    handoff_id = returned.handoff_id
         if not handoff_id and parent.mode == 'collab' and parent.conversation:
             # Repair can interrupt route dispatch before a handoff is written.
             # Inspect the exact pending reply before resetting the parent's
@@ -468,8 +478,8 @@ class WorkflowCoordinator:
             return None  # Missing custody is not an amendment; keep the engine binding check.
         return child if pending(child) else None
 
-    def _resume_blocked_engine_handoff(self, state, snapshot):
-        """Recheck a returned binding failure only at an explicit resume boundary."""
+    def _returned_blocked_handoff(self, state, snapshot):
+        """Resolve only this parent's durable blocked return, without changing it."""
         if (state.status != "blocked" or state.resolution not in {
                 'execution_binding_mismatch', 'verification_ownership', 'verification_execution_binding'}
                 or state.active_handoff_id or not state.last_child_result_ref):
@@ -486,6 +496,13 @@ class WorkflowCoordinator:
                 or handoff.parent != WorkflowRef(state.mode, state.session_id)
                 or not handoff.returned_at or handoff.status != "blocked"
                 or handoff.result.get("resolution") != state.resolution):
+            return
+        return handoff
+
+    def _resume_blocked_engine_handoff(self, state, snapshot):
+        """Recheck a returned binding failure only at an explicit resume boundary."""
+        handoff = self._returned_blocked_handoff(state, snapshot)
+        if handoff is None:
             return
         payload = handoff.payload
         if handoff.target == "resume":

@@ -248,6 +248,12 @@ def namespace_exec(payload):
                 kept.append((str(path), os.open(path, os.O_PATH | os.O_CLOEXEC)))
         if payload.get("ip"):
             subprocess.run([payload["ip"], "link", "set", "lo", "up"], check=True)
+        # Hide host runtime mounts before Codex/bwrap constructs its denied
+        # /run view. WSL's nested /run/WSL mounts otherwise require creating
+        # mountpoints below that already read-only view. This mount belongs
+        # only to our private namespace; the sandbox still denies /run.
+        subprocess.run([payload["mount"], "-t", "tmpfs", "-o", "mode=755,nosuid,nodev",
+                        "tmpfs", "/run"], check=True)
         subprocess.run([payload["mount"], "-t", "tmpfs", "-o", "mode=1777", "tmpfs", "/tmp"], check=True)
         if payload.get('private_shm'):
             subprocess.run([payload['mount'], '-t', 'tmpfs', '-o', 'mode=1777,nosuid,nodev',

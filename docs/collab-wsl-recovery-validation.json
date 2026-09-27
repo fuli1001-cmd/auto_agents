@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "incident_job": "9d2924157fbd47b6a15334b0",
+  "source_files": {
+    "verification_sandbox.py": "54ae7534c189be3d64fce89277063375badb0d3ab6cda1efa565f2d90c4b04dc",
+    "workflow_runtime.py": "518b5623e63f0b95f868386e61402545a34df40ae443275b2d13344b2b5aa9fa"
+  },
+  "replay": {
+    "ok": true,
+    "snapshot": "2e8c250b8f2a5f51935167c2613bb494a15ed00426de579c2072499f17a07ffb",
+    "runtime": "14bb81003224f9c3d294511de257fe4c1854d1121d5c08dfc11d6a7795e253f6",
+    "returncode": 0,
+    "isolation_profile": "session",
+    "environment_inputs": [
+      {
+        "prefix": "/home/fuli/projects/sdgp/.conda",
+        "digest": "348af74b437c614ee9dc1ed6e7dee67d86dd9b873a1186ae95ec8a7b4683fc7a",
+        "kind": "conda-runtime-prefix",
+        "activation_state_included": false
+      },
+      {
+        "prefix": "/home/fuli/projects/sdgp/workbench/node_modules",
+        "digest": "a2dfdd1d46b0774899a555781e43b7b1e4b46ea553d32b0343b0aed40e033297",
+        "kind": "node-dependencies",
+        "credential_files_excluded": true
+      }
+    ],
+    "live_bound_records_unchanged": true
+  },
+  "observation": {
+    "ok": true,
+    "status": "next_provider_boundary",
+    "session_id": "091707202dc3",
+    "route_consumed": true
+  },
+  "recovery": {
+    "ok": true,
+    "parent_session_id": "091707202dc3",
+    "child_session_id": "891c808047b7",
+    "boundary_session_id": "891c808047b7",
+    "original_handoff_id": "hf-d05add764339",
+    "boundary_kind": "implementation",
+    "preflight_rechecked": true,
+    "retained_constraints": true,
+    "diagnostic_provider_calls": 0,
+    "provider_boundary_calls": 1,
+    "parent_budget": {
+      "before": {
+        "current_attempt": 13,
+        "attempt_epoch": 2,
+        "attempts_since_progress": 3,
+        "max_attempts": 10,
+        "hard_ceiling": 25
+      },
+      "after": {
+        "current_attempt": 13,
+        "attempt_epoch": 2,
+        "attempts_since_progress": 3,
+        "max_attempts": 10,
+        "hard_ceiling": 25
+      }
+    },
+    "child_budget": {
+      "before": {
+        "current_attempt": 0,
+        "attempt_epoch": 0,
+        "attempts_since_progress": 0,
+        "max_attempts": 4,
+        "hard_ceiling": 15
+      },
+      "after": {
+        "current_attempt": 1,
+        "attempt_epoch": 0,
+        "attempts_since_progress": 1,
+        "max_attempts": 4,
+        "hard_ceiling": 15
+      }
+    }
+  },
+  "original_goal_completed": false
+}

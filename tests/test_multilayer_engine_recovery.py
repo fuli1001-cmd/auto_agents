@@ -85,6 +85,40 @@ def assert_recovery_budget(observed, reservations):
         'attempts_since_progress': before['attempts_since_progress'] + reservations}
 
 
+@pytest.mark.parametrize('receipt', ['matching', 'mismatch'])
+def test_returned_engine_recovery_precedes_later_parent_route(tmp_path, receipt):
+    root, child, store, snapshot, original, active, route, _ = incident(tmp_path)
+    store.record_result(snapshot, active, status='blocked', result={
+        'status': 'blocked', 'resolution': 'verification_ownership',
+        'session_id': child.session_id, 'summary': 'host confinement failed'})
+    store.consume_result(snapshot, active, operation_id='failed-live-activation')
+    parent = load_session_state(root, 'parent')
+    parent.status, parent.resolution, parent.active_handoff_id = 'blocked', 'verification_ownership', ''
+    parent.last_child_result_ref = str(store.handoff_path(active.handoff_id))
+    # After the failed activation, the parent proposed an engine repair of
+    # the engine envelope (which has no product child), as in the incident.
+    later = {'target': 'fix', 'reason': 'new confinement failure',
+             'target_repository': str(ENGINE), 'issue_seed': {
+                 'summary': 'repair confinement', 'failed_handoff_id': active.handoff_id,
+                 'original_handoff_id': original.handoff_id}}
+    parent.conversation.append({'role': 'assistant', 'content': 'ROUTE_WORKFLOW v1: ' + json.dumps(later)})
+    save_session_state(root, parent)
+    returned = store.handoff_path(active.handoff_id).read_bytes()
+    before = child.to_dict()
+    report = replay(root, route, tmp_path, receipt=receipt)
+    assert report['ok'] is (receipt == 'matching'), report
+    assert store.handoff_path(active.handoff_id).read_bytes() == returned
+    saved = load_session_state(root, child.session_id)
+    if receipt == 'matching':
+        observation = report['recovery_observation']
+        assert observation['boundary_session_id'] == child.session_id
+        assert observation['original_handoff_id'] == original.handoff_id
+        assert_recovery_budget(observation, 1)
+        assert len(list((root / '.auto-agents/state/sessions').iterdir())) == 2
+    else:
+        assert saved.to_dict() == before
+
+
 @pytest.mark.parametrize('entry', ['engine', 'resume', 'returned_resume', 'child'])
 def test_public_multilayer_recovery_rechecks_retained_child(tmp_path, entry):
     root, child, store, _, original, active, route, old = incident(
