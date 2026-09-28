@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS kernel_results(
 CREATE TABLE IF NOT EXISTS kernel_project_heads(
  project TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,
  PRIMARY KEY(project, kind));
+CREATE TABLE IF NOT EXISTS kernel_runtimes(
+ id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, artifact TEXT NOT NULL,
+ inode TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, trash TEXT NOT NULL DEFAULT '',
+ error TEXT NOT NULL DEFAULT '', freed INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS kernel_runtime_uses(
+ token TEXT PRIMARY KEY, runtime TEXT NOT NULL, owner TEXT NOT NULL, purpose TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
+ id TEXT PRIMARY KEY, payload TEXT NOT NULL);
 ''')
         self.path.chmod(0o600)
 
@@ -230,8 +238,11 @@ CREATE TABLE IF NOT EXISTS kernel_project_heads(
         with self.connect() as db:
             streams = [json.loads(row['snapshot']) for row in db.execute('SELECT snapshot FROM kernel_streams ORDER BY id')]
             active = [dict(row) for row in db.execute("SELECT id,stream,state,epoch FROM kernel_outbox WHERE state NOT IN ('finished','cancelled')")]
+            runtimes = ([dict(row) for row in db.execute('SELECT id,path,kind,state,error,freed FROM kernel_runtimes')]
+                        if db.execute("SELECT 1 FROM sqlite_master WHERE name='kernel_runtimes'").fetchone() else [])
         return {'schema': 1, 'mode': self.meta('mode', 'staged'), 'active_runtime': self.meta('active_runtime'),
-                'workflows': streams, 'operations': active}
+                'workflows': streams, 'operations': active,
+                'runtimes': runtimes, 'runtime_cleanup': self.meta('runtime_cleanup')}
 
     def frontier(self):
         with self.connect() as db:

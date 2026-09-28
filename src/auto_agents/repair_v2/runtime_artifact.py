@@ -43,6 +43,15 @@ def inspect(root, *, commit=None, source=None):
 
 
 def build(root, source, identity, environments):
+    from ..recovery.runtime_lifecycle import building
+    control = next((p for p in [Path(root), *Path(root).parents]
+                    if (p / 'control.sqlite3').is_file()), None)
+    if control is not None: root = control / 'kernel-releases'
+    with building(root):
+        return _build(root, source, identity, environments)
+
+
+def _build(root, source, identity, environments):
     source, root = Path(source), Path(root)
     commit = git(source, 'rev-parse', 'HEAD')
     inputs = {'format': FORMAT, 'commit': commit, 'source': identity, 'environments': environments}
@@ -52,7 +61,8 @@ def build(root, source, identity, environments):
     if not destination.exists():
         destination.parent.mkdir(parents=True, exist_ok=True)
         require_space(destination.parent, tree_bytes(source) * 2)
-        with tempfile.TemporaryDirectory(prefix='.building-', dir=destination.parent) as temporary:
+        from ..recovery.runtime_lifecycle import build_directory
+        with build_directory(root, destination.parent, artifact_id) as temporary:
             staging = Path(temporary) / 'artifact'
             staging.mkdir()
             checkout = staging / 'source'
@@ -72,6 +82,8 @@ def build(root, source, identity, environments):
         raise RepairBlocked('runtime_artifact_invalid', '运行产物清单与预期不一致')
     artifact = RuntimeArtifact(artifact_id, str(destination / 'source'), commit, identity, environments, FORMAT)
     verify(asdict(artifact))
+    from ..recovery.runtime_lifecycle import produced
+    produced(root, asdict(artifact))
     return asdict(artifact)
 
 

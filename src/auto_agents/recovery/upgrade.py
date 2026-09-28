@@ -71,6 +71,8 @@ def activate(store, runtime, receipt, *, migration_manifests=()):
                   'activation': {'at': time.time(), 'epoch': generation,
                                  'projects': sorted(set(get('activation', {}).get('projects', [])) |
                                                     {m['project'] for m in migration_manifests})}}
+        if (Path(runtime['path']) / 'src/auto_agents/recovery/runtime_manager.py').is_file():
+            values['runtime_manager_runtime'] = runtime
         for key, value in values.items():
             db.execute('INSERT INTO kernel_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, canonical(value)))
     return {'ok': True, 'epoch': generation, 'runtime': runtime['artifact_id']}

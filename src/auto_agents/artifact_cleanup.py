@@ -84,6 +84,12 @@ def _clean(store, scope, started, deadline, progress):
                 record(item)
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
                 record({'path': row['path'], 'result': 'error', 'reason': str(error), 'freed_bytes': 0})
+        from .recovery.store import KernelStore
+        from .recovery.runtime_lifecycle import maintain as maintain_runtimes
+        for root in roots:
+            if time.monotonic() >= deadline: complete = False; break
+            if KernelStore(root, readonly=True).meta('active_runtime'):
+                for item in maintain_runtimes(KernelStore(root), deadline=deadline): record(item)
         complete = clean_legacy(store, roots, min(deadline, time.monotonic() + phase_seconds), record, scope) and complete
         if time.monotonic() < deadline:
             try: _clean_docker(store, roots, scope, deadline, record)

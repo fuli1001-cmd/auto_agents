@@ -84,22 +84,22 @@ class IsolatedEngineEffects:
         from ..repair_v2.workspace import Workspace
         from ..repair_v2.migration import request_from_payload
         from ..repair_v2.scope import ScopeGuard
-        from ..repair_v2.diagnostic_evidence import prepare
+        from ..repair_v2.diagnostic_evidence import prepare as prepare_evidence
         self.store, self.stream, self.contract = store, stream, contract
         self.payload, self.root, self.base = payload, Path(root), Path(source)
         self.cancel = threading.Event()
         self.accepted = request_from_payload(payload, contract.task_id)
         config = load_project_config(Path(payload['project']))
         provider = config.providers[payload['provider']]
-        from .environment import prepare
+        from .environment import prepare as prepare_environment
         trusted = (store.meta('trusted_verifier_runtime') or {}).get('path') or str(self.base)
-        self.verifier = DockerVerifier(store.root/'kernel-verification',python=prepare(store,trusted),
+        self.verifier = DockerVerifier(store.root/'kernel-verification',python=prepare_environment(store,trusted),
                                       codex_binary=provider.binary if provider.kind == 'codex' else None)
         self.verifier.prepare()
         self.environment = digest({'verifier':self.verifier.runtime, 'provider':payload['provider']})
         self.workspace = Workspace(self.root/'workspace', self.base, payload['base'])
         self.candidate = self.workspace.prepare()
-        evidence, self.evidence_context = prepare(self.root, payload)
+        evidence, self.evidence_context = prepare_evidence(self.root, payload)
         provider.provider_name = payload['provider']
         self.driver = NativeDriver(provider, AgentSandbox(self.root/'provider-state',self.verifier.image,evidence=evidence),
             effort=config.efforts.get('self_repair','deep'), review_effort=config.efforts.get('self_repair_review','max'))
@@ -328,22 +328,25 @@ def submit(store, project, orchestrator, payload, args, run_lock):
     # The foreground is suspended at this boundary and holds no model command.
     # Release project custody before the independent all-project adoption.
     run_lock.release()
+    from .runtime_manager import adopt_source, suspend_business, adoption_lock
+    from . import runtime_lifecycle
+    suspend_business(store)
+    from .runtime_delivery import deliver
+    from .runtime_manager import bound_source
+    deliver(store, bound_source(store), source, Path(candidate['path']))
     if store.meta('active_runtime')['source'] != candidate['source']:
-        import subprocess
-        import sys
-        trusted = store.meta('trusted_verifier_runtime')
-        require(trusted is not None,'upgrade_verifier','Engine adoption requires the separately installed stable verifier')
-        result = subprocess.run([sys.executable,str(Path(trusted['path'])/'auto_agents.py'),
-            'repair','upgrade','--runtime',candidate['path']],
-            env={**os.environ,'AUTO_AGENTS_RECOVERY_CONTROL':str(store.root),'PYTHONPATH':str(Path(trusted['path'])/'src')})
-        require(result.returncode == 0,'adoption_required','Independent core adoption did not complete; candidate and continuation are retained')
+        adopt_source(store.root, candidate['path'])
     state = store.load(stream)
     emit('continuation_consumed',{'continuation_id':continuation,'task_id':kind + ':' + native,
         'operation':'resume:' + candidate['source']},'continued')
     from ..cli import _run_command_for_self_repair_resume
     artifact = store.meta('active_runtime')
+    with adoption_lock(store):
+        runtime_lifecycle.register(store, artifact)
+        runtime_token = runtime_lifecycle.acquire(store, artifact, 'business')
     command = _run_command_for_self_repair_resume(args,repo_root=Path(artifact['path']))
-    environment = {**os.environ,'PYTHONPATH':str(Path(artifact['path'])/'src'),'AUTO_AGENTS_RECOVERY_CONTROL':str(store.root)}
+    environment = {**os.environ,'PYTHONPATH':str(Path(artifact['path'])/'src'),'AUTO_AGENTS_RECOVERY_CONTROL':str(store.root),
+                   'AUTO_AGENTS_RUNTIME_USE':runtime_token,'AUTO_AGENTS_RUNTIME_ID':artifact['artifact_id']}
     for key in ('AUTO_AGENTS_RUN_LOCK_FD','AUTO_AGENTS_RUN_LOCK_KEY','AUTO_AGENTS_RUN_TOKEN','AUTO_AGENTS_REPAIR_SUBSCRIBER'):
         environment.pop(key,None)
     os.execve(command[0],command,environment)

@@ -39,6 +39,9 @@ _MODULES = {
         'validate_task_requirement_proofs'),
     'auto_agents.validation': ('validate_task_plan_with_requirements',),
     'auto_agents.cli': ('main',),
+    'auto_agents.cli_impl': ('main', '_dispatch'),
+    'auto_agents.recovery.runtime_manager': ('ensure_current_runtime', 'launch'),
+    'auto_agents.recovery.runtime_lifecycle': ('collect',),
     'auto_agents.session': ('Session.resume', 'Session._retain_resume_authority',
                            'Session._phase_fix_execute', 'Session._prepare_workflow_handoff',
                            'Session._phase_fix_execute_owned', 'Session._resume_existing',
@@ -123,6 +126,9 @@ def observe_engine(runtime, *, expected_commit=None):
     for name, functions in _MODULES.items():
         expected = runtime / 'src' / Path(*name.split('.'))
         expected = expected / '__init__.py' if name == 'auto_agents' else expected.with_suffix('.py')
+        if name in {'auto_agents.cli_impl', 'auto_agents.recovery.runtime_manager',
+                    'auto_agents.recovery.runtime_lifecycle'} and not expected.is_file():
+            continue  # Compatible historical releases predate these modules.
         record = report['modules'][name] = {'expected_path': str(expected), 'functions': {}}
         try:
             module = importlib.import_module(name)

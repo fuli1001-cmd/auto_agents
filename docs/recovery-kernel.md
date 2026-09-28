@@ -2,9 +2,17 @@
 
 A new installation starts in staged mode. No SDGP session or installed runtime is switched
 by importing the package, running tests, or inspecting migration inputs.
-`repair upgrade --runtime PATH` is the explicit release boundary. It requires
-a clean committed runtime, independent release evidence, compatible control
-protocols, quiescent operations, and all project migrations before adoption.
+Ordinary business commands automatically adopt changes from the installation's
+bound source directory, including uncommitted files. Content is frozen privately;
+independent release evidence, compatible protocols, quiescent operations and a
+fresh journal replay remain required before adoption. `repair upgrade --runtime
+PATH` is retained for explicit maintenance/revalidation, not a daily prerequisite.
+
+The stdlib entry layer selects the installed manager before importing editable
+business modules. Each executing process has runtime custody; superseded snapshots
+are reclaimed when their last role, recovery reference or process use ends.
+See [automatic adoption and cleanup](automatic-runtime-adoption-and-cleanup.md)
+for source capture, concurrency, crash recovery and migration behavior.
 
 ## State and execution
 

@@ -702,7 +702,12 @@ def rpc(config, request, fds=()):
 
 def ensure_supervisor(config):
     root = private_directory(config["root"])
-    with (root / "supervisor-start.lock").open("a+") as ownership:
+    try:
+        from .recovery.runtime_lifecycle import building
+        custody = building(root)
+    except ImportError:
+        custody = contextlib.nullcontext()
+    with custody, (root / "supervisor-start.lock").open("a+") as ownership:
         fcntl.flock(ownership, fcntl.LOCK_EX)
         return _ensure_supervisor(config)
 
@@ -741,20 +746,26 @@ def retire_idle_legacy_supervisor(config, response):
 
 
 def _ensure_supervisor(config):
-    revision = git(config["source_root"], "rev-parse", "HEAD")
+    selected = None
+    if os.environ.get('AUTO_AGENTS_REPAIR_CONTROL_DISABLED') != '1':
+        from .recovery.store import KernelStore
+        selected = KernelStore(config['root'], readonly=True).meta('active_runtime')
+    source_root = selected['path'] if selected else config['source_root']
+    revision = selected['commit'] if selected else git(source_root, "rev-parse", "HEAD")
     try:
         response = rpc(config, {"op": "ping"})
     except (OSError, RuntimeError):
         response = None
     if response is not None:
         supports = "managed-verification-v1" in response.get("capabilities", [])
-        committed_support = git(config["source_root"], "cat-file", "-e", "HEAD:src/auto_agents/verification_worker.py", check=False).returncode == 0
+        committed_support = git(source_root, "cat-file", "-e", "HEAD:src/auto_agents/verification_worker.py", check=False).returncode == 0
         running_revision = response.get("implementation_revision", "")
         if not running_revision and config.get("implementation_root"):
             pinned_revision = git(config["implementation_root"], "rev-parse", "HEAD", check=False)
             if not pinned_revision.returncode:
                 running_revision = pinned_revision.stdout.strip()
-        if (supports and running_revision == revision) or not committed_support:
+        if (supports and running_revision == revision
+                and (not selected or config.get('implementation_root') == selected['path'])) or not committed_support:
             return
         if not retire_idle_legacy_supervisor(config, response):
             raise RuntimeError("repair supervisor upgrade deferred: the older controller still owns active work; retry after it becomes idle")
@@ -762,12 +773,17 @@ def _ensure_supervisor(config):
     pinned = config.get("implementation_root")
     if pinned:
         old = git(pinned, "rev-parse", "HEAD", check=False)
-        if old.returncode or old.stdout.strip() != revision:
+        if old.returncode or old.stdout.strip() != revision or (selected and pinned != selected['path']):
             config.pop("implementation_root", None)
     if not config.get("implementation_root"):
-        repository = Repository(config)
-        repository.import_commit(config["source_root"], revision)
-        implementation = repository.worktree(revision, "controller-" + revision[:20])
+        if selected:
+            from .repair_v2.runtime_artifact import verify
+            verify(selected)
+            implementation = Path(selected['path'])
+        else:
+            repository = Repository(config)
+            repository.import_commit(config["source_root"], revision)
+            implementation = repository.worktree(revision, "controller-" + revision[:20])
         if not (implementation / "src/auto_agents/repair_worker.py").is_file():
             raise RuntimeError("repair controller must be installed from a committed implementation")
         config["implementation_root"] = str(implementation)
@@ -1647,6 +1663,19 @@ class Supervisor:
                 self.verification_processes.pop(row["id"], None)
 
     def serve(self):
+        implementation = Path(self.config.get('implementation_root', ''))
+        if not (implementation / 'src/auto_agents/recovery/runtime_lifecycle.py').is_file():
+            return self._serve()
+        from .recovery.store import KernelStore
+        from .recovery import runtime_lifecycle
+        store = KernelStore(self.config['root'])
+        active = store.meta('active_runtime')
+        if active and active['path'] == self.config.get('implementation_root'):
+            with runtime_lifecycle.using(store, active, 'supervisor'), runtime_lifecycle.watch(store):
+                return self._serve()
+        return self._serve()
+
+    def _serve(self):
         with (self.store.root / "supervisor.lock").open("a+") as ownership:
             try:
                 fcntl.flock(ownership, fcntl.LOCK_EX | fcntl.LOCK_NB)

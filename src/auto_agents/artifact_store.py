@@ -333,6 +333,8 @@ class ArtifactStore:
             row = self.get(identity)
             if row["state"] in {"quarantining", "quarantined", "deleting", "deleted"}:
                 raise ValueError("restore artifact before pinning")
+            if not Path(row['path']).exists() or _identity(row['path']) != row['inode']:
+                raise ValueError('artifact is missing or was replaced before pinning')
             row["pin"] = reason
             self._save(row, "pin_changed")
 

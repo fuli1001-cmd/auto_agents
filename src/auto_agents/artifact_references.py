@@ -191,6 +191,8 @@ def protection(row):
         if metadata.get("repair_root"):
             root = Path(metadata["repair_root"])
             path = Path(row['path'])
+            from .recovery.runtime_lifecycle import owns_path
+            if owns_path(root, path): return 'managed_runtime_lifecycle'
             merge = path.with_name(path.name + '.source.json')
             if path.parent == root / 'runtimes' and path.name.startswith('source-merge-') and merge.is_file():
                 if _json(merge).get('pending', True):

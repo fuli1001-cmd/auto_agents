@@ -150,6 +150,10 @@ def verify_current_journal(store, runtime, receipt):
 
 
 def upgrade(control, source, trusted_root, *, callback=None):
+    installed = KernelStore(control, readonly=True).meta('active_runtime')
+    if installed and (Path(installed['path']) / 'src/auto_agents/recovery/runtime_manager.py').is_file():
+        from .runtime_manager import adopt_source
+        return adopt_source(control, source)
     from contextlib import ExitStack
     from ..run_lock import ProjectRunLock
     from .migration import check, apply_project, import_repairs
