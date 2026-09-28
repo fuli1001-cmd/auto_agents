@@ -23,7 +23,8 @@ def test_submit_loads_real_dependencies_before_checking_task_admission(tmp_path)
     assert failure.value.code == 'kernel_binding'
 
 
-def test_isolated_engine_initializes_environment_and_diagnostic_evidence(scene, tmp_path, monkeypatch):
+@pytest.mark.parametrize('with_progress', [False, True])
+def test_isolated_engine_initializes_environment_and_diagnostic_evidence(scene, tmp_path, monkeypatch, with_progress):
     from auto_agents.recovery.engine import IsolatedEngineEffects
     from auto_agents import config, repair_dependencies, repair_worker
     from auto_agents.repair_v2 import docker, providers, scope, workspace
@@ -60,7 +61,8 @@ def test_isolated_engine_initializes_environment_and_diagnostic_evidence(scene, 
     monkeypatch.setattr(providers, 'NativeDriver', driver_factory)
     monkeypatch.setattr(scope, 'ScopeGuard', Mock())
 
-    effects = IsolatedEngineEffects(store, 'workflow', contract, payload, root, source)
+    progress = Mock() if with_progress else None
+    effects = IsolatedEngineEffects(store, 'workflow', contract, payload, root, source, progress)
 
     environment.assert_called_once()
     assert environment.call_args.args[1] == trusted
@@ -73,6 +75,8 @@ def test_isolated_engine_initializes_environment_and_diagnostic_evidence(scene, 
     assert effects.evidence_context['original_goal'] == 'Finish the original acceptance'
     assert effects.candidate == candidate
     assert effects.driver is driver_factory.return_value
+    if progress is not None:
+        assert verifier.callback == progress.check
 
 
 class Effects:

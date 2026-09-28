@@ -27,5 +27,5 @@ def identity(root):
 def dissociate(root):
     root = Path(root)
     if (root / '.git').is_dir():
-        git(root, 'repack', '-a', '-d')
+        git(root, 'repack', '-a', '-d', '-q')
         (root / '.git/objects/info/alternates').unlink(missing_ok=True)

@@ -103,6 +103,9 @@ def observation(job, subscriber, language='zh'):
                      'Model usage limit reached; retry repair when usage resets')
         elif 'Insufficient disk space' in error:
             label = ('磁盘空间不足；清理空间后重新运行以继续', 'Disk space is low; free space and rerun to continue')
+        elif 'input_too_large' in error or 'Input exceeds the maximum length' in error:
+            label = ('请求内容超出模型限制；进度已保留，需缩减输入后继续',
+                     'Request exceeds the model input limit; progress saved, reduce input before continuing')
         elif 'recovery_proof_incomplete' in error or '恢复验证证据不完整' in error:
             label = ('原任务恢复证据不完整；更新验证控制器后重试',
                      'Task recovery evidence is incomplete; update the verifier and retry')

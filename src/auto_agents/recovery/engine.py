@@ -21,8 +21,9 @@ def previous_result(store, stream, task_id, phase):
 
 
 class EngineRunner:
-    def __init__(self, store, stream, contract, effects):
+    def __init__(self, store, stream, contract, effects, progress=None):
         self.store, self.stream, self.contract, self.effects = store, stream, contract, effects
+        self.progress = progress
 
     def emit(self, kind, data, identity):
         return self.store.apply(self.stream, self.store.load(self.stream)['revision'], Event(identity, kind, data))
@@ -40,6 +41,8 @@ class EngineRunner:
             if task['active_command']:
                 command_id = task['active_command']
                 current = state['commands'][command_id]
+                if self.progress is not None:
+                    self.progress.command(current, task)
                 executor = Executor(self.store, {current['phase']:FunctionExecutor(self.effects.execute)})
                 if current['status'] == 'reserved': executor.execute(self.stream, command_id)
                 else: executor.reconcile(self.stream, command_id)
@@ -60,7 +63,7 @@ class EngineRunner:
                 if state['budget']['diagnosis_due']:
                     diagnosis = replace(self.contract, task_id=self.contract.task_id + ':diagnosis',
                         completion='phase_completed', phases=('diagnose',))
-                    diagnostic = EngineRunner(self.store, self.stream, diagnosis, self.effects).run()
+                    diagnostic = EngineRunner(self.store, self.stream, diagnosis, self.effects, self.progress).run()
                     if diagnostic['status'] != 'completed': return task
                     evidence = self.store.put(diagnostic['proofs'])
                     self.emit('task_resumed', {'task_id':self.contract.task_id,'evidence_ref':evidence},
@@ -77,7 +80,7 @@ class EngineRunner:
 
 
 class IsolatedEngineEffects:
-    def __init__(self, store, stream, contract, payload, root, source):
+    def __init__(self, store, stream, contract, payload, root, source, progress=None):
         from ..config import load_project_config
         from ..repair_v2.docker import DockerVerifier
         from ..repair_v2.providers import AgentSandbox, NativeDriver
@@ -86,6 +89,7 @@ class IsolatedEngineEffects:
         from ..repair_v2.scope import ScopeGuard
         from ..repair_v2.diagnostic_evidence import prepare as prepare_evidence
         self.store, self.stream, self.contract = store, stream, contract
+        self.progress = progress
         self.payload, self.root, self.base = payload, Path(root), Path(source)
         self.cancel = threading.Event()
         self.accepted = request_from_payload(payload, contract.task_id)
@@ -95,6 +99,8 @@ class IsolatedEngineEffects:
         trusted = (store.meta('trusted_verifier_runtime') or {}).get('path') or str(self.base)
         self.verifier = DockerVerifier(store.root/'kernel-verification',python=prepare_environment(store,trusted),
                                       codex_binary=provider.binary if provider.kind == 'codex' else None)
+        if progress is not None:
+            self.verifier.callback = progress.check
         self.verifier.prepare()
         self.environment = digest({'verifier':self.verifier.runtime, 'provider':payload['provider']})
         self.workspace = Workspace(self.root/'workspace', self.base, payload['base'])
@@ -120,6 +126,18 @@ class IsolatedEngineEffects:
     def _previous(self, phase):
         return previous_result(self.store,self.stream,self.contract.task_id,phase)
 
+    def phase(self, name):
+        if getattr(self, 'progress', None) is not None:
+            self.progress.phase(name)
+
+    def agent_progress(self, event):
+        if getattr(self, 'progress', None) is not None:
+            self.progress.agent(event)
+
+    def rejected(self, failures):
+        if getattr(self, 'progress', None) is not None:
+            self.progress.rejected(failures)
+
     def execute(self, command):
         from ..repair_v2.types import RepairBlocked
         try: return self._execute(command)
@@ -137,31 +155,34 @@ class IsolatedEngineEffects:
         from ..repair_v2.scope import INSTRUCTION, proposal, changes
         from ..repair_v2.controller import REVIEW_SCHEMA, review_result
         from .protocol import ReviewManifest
+        from .prompt_evidence import PromptEvidence, READ_INSTRUCTION, result_summary
         phase = command.phase
         state = self.store.load(self.stream)
         ordered = sorted(state['commands'].values(),key=lambda row:row['sequence'])
         failures = [c['outcome'] for c in ordered if c['task_id'] == self.contract.task_id
                     and c.get('outcome') and c['outcome']['kind'] != 'success'][-3:]
-        from ..repair_v2.feedback import diagnose
-        observations = []
-        for failure in failures:
-            reference = failure.get('details',{}).get('result_ref')
-            if not reference: continue
-            observed = self.store.read(reference)
-            if observed.get('failures'): observed = {'diagnosis':diagnose(observed['failures'])}
-            observations.append({**failure,'observed':observed})
-        failures = observations
-        context = json.dumps({'contract':self.contract.to_dict(), 'goal':self.store.read(self.contract.goal_ref),
-            'issue':self.store.read(self.contract.issue_ref),'acceptance':[asdict(a) for a in self.accepted.acceptance],
-            'read_only_evidence':self.evidence_context,'failures':failures}, ensure_ascii=False)
+        if phase != 'verify':
+            evidence = PromptEvidence(self.root / 'prompt-evidence', self.driver)
+            observations = []
+            for failure in failures:
+                reference = failure.get('details',{}).get('result_ref')
+                if not reference: continue
+                observed = self.store.read(reference)
+                observations.append({**failure, 'observed': evidence.section(
+                    observed, summary=result_summary(observed))})
+            context = READ_INSTRUCTION + evidence.render({
+                'contract':self.contract.to_dict(), 'goal':self.store.read(self.contract.goal_ref),
+                'issue':self.store.read(self.contract.issue_ref),'acceptance':[asdict(a) for a in self.accepted.acceptance],
+                'read_only_evidence':self.evidence_context,'failures':observations})
         if phase in {'plan','diagnose','implement'}:
             prefix = ('Implement only the authorized repair and preserve all existing test obligations.' if phase == 'implement'
                 else 'Inspect the original failure and propose a bounded, falsifiable repair plan. Do not modify files or run a broad test suite.')
             if phase == 'implement': require(self.scope.current(), 'scope_missing', 'Implementation requires retained necessity evidence')
-            prompt = prefix + '\n' + context + '\n' + json.dumps(self._previous('plan'),ensure_ascii=False)
+            prompt = prefix + '\n' + context + '\nPlan context:\n' + evidence.render(self._previous('plan'))
             if phase != 'implement': prompt += '\n' + INSTRUCTION
             before = self.source()
-            reply = self.driver.run('implement' if phase == 'implement' else 'plan',prompt,self.candidate,cancel=self.cancel)
+            reply = self.driver.run('implement' if phase == 'implement' else 'plan',prompt,self.candidate,
+                                    progress=self.agent_progress,cancel=self.cancel)
             after = self.source()
             if phase != 'implement': require(after == before, 'read_only_violation','Diagnosis changed protected source')
             if not reply.ok:
@@ -170,6 +191,7 @@ class IsolatedEngineEffects:
                     reply.error or 'Provider did not finish')
             if phase != 'implement': self.scope.admit(proposal(reply.text))
             else:
+                self.phase('artifact')
                 self.workspace.checkpoint()
                 artifact = build(self.root, self.candidate, self.source(), {'verifier':self.verifier.runtime})
                 result = {'reply':asdict(reply),'artifact':artifact}
@@ -189,10 +211,14 @@ class IsolatedEngineEffects:
         if phase == 'verify':
             from ..repair_v2.audit import test_protection_findings
             findings = test_protection_findings(snapshot, self.payload['base'], snapshot)
-            if findings: return self.observed(command, {'findings':findings},OutcomeKind.CANDIDATE_REJECTED,'Candidate weakens retained tests')
+            if findings:
+                self.rejected(findings)
+                return self.observed(command, {'findings':findings},OutcomeKind.CANDIDATE_REJECTED,'Candidate weakens retained tests')
+            self.phase('full_suite')
             units = self.verifier.suite_units(snapshot, self.accepted)
             suite = self.verifier.validate_suite(command.source,snapshot,units,self.cancel)
             if not suite.ok:
+                self.rejected(suite.failures)
                 from ..verification_dependencies import detect_verification_dependencies
                 missing = [dependency.to_dict() for failure in suite.failures
                            for dependency in detect_verification_dependencies(failure.get('excerpt',''))]
@@ -200,7 +226,10 @@ class IsolatedEngineEffects:
                     OutcomeKind.ENVIRONMENT_BLOCKED if suite.infrastructure or missing else OutcomeKind.CANDIDATE_REJECTED,
                     'Verification prerequisites are unavailable' if missing else 'Mandatory verification failed')
             from ..repair_v2.integration import _boundaries
+            self.phase('boundary')
             boundary = _boundaries(self.verifier,self.root,command.source,snapshot,self.payload,self.cancel)
+            if not boundary['ok']:
+                self.rejected([{'unit': 'original-boundary', 'infrastructure': boundary.get('infrastructure', False)}])
             return self.observed(command, {'suite':asdict(suite),'boundary':boundary},
                 OutcomeKind.SUCCESS if boundary['ok'] else OutcomeKind.CANDIDATE_REJECTED,'Original failure recovery checked')
         require(phase == 'review', 'phase','Unknown engine phase')
@@ -211,16 +240,18 @@ class IsolatedEngineEffects:
             tuple(a.identity for a in self.accepted.acceptance),changes(snapshot,self.payload['base'],[]))
         prompt = ('Independently review this immutable candidate and concrete test/recovery evidence against every requirement. '
             'Do not modify source. Reject only demonstrated violations with a counterexample.\n' + context + '\n' +
-            json.dumps(verification,ensure_ascii=False) + '\n' + manifest.instruction())
+            evidence.render(verification, summary=result_summary(verification)) + '\n' + evidence.render(manifest.instruction()))
         invalid = [c for c in ordered if c['task_id'] == self.contract.task_id
                    and (c.get('outcome') or {}).get('kind') == 'protocol_invalid']
         original = None
         if invalid:
             prior = self.store.read(invalid[-1]['outcome']['details']['result_ref'])
-            prompt = manifest.correction(invalid[-1]['command_id'],prior['reply'],prior['diagnostic'])
+            prompt = READ_INSTRUCTION + '\nResponse protocol correction:\n' + evidence.render(
+                manifest.correction(invalid[-1]['command_id'],prior['reply'],prior['diagnostic']))
             try: original = json.loads(prior['reply'])
             except ValueError: pass
-        reply = self.driver.run('review',prompt,snapshot,schema=manifest.schema(REVIEW_SCHEMA),cancel=self.cancel)
+        reply = self.driver.run('review',prompt,snapshot,schema=manifest.schema(REVIEW_SCHEMA),
+                                progress=self.agent_progress,cancel=self.cancel)
         if not reply.ok: return self.observed(command,asdict(reply),OutcomeKind.ENVIRONMENT_BLOCKED,reply.error)
         try:
             parsed = manifest.validate(reply.text)
@@ -231,11 +262,20 @@ class IsolatedEngineEffects:
                         'review_changed','Protocol correction changed its substantive judgment')
         except (KernelError, ValueError, TypeError, RepairBlocked) as error:
             return self.observed(command, {'reply':reply.text,'diagnostic':str(error)},OutcomeKind.PROTOCOL_INVALID,'Review protocol does not match the manifest')
+        if not reviewed.ok: self.rejected(reviewed.findings)
         return self.observed(command,asdict(reviewed),OutcomeKind.SUCCESS if reviewed.ok else OutcomeKind.CANDIDATE_REJECTED,'Independent review completed')
 
 
 def submit(store, project, orchestrator, payload, args, run_lock):
     """Admit a concrete failure, repair privately, adopt independently, resume."""
+    from ..reporting import find_reporter
+    from .progress import RepairProgress
+    reporter = getattr(orchestrator, 'reporter', None) or find_reporter(project)
+    with RepairProgress(reporter, payload) as progress:
+        return _submit(store, project, orchestrator, payload, args, run_lock, progress)
+
+
+def _submit(store, project, orchestrator, payload, args, run_lock, progress):
     from ..repair_v2.migration import request_from_payload
     from ..root_cause import RootCauseCoordinator
     from ..repair_v2.store import atomic_json, Store as ArtifactStore
@@ -299,7 +339,7 @@ def submit(store, project, orchestrator, payload, args, run_lock):
     result = store.load(stream)['tasks'][task_id]
     if result['status'] != 'completed':
         try:
-            effects = IsolatedEngineEffects(store,stream,contract,retained,working,source)
+            effects = IsolatedEngineEffects(store,stream,contract,retained,working,source,progress)
         except (OSError,RuntimeError,ValueError) as error:
             from ..repair_environment_log import sanitize
             detail = {'code':getattr(error,'code','environment_preparation'),'reason':sanitize(str(error))}
@@ -308,12 +348,16 @@ def submit(store, project, orchestrator, payload, args, run_lock):
                               detail['reason'],details={'observation_ref':reference})
             emit('task_preparation_blocked',{'task_id':task_id,'failure':failure.to_dict(),'observation_ref':reference},
                  'prepare-blocked:' + reference[:32])
-            print(json.dumps({'ok':False,'incident':incident_id,'failure':failure.to_dict()},ensure_ascii=False))
+            progress.blocked(failure.to_dict(), incident_id)
+            if progress.reporter is None:
+                print(json.dumps({'ok':False,'incident':incident_id,'failure':failure.to_dict()},ensure_ascii=False))
             return 3
-        result = EngineRunner(store,stream,contract,effects).run(resume=True)
+        result = EngineRunner(store,stream,contract,effects,progress).run(resume=True)
     if result['status'] != 'completed':
         failure = result.get('failure') or {'kind':'outcome_unknown','reason':'Unsettled engine operation'}
-        print(json.dumps({'ok':False,'incident':incident_id,'failure':failure},ensure_ascii=False))
+        progress.blocked(failure, incident_id)
+        if progress.reporter is None:
+            print(json.dumps({'ok':False,'incident':incident_id,'failure':failure},ensure_ascii=False))
         return 3
     proof = result['proofs']['review'][0]
     implementation = previous_result(store,stream,contract.task_id,'implement')
@@ -333,8 +377,10 @@ def submit(store, project, orchestrator, payload, args, run_lock):
     suspend_business(store)
     from .runtime_delivery import deliver
     from .runtime_manager import bound_source
+    progress.phase('deliver')
     deliver(store, bound_source(store), source, Path(candidate['path']))
     if store.meta('active_runtime')['source'] != candidate['source']:
+        progress.phase('activation')
         adopt_source(store.root, candidate['path'])
     state = store.load(stream)
     emit('continuation_consumed',{'continuation_id':continuation,'task_id':kind + ':' + native,
@@ -349,4 +395,5 @@ def submit(store, project, orchestrator, payload, args, run_lock):
                    'AUTO_AGENTS_RUNTIME_USE':runtime_token,'AUTO_AGENTS_RUNTIME_ID':artifact['artifact_id']}
     for key in ('AUTO_AGENTS_RUN_LOCK_FD','AUTO_AGENTS_RUN_LOCK_KEY','AUTO_AGENTS_RUN_TOKEN','AUTO_AGENTS_REPAIR_SUBSCRIBER'):
         environment.pop(key,None)
+    progress.handoff()
     os.execve(command[0],command,environment)

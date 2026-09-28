@@ -79,6 +79,7 @@ class AgentSandbox:
         self.binding = binding
         self.evidence = Path(evidence).resolve() if evidence is not None else None
         self.recovery_evidence = None
+        self.prompt_evidence = None
 
     @property
     def environment(self):
@@ -169,6 +170,8 @@ class AgentSandbox:
                 argv += ['--mount', 'type=bind,src=' + str(root / '.git') + ',dst=' + str(root / '.git') + ',readonly']
             if self.evidence is not None:
                 argv += ['--mount', f'type=bind,src={self.evidence},dst=/repair-evidence,readonly']
+            if self.prompt_evidence is not None:
+                argv += ['--mount', f'type=bind,src={self.prompt_evidence},dst=/repair-observations,readonly']
             if role == 'review' and self.recovery_evidence is not None:
                 argv += ['--mount', f'type=bind,src={self.recovery_evidence},dst=/repair-recovery/boundary.json,readonly']
             # Executables are public, read-only tool inputs; no host home is mounted.
@@ -245,6 +248,11 @@ class NativeDriver:
             return False
         self.sandbox.recovery_evidence = Path(path).resolve() if path is not None else None
         return path is not None
+
+    def set_prompt_evidence(self, path):
+        if self.sandbox is None:
+            raise RepairBlocked('diagnostic_evidence_unavailable', 'Prompt evidence requires a read-only sandbox mount')
+        self.sandbox.prompt_evidence = Path(path).resolve()
 
     def identity(self):
         from .store import digest
