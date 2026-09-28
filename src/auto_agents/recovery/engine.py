@@ -266,6 +266,31 @@ class IsolatedEngineEffects:
         return self.observed(command,asdict(reviewed),OutcomeKind.SUCCESS if reviewed.ok else OutcomeKind.CANDIDATE_REJECTED,'Independent review completed')
 
 
+def deliver_runtime(store, base, candidate, progress):
+    """Verify and adopt the exact delivered tree, including concurrent edits."""
+    from .runtime_delivery import deliver
+    from .runtime_manager import adopt_source, bound_source
+    from .runtime_source import capture
+    from . import runtime_lifecycle
+
+    source = bound_source(store)
+    progress.phase('deliver')
+    delivery = deliver(store, source, base, Path(candidate['path']))
+    expected = delivery['after'] if delivery else candidate['source']
+    merged = None
+    try:
+        runtime = candidate
+        if expected != candidate['source']:
+            merged = capture(store, source, expected=expected)
+            runtime = merged
+        if store.meta('active_runtime')['source'] != runtime['source']:
+            progress.phase('activation')
+            adopt_source(store.root, runtime['path'])
+        return store.meta('active_runtime')
+    finally:
+        if merged: runtime_lifecycle.release_produced(store, merged)
+
+
 def submit(store, project, orchestrator, payload, args, run_lock):
     """Admit a concrete failure, repair privately, adopt independently, resume."""
     from ..reporting import find_reporter
@@ -372,21 +397,16 @@ def _submit(store, project, orchestrator, payload, args, run_lock, progress):
     # The foreground is suspended at this boundary and holds no model command.
     # Release project custody before the independent all-project adoption.
     run_lock.release()
-    from .runtime_manager import adopt_source, suspend_business, adoption_lock
+    from .runtime_manager import suspend_business, adoption_lock
     from . import runtime_lifecycle
     suspend_business(store)
-    from .runtime_delivery import deliver
-    from .runtime_manager import bound_source
-    progress.phase('deliver')
-    deliver(store, bound_source(store), source, Path(candidate['path']))
-    if store.meta('active_runtime')['source'] != candidate['source']:
-        progress.phase('activation')
-        adopt_source(store.root, candidate['path'])
+    artifact = deliver_runtime(store, source, candidate, progress)
     state = store.load(stream)
+    from .engine_adoption import record as record_adoption
+    record_adoption(store, stream, state['incidents'][incident_id], source, candidate, artifact)
     emit('continuation_consumed',{'continuation_id':continuation,'task_id':kind + ':' + native,
         'operation':'resume:' + candidate['source']},'continued')
     from ..cli import _run_command_for_self_repair_resume
-    artifact = store.meta('active_runtime')
     with adoption_lock(store):
         runtime_lifecycle.register(store, artifact)
         runtime_token = runtime_lifecycle.acquire(store, artifact, 'business')

@@ -321,17 +321,120 @@ def test_source_delivery_refuses_concurrent_changes(installation):
     (source / 'value.py').write_text('VALUE = 2\n')
     accepted = capture(store, source)
     (source / 'value.py').write_text('VALUE = 99\n')
-    with pytest.raises(KernelError, match='变化'): deliver(store, source, before['path'], accepted['path'])
+    with pytest.raises(KernelError, match='变化') as failure:
+        deliver(store, source, before['path'], accepted['path'])
+    assert failure.value.details['paths'] == ['value.py']
     assert (source / 'value.py').read_text() == 'VALUE = 99\n'
+    assert store.meta('runtime_delivery') is None
 
 
-def test_source_delivery_resumes_after_file_write_before_checkpoint(installation, monkeypatch):
+@pytest.mark.parametrize('already_applied', [False, True])
+def test_source_delivery_preserves_unrelated_edits_and_partial_manual_merge(installation, already_applied):
+    from auto_agents.recovery.runtime_delivery import deliver
+    store, source = installation
+    before = adopt_fixture(store, source)
+    (source / 'value.py').write_text('VALUE = 2\n')
+    (source / 'added.py').write_text('ADDED = True\n')
+    accepted = capture(store, source)
+    if not already_applied: (source / 'value.py').write_text('VALUE = 1\n')
+    (source / 'added.py').unlink()
+    (source / 'removed.py').unlink()
+    (source / 'user.py').write_text('USER = True\n')
+    (source / 'user.py').chmod(0o755)
+    index = (source / '.git/index').read_bytes()
+    delivery = deliver(store, source, before['path'], accepted['path'])
+    assert delivery['status'] == 'complete'
+    assert delivery['after'] == source_identity(source) != accepted['source']
+    assert delivery['accepted'] == accepted['source']
+    assert (source / 'value.py').read_text() == 'VALUE = 2\n'
+    assert (source / 'added.py').read_text() == 'ADDED = True\n'
+    assert (source / 'user.py').read_text() == 'USER = True\n'
+    assert (source / 'user.py').stat().st_mode & 0o111
+    assert not (source / 'removed.py').exists()
+    assert (source / '.git/index').read_bytes() == index
+    deliver(store, source, before['path'], accepted['path'])
+    assert source_identity(source) == delivery['after']
+
+
+def test_source_delivery_preflights_all_paths_before_resuming(installation, monkeypatch):
+    from auto_agents.recovery import runtime_delivery
+    store, source = installation
+    before = adopt_fixture(store, source)
+    (source / 'removed.py').write_text('OLD = False\n')
+    (source / 'value.py').write_text('VALUE = 2\n')
+    accepted = capture(store, source)
+    (source / 'removed.py').write_text('OLD = True\n')
+    (source / 'value.py').write_text('VALUE = 1\n')
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_delivery, 'resume', lambda store: None)
+        runtime_delivery.deliver(store, source, before['path'], accepted['path'])
+    (source / 'value.py').write_text('VALUE = 99\n')
+    with pytest.raises(KernelError) as failure: runtime_delivery.resume(store)
+    assert failure.value.details['paths'] == ['value.py']
+    assert (source / 'removed.py').read_text() == 'OLD = True\n'
+
+
+def test_source_delivery_refuses_unrelated_file_blocking_candidate_directory(installation):
+    from auto_agents.recovery.runtime_delivery import deliver
+    store, source = installation
+    before = adopt_fixture(store, source)
+    (source / 'new').mkdir()
+    (source / 'new/value.py').write_text('VALUE = 2\n')
+    accepted = capture(store, source)
+    (source / 'new/value.py').unlink()
+    (source / 'new').rmdir()
+    (source / 'new').write_text('user file\n')
+    with pytest.raises(KernelError) as failure:
+        deliver(store, source, before['path'], accepted['path'])
+    assert failure.value.code == 'source_delivery_conflict'
+    assert failure.value.details['paths'] == ['new/value.py']
+    assert (source / 'new').read_text() == 'user file\n'
+    assert store.meta('runtime_delivery') is None
+
+
+@pytest.mark.parametrize('fail_verification', [False, True])
+def test_engine_delivery_adopts_verified_merged_snapshot(installation, monkeypatch, fail_verification):
+    from auto_agents.recovery.engine import deliver_runtime
+    from auto_agents.repair_v2.runtime_artifact import verify
+    store, source = installation
+    before = adopt_fixture(store, source)
+    (source / 'value.py').write_text('VALUE = 2\n')
+    accepted = capture(store, source)
+    (source / 'value.py').write_text('VALUE = 1\n')
+    (source / 'removed.py').write_text('USER = True\n')
+    calls = []
+    def adopt(control, path):
+        runtime = capture(store, path)
+        verify(runtime)
+        assert control == store.root
+        assert Path(path) != source
+        assert runtime['source'] == source_identity(source) != accepted['source']
+        assert (Path(path) / 'value.py').read_text() == 'VALUE = 2\n'
+        assert (Path(path) / 'removed.py').read_text() == 'USER = True\n'
+        calls.append(runtime)
+        if fail_verification: raise KernelError('runtime_verification', 'verification failed')
+        store.set_meta('active_runtime', runtime)
+    monkeypatch.setattr(manager, 'adopt_source', adopt)
+    progress = Mock()
+    if fail_verification:
+        with pytest.raises(KernelError, match='verification failed'):
+            deliver_runtime(store, before['path'], accepted, progress)
+        assert store.meta('active_runtime') == before
+    else:
+        assert deliver_runtime(store, before['path'], accepted, progress) == calls[0]
+    assert len(calls) == 1
+    assert [call.args[0] for call in progress.phase.call_args_list] == ['deliver', 'activation']
+
+
+@pytest.mark.parametrize('concurrent_edit', [False, True])
+def test_source_delivery_resumes_after_file_write_before_checkpoint(installation, monkeypatch, concurrent_edit):
     from auto_agents.recovery import runtime_delivery
     store, source = installation
     before = adopt_fixture(store, source)
     (source / 'value.py').write_text('VALUE = 2\n')
     accepted = capture(store, source)
     (source / 'value.py').write_text('VALUE = 1\n')
+    if concurrent_edit: (source / 'removed.py').write_text('USER = True\n')
     original = store.set_meta
     def killed(key, value):
         if key == 'runtime_delivery' and value.get('done'): raise SystemExit('killed')
@@ -339,8 +442,10 @@ def test_source_delivery_resumes_after_file_write_before_checkpoint(installation
     monkeypatch.setattr(store, 'set_meta', killed)
     with pytest.raises(SystemExit): runtime_delivery.deliver(store, source, before['path'], accepted['path'])
     monkeypatch.setattr(store, 'set_meta', original)
-    runtime_delivery.resume(store)
-    assert source_identity(source) == accepted['source']
+    runtime_delivery.deliver(store, source, before['path'], accepted['path'])
+    assert (source / 'value.py').read_text() == 'VALUE = 2\n'
+    if concurrent_edit: assert (source / 'removed.py').read_text() == 'USER = True\n'
+    assert source_identity(source) == store.meta('runtime_delivery')['after']
     assert store.meta('runtime_delivery')['status'] == 'complete'
 
 

@@ -396,8 +396,15 @@ def recovered_route(orchestrator, payload):
     state, incident = matches[-1]
     artifact = store.meta('active_runtime')
     require(artifact and artifact.get('source'), 'adoption_required', 'Current engine has no adoption proof')
-    require(not incident.get('required_runtime') or incident['required_runtime'] == artifact['source'],
-            'adoption_required', 'The resolved engine candidate still requires independent runtime adoption')
+    from .engine_adoption import adopted
+    pending = any(row['incident_id'] == incident['incident_id'] and row['status'] == 'ready'
+                  for row in state['continuations'].values())
+    accepted = adopted(store, current, incident, artifact)
+    if incident.get('payload_ref') and (pending or not accepted):
+        from ..repair_client import EngineRepairRequired
+        raise EngineRepairRequired(payload, resume_incident=(current, incident['incident_id']))
+    require(accepted, 'adoption_required',
+            'The resolved engine candidate still requires independent runtime adoption')
     from ..repair_client import _remember_engine_receipt
     return _remember_engine_receipt(orchestrator, payload, {'incident': incident['incident_id'],
         'resolution': incident['resolution_ref'], 'commit': artifact['commit'],

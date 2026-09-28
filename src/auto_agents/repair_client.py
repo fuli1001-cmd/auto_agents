@@ -14,8 +14,9 @@ from .repair_control import configure, digest, ensure_supervisor, git, rpc, star
 
 
 class EngineRepairRequired(RuntimeError):
-    def __init__(self, payload):
+    def __init__(self, payload, *, resume_incident=None):
         self.route_payload = payload
+        self.resume_incident = resume_incident
         super().__init__("auto_agents engine self-repair required for explicitly bound engine route: " + json.dumps(payload, ensure_ascii=False))
 
 
@@ -581,6 +582,11 @@ def submit_and_wait(project, orchestrator, error, decision, args, lock, diagnosi
     if health is not None:
         health.set_phase("self_repair")
         health.set_active_operation("self_repair", "independent repair supervisor owns recovery")
+    if kernel is not None and isinstance(error, EngineRepairRequired) and error.resume_incident:
+        from .recovery.engine_adoption import retained_payload
+        from .recovery.engine import submit
+        payload = retained_payload(kernel, project, orchestrator, error)
+        return submit(kernel, project, orchestrator, payload, args, lock)
     retained = getattr(orchestrator, '_retained_repair_payload', None)
     if retained:
         validate_retained_run_contract(project, auto_agents_repo_root(), retained, error)

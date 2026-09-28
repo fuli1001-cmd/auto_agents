@@ -69,8 +69,11 @@ def control(store, args):
     from ..config import load_session_state
     with ProjectRunLock(project) as run_lock:
         orch = Orchestrator(project)
+        from .engine_adoption import adopted
         engine = [i for i in state['incidents'].values() if i.get('payload_ref') and
-                  (i['status'] == 'open' or i.get('required_runtime') != (store.meta('active_runtime') or {}).get('source'))]
+                  (i['status'] == 'open' or not adopted(store, state['workflow_id'], i)
+                   or any(c['incident_id'] == i['incident_id'] and c['status'] == 'ready'
+                          for c in state['continuations'].values()))]
         if engine:
             require(len(engine) == 1,'incident_selection','Select the engine incident to resume')
             payload = store.read(engine[0]['payload_ref'])
