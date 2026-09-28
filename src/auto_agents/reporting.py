@@ -845,6 +845,9 @@ class Reporter:
             if kind == 'repair.eligible':
                 return ('[自修复] 已找到原因，准备修复' if zh else
                         '[Self-repair] Cause identified; preparing repair'), ''
+            if kind in {'diagnosis.unavailable', 'diagnosis.review_incomplete'}:
+                return ('[自修复] 诊断未完成，本次未启动修复' if zh else
+                        '[Self-repair] Diagnosis incomplete; no repair started'), ''
             return ('[自修复] 检查已结束，本次未启动修复' if zh else
                     '[Self-repair] Investigation ended; no repair started'), ''
         if kind == 'repair.action':

@@ -179,6 +179,23 @@ def provider_outcome(orchestrator, result):
 
 
 def provider(orchestrator, request, execute):
+    # Root-cause consensus has its own bounded, read-only coordinator. It is
+    # investigating a stopped workflow, not performing a native business phase.
+    # In particular, an empty usage context must not bind its parallel roles to
+    # an ambient run and publish plan proofs (or consume that run's retry credit).
+    if (request.purpose == 'diagnosis'
+            and request.stage in {'self_repair_investigator', 'self_repair_reviewer', 'self_repair_arbiter'}
+            and request.sandbox_mode == 'read-only'
+            and not request.record_execution_incidents):
+        return execute(request)
+    # Test amendments likewise reserve their independent review in the
+    # proof-review store. They must not become business reviews of the parent
+    # collab task, nor manufacture implementation credit in a stopped search.
+    if (request.stage == request.purpose == 'proof_review'
+            and request.sandbox_mode == 'read-only'
+            and request.usage_context.get('workflow_kind') == 'proof_review'
+            and request.logical_call_id.startswith('proof-review:')):
+        return execute(request)
     selected = context(orchestrator, request.usage_context)
     if selected is None: return execute(request)
     store, stream, root, kind, native, state = selected

@@ -411,6 +411,8 @@ def ensure(session, state):
                     session._print(str(error))
                     session._save(state)
                     return 'paused'
+            from .proof_review_prompt import render
+            evidence = render(store, value)
             store.transition(saved, status='dispatched', model_calls=saved['model_calls'] + 1)
             request = AgentRequest(stage='proof_review', purpose='proof_review',
                 effort=session.orch.config.efforts.get('self_repair_review', 'max'),
@@ -424,7 +426,7 @@ def ensure(session, state):
                     '"coverage":[{"path":"...", "requirement":"original_goal or bound requirement ID", "reason":"..."}], '
                     '"change_coverage":[{"path":"every path in delta", "reason":"why necessary for the original goal"}], '
                     '"question":"plain user explanation when ambiguous", "suggestion":"specific choice"}.\n'
-                    + json.dumps(value, ensure_ascii=False)), cwd=session.project_root,
+                    + evidence), cwd=session.project_root,
                 output_path=output, sandbox_mode='read-only', resume_session_id='',
                 logical_call_id='proof-review:' + digest(value) + ':' + str(saved['model_calls']),
                 usage_context={'project_root': str(_root(session)), 'workflow_kind': 'proof_review',

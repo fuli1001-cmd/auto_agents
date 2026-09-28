@@ -827,6 +827,9 @@ class WorkflowCoordinator:
         # Explicit resume shares the automatic diagnosis boundary without
         # replaying acceptance execution or resetting its budget.
         begin_recovery(session, state)
+        if root:
+            from .retained_candidate_resume import prepare as prepare_retained_candidate
+            prepare_retained_candidate(self, state, snapshot)
         if state.status == "failed":
             session._invalidate_provider_continuations(
                 state,
@@ -1834,9 +1837,12 @@ class WorkflowCoordinator:
         parent_state.active_handoff_id = ""
         parent_state.return_phase = "after_child"
         parent_state.status = "executing"
-        if result.get("resolution") in {"execution_binding_mismatch", "verification_execution_binding"}:
+        if (result.get("resolution") in {"execution_binding_mismatch", "verification_execution_binding"}
+                or str(result.get('resolution', '')).startswith('kernel_')):
             parent_state.status = "blocked"
             parent_state.resolution = str(result["resolution"])
+        if result.get('status') == 'completed' and delivery:
+            parent_state.consecutive_agent_errors = 0
         if not self._preserve_engine_resume_budget:
             parent_state.attempt_epoch += 1
             parent_state.attempts_since_progress = 0

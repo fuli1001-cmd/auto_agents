@@ -26,6 +26,100 @@ def activate(root, control, monkeypatch):
     return store
 
 
+def test_parallel_root_cause_roles_do_not_claim_ambient_business_operations(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from auto_agents.config import load_run_state
+    root, child = project(tmp_path)
+    store = activate(root, tmp_path/'control', monkeypatch)
+    orch = Orchestrator(root)
+    orch._invocation_context = {'command': 'collab', 'session_id': child.session_id}
+    before = store.status()
+    unrelated = load_run_state(root).to_dict()
+    barrier = Barrier(2)
+    def execute(request):
+        barrier.wait(timeout=10)
+        assert request.purpose == 'diagnosis'
+        assert 'Controller task contract' not in request.prompt
+        return AgentResult(True, ['fixture'], request.output_path, summary='Evidence inspected')
+    monkeypatch.setattr(orch, '_call_with_failover_owned', execute)
+    def diagnose(role):
+        request = AgentRequest('self_repair_' + role, 'medium', 'Inspect the stopped session',
+            root, tmp_path/role, purpose='diagnosis', attempt_id='root-cause-' + role,
+            sandbox_mode='read-only', record_execution_incidents=False)
+        return orch._call_with_failover(request)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert all(result.ok for result in pool.map(diagnose, ['investigator', 'reviewer']))
+    assert store.status() == before
+    assert load_run_state(root).to_dict() == unrelated
+
+
+def test_amendment_review_does_not_become_a_parent_business_review(tmp_path, monkeypatch):
+    root, child = project(tmp_path)
+    store = activate(root, tmp_path/'control', monkeypatch)
+    before = store.status()
+    request = AgentRequest('proof_review', 'medium', 'Review amended assertions', root, tmp_path/'reply',
+        purpose='proof_review', sandbox_mode='read-only', logical_call_id='proof-review:sealed:1',
+        usage_context={'workflow_kind': 'proof_review', 'subject_id': child.session_id})
+    seen = []
+    def execute(bound):
+        seen.append(bound)
+        return AgentResult(True, ['fixture-review'], bound.output_path, summary='reviewed')
+    assert provider(Orchestrator(root), request, execute).ok
+    assert seen == [request]
+    assert store.status() == before
+
+
+@pytest.mark.parametrize('code', ['no_progress', 'outcome_unknown', 'stale_transition'])
+def test_collab_kernel_stop_preserves_reason_without_agent_error_retries(tmp_path, monkeypatch, code):
+    from auto_agents.session import Session
+    from test_session import _confirm_collab_state
+    root, state = project(tmp_path)
+    state.mode, state.status = 'collab', 'executing'
+    _confirm_collab_state(state)
+    save_session_state(root, state)
+    store = activate(root, tmp_path/'control', monkeypatch)
+    state = load_session_state(root, state.session_id)
+    session = Session(Orchestrator(root), mode='collab', auto_approve=True)
+    calls = []
+    def stopped(*args):
+        calls.append(True)
+        raise KernelError(code, 'Retain the original candidate', command_id='retained-command')
+    monkeypatch.setattr(session, '_call_agent', stopped)
+    monkeypatch.setattr(session, '_restore_collab_mutations',
+                        lambda *a: pytest.fail('uncertain kernel effects must not be rolled back'))
+    result = session._phase_collab_loop(state)
+    assert result.status == 'blocked' and result.resolution == 'kernel_' + code
+    assert len(calls) == 1 and result.consecutive_agent_errors == 0
+    assert not any(row['action'] == 'agent_error' for row in result.execution_log)
+    saved = load_session_state(root, state.session_id)
+    assert saved.execution_log[-1]['diagnostic']['command_id'] == 'retained-command'
+    from auto_agents.controlled_failure import capture
+    assert capture(saved).evidence['reason'] == 'Retain the original candidate'
+
+
+def test_provider_resolve_kernel_stop_does_not_retry_or_restore_unknown_effects(tmp_path, monkeypatch):
+    from auto_agents.session import Session
+    from test_session import _make_provider_blocked_project
+    root, _ = _make_provider_blocked_project(str(tmp_path))
+    state = SessionState('provider-stop', mode='provider_resolve', status='executing',
+                         goal='Resolve the retained provider reference')
+    save_session_state(root, state)
+    activate(root, tmp_path/'control', monkeypatch)
+    state = load_session_state(root, state.session_id)
+    session = Session(Orchestrator(root), mode='provider_resolve')
+    calls = []
+    def stopped(*args):
+        calls.append(True)
+        raise KernelError('outcome_unknown', 'Original operation requires reconciliation')
+    monkeypatch.setattr(session, '_call_agent', stopped)
+    monkeypatch.setattr(session, '_restore_provider_artifacts',
+                        lambda *a: pytest.fail('unknown effects must remain available for reconciliation'))
+    result = session._phase_provider_resolve_execute(state)
+    assert result.status == 'blocked' and result.resolution == 'kernel_outcome_unknown'
+    assert len(calls) == 1 and result.consecutive_agent_errors == 0
+
+
 @pytest.mark.parametrize('kind,purpose', [('collab','collab'), ('fix','fix'), ('provider_resolve','provider_resolve'), ('run','implement')])
 def test_all_native_provider_modes_reserve_once_and_replay(tmp_path, monkeypatch, kind, purpose):
     root, child = project(tmp_path)

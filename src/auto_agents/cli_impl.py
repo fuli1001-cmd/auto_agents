@@ -2008,12 +2008,12 @@ def _triage_terminal_run_error(
         else ""
     )
     notice(
+        "diagnosis.unavailable" if result.provider_error else
         "repair.eligible" if result.decision.eligible else "repair.not_eligible",
         f"Self-repair triage source={result.source} eligible={result.decision.eligible}"
-        f" category={result.decision.category or '-'}{detail}: {result.reason}",
+        f" category={result.decision.category or '-'}{detail}: {result.reason}"
+        + (f"; provider error: {result.provider_error}" if result.provider_error else ""),
     )
-    if result.provider_error:
-        notice("diagnosis.unavailable", f"Self-repair triage provider error: {result.provider_error}")
     return result
 
 
@@ -2078,6 +2078,13 @@ def _triage_controlled_workflow_result(project_root, orchestrator, state, args,
                   'user_input': '用户输入', 'unknown': '尚未确定'}
         reporter.text(('问题归属：' + labels.get(owner, owner)) if reporter.language == 'zh' else
                       'Failure owner: ' + owner)
+        if triage is not None and triage.provider_error:
+            from .diagnostic_output import clean_payload
+            detail = clean_payload(str(triage.provider_error))
+            reporter.text(('诊断未完成：' if reporter.language == 'zh' else
+                           'Diagnosis did not complete: ') + detail)
+            reporter.text(('诊断记录：' if reporter.language == 'zh' else
+                           'Diagnosis record: ') + str(path))
     if triage is not None and triage.decision.eligible:
         foreground.release()
         return _auto_repair_auto_agents_and_resume(

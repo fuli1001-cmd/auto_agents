@@ -478,6 +478,10 @@ def verification_identity(session, state, *, scope='final'):
         from .proof_amendments import identities
         value = ['execution-bound-receipt-v3', scope, contracts, commands, receipt['fingerprint'], receipt['source_revision'],
                  state.verification_binding, state.fix_verify_command, state.full_verify, environment]
+        from .recovery.authority import installed
+        store = installed(Path(getattr(session, '_custody_control_root', session.project_root)))
+        if store is not None:
+            value.append({'verifier_runtime': (store.meta('active_runtime') or {}).get('source')})
         amendments = identities(session, state)
         return fingerprint([*value, {'proof_amendments': amendments}] if amendments else value)
 

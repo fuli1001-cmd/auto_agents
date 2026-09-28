@@ -37,6 +37,14 @@ def events(reporter):
     return [json.loads(line) for line in (reporter.root / "events.jsonl").read_text().splitlines()]
 
 
+@pytest.mark.parametrize('kind', ['diagnosis.unavailable', 'diagnosis.review_incomplete'])
+def test_incomplete_diagnosis_is_not_reported_as_completed_investigation(report, kind):
+    reporter, stream = report
+    reporter.event(kind, {}, audience='user', message='Investigation failed')
+    assert '诊断未完成' in stream.getvalue()
+    assert '检查已结束' not in stream.getvalue()
+
+
 def test_progress_replans_rewinds_and_does_not_count_attempts(report):
     reporter, stream = report
     state = RunState("example", current_stage="implement", tasks=[task(status="done"), task("T2")])

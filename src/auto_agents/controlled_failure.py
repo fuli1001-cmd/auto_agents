@@ -31,7 +31,8 @@ def capture(state):
         relevant = acceptance if evidence['resolution'].startswith('acceptance_') else {}
         result, review = relevant.get('result') or {}, relevant.get('review') or {}
         recent = list(getattr(state, 'execution_log', []) or [])[-5:]
-        recent_reason = str(recent[-1].get('result', '')) if recent else ''
+        recent_reason = next((str(item['result']) for item in reversed(recent)
+                              if item.get('result') and item.get('action') != 'session_stopped'), '')
         evidence.update(
             mode=state.mode, workflow_id=getattr(state, 'workflow_id', ''),
             goal=getattr(state, 'goal', ''),
@@ -41,7 +42,7 @@ def capture(state):
             code_root=(getattr(state, 'candidate_custody', {}) or {}).get('checkout', ''),
             reason=(relevant.get('error') or
                     (review.get('reason') if evidence['resolution'] == 'acceptance_review_rejected' else '') or
-                    result.get('summary') or evidence['resolution'] or recent_reason or 'session stopped without a reason'),
+                    result.get('summary') or recent_reason or evidence['resolution'] or 'session stopped without a reason'),
             acceptance={k: relevant[k] for k in ('identity', 'phase', 'directory', 'result', 'review', 'error')
                         if k in relevant},
             derived_acceptance_plan=(relevant.get('inputs') or {}).get('request', {}),

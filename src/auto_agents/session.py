@@ -2753,6 +2753,10 @@ class Session:
                 except ProviderCleanupIncompleteError:
                     raise
                 except RuntimeError as exc:
+                    from .recovery.model import KernelError
+                    if isinstance(exc, KernelError):
+                        exc.diagnostic = {'failure_kind': exc.code, **exc.details, 'retry_fix': False}
+                        return self._block_execution_binding(state, exc, 'kernel_' + exc.code)
                     offending = self._restore_collab_mutations(
                         state,
                         before_snapshot,
@@ -3134,6 +3138,10 @@ class Session:
                 except ProviderCleanupIncompleteError:
                     raise
                 except RuntimeError as exc:
+                    from .recovery.model import KernelError
+                    if isinstance(exc, KernelError):
+                        exc.diagnostic = {'failure_kind': exc.code, **exc.details, 'retry_fix': False}
+                        return self._block_execution_binding(state, exc, 'kernel_' + exc.code)
                     self._restore_provider_artifacts(restore_root)
                     violation = self.orch._stage_mutation_scope_violation(
                         stage="provider_resolve",
@@ -4788,7 +4796,10 @@ class Session:
                     if state.verification_binding and not extract_failure_info(targeted_gate).comparable:
                         return outcome(False, f"fix_verify_command has no comparable failure identity: {detail[:500]}",
                                        retry_fix=False, failure_kind="verification_inconclusive")
-                    return outcome(False, f"fix_verify_command failed: {detail[:500]}", retry_fix=True)
+                    from .verification_failure import details as failure_details
+                    reason, diagnostic = failure_details(targeted_gate)
+                    return outcome(False, f"fix_verify_command failed: {reason}", retry_fix=True,
+                                   failure_kind='candidate_verification', diagnostic=diagnostic)
 
             # Layer 2: baseline-diff gate check
             if not plan.commands and not plan.parallel_groups:

@@ -12,6 +12,11 @@ from auto_agents.workflow_runtime import WorkflowCoordinator
 from test_session_verification_ownership import project
 
 
+@pytest.fixture(autouse=True)
+def disable_external_notifications(monkeypatch):
+    monkeypatch.setenv('WECHAT_WEBHOOK_URL', '')
+
+
 def terminal_fixture(tmp_path, monkeypatch, *, mode='collab', status='blocked'):
     monkeypatch.setenv('AUTO_AGENTS_REPAIR_CONTROL_DISABLED', '1')
     root, _ = project(tmp_path)
@@ -128,6 +133,14 @@ def test_rejected_review_and_explicit_user_limits_survive_evidence_capture():
     assert failure.evidence['derived_acceptance_plan']['continuation_constraints'] == ['Agent-derived cap 3']
 
 
+def test_agent_error_capture_keeps_cause_before_terminal_summary():
+    from auto_agents.controlled_failure import capture
+    state = SessionState('stopped', mode='collab', status='failed', resolution='agent_errors_exhausted',
+        execution_log=[{'action': 'agent_error', 'result': 'No verified progress; preserve the candidate'},
+                       {'action': 'session_stopped', 'result': 'agent_errors_exhausted'}])
+    assert capture(state).evidence['reason'] == 'No verified progress; preserve the candidate'
+
+
 @pytest.mark.parametrize('owner', ['auto_agents', 'target_project'])
 def test_controlled_failure_reaches_independent_root_cause_review(tmp_path, owner):
     from pathlib import Path
@@ -178,6 +191,22 @@ def test_unavailable_diagnosis_preserves_original_failure_without_recursive_tria
     assert len(called) == 1
     saved = json.loads((root / '.auto-agents/state/sessions/terminal/terminal-triage.json').read_text())
     assert saved['owner'] == 'unknown' and saved['diagnosis_error'] == 'diagnosis service unavailable'
+    assert {p: (root / p).read_bytes() for p in protected} == protected
+
+
+def test_failed_root_cause_reports_the_actual_diagnostic_error(tmp_path, monkeypatch, capsys):
+    root, state, protected = terminal_fixture(tmp_path, monkeypatch)
+    triage = SelfRepairTriageResult(SelfRepairDecision(False, category='root_cause_diagnosis_unavailable'),
+        source='root_cause_failed', reason='Root-cause consensus unavailable',
+        provider_error='Concurrent transition won; reload state; api_key=hidden-secret')
+    monkeypatch.setattr(cli, 'adjudicate_auto_agents_error', lambda *a, **kw: triage)
+    assert cli.main(['collab', '--project', str(root), '--session', state.session_id, '--no-health-watch']) == 3
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert 'Concurrent transition won; reload state' in output
+    assert 'terminal-triage.json' in output
+    assert 'hidden-secret' not in output
+    assert 'Investigation ended' not in output and '检查已结束' not in output
     assert {p: (root / p).read_bytes() for p in protected} == protected
 
 
