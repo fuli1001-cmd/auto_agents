@@ -10,6 +10,10 @@ from .store import KernelStore
 def maintenance(args):
     root = installation_root()
     require(root is not None, 'installation', 'No registered recovery installation')
+    if args.repair_action == 'abandon':
+        require(not args.job and not args.project, 'transaction_selection', 'Use --transaction to select one stopped V2 repair')
+        from ..repair_v2.retirement import abandon
+        return abandon(root, args.transaction, args.reason)
     if args.repair_action == 'migrate':
         require(args.check, 'migration_mode', 'Use migrate --check; activation belongs to the verified upgrade transaction')
         from .migration import check

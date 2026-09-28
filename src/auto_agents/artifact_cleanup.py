@@ -106,7 +106,10 @@ def _clean(store, scope, started, deadline, progress):
 def _clean_docker(store, roots, scope, deadline, record):
     # Only an existing, local Docker connection is eligible. Never contact a
     # remote worker/daemon or create an image just to perform cleanup.
-    if scope is not None or not (roots or (store.root / 'v2-images').is_dir()) or not shutil.which('docker'): return
+    default = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'auto-agents/storage'
+    discover_origins = store.root == default.absolute()
+    if (scope is not None or not (roots or (store.root / 'v2-images').is_dir() or discover_origins)
+            or not shutil.which('docker')): return
     from .repair_v2.docker import run
     host = os.environ.get('DOCKER_HOST', '') if not os.environ.get('DOCKER_CONTEXT') else ''
     if not host:
@@ -156,3 +159,7 @@ def _clean_docker(store, roots, scope, deadline, record):
     if scope is None:
         from .repair_v2 import images
         images.maintain(deadline=deadline, registry_root=store.root / 'v2-images', record=record)
+        # Only default maintenance visits positively identified owned registries.
+        # A missing registry is collectible only for explicit disposable tests.
+        if discover_origins:
+            images.reap_ephemeral(deadline=deadline, record=record)

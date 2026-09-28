@@ -204,9 +204,9 @@ def test_one_bad_legacy_cache_does_not_skip_other_jobs(store, legacy, monkeypatc
     _, _, good = make_job('d' * 24)
     import auto_agents.artifact_legacy as module
     original = module.clean_build
-    def fail(store, db, directory, project, path, *args):
+    def fail(store, db, directory, project, path, *args, **kwargs):
         if path == bad: raise PermissionError('preserve inaccessible cache')
-        return original(store, db, directory, project, path, *args)
+        return original(store, db, directory, project, path, *args, **kwargs)
     monkeypatch.setattr(module, 'clean_build', fail)
     result = clean(store=store)
     assert not result['ok'] and not result['complete']
@@ -371,6 +371,7 @@ def test_image_removal_failure_is_reported_and_never_prunes_global_cache(store, 
     def run(command, **kwargs):
         assert not any(word in command for word in ('volume', 'prune', 'build'))
         if command[1:3] == ['image', 'inspect']:
+            if command[-1] == '{{.Id}}': return 0, 'sha256:' + command[3].split(':')[-1]
             return 0, json.dumps([{'Config': {'Labels': {'org.auto-agents.registry': images.owner()}}}])
         if command[1:3] == ['image', 'rm']: return 1, 'removal failed'
         return 0, ''
@@ -379,3 +380,60 @@ def test_image_removal_failure_is_reported_and_never_prunes_global_cache(store, 
     records = []
     assert images.maintain(record=records.append) == []
     assert any(r['result'] == 'error' and r['reason'] == 'image_removal_failed' for r in records)
+
+
+@pytest.mark.parametrize('protection', ['', 'undelivered', 'pending', 'tracked', 'pinned', 'active', 'new_consumer'])
+def test_cancelled_dependency_cache_requires_proven_delivery(store, legacy, protection, monkeypatch):
+    root, make_job = legacy
+    cancelled, project, _ = make_job()
+    successor, _, _ = make_job('c' * 24, 'completed')
+    (project / '.gitignore').write_text('.next/\nnode_modules/\n')
+    git(project, 'add', '.gitignore'); git(project, 'commit', '-qm', 'ignore generated dependencies')
+    commit = git(project, 'rev-parse', 'HEAD')
+    git(root, 'clone', '--bare', str(project), str(root / 'engine.git'))
+    ref = 'refs/auto-agents/delivered/' + successor.name
+    git(root / 'engine.git', 'update-ref', ref, commit)
+    (successor / 'source-delivery.json').write_text(json.dumps({'commit': commit, 'retained_ref': ref}))
+    (successor / 'prior-repair-import.json').write_text(json.dumps({'source_job': cancelled.name, 'source_commit': commit}))
+    modules = project / 'node_modules'; modules.mkdir()
+    (modules / '.package-lock.json').write_text('{}')
+    (modules / 'package.js').write_text('generated dependency')
+    if protection == 'undelivered': git(root / 'engine.git', 'update-ref', '-d', ref)
+    if protection == 'pending':
+        with sqlite3.connect(root / 'control.sqlite3') as db:
+            db.execute('INSERT INTO subscribers VALUES(?,?)', (cancelled.name, 'waiting_user'))
+    if protection == 'tracked': git(project, 'add', '-f', 'node_modules/package.js')
+    if protection == 'pinned':
+        identity = store.register(modules, kind='cache'); store.release(identity); store.pin(identity, 'preserve')
+    if protection == 'active':
+        from auto_agents.artifact_store import process_identity
+        (cancelled / 'repair-lease.json').write_text(json.dumps(process_identity()))
+    if protection == 'new_consumer':
+        from auto_agents import artifact_legacy
+        original = artifact_legacy._allocated
+        def measure(path, *args):
+            if path == modules:
+                with sqlite3.connect(root / 'control.sqlite3') as db:
+                    db.execute('INSERT INTO subscribers VALUES(?,?)', (cancelled.name, 'validating'))
+            return original(path, *args)
+        monkeypatch.setattr(artifact_legacy, '_allocated', measure)
+    clean(store=store)
+    assert modules.exists() == bool(protection)
+    assert (cancelled / 'continuous/repair/uncommitted.py').read_text() == 'valuable repair'
+    assert (project / 'source.py').exists()
+
+
+def test_default_cleanup_discovers_test_images_without_a_local_image_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+    store = ArtifactStore(tmp_path / 'auto-agents/storage')
+    monkeypatch.setattr('auto_agents.artifact_cleanup.shutil.which', lambda _: '/usr/bin/docker')
+    def run(command, **kwargs):
+        if command[1:3] == ['context', 'inspect']: return 0, json.dumps('unix:///var/run/docker.sock')
+        assert command[1] == 'ps'
+        return 0, ''
+    monkeypatch.setattr('auto_agents.repair_v2.docker.run', run)
+    monkeypatch.setattr('auto_agents.repair_v2.images.maintain', lambda **k: [])
+    called = []
+    monkeypatch.setattr('auto_agents.repair_v2.images.reap_ephemeral', lambda **k: called.append(True))
+    _clean_docker(store, [], None, float('inf'), lambda _: None)
+    assert called == [True]

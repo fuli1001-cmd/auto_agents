@@ -18,6 +18,7 @@ from .artifact_store import _allocated, _identity, _parents, _parent_fd, _remove
 
 
 COPIES = ('evidence', 'working-evidence', 'continuous/target-evidence')
+DELIVERED_CACHES = {'node_modules', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache'}
 
 
 def quiescent(directory):
@@ -93,9 +94,16 @@ def git(root, *args):
                           capture_output=True, timeout=5)
 
 
-def disposable_build(project, path, *, resuming=False):
-    if path.name != '.next' or not path.is_dir() or path.is_symlink(): return False
-    if not resuming and not any((path / name).exists() for name in ('cache', 'BUILD_ID', 'build-manifest.json')): return False
+def disposable_build(project, path, *, resuming=False, delivered=False):
+    if not path.is_dir() or path.is_symlink(): return False
+    if path.name == '.next':
+        if not resuming and not any((path / name).exists() for name in ('cache', 'BUILD_ID', 'build-manifest.json')): return False
+    elif delivered and path.name in DELIVERED_CACHES:
+        if path.name == 'node_modules' and not resuming and not any(
+                (path / name).is_file() for name in ('.package-lock.json', '.modules.yaml', '.yarn-state.yml')):
+            return False
+    else:
+        return False
     # The working tree must be this diagnostic copy, never a Git repository
     # discovered by walking into a live parent project.
     top = git(project, 'rev-parse', '--show-toplevel')
@@ -122,7 +130,15 @@ def enclosing_protection(store, path):
     return ''
 
 
-def clean_build(store, db, directory, project, path, deadline, record):
+def consumers_finished(db, job):
+    return not db.execute(
+        "SELECT 1 FROM subscribers WHERE job=? AND state NOT IN ('finished','cancelled') LIMIT 1",
+        (job,)).fetchone() and not db.execute(
+        "SELECT 1 FROM outbox WHERE job=? AND state NOT IN ('published','invalidated','cancelled') LIMIT 1",
+        (job,)).fetchone()
+
+
+def clean_build(store, db, directory, project, path, deadline, record, *, delivered=False):
     def retained(reason):
         record({'path': str(path), 'result': 'retained', 'reason': reason, 'freed_bytes': 0})
     reason = enclosing_protection(store, path)
@@ -132,14 +148,16 @@ def clean_build(store, db, directory, project, path, deadline, record):
     with store.connect() as index:
         saved = index.execute('SELECT data FROM maintenance WHERE key=?', (key,)).fetchone()
     resuming = saved is not None and json.loads(saved[0]) == row
-    if not disposable_build(project, path, resuming=resuming):
+    if not disposable_build(project, path, resuming=resuming, delivered=delivered):
         retained('unverified_build_output'); return
     size, measured = _allocated(path, min(deadline, time.monotonic() + .5))
     current = db.execute('SELECT state FROM jobs WHERE id=?', (directory.name,)).fetchone()
     if not current or current[0] not in ('cancelled', 'completed', 'failed') or not quiescent(directory):
         retained('job_became_active'); return
     with store.locked(), _parent_fd(row, path) as fd:
-        if enclosing_protection(store, path) or not disposable_build(project, path, resuming=resuming):
+        if delivered and not consumers_finished(db, directory.name):
+            retained('repair_consumer_became_active'); return
+        if enclosing_protection(store, path) or not disposable_build(project, path, resuming=resuming, delivered=delivered):
             retained('ownership_changed'); return
         # Persist authorization before removing any marker. A killed cleaner
         # can finish this same inode after BUILD_ID/cache has already vanished.
@@ -158,6 +176,8 @@ def clean_legacy(store, roots, deadline, record, scope=None):
         if time.monotonic() >= deadline: return False
         try:
             with repair_lock(root), closing(sqlite3.connect((root / 'control.sqlite3').as_uri() + '?mode=ro', uri=True)) as db:
+                from .artifact_references import delivered_repair_candidates
+                delivered = delivered_repair_candidates(root, db)
                 jobs = db.execute("SELECT id,state FROM jobs ORDER BY updated,id").fetchall()
                 if scope and scope.startswith('project:'):
                     jobs = [(job, state) for job, state in jobs if
@@ -181,6 +201,10 @@ def clean_legacy(store, roots, deadline, record, scope=None):
                         record({'path': str(directory), 'result': 'retained', 'reason': 'active_or_recoverable_legacy_job',
                                 'freed_bytes': 0, 'size_complete': False})
                         continue
+                    # A cancellation alone never authorizes deleting dependencies
+                    # needed to replay a retained candidate. Require durable Git
+                    # delivery and no pending subscriber/publication for that job.
+                    released = job in delivered and consumers_finished(db, job)
                     record({'path': str(directory), 'result': 'retained', 'reason': 'legacy_candidate_and_recovery_evidence',
                             'freed_bytes': 0, 'size_complete': False})
                     for suffix in COPIES:
@@ -188,17 +212,17 @@ def clean_legacy(store, roots, deadline, record, scope=None):
                         if not project.is_dir() or project.is_symlink(): continue
                         for parent, directories, _ in os.walk(project, followlinks=False):
                             if time.monotonic() >= deadline: return False
+                            caches = ['.next', *(DELIVERED_CACHES if released else ())]
+                            candidates = [Path(parent) / name for name in caches if name in directories]
                             directories[:] = [d for d in directories if d not in
-                                ('.git', '.auto-agents', 'node_modules', '.venv', '.conda')
+                                ('.git', '.auto-agents', 'node_modules', '.venv', '.conda', *caches)
                                 and not (Path(parent) / d).is_symlink()]
-                            if '.next' not in directories: continue
-                            directories.remove('.next')
-                            path = Path(parent) / '.next'
-                            try: clean_build(store, db, directory, project, path, deadline, record)
-                            except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
-                                complete = False
-                                record({'path': str(path), 'result': 'deferred' if isinstance(error, TimeoutError) else 'error',
-                                        'reason': str(error), 'freed_bytes': 0})
+                            for path in candidates:
+                                try: clean_build(store, db, directory, project, path, deadline, record, delivered=released)
+                                except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
+                                    complete = False
+                                    record({'path': str(path), 'result': 'deferred' if isinstance(error, TimeoutError) else 'error',
+                                            'reason': str(error), 'freed_bytes': 0})
         except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
             complete = False
             record({'path': str(root), 'result': 'deferred' if isinstance(error, (TimeoutError, BlockingIOError)) else 'error',

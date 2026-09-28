@@ -205,44 +205,44 @@ def _tool_image(root, python, driver, *, codex_binary=None):
     search_path = ':'.join([*tools.get('path_entries',[]),paths['prefix'] + '/bin','/usr/bin','/bin','/usr/sbin','/sbin'])
     identity = digest([records, os.getuid(), os.getgid(), images.owner(), search_path, 4])[:24]
     image = 'auto-agents-verifier:v2-' + identity
-    code, _ = run(['docker', 'image', 'inspect', image], timeout=15)
-    if code:
-        generated = {
-            **{key: (marker, 0o644) for key, marker in conda_markers.items()},
-            'opt/repair/driver.py': (driver, 0o644),
-            'etc/passwd': ('root:x:0:0:root:/root:/bin/sh\n'
-                f'repair:x:{os.getuid()}:{os.getgid()}:repair:/home/repair:/bin/sh\n', 0o644),
-            'etc/group': (f'root:x:0:\nrepair:x:{os.getgid()}:\n', 0o644),
-        }
-        if script is not None: generated['usr/bin/codex'] = (script, 0o755)
-        for key, value in sources.items():
-            if key.startswith('@wrapper:'): generated['usr/bin/' + key.split(':', 1)[1]] = (value, 0o755)
-        total = sum(p.stat().st_size for key, p in sources.items()
-                    if not key.startswith('@wrapper:') and records[key][0] != 'link')
-        require_space(stage, total)
-        import_image(image, records, sources, generated, paths['prefix'], stage / 'build.log', search_path=search_path)
-    code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
-        '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'PYTHONDONTWRITEBYTECODE=1', image, 'python', '-c',
-        'import sqlite3,ssl,bz2,lzma,ctypes,uuid,regex,pytest; print("toolchain ready")'], timeout=30)
-    if code: raise RepairBlocked('image_validation_failed', text[-2000:])
-    # Native agents use these utilities for repository discovery. A missing
-    # dirname previously turned a parent walk into an endless shell loop.
-    code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only', image,
-        '/bin/sh', '-ec', 'test "$(dirname /work/tests)" = /work; '
-        'test "$(basename /work/tests)" = tests; command -v mktemp >/dev/null; rg --version'], timeout=15)
-    if code: raise RepairBlocked('image_validation_failed', text[-2000:])
-    code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only', image,
-        str(Path(paths['base']) / 'bin/python'), '-c', 'import pytest,regex; print("base interpreter ready")'], timeout=30)
-    if code: raise RepairBlocked('image_validation_failed', text[-2000:])
-    if conda:
-        code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only', image, 'conda', '--version'], timeout=30)
+    with images.preparation(image):
+        code, _ = run(['docker', 'image', 'inspect', image], timeout=15)
+        if code:
+            generated = {
+                **{key: (marker, 0o644) for key, marker in conda_markers.items()},
+                'opt/repair/driver.py': (driver, 0o644),
+                'etc/passwd': ('root:x:0:0:root:/root:/bin/sh\n'
+                    f'repair:x:{os.getuid()}:{os.getgid()}:repair:/home/repair:/bin/sh\n', 0o644),
+                'etc/group': (f'root:x:0:\nrepair:x:{os.getgid()}:\n', 0o644),
+            }
+            if script is not None: generated['usr/bin/codex'] = (script, 0o755)
+            for key, value in sources.items():
+                if key.startswith('@wrapper:'): generated['usr/bin/' + key.split(':', 1)[1]] = (value, 0o755)
+            total = sum(p.stat().st_size for key, p in sources.items()
+                        if not key.startswith('@wrapper:') and records[key][0] != 'link')
+            require_space(stage, total)
+            import_image(image, records, sources, generated, paths['prefix'], stage / 'build.log', search_path=search_path)
+        images.register_tag(image, status='preparing')
+        code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
+            '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'PYTHONDONTWRITEBYTECODE=1', image, 'python', '-c',
+            'import sqlite3,ssl,bz2,lzma,ctypes,uuid,regex,pytest; print("toolchain ready")'], timeout=30)
         if code: raise RepairBlocked('image_validation_failed', text[-2000:])
-    code, image_id = run(['docker', 'image', 'inspect', image, '--format', '{{.Id}}'], timeout=15)
-    if code: raise RepairBlocked('image_unavailable', image_id)
-    images.record(image_id.strip(), image)
-    atomic_json(root / 'image.json', {'image': image, 'python': str(python), 'toolchain': paths,
-        'manifest': digest(records), 'driver': digest(driver), 'source': 'selected local toolchain'})
-    return image
+        # Native agents use these utilities for repository discovery. A missing
+        # dirname previously turned a parent walk into an endless shell loop.
+        code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only', image,
+            '/bin/sh', '-ec', 'test "$(dirname /work/tests)" = /work; '
+            'test "$(basename /work/tests)" = tests; command -v mktemp >/dev/null; rg --version'], timeout=15)
+        if code: raise RepairBlocked('image_validation_failed', text[-2000:])
+        code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only', image,
+            str(Path(paths['base']) / 'bin/python'), '-c', 'import pytest,regex; print("base interpreter ready")'], timeout=30)
+        if code: raise RepairBlocked('image_validation_failed', text[-2000:])
+        if conda:
+            code, text = run(['docker', 'run', '--rm', '--network', 'none', '--read-only', image, 'conda', '--version'], timeout=30)
+            if code: raise RepairBlocked('image_validation_failed', text[-2000:])
+        images.register_tag(image, status='ready')
+        atomic_json(root / 'image.json', {'image': image, 'python': str(python), 'toolchain': paths,
+            'manifest': digest(records), 'driver': digest(driver), 'source': 'selected local toolchain'})
+        return image
 
 
 def import_image(image, records, sources, generated, prefix, logfile, *, search_path=None):
@@ -253,7 +253,15 @@ def import_image(image, records, sources, generated, prefix, logfile, *, search_
     temporary = 'auto-agents-verifier:building-' + uuid.uuid4().hex
     command = ['docker', 'import', '--change', 'ENV PATH=' + search_path,
                '--change', 'WORKDIR /work', '--change', 'LABEL org.auto-agents.purpose=repair-verifier-v2',
-               '--change', 'LABEL org.auto-agents.registry=' + images.owner(), '-', temporary]
+               '--change', 'LABEL org.auto-agents.registry=' + images.owner()]
+    from ..artifact_store import process_identity
+    labels = {'origin-version': '1', 'ephemeral': str(os.environ.get('AUTO_AGENTS_STORAGE_EPHEMERAL') == '1').lower(),
+              'uid': str(os.getuid()), 'registry-path': str(images.registry().resolve()),
+              **{'creator-' + key: str(value) for key, value in process_identity().items()}}
+    for key, value in labels.items():
+        command.extend(['--change', 'LABEL org.auto-agents.' + key + '=' + json.dumps(value)])
+    images.begin_build(image, temporary)
+    command.extend(['-', temporary])
     class CheckedReader:
         def __init__(self, stream): self.stream, self.digest = stream, hashlib.sha256()
         def read(self, size=-1):

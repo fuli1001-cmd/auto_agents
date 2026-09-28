@@ -2090,11 +2090,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     repair_parser = subparsers.add_parser("repair", help="Inspect and control durable engine repairs")
-    repair_parser.add_argument("repair_action", choices=("status", "resume", "cancel", "retry-publish", "migrate", "upgrade"))
+    repair_parser.add_argument("repair_action", choices=("status", "resume", "cancel", "abandon", "retry-publish", "migrate", "upgrade"))
     repair_parser.add_argument("--job", default="")
     repair_parser.add_argument("--project", default="")
     repair_parser.add_argument("--check", action="store_true")
     repair_parser.add_argument("--runtime", default="")
+    repair_parser.add_argument("--transaction", default="", help="Exact stopped V2 transaction to abandon.")
+    repair_parser.add_argument("--reason", default="", help="Reason for explicitly abandoning a V2 transaction.")
     repair_parser.add_argument("--json", action="store_true")
     prompt_eval_parser = subparsers.add_parser(
         "prompt-eval", help="Capture prompt baselines or explicitly evaluate configured providers"
@@ -2822,6 +2824,11 @@ def _dispatch(args) -> int:
                     print(json.dumps(managed, ensure_ascii=False, indent=2))
                     return 0 if managed.get('ok') else 3
             config = configure(auto_agents_repo_root())
+            if args.repair_action == 'abandon':
+                from .repair_v2.retirement import abandon
+                payload = abandon(config['root'], args.transaction, args.reason)
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+                return 0
             ensure_supervisor(config)
             request = {"op": args.repair_action}
             if args.repair_action == "resume":

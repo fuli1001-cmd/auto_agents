@@ -18,6 +18,7 @@ def isolate_verification_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTO_AGENTS_CLUSTER_HOME", str(tmp_path / "cluster-state"))
     monkeypatch.setenv("AUTO_AGENTS_STORAGE_ROOT", str(tmp_path / "storage-state"))
     monkeypatch.setenv("AUTO_AGENTS_STORAGE_MAINTENANCE", "off")
+    monkeypatch.setenv("AUTO_AGENTS_STORAGE_EPHEMERAL", "1")
     from auto_agents import artifact_runtime
     token = artifact_runtime._context.set(None)
     try:
@@ -25,3 +26,8 @@ def isolate_verification_state(tmp_path, monkeypatch):
     finally:
         artifact_runtime.release_owned()
         artifact_runtime._context.reset(token)
+        # Real Docker integration tests must not outlive their private registry.
+        # Only this test's positively owned, unpinned images are eligible.
+        from auto_agents.repair_v2 import images
+        images.release_process()
+        images.maintain(keep=0, age_days=0, registry_root=tmp_path / 'storage-state/v2-images')

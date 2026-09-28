@@ -130,13 +130,15 @@ def _matches_legacy_session(root, payload):
 
 
 @contextmanager
-def transaction_lock(root):
+def transaction_lock(root, *, allow_abandoned=False):
     root = Path(root)
     root.mkdir(parents=True, mode=0o700, exist_ok=True)
     with (root / 'transaction.lock').open('a+b') as handle:
         try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RepairBlocked('transaction_busy', 'the same repair is already running') from error
+        if not allow_abandoned and (root / 'abandonment.json').exists():
+            raise RepairBlocked('transaction_abandoned', 'this repair was explicitly abandoned; its evidence remains read-only')
         yield
 
 
@@ -168,6 +170,8 @@ def frozen_request(root, payload, create):
 
 def bind_controller(root, config, owner):
     """Pin one controller per job generation; retries retain transaction budgets."""
+    if (Path(root) / 'abandonment.json').exists():
+        raise RepairBlocked('transaction_abandoned', 'explicitly abandoned repair cannot load an older controller')
     from .workspace import git, source_identity
     implementation = Path(config.get('implementation_root') or config['source_root']).resolve()
     identity = {'root': str(implementation), 'commit': git(implementation, 'rev-parse', 'HEAD'),
