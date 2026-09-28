@@ -138,14 +138,19 @@ def selected_nodes(session, state, invocation, *, expected_missing=(), candidate
                              for key in ('selected', 'deselected', 'collection_errors')))
             eligible_missing = invocation.repository_targets if candidate else expected_missing
             if result.returncode == 4 and eligible_missing and valid and not observed['collection_errors']:
-                expected_paths = {
-                    str(checkout / ref.split('::', 1)[0]) + '::' + ref.split('::', 1)[1]: ref
-                    for ref in eligible_missing if '::' in ref
-                }
-                errors = re.findall(r'^ERROR: not found: (.+)$', result.stderr, re.MULTILINE)
-                other_errors = [line for line in result.stderr.splitlines()
-                                if line.startswith('ERROR:') and not line.startswith('ERROR: not found: ')]
-                if errors and not other_errors and all(error.strip() in expected_paths for error in errors):
+                expected_paths = {}
+                for raw, ref in zip(invocation.targets, invocation.repository_targets):
+                    if ref not in eligible_missing:
+                        continue
+                    path, _, node = ref.partition('::')
+                    if node:
+                        expected_paths['not found: ' + str(checkout / path) + '::' + node] = ref
+                    # Pytest reports an absent file differently from an absent
+                    # node. Only an explicit .py target may be omitted here.
+                    if path.endswith('.py') and not (checkout / path).exists():
+                        expected_paths['file or directory not found: ' + raw] = ref
+                errors = re.findall(r'^ERROR: (.+)$', result.stderr, re.MULTILINE)
+                if errors and all(error.strip() in expected_paths for error in errors):
                     missing = frozenset(expected_paths[error.strip()] for error in errors)
             if result.returncode not in (0, 5) and (not missing or candidate):
                 kind = 'candidate_selection' if candidate and missing else 'discovery'
@@ -165,8 +170,17 @@ def selected_nodes(session, state, invocation, *, expected_missing=(), candidate
                 raise ValueError('invalid pytest selection report')
             selected = (frozenset(observed['selected']), frozenset(observed['deselected']))
             if missing:
-                retained = _without_missing_targets(invocation, missing, environment)
-                selected = selected_nodes(session, state, retained)
+                # With no retained targets left, pytest's default discovery
+                # would widen the original command to the whole repository.
+                if len(missing) == len(invocation.repository_targets):
+                    selected = (frozenset(), frozenset())
+                else:
+                    retained = _without_missing_targets(invocation, missing, environment)
+                    selected = selected_nodes(session, state, retained,
+                                              expected_missing=expected_missing - missing)
+                    if len(selected) == 3:
+                        missing = missing | selected[2]
+                        selected = selected[:2]
             if expected_missing:
                 selected = (*selected, missing)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:

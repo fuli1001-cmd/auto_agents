@@ -4411,7 +4411,8 @@ class Session:
                 self._candidate_source_ref = previous
                 manager.close()
 
-    def _session_gate_executor_context(self, metadata=None, *, source_ref="", original_commands=None, **kwargs):
+    def _session_gate_executor_context(self, metadata=None, *, source_ref="", original_commands=None,
+                                       record_pytest_execution=False, **kwargs):
         state = self._current_state
         if state is not None and state.verification_binding:
             from .verification_context import current_context
@@ -4427,6 +4428,8 @@ class Session:
         executor = self.orch._gate_executor_context(
             metadata, source_ref=source_ref or getattr(self, "_candidate_source_ref", ""), **kwargs
         )
+        if record_pytest_execution:
+            executor.record_pytest_execution = True
         executor.original_commands = dict(original_commands or {})
         if state is not None and state.verification_binding:
             from functools import partial
@@ -4749,9 +4752,14 @@ class Session:
             if self.mode == "fix" and state.fix_verify_command:
                 try:
                     verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
+                    from .session_verification import planned_pytest_execution_nodes
+                    planned_nodes = (planned_pytest_execution_nodes(self, state, verify_command)
+                                     if state.verification_binding else set())
                     with self._session_gate_executor_context(
                         {verify_command: plan.metadata.get(verify_command, {})},
                         original_commands={verify_command: state.fix_verify_command},
+                        record_pytest_execution=bool(planned_nodes),
+                        use_result_cache=not planned_nodes,
                     ) as gate_executor:
                         targeted_gate = run_gate_plan(
                             [verify_command],
@@ -4800,6 +4808,14 @@ class Session:
                     reason, diagnostic = failure_details(targeted_gate)
                     return outcome(False, f"fix_verify_command failed: {reason}", retry_fix=True,
                                    failure_kind='candidate_verification', diagnostic=diagnostic)
+                if planned_nodes:
+                    passed = {node for result in targeted_gate.commands for node in result.executed_tests}
+                    unexecuted = sorted(planned_nodes - passed)
+                    if unexecuted:
+                        return outcome(False, "planned pytest tests did not execute and pass: " +
+                                       ", ".join(unexecuted[:10]), retry_fix=True,
+                                       failure_kind="candidate_execution",
+                                       diagnostic={"unexecuted_nodes": unexecuted})
 
             # Layer 2: baseline-diff gate check
             if not plan.commands and not plan.parallel_groups:

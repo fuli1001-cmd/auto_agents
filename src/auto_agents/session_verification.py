@@ -1355,8 +1355,17 @@ def _validate_required_node_selection(session, state, commands, *, candidate=Non
     Keep their command and safety exclusions intact; collection only establishes
     selection, while the later execution gate still requires passing test bodies.
     """
+    from .verification_context import current_context
+    exact_files = set()
+    for command in commands:
+        try:
+            exact_files.update(ref for invocation in current_context(session, state).invocations(command)
+                               if invocation.runner == 'pytest' and invocation.repository_targets
+                               for ref in invocation.repository_targets if ref.endswith('.py'))
+        except ValueError:
+            continue
     refs = sorted(ref for ref in _mandatory_refs(state)
-                  if not ref.startswith('cmd:') and '.py::' in ref)
+                  if not ref.startswith('cmd:') and ('.py::' in ref or ref in exact_files))
     if not refs:
         return
     binding = state.verification_binding
@@ -1375,6 +1384,8 @@ def _validate_required_node_selection(session, state, commands, *, candidate=Non
     rejected = {ref: [] for ref in refs}
     unparsed = []
     focused = binding.get('task_scope', {}).get('mode') == 'focused_fix'
+    provisional_focus = (focused and not binding.get('task_scope', {}).get('task_ids')
+                         and not binding.get('task_scope', {}).get('requirement_ids'))
     # Binding proves retained authority; candidate selection is verified at
     # validate_selected_contracts, where defects can become repair feedback.
     if candidate is None:
@@ -1422,23 +1433,35 @@ def _validate_required_node_selection(session, state, commands, *, candidate=Non
                         selection_args = [*config_args, *options]
                         if not contains:
                             continue
+                        file_ref = ref.endswith('.py')
                         restricted = _pytest_selection_restricted(selection_args)
-                        excluded = (None if restricted else _pytest_discovery_excludes(selection_args, ref,
+                        excluded = (None if restricted or file_ref else _pytest_discovery_excludes(selection_args, ref,
                             directory=absolute != selected, collection_root=selected, source_path=absolute))
                         provisional = False
-                        if restricted and not _pytest_selection_restricted(selection_args, allow_expressions=True):
+                        exact = set(invocation.repository_targets)
+                        # Focused fixes can name tests that are not present in
+                        # retained source. Collect every exact target even
+                        # without -k/-m, so the candidate must contain it.
+                        if (not _pytest_selection_restricted(selection_args, allow_expressions=True)
+                                and (restricted or file_ref or focused and ref in exact)):
                             from .pytest_selection import selected_nodes
-                            exact = set(invocation.repository_targets)
-                            pending = sorted(set(refs) & exact) if focused and not candidate else []
+                            pending = sorted(set(refs) & exact) if provisional_focus and not candidate else []
                             observation = selected_nodes(session, state, invocation,
                                 **({'candidate': True} if candidate else
                                    {'expected_missing': pending} if pending else {}))
                             collected, deselected = observation[:2]
                             missing = observation[2] if len(observation) == 3 else ()
-                            matches = lambda item: item == ref or item.startswith(ref + '[')
+                            # A file target must contribute collected items;
+                            # newly planned files cannot hide tests behind filters.
+                            matches = (lambda item: item.startswith(ref + '::')) if file_ref else (
+                                lambda item: item == ref or item.startswith(ref + '['))
                             provisional = ref in missing and ref in exact
+                            planned_file = (file_ref and provisional_focus and
+                                _historical_source(session, _contract_source_revision(session, state) or 'HEAD', path) is None)
                             restricted = (not (any(map(matches, collected)) or provisional)
-                                          or any(map(matches, deselected)))
+                                          or (file_ref and any(map(matches, deselected))
+                                              and planned_file and candidate)
+                                          or (not file_ref and any(map(matches, deselected))))
                             excluded = restricted
                         if not restricted and not excluded:
                             covered.add(ref)
@@ -1461,6 +1484,36 @@ def _validate_required_node_selection(session, state, commands, *, candidate=Non
                                   verification_ref=ref, owners=diagnostic_owners(state, ref),
                                   selection_rejections=rejected[ref], unparsed_commands=unparsed,
                                   commands=[command for command in commands if command])
+
+
+def planned_pytest_execution_nodes(session, state, command):
+    """Return candidate nodes whose exact targets were absent at admission."""
+    scope = state.verification_binding.get('task_scope', {})
+    if (scope.get('mode') != 'focused_fix' or scope.get('task_ids')
+            or scope.get('requirement_ids') or not state.candidate_custody.get('receipt')):
+        return set()
+    from .verification_context import current_context
+    from .pytest_selection import selected_nodes
+    planned_nodes = set()
+    refs = _mandatory_refs(state)
+    for invocation in current_context(session, state).invocations(command):
+        if invocation.runner != 'pytest' or not invocation.repository_targets:
+            continue
+        exact = refs.intersection(invocation.repository_targets)
+        if not exact:
+            continue
+        retained = selected_nodes(session, state, invocation, expected_missing=exact)
+        missing = retained[2]
+        if not missing:
+            continue
+        candidate_nodes = selected_nodes(session, state, invocation, candidate=True)[0]
+        for ref in missing:
+            if ref.endswith('.py'):
+                planned_nodes.update(node for node in candidate_nodes if node.startswith(ref + '::'))
+            else:
+                planned_nodes.update(node for node in candidate_nodes
+                                     if node == ref or node.startswith(ref + '['))
+    return planned_nodes
 
 
 def _pytest_selection_config(root, cwd, args, targets, configurations, *, source_exists,

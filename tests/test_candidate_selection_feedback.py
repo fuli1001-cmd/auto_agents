@@ -14,11 +14,15 @@ from auto_agents.workflow_chain import IssueBriefBuilder
 from test_session_verification_ownership import project
 
 
-@pytest.mark.parametrize('mode', ['fresh', 'resume', 'collection_fault', 'resume_collection_fault'])
+@pytest.mark.parametrize('mode', ['fresh', 'fresh_new_file', 'fresh_new_file_target', 'resume',
+                                  'collection_fault', 'resume_collection_fault'])
 @pytest.mark.parametrize('managed', [False, True])
 def test_candidate_selection_failure_has_durable_feedback_and_preserves_budget(tmp_path, monkeypatch, mode, managed):
     root, state = project(tmp_path)
-    required = 'tests/test_owned.py::test_planned_regression'
+    new_file = mode in {'fresh_new_file', 'fresh_new_file_target'}
+    required = ('tests/test_planned.py' if mode == 'fresh_new_file_target' else
+                'tests/test_planned.py::test_planned_regression' if new_file else
+                'tests/test_owned.py::test_planned_regression')
     state.fix_verify_command = shlex.join([sys.executable, '-m', 'pytest', '-q', '-m',
         'not real_service', 'tests/test_owned.py::test_owned', required])
     state.hard_ceiling = 3
@@ -43,7 +47,8 @@ def test_candidate_selection_failure_has_durable_feedback_and_preserves_budget(t
             (request.cwd / 'tests/conftest.py').write_text("raise RuntimeError('candidate collection unavailable')\n")
         elif len(calls) == 2:
             assert 'candidate is missing required tests' in request.prompt
-            with (request.cwd / 'tests/test_owned.py').open('a') as stream:
+            target = request.cwd / ('tests/test_planned.py' if new_file else 'tests/test_owned.py')
+            with target.open('a') as stream:
                 # The retained test checks actual file behavior. This separate
                 # fixture node exercises the promised collection obligation.
                 stream.write('\ndef test_planned_regression():\n'
@@ -117,3 +122,38 @@ def test_private_prompt_uses_control_issue_and_rejects_foreign_handoff(tmp_path)
     from auto_agents.session_verification import SessionOwnershipError
     with pytest.raises(SessionOwnershipError, match='another session or handoff'):
         session._build_fix_prompt(state, '')
+
+
+def test_skipped_planned_file_cannot_complete_candidate_receipt(tmp_path, monkeypatch):
+    root, state = project(tmp_path)
+    planned = 'tests/test_planned.py'
+    state.fix_verify_command = shlex.join([sys.executable, '-m', 'pytest', '-q',
+        'tests/test_owned.py::test_owned', planned])
+    state.hard_ceiling = 1
+    save_session_state(root, state)
+    IssueBriefBuilder(root, state.session_id).materialize({
+        'summary': 'Repair the classified value defect', 'expected': 'The value becomes one',
+        'reproduction': ['Read the existing value'], 'decision': 'fix',
+        'verification_scope': {'mode': 'focused_fix'},
+        'verification_command': state.fix_verify_command})
+
+    def writer(request):
+        (request.cwd / 'value.py').write_text('VALUE = 1\n')
+        (request.cwd / planned).write_text('import pytest\n'
+            '@pytest.mark.skip(reason="not implemented")\n'
+            'def test_planned(): raise AssertionError("test body did not run")\n')
+        reply = 'Repaired value\nCOMMIT_MESSAGE: Repair the classified value defect'
+        request.output_path.write_text(reply)
+        return AgentResult(ok=True, command=['fixture'], output_path=request.output_path,
+                           summary=reply, stdout=reply, returncode=0)
+
+    orch = Orchestrator(root, user_input_fn=lambda *_args, **_kwargs: 'y')
+    monkeypatch.setattr(orch, '_call_with_failover', writer)
+    result = Session(orch, mode='fix', auto_approve=True).resume(state.session_id)
+    failures = [entry['verification'] for entry in result.execution_log
+                if entry.get('action') == 'receipt_verification' and not entry['verification']['ok']]
+    assert failures
+    assert failures[0]['failure_kind'] == 'candidate_execution'
+    assert failures[0]['diagnostic']['unexecuted_nodes'] == [planned + '::test_planned']
+    assert not result.candidate_custody.get('delivered_revision')
+    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
