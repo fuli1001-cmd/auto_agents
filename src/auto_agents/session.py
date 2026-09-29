@@ -4656,8 +4656,9 @@ class Session:
             result.update(details)
             if getattr(self, '_recovery_policy_active', False):
                 from .recovery.observations import retained_progress_checks
+                observed_commands = list(dict.fromkeys(row['command'] for row in verification_checks if row.get('command')))
                 result.update(verification_checks=verification_checks,
-                              progress_checks=retained_progress_checks(self, state, commands),
+                              progress_checks=retained_progress_checks(self, state, observed_commands),
                               verification_manifest=state.verification_binding.get('contract_fingerprint', '')
                                   or verification_fingerprint([state.fix_verify_command, commands]),
                               baseline_failures=list(state.baseline_failures))
@@ -4714,6 +4715,31 @@ class Session:
             )
             return diagnostic_gate
 
+        def priority_check():
+            from .recovery.policy import retained_failure_commands
+            priority = retained_failure_commands(self, state, commands)
+            if not priority: return None
+            with self._session_gate_executor_context(
+                {command: plan.metadata.get(command, {}) for command in priority},
+            ) as gate_executor:
+                gate = run_gate_plan(priority, [], self.project_root, collect_all=True,
+                    command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                    adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                    command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                    progress=self.orch._gate_progress_callback('retained failure verification'),
+                    gate_executor=gate_executor)
+            record_gate(gate)
+            self.orch._classify_reported_infrastructure_failures(gate)
+            if gate.ok: return None
+            from .verification_failure import details as failure_details
+            reason, diagnostic = failure_details(gate)
+            new_failures = sorted(set(diagnostic['failure_ids']) - set(state.baseline_failures))
+            if diagnostic['comparable'] and not new_failures: return None
+            diagnostic = {**diagnostic, 'failure_ids': new_failures}
+            return outcome(False, reason, retry_fix=diagnostic['comparable'],
+                failure_kind='candidate_verification' if diagnostic['comparable'] else 'verification_inconclusive',
+                diagnostic=diagnostic, recovery_priority_commands=priority, regression_ids=new_failures)
+
         try:
             # Resolve once so targeted and affected layers share identical proof
             # metadata and therefore the same candidate certificate.
@@ -4724,6 +4750,9 @@ class Session:
 
             if state.verification_binding:
                 validate_selected_contracts(self, state, commands, metadata=plan.metadata)
+            priority_failure = priority_check()
+            if priority_failure is not None: return priority_failure
+            if state.verification_binding:
                 for command in dict.fromkeys(commands):
                     collect = collection_command(command)
                     if not collect:
@@ -4831,30 +4860,6 @@ class Session:
                                        diagnostic={"unexecuted_nodes": unexecuted})
 
             # Layer 2: baseline-diff gate check
-            from .recovery.policy import retained_failure_commands
-            priority = retained_failure_commands(self, state, commands)
-            if priority:
-                with self._session_gate_executor_context(
-                    {command: plan.metadata.get(command, {}) for command in priority},
-                ) as gate_executor:
-                    priority_gate = run_gate_plan(priority, [], self.project_root, collect_all=True,
-                        command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                        adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                        command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                        progress=self.orch._gate_progress_callback('retained failure verification'),
-                        gate_executor=gate_executor)
-                record_gate(priority_gate)
-                self.orch._classify_reported_infrastructure_failures(priority_gate)
-                if not priority_gate.ok:
-                    from .verification_failure import details as failure_details
-                    reason, diagnostic = failure_details(priority_gate)
-                    new_failures = sorted(set(diagnostic['failure_ids']) - set(state.baseline_failures))
-                    if not diagnostic['comparable'] or new_failures:
-                        diagnostic = {**diagnostic, 'failure_ids': new_failures}
-                        return outcome(False, reason, retry_fix=diagnostic['comparable'],
-                            failure_kind='candidate_verification' if diagnostic['comparable'] else 'verification_inconclusive',
-                            diagnostic=diagnostic, recovery_priority_commands=priority,
-                            regression_ids=new_failures)
             if not plan.commands and not plan.parallel_groups:
                 return outcome(True, "no verification steps or commands configured")
             metadata = plan.metadata

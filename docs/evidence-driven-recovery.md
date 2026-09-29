@@ -44,6 +44,9 @@ Known failures select existing managed verification commands for early replay.
 Selection uses retained collected nodes, including pytest filters and parameter
 identities. A filename appearing only in `--deselect` is not a selected test.
 Smaller existing commands are preferred when several commands cover a failure.
+After contract validation, these probes run before broad collection. Progress
+eligibility is collected only for executed commands; untouched commands cannot
+contribute pass credit and do not need recollection on an early failure.
 Known baseline failures, including their failed command summaries, are not new
 counterexamples. A priority probe that encounters only those failures continues
 to ordinary verification. New observations mark this distinction explicitly;

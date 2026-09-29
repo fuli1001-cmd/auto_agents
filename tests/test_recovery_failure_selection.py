@@ -89,3 +89,37 @@ def test_priority_probe_with_only_baseline_failures_still_runs_full_verification
     result = session._run_baseline_diff_verify()
     assert calls == [[command], [command]]
     assert result['ok'] is True
+
+
+def test_new_retained_failure_precedes_broad_collection_and_only_admits_observed_nodes(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from auto_agents import session as session_module
+    from auto_agents.models import CommandResult, GateResult, SessionState
+    from auto_agents.orchestrator import Orchestrator
+    from auto_agents.session import Session
+    from auto_agents.recovery import observations, policy
+    from test_session_verification_ownership import project
+    root, _ = project(tmp_path)
+    session = Session(Orchestrator(root), mode='collab', auto_approve=True)
+    narrow, broad = 'python -m pytest tests/test_value.py::test_new', 'python -m pytest tests'
+    state = SessionState('priority', mode='collab', verification_binding={'contract_fingerprint': 'frozen'})
+    session._current_state, session._recovery_policy_active = state, True
+    plan = SimpleNamespace(commands=[narrow, broad], parallel_groups=[], metadata={})
+    monkeypatch.setattr(session, '_verification_plan_commands', lambda *args: (plan, [narrow, broad]))
+    monkeypatch.setattr(session, '_session_gate_executor_context', lambda *args, **kw: nullcontext(None))
+    validated = []
+    monkeypatch.setattr(session_module, 'validate_selected_contracts', lambda *args, **kw: validated.append(True))
+    monkeypatch.setattr(policy, 'retained_failure_commands', lambda *args: [narrow])
+    admitted = []
+    monkeypatch.setattr(observations, 'retained_progress_checks', lambda session, state, commands: admitted.extend(commands) or [])
+    calls = []
+    def run(commands, groups, root, **kwargs):
+        assert validated
+        calls.append(list(commands))
+        assert list(commands) == [narrow]
+        return GateResult(False, [CommandResult(narrow, False, 1,
+            stdout='FAILED tests/test_value.py::test_new - AssertionError')])
+    monkeypatch.setattr(session_module, 'run_gate_plan', run)
+    result = session._run_baseline_diff_verify()
+    assert result['ok'] is False and result['retry_fix'] is True
+    assert calls == [[narrow]] and admitted == [narrow]
