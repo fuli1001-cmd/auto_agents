@@ -113,7 +113,8 @@ def diagnosis_input(snapshot, task_id, store=None):
               'Keep all original verification obligations. Return exactly one JSON object matching response_schema. '
               'Read the complete evidence and original contract when the summaries are insufficient. '
               'Name every relative source path needed by the correction, including regression tests; '
-              'the writer may change only these paths. Use observed failure IDs. Do not repeat a disproved hypothesis.\n'
+              'additional product paths require independent necessity review before delivery. '
+              'Use observed failure IDs. Do not repeat a disproved hypothesis.\n'
               + json.dumps(payload, ensure_ascii=False))
     return prompt, schema
 
@@ -150,7 +151,9 @@ def correction_context(snapshot, task_id):
 
 
 def correction_paths(snapshot, task_id, before, after):
-    proposal = (scope(snapshot, task_id)['correction'] or {}).get('proposal')
+    item = scope(snapshot, task_id)
+    proposal = (item['correction'] or {}).get('proposal')
+    if not proposal and item['hypotheses']: proposal = item['hypotheses'][-1]['proposal']
     if not proposal: return []
     paths = [p.rstrip('/') for p in proposal['paths']]
     return sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path)

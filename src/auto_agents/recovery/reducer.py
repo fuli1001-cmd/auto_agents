@@ -107,6 +107,10 @@ def decide(snapshot, event):
                 'command_binding', 'Command belongs to another workflow or contract')
         require(state['status'] == 'active' and task['status'] == 'ready', 'dispatch_blocked', 'Task cannot dispatch')
         require(command.phase == task['phase'], 'phase', 'Command is not the authorized next stage')
+        if 'recovery' in state and command.phase == 'deliver':
+            from .scope_amendments import pending
+            require(not pending(state, command.task_id), 'scope_review_required',
+                    'Delivery requires independent approval of scope amendments')
         previous = state['operations'].get(command.operation_key)
         require(previous is None or previous == command.command_id, 'duplicate_operation',
                 'Operation already has a durable command identity', command_id=previous)
@@ -198,11 +202,30 @@ def decide(snapshot, event):
             else: task['status'] = 'blocked'
         if 'recovery' in state and outcome.kind != OutcomeKind.OUTCOME_UNKNOWN:
             from .convergence import observe, record_diagnosis
+            if command['phase'] == 'implement' and outcome.kind == OutcomeKind.SUCCESS and outcome.details.get('scope_amendment_required'):
+                from .convergence import event as recovery_event
+                recovery_event(state, 'recovery_scope_change_requested', {
+                    'command_id': command['command_id'], 'paths': outcome.details['scope_amendment_required'],
+                    'source': outcome.details['post_source'], 'result_ref': outcome.details['native_result']})
             if (command['phase'] == 'verify' or command['phase'] == 'review'
                     and outcome.kind == OutcomeKind.CANDIDATE_REJECTED) and outcome.details.get('verification_observation'):
                 observe(state, command, outcome.details['verification_observation'])
             if command['phase'] == 'diagnose' and outcome.kind == OutcomeKind.SUCCESS:
                 record_diagnosis(state, command, outcome.details.get('recovery_diagnosis'))
+            if command['phase'] == 'review' and outcome.kind == OutcomeKind.SUCCESS:
+                from .convergence import scope
+                item = scope(state, command['task_id'])
+                paths = sorted(item.get('scope_changes', {}))
+                if paths:
+                    grant = outcome.details.get('scope_approval') or {}
+                    from .scope_amendments import approval
+                    require(grant.get('source') == command['source'] and grant.get('paths') == paths
+                            and approval({'decision': 'APPROVE', 'scope_coverage': grant.get('coverage')}, paths,
+                                         command['source']) == grant,
+                            'scope_review_required', 'Unplanned changes require independent scope approval')
+                    item.setdefault('scope_approvals', []).append({**grant, 'command_id': command['command_id']})
+                    item['scope_changes'] = {}
+                    item['revision'] += 1
         parent_id = task['contract'].get('parent_task')
         if parent_id:
             parent = _task(state, parent_id)
@@ -336,7 +359,8 @@ def decide(snapshot, event):
             old = budget['repair_limits'][key]
             budget['repair_limits'][key] = old if limit is None else limit if old is None else min(old,limit)
     elif kind in {'recovery_policy_activated', 'recovery_permit_issued', 'recovery_observation_imported',
-                  'recovery_auxiliary_reserved', 'recovery_auxiliary_finished', 'recovery_request_rejected'}:
+                  'recovery_auxiliary_reserved', 'recovery_auxiliary_finished', 'recovery_request_rejected',
+                  'recovery_scope_change_requested'}:
         from .convergence import event as recovery_event
         recovery_event(state, kind, data)
     elif kind == 'workflow_stopped':

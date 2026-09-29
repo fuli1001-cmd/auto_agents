@@ -1200,6 +1200,11 @@ class RootCauseCoordinator:
         def ignore(current: str, names: List[str]) -> List[str]:
             current_path = Path(current)
             ignored = [name for name in names if name in ignored_names]
+            # Atomic control writers rename these files while snapshots are
+            # copied. The final records are exported from the kernel below.
+            relative_parts = current_path.relative_to(source).parts
+            if relative_parts[:2] == ('.auto-agents', 'state'):
+                ignored.extend(name for name in names if re.fullmatch(r'.+\.json(?:l)?\.\d+\.[0-9a-f]+\.tmp', name))
             # Next.js caches can be hundreds of MiB per snapshot. Omit them
             # only when Git confirms the directory is generated, and never
             # omit tracked files or dirty changes under a similarly named path.

@@ -169,6 +169,8 @@ def execution_checkout(session, state):
         validate_custody_binding(state)
     elif custody['session_id'] != state.session_id or custody['repository'] != str(root.resolve()):
         raise ownership_error(state, 'candidate custody conflicts with session authority')
+    from .recovery.scope_amendments import recover_writer
+    recover_writer(root, state)
     validate_receipt(state)
     context = (SessionExecutionBinding.for_checkout(session, state, destination)
                if state.verification_binding else None)
@@ -226,11 +228,16 @@ def candidate_request(session, state, request):
         yield replace(request, resume_session_id='', resume_provider='',
                       prompt_is_continuation=False, prompt_continuation='',
                       writer_boundary=boundary)
-    if _git(session.project_root, 'rev-parse', 'HEAD') != source_head:
+    session._candidate_receipt = freeze_writer_receipt(session.project_root, state, source_head)
+
+
+def freeze_writer_receipt(root, state, source_head):
+    """Seal a completed writer's exact private bytes; this does not authorize delivery."""
+    if _git(root, 'rev-parse', 'HEAD') != source_head:
         raise ownership_error(state, 'isolated candidate changed its Git checkpoint')
     # Freeze before returning to ownership recording. Nothing is copied into
     # the shared worktree, including at the former publication boundary.
-    after = _inventory(session.project_root)
+    after = _inventory(root)
     before = state.candidate_custody['preimages']
     absent = {'worktree': {'kind': 'absent'}, 'index': []}
     manifest = {path: {'preimage': before.get(path, absent), 'postimage': after.get(path, absent)}
@@ -239,13 +246,13 @@ def candidate_request(session, state, request):
     # its new regular-file ancestor is not a valid Git pathspec.
     snapshot_paths = [path for path in manifest
                       if not any(parent.as_posix() in manifest for parent in Path(path).parents)]
-    snapshot = GateSnapshotManager(session.project_root, 'candidate-' + uuid4().hex).create(paths=snapshot_paths)
+    snapshot = GateSnapshotManager(root, 'candidate-' + uuid4().hex).create(paths=snapshot_paths)
     receipt = {'attempt_id': uuid4().hex, 'attempt': state.current_attempt,
         'session_id': state.session_id, 'binding_fingerprint': state.verification_binding['binding_fingerprint'],
         'base_revision': state.candidate_custody['base_revision'],
         'source_revision': snapshot.commit_sha, 'manifest': manifest}
     receipt['fingerprint'] = fingerprint(receipt)
-    session._candidate_receipt = receipt
+    return receipt
 
 
 def validate_receipt(state):

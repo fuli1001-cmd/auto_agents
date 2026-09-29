@@ -145,6 +145,10 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
         parent = store.load(stream)['tasks'][contract.parent_task]
         require(all(parent['proofs'].get(stage) and all(p['source'] == source for p in parent['proofs'][stage])
                     for stage in ('verify','review')), 'delivery_evidence', 'Delivery requires verification and review of the same candidate')
+        if owner._recovery_policy_active:
+            from .scope_amendments import pending
+            require(not pending(store.load(stream), contract.task_id), 'scope_review_required',
+                    'Delivery requires independent approval of scope amendments')
     command = Command('cmd:' + operation_key, stream, contract.task_id, phase, source, contract.identity,
                       environment, runtime['source'], operation_key, model_call=model)
     if owner._recovery_policy_active:
@@ -164,12 +168,19 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
         if isinstance(plain, dict) and isinstance(plain.get('output_path'), Path): plain['output_path'] = str(plain['output_path'])
         reference = store.put(plain)
         verdict, reason = classify(result)
+        scope_paths = []
         if before is not None:
             from .policy import correction_paths
             outside = correction_paths(correction_snapshot, command.task_id, before, inspector._worktree_change_snapshot())
             if outside:
-                verdict, reason = OutcomeKind.OWNERSHIP_CONFLICT, 'Correction exceeded approved paths: ' + ', '.join(outside)
+                from .scope_amendments import product_paths
+                if product_paths(outside) and verdict == OutcomeKind.SUCCESS:
+                    scope_paths = outside
+                else:
+                    verdict, reason = OutcomeKind.OWNERSHIP_CONFLICT, 'Correction crossed a protected boundary: ' + ', '.join(outside)
         extra = {}
+        if scope_paths: extra['scope_amendment_required'] = scope_paths
+        if isinstance(plain, dict) and plain.get('scope_approval'): extra['scope_approval'] = plain['scope_approval']
         if model and verdict == OutcomeKind.PROTOCOL_INVALID:
             from .rejections import request_rejection
             rejection = request_rejection(plain)
@@ -177,7 +188,7 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
             elif rejection: verdict, reason = OutcomeKind.OUTCOME_UNKNOWN, 'Source changed after a rejected request'
         if owner._recovery_policy_active:
             from .policy import result_details, parse_diagnosis
-            if phase in {'verify', 'review'}: extra = result_details(store, stream, command, plain)
+            if phase in {'verify', 'review'}: extra.update(result_details(store, stream, command, plain))
             if phase == 'diagnose' and verdict == OutcomeKind.SUCCESS:
                 try:
                     text = plain.get('summary') or plain.get('stdout') or plain.get('text', '')
@@ -375,6 +386,8 @@ def review_candidate(owner, state, verification):
     require(receipt and verification.get('ok'),'review_evidence','Review requires a verified candidate')
     parent = store.load(stream)['tasks'][kind + ':' + native]
     business = Contract.read(parent['contract'])
+    from .scope_amendments import pending, schema as scope_schema, approval as scope_approval
+    scope_paths = pending(store.load(stream), business.task_id) if 'recovery' in store.load(stream) else []
     if 'recovery' in store.load(stream):
         from .policy import materialize_observation, observation_summary
         from .convergence import scope
@@ -391,6 +404,12 @@ def review_candidate(owner, state, verification):
         json.dumps({'contract_id':business.identity,'goal':store.read(business.goal_ref),
             'issue':store.read(business.issue_ref),'required_checks':business.required_checks,
             'verification':verification},ensure_ascii=False) + '\n' + manifest.instruction())
+    if scope_paths:
+        text += ('\nThese paths exceeded the diagnostic plan but remain inside the original repository: '
+                 + json.dumps(scope_paths) + '. Independently assess whether each is necessary for the original goal '
+                 'and preserves its constraints. Approval requires scope_coverage with path, reason and concrete evidence '
+                 'for every listed path; reject unrelated expansion. This does not authorize new requirements.')
+    original_review_text = text
     usage = {'workflow_kind':kind,'subject_id':native,'kernel_owned':'1'}
     previous = None
     for correction in range(2):
@@ -399,7 +418,7 @@ def review_candidate(owner, state, verification):
         output = owner.project_root/'.auto-agents/recovery-reviews'/ (key + '.json')
         output.parent.mkdir(parents=True,exist_ok=True)
         request = AgentRequest('review','max',prompt,owner.project_root,output,
-            purpose='review',sandbox_mode='read-only',response_schema=manifest.schema(REVIEW_SCHEMA),usage_context=usage)
+            purpose='review',sandbox_mode='read-only',response_schema=scope_schema(manifest.schema(REVIEW_SCHEMA), scope_paths),usage_context=usage)
         def execute():
             reply = owner.orch._call_with_failover_owned(request)
             raw = reply.summary or reply.stdout
@@ -431,8 +450,10 @@ def review_candidate(owner, state, verification):
                 if previous is not None:
                     require(previous.get('decision') == result['decision'] and previous.get('findings') == findings,
                             'protocol_invalid','Format correction changed the substantive judgment')
+                grant = scope_approval(result, scope_paths, manifest.source)
                 return {'kind':'success' if approved else 'candidate_rejected','ok':approved,'review':result,'text':raw,
                         'review_requirements': list(business.required_checks),
+                        **({'scope_approval': grant} if grant else {}),
                         'reason':'Independent candidate review completed' if approved else
                                  'Candidate review rejected: ' + json.dumps(findings,ensure_ascii=False)}
             except (KernelError,TypeError,ValueError) as error:
@@ -450,7 +471,7 @@ def review_candidate(owner, state, verification):
             try: previous = json.loads(response)
             except ValueError: previous = None
             if not isinstance(previous,dict): previous = None
-            text = manifest.correction(command['command_id'],response,error)
+            text = original_review_text + '\n' + manifest.correction(command['command_id'],response,error)
     raise KernelError('protocol_invalid','Review correction exhausted')
 
 

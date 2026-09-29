@@ -270,5 +270,20 @@ def event(state, kind, data):
                 'request_rejection', 'Rejection was already recorded')
         recorded.append({**data, 'window': digest([item['credited'], item['completed_manifests']])})
         item['revision'] += 1
+    elif kind == 'recovery_scope_change_requested':
+        command = state['commands'][data['command_id']]
+        outcome = command.get('outcome') or {}
+        details = outcome.get('details') or {}
+        from .scope_amendments import product_paths
+        require(command['phase'] == 'implement' and command['status'] == 'finished'
+                and (outcome.get('kind') == 'success' or outcome.get('kind') == 'ownership_conflict'
+                     and outcome.get('reason', '').startswith('Correction exceeded approved paths: '))
+                and details.get('post_source') == data['source']
+                and details.get('native_result') == data['result_ref'] and product_paths(data['paths']),
+                'scope_review_required', 'Scope amendment lacks an owned completed writer')
+        item = state['recovery']['scopes'][scope_id(state, command['task_id'])]
+        changes = item.setdefault('scope_changes', {})
+        for path in data['paths']: changes[path] = {'command_id': command['command_id'], 'source': data['source']}
+        item['revision'] += 1
     else:
         require(False, 'recovery_policy', 'Unknown recovery event')

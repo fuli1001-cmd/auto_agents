@@ -68,8 +68,12 @@ Validated independent review findings can also supply a bound counterexample
 for diagnosis. They cannot close test obligations or grant verification credit.
 Review allowances bind source and verification inputs, so changing an operation
 ID cannot renew an exhausted format-correction allowance.
-The writer is confined by the existing project contract and its proposed path
-set. Rephrasing a request, changing source, or generating a new operation ID does
+The writer remains confined by the existing project contract. Additional product
+paths outside the diagnostic plan are recorded atomically with its result and
+require independent review of necessity and evidence for every added path.
+Protected control files cannot use this amendment route. Review approval and
+delivery remain blocked until the complete verified candidate covers the original
+requirements and all pending scope amendments. Rephrasing a request, changing source, or generating a new operation ID does
 not reset the window. A successful verification permits review of that same
 candidate, with at most one format correction. Ordinary run planning reviews
 retain their stage authority and do not require a fix-candidate receipt.
@@ -98,6 +102,15 @@ After a verified runtime correction, an unchanged failed candidate can resume
 that rejected diagnosis from its retained evidence. It does not repeat broad
 verification merely to correct an outbound schema, and still requires normal
 verification and review of any subsequent source correction.
+
+A completed legacy writer rejected solely for exceeding its diagnostic path
+plan can resume without another model call. Recovery validates its sealed success
+result, original custody, reconstructed input fingerprint, unchanged output and
+absence of unsettled operations before issuing a replacement candidate receipt.
+The original receipt is archived, usage remains charged, and added product paths
+still require independent review. Uncertain writes and ownership conflicts outside
+this precise case remain blocked. Diagnostic snapshots exclude transient atomic
+state-write files while retaining final records and product files.
 
 ## Session continuation and operations
 

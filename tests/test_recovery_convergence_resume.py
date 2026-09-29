@@ -12,7 +12,8 @@ from test_engine_child_recovery import ObservationBoundary
 from test_retained_candidate_resume import stopped_candidate
 
 
-def test_stopped_child_automatically_corrects_candidate_and_returns_to_parent(tmp_path, monkeypatch):
+@pytest.mark.parametrize('extra_path', [False, True])
+def test_stopped_child_automatically_corrects_candidate_and_returns_to_parent(tmp_path, monkeypatch, extra_path):
     root, store, child, calls = stopped_candidate(tmp_path, monkeypatch, candidate_value=-1,
         verify_command='python -m pytest -q tests/test_owned.py::test_owned')
     stream = store.binding(root, 'session:' + child.session_id)
@@ -31,6 +32,13 @@ def test_stopped_child_automatically_corrects_candidate_and_returns_to_parent(tm
         result = original(self, request)
         if request.purpose == 'fix':
             (request.cwd/'value.py').write_text('VALUE = 1\n')
+            if extra_path: (request.cwd/'boundary.py').write_text('from value import VALUE\n')
+        if request.purpose == 'review' and extra_path:
+            assert 'scope_coverage' in request.response_schema['required']
+            value = json.loads(result.summary)
+            value['scope_coverage'] = [{'path': 'boundary.py', 'reason': 'Publishes the repaired value',
+                                        'evidence': 'boundary.py imports the verified VALUE'}]
+            result.summary = result.stdout = json.dumps(value)
         return result
     monkeypatch.setattr(Orchestrator, '_call_with_failover_owned', transport)
     # The new candidate must be checked against the actual bug selector, not
@@ -46,6 +54,10 @@ def test_stopped_child_automatically_corrects_candidate_and_returns_to_parent(tm
     assert store.replay(stream)['budget']['implementations'] == before['implementations'] + 1
     assert store.load(stream)['recovery']['legacy_budget'] == before
     assert saved.current_attempt == child.current_attempt + 1
+    if extra_path:
+        from auto_agents.recovery.convergence import scope
+        item = scope(store.replay(stream), 'fix:' + child.session_id)
+        assert item['scope_changes'] == {} and len(item['scope_approvals']) == 1
 
 
 @pytest.mark.parametrize('stop_kind', ['kernel_environment_blocked', 'kernel_protocol_invalid', 'verification_inconclusive'])

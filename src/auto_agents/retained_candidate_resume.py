@@ -16,6 +16,7 @@ def prepare(coordinator, parent, snapshot):
     recoverable = {'kernel_no_progress'}
     if 'recovery' in kernel:
         recoverable.update({'kernel_environment_blocked', 'kernel_protocol_invalid', 'verification_inconclusive'})
+        recoverable.add('kernel_ownership_conflict')
         if (not any(command['status'] in {'reserved', 'running', 'unknown'} for command in kernel['commands'].values())
                 and any(item.get('rejected_requests') for item in kernel['recovery']['scopes'].values())):
             recoverable.add('kernel_outcome_unknown')
@@ -43,6 +44,9 @@ def prepare(coordinator, parent, snapshot):
     if (owned.parent != returned.parent or child.resolution not in recoverable | {
             'proof_review_unavailable', 'proof_review_interrupted', 'proof_review_invalid'}):
         return False
+    if child.resolution == 'kernel_ownership_conflict':
+        from .recovery.scope_amendments import recover_writer
+        if not recover_writer(coordinator.project_root, child): return False
     receipt = child.candidate_custody.get('receipt')
     if not receipt:
         return False

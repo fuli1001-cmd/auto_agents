@@ -161,6 +161,10 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
             from .rejections import request_rejection
             require(request_rejection(self.read(data['result_ref'])) == data['rejection'],
                     'request_rejection', 'Rejection does not match the retained provider response')
+        if event.kind == 'recovery_scope_change_requested' or details.get('scope_amendment_required'):
+            result = self.read(data['result_ref'] if event.kind == 'recovery_scope_change_requested' else details['native_result'])
+            require(result.get('ok') is True and not result.get('cleanup_incomplete'),
+                    'scope_review_required', 'Scope amendment requires a completed writer result')
         if event.kind == 'projection_saved': self.verify_blob(data['blob'])
         if event.kind == 'projection_batch_saved':
             for row in data['entries']: self.verify_blob(row['blob'])

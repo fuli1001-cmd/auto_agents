@@ -151,6 +151,10 @@ class IsolatedEngineEffects:
             digest('isolated-engine-executor-v1'),command.phase,predicate)
         from .policy import result_details, parse_diagnosis
         extra = result_details(self.store, self.stream, command, result)
+        if result.get('scope_approval'): extra['scope_approval'] = result['scope_approval']
+        if result.get('scope_amendment_required'):
+            extra.update(scope_amendment_required=result['scope_amendment_required'], native_result=reference,
+                         post_source=result['artifact']['source'])
         if command.phase == 'diagnose' and 'recovery' in self.store.load(self.stream) and kind == OutcomeKind.SUCCESS:
             try:
                 extra['recovery_diagnosis'] = parse_diagnosis(self.store.load(self.stream), command, result.get('text', ''))
@@ -235,10 +239,13 @@ class IsolatedEngineEffects:
             reply = self.driver.run('implement' if phase == 'implement' else 'plan',prompt,self.candidate,
                                     progress=self.agent_progress,cancel=self.cancel)
             after = self.source()
+            outside = []
             if before_paths is not None:
                 from .policy import correction_paths
                 outside = correction_paths(state, self.contract.task_id, before_paths, inventory(self.candidate))
-                require(not outside, 'read_only_violation', 'Correction exceeded approved source paths', paths=outside)
+                from .scope_amendments import product_paths
+                require(not outside or product_paths(outside), 'read_only_violation',
+                        'Correction crossed a protected source boundary', paths=outside)
             if phase != 'implement': require(after == before, 'read_only_violation','Diagnosis changed protected source')
             if not reply.ok:
                 return self.observed(command, asdict(reply),
@@ -249,7 +256,8 @@ class IsolatedEngineEffects:
                 self.phase('artifact')
                 self.workspace.checkpoint()
                 artifact = build(self.root, self.candidate, self.source(), {'verifier':self.verifier.runtime})
-                result = {'reply':asdict(reply),'artifact':artifact}
+                result = {'reply':asdict(reply),'artifact':artifact, 'ok': True,
+                          **({'scope_amendment_required': outside} if outside else {})}
                 candidate_id = digest(artifact)
                 task = self.store.load(self.stream)['tasks'][self.contract.task_id]
                 parent = (task.get('candidate') or {}).get('candidate_id')
@@ -293,9 +301,16 @@ class IsolatedEngineEffects:
                 'verification_required','Review needs a current recovery proof')
         manifest = ReviewManifest(command.source,self.payload['base'],self.contract.identity,
             tuple(a.identity for a in self.accepted.acceptance),changes(snapshot,self.payload['base'],[]))
+        from .scope_amendments import pending, schema as scope_schema, approval as scope_approval
+        scope_paths = pending(state, self.contract.task_id) if 'recovery' in state else []
         prompt = ('Independently review this immutable candidate and concrete test/recovery evidence against every requirement. '
             'Do not modify source. Reject only demonstrated violations with a counterexample.\n' + context + '\n' +
             evidence.render(verification, summary=result_summary(verification)) + '\n' + evidence.render(manifest.instruction()))
+        if scope_paths:
+            prompt += ('\nIndependently review whether these unplanned source paths are necessary for the original goal: '
+                       + json.dumps(scope_paths) + '. Approval requires scope_coverage entries with path, reason and evidence '
+                       'for every path. Reject unrelated scope expansion.')
+        original_review_prompt = prompt
         invalid = [c for c in ordered if c['task_id'] == self.contract.task_id
                    and (c.get('outcome') or {}).get('kind') == 'protocol_invalid']
         original = None
@@ -303,14 +318,16 @@ class IsolatedEngineEffects:
             prior = self.store.read(invalid[-1]['outcome']['details']['result_ref'])
             prompt = READ_INSTRUCTION + '\nResponse protocol correction:\n' + evidence.render(
                 manifest.correction(invalid[-1]['command_id'],prior['reply'],prior['diagnostic']))
+            prompt = original_review_prompt + '\n' + prompt
             try: original = json.loads(prior['reply'])
             except ValueError: pass
-        reply = self.driver.run('review',prompt,snapshot,schema=manifest.schema(REVIEW_SCHEMA),
+        reply = self.driver.run('review',prompt,snapshot,schema=scope_schema(manifest.schema(REVIEW_SCHEMA), scope_paths),
                                 progress=self.agent_progress,cancel=self.cancel)
         if not reply.ok: return self.observed(command,asdict(reply),OutcomeKind.ENVIRONMENT_BLOCKED,reply.error)
         try:
             parsed = manifest.validate(reply.text)
             reviewed = review_result(reply.text,command.source,set(manifest.requirements),manifest.changes)
+            grant = scope_approval(parsed, scope_paths, command.source)
             if original is not None:
                 require(isinstance(original,dict) and original.get('decision') == parsed['decision']
                         and original.get('findings') == reviewed.findings,
@@ -318,7 +335,8 @@ class IsolatedEngineEffects:
         except (KernelError, ValueError, TypeError, RepairBlocked) as error:
             return self.observed(command, {'reply':reply.text,'diagnostic':str(error)},OutcomeKind.PROTOCOL_INVALID,'Review protocol does not match the manifest')
         if not reviewed.ok: self.rejected(reviewed.findings)
-        return self.observed(command,{**asdict(reviewed), 'review_requirements': list(manifest.requirements)},
+        return self.observed(command,{**asdict(reviewed), 'review_requirements': list(manifest.requirements),
+                                     **({'scope_approval': grant} if grant else {})},
                              OutcomeKind.SUCCESS if reviewed.ok else OutcomeKind.CANDIDATE_REJECTED,'Independent review completed')
 
 
