@@ -113,6 +113,14 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
     operation_key = digest([kind,native,phase,key] if model and phase != 'review' else
                            [kind,native,phase,key,source,environment])
     prior_id = store.load(stream)['operations'].get(operation_key)
+    # A dead verifier supplies an interruption receipt, not an outcome that
+    # can satisfy this verification. Retry has its own durable operation ID.
+    while prior_id and phase == 'verify' and not model:
+        prior = store.load(stream)['commands'][prior_id]
+        if prior['status'] != 'finished' or not (prior.get('outcome') or {}).get('details', {}).get('interrupted_verification'):
+            break
+        operation_key = digest(['verification-after-interruption', operation_key, prior_id])
+        prior_id = store.load(stream)['operations'].get(operation_key)
     if model and prior_id is None and kind != 'run':
         snapshot = store.load(stream)
         pending = [c for c in snapshot['commands'].values() if c['status'] == 'reserved'

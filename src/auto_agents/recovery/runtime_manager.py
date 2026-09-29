@@ -214,6 +214,9 @@ def ensure_current_runtime(store, source=None, *, automatic=True, retry=False):
     from ..artifact_store import process_identity
     from ..repair_v2.runtime_artifact import verify
     source = Path(source).resolve() if source else bound_source(store)
+    from .interrupted_verification import reconcile_installation
+    reconciled = reconcile_installation(store)
+    if reconciled: notice('已登记 ' + str(len(reconciled)) + ' 次中断验证；原候选和累计用量已保留')
     recover_cutover(store)
     if automatic:
         from .runtime_delivery import resume

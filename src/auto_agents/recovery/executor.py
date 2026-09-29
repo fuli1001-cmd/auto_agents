@@ -23,7 +23,11 @@ class Executor:
         handler = self.handlers.get(command['phase'])
         require(handler is not None, 'executor', 'No executor for stage', phase=command['phase'])
         epoch = command['epoch'] + 1
-        self._event(stream, 'command_dispatched', {'command_id': command_id, 'epoch': epoch, 'owner': self.owner},
+        dispatch = {'command_id': command_id, 'epoch': epoch, 'owner': self.owner}
+        if command['phase'] == 'verify' and not command['model_call'] and self.owner.startswith('native:'):
+            from ..artifact_store import process_identity
+            dispatch['dispatch_identity'] = process_identity()
+        self._event(stream, 'command_dispatched', dispatch,
                     command_id + ':dispatch')
         request = Command(**{key: command[key] for key in Command.__dataclass_fields__})
         try:

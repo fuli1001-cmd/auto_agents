@@ -112,6 +112,16 @@ still require independent review. Uncertain writes and ownership conflicts outsi
 this precise case remain blocked. Diagnostic snapshots exclude transient atomic
 state-write files while retaining final records and product files.
 
+Public bootstrap also reconciles interrupted native fix verification before
+source adoption. Recovery requires a dead process identity, unchanged valid
+candidate custody, and no final result; a saved executor result takes precedence.
+New dispatches retain PID, start ticks and boot identity. Legacy dispatches need
+the matching verification health record. The existing fenced receipt protocol
+records an inconclusive interruption with no pass evidence or refunded usage.
+The next verification receives a new durable operation identity, including when
+the runtime has not changed. Models, writers, review and delivery cannot use this
+recovery route. Existing cache input validation continues to govern reuse.
+
 ## Session continuation and operations
 
 Session stop decisions consult the kernel for admitted policy-2 workflows.

@@ -151,6 +151,13 @@ def decide(snapshot, event):
         require(type(data['epoch']) is int and data['epoch'] > command['epoch'] and bool(data['owner']),
                 'lease', 'Dispatch needs a current fenced lease')
         command.update(status='running', epoch=data['epoch'], owner=data['owner'])
+        if data.get('dispatch_identity') is not None:
+            identity = data['dispatch_identity']
+            require(command['phase'] == 'verify' and not command['model_call']
+                    and isinstance(identity, dict) and type(identity.get('pid')) is int
+                    and data['owner'].startswith('native:' + str(identity['pid']) + ':'),
+                    'lease', 'Verification dispatch identity must match its native owner')
+            command['dispatch_identity'] = identity
     elif kind == 'command_finished':
         command = _command(state, data['command_id']); task = _task(state, command['task_id'])
         require(command['status'] in {'running', 'unknown'}, 'receipt_duplicate', 'Command is already settled')
