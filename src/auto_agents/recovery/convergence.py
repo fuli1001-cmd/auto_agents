@@ -44,12 +44,19 @@ def failures(item):
                   if check['status'] == 'failed' and key not in baseline and not check.get('baseline'))
 
 
+def diagnosis_usage(item):
+    window = digest([item['credited'], item['completed_manifests']])
+    rejected = sum(row['window'] == window for row in item.get('rejected_requests', []))
+    return max(0, item['diagnoses'] - min(1, rejected)), rejected >= 2
+
+
 def decision(state, task_id, phase, source):
     item = scope(state, task_id)
+    diagnoses, format_exhausted = diagnosis_usage(item)
     base = {'version': VERSION, 'scope': scope_id(state, task_id), 'scope_revision': item['revision'],
             'owner': owner(state, task_id), 'phase': phase, 'source': source,
             'observation': item['latest'], 'action': phase, 'allowed': True, 'reason': 'owned phase',
-            'stalled': item['stalled'], 'diagnoses_remaining': max(0, 2 - item['diagnoses'])}
+            'stalled': item['stalled'], 'diagnoses_remaining': max(0, 2 - diagnoses)}
     budget = state['budget']
     if budget['limit'] is not None and budget['model_calls'] >= budget['limit']:
         return {**base, 'allowed': False, 'reason': 'user_budget_exhausted'}
@@ -62,16 +69,17 @@ def decision(state, task_id, phase, source):
     if kind == 'run' and phase not in {'implement', 'diagnose'}:
         return {**base, 'frontier': digest([source, state['recovery']['frontier'], phase])}
     if phase == 'diagnose':
-        allowed = bool(failures(item)) and item['diagnoses'] < 2 and item['stalled'] >= 2
-        return {**base, 'allowed': allowed, 'reason': 'bounded_diagnosis' if allowed else 'no_distinct_hypothesis'}
+        allowed = bool(failures(item)) and diagnoses < 2 and item['stalled'] >= 2 and not format_exhausted
+        return {**base, 'allowed': allowed, 'reason': 'bounded_diagnosis' if allowed else
+                'request_format_exhausted' if format_exhausted else 'no_distinct_hypothesis'}
     if phase == 'implement':
         correction = item['correction']
         permitted = bool(correction and correction['observation'] == item['latest']
                          and correction['source'] == source and not correction['used'])
         if item['stalled'] >= 2 and not permitted:
             return {**base, 'allowed': False,
-                    'action': 'diagnose' if failures(item) and item['diagnoses'] < 2 else 'blocked',
-                    'reason': 'diagnosis_required' if failures(item) and item['diagnoses'] < 2 else 'no_progress'}
+                    'action': 'diagnose' if failures(item) and diagnoses < 2 and not format_exhausted else 'blocked',
+                    'reason': 'diagnosis_required' if failures(item) and diagnoses < 2 and not format_exhausted else 'no_progress'}
         return {**base, 'reason': 'evidence_bound_correction' if permitted else 'bounded_implementation'}
     if phase == 'review':
         allowed = observed.get('complete') is True and observed.get('source') == source
@@ -173,11 +181,13 @@ def record_diagnosis(state, command, proposal):
             'diagnosis_invalid', 'Diagnosis has no falsifiable hypothesis or expected result')
     keys, paths = proposal['failure_ids'], proposal['paths']
     require(isinstance(keys, list) and keys and all(isinstance(k, str) for k in keys)
-            and set(keys) <= set(failures(item)), 'diagnosis_invalid', 'Diagnosis names an unobserved failure')
+            and len(keys) == len(set(keys)) and set(keys) <= set(failures(item)),
+            'diagnosis_invalid', 'Diagnosis names a duplicate or unobserved failure')
     require(isinstance(paths, list) and paths and all(isinstance(p, str) and p not in {'', '.', './'} and
             not PurePosixPath(p).is_absolute() and '..' not in PurePosixPath(p).parts
             and '.git' not in PurePosixPath(p).parts and not p.startswith('.auto-agents/') for p in paths),
             'diagnosis_invalid', 'Correction must name relative source paths, not control records')
+    require(len(paths) == len(set(paths)), 'diagnosis_invalid', 'Correction paths must be unique')
     hypothesis = ' '.join(proposal['hypothesis'].casefold().split())
     signature = digest([sorted(keys), hypothesis, sorted(paths), proposal['expected_result'].strip()])
     require(hypothesis not in [h['hypothesis'] for h in item['hypotheses']]
@@ -247,5 +257,18 @@ def event(state, kind, data):
         require(row is not None and row['status'] == 'reserved' and data.get('result_ref'),
                 'recovery_permit', 'Auxiliary result has no open reservation')
         row.update(status='finished', result_ref=data['result_ref'])
+    elif kind == 'recovery_request_rejected':
+        command = state['commands'][data['command_id']]
+        require(command['status'] == 'finished' and command['phase'] == 'diagnose'
+                and command['outcome']['kind'] == 'protocol_invalid'
+                and command['outcome']['details'].get('native_result') == data['result_ref']
+                and command['outcome']['details'].get('request_rejection') == data['rejection'],
+                'request_rejection', 'Request rejection needs its settled provider receipt')
+        item = state['recovery']['scopes'][scope_id(state, command['task_id'])]
+        recorded = item.setdefault('rejected_requests', [])
+        require(not any(row['command_id'] == data['command_id'] for row in recorded),
+                'request_rejection', 'Rejection was already recorded')
+        recorded.append({**data, 'window': digest([item['credited'], item['completed_manifests']])})
+        item['revision'] += 1
     else:
         require(False, 'recovery_policy', 'Unknown recovery event')

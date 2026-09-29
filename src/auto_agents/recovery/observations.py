@@ -154,10 +154,9 @@ def diagnosis_schema(failures, observation_id):
     return {'type': 'object', 'additionalProperties': False,
             'properties': {
                 'observation': {'type': 'string', 'enum': [observation_id]},
-                'hypothesis': {'type': 'string', 'minLength': 1},
-                'failure_ids': {'type': 'array', 'minItems': 1, 'uniqueItems': True,
+                'hypothesis': {'type': 'string'},
+                'failure_ids': {'type': 'array',
                                 'items': {'type': 'string', 'enum': failures}},
-                'paths': {'type': 'array', 'minItems': 1, 'uniqueItems': True,
-                          'items': {'type': 'string', 'minLength': 1}},
-                'expected_result': {'type': 'string', 'minLength': 1}},
+                'paths': {'type': 'array', 'items': {'type': 'string'}},
+                'expected_result': {'type': 'string'}},
             'required': ['observation', 'hypothesis', 'failure_ids', 'paths', 'expected_result']}

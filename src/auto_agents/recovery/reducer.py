@@ -336,7 +336,7 @@ def decide(snapshot, event):
             old = budget['repair_limits'][key]
             budget['repair_limits'][key] = old if limit is None else limit if old is None else min(old,limit)
     elif kind in {'recovery_policy_activated', 'recovery_permit_issued', 'recovery_observation_imported',
-                  'recovery_auxiliary_reserved', 'recovery_auxiliary_finished'}:
+                  'recovery_auxiliary_reserved', 'recovery_auxiliary_finished', 'recovery_request_rejected'}:
         from .convergence import event as recovery_event
         recovery_event(state, kind, data)
     elif kind == 'workflow_stopped':

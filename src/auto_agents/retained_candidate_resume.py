@@ -16,6 +16,9 @@ def prepare(coordinator, parent, snapshot):
     recoverable = {'kernel_no_progress'}
     if 'recovery' in kernel:
         recoverable.update({'kernel_environment_blocked', 'kernel_protocol_invalid', 'verification_inconclusive'})
+        if (not any(command['status'] in {'reserved', 'running', 'unknown'} for command in kernel['commands'].values())
+                and any(item.get('rejected_requests') for item in kernel['recovery']['scopes'].values())):
+            recoverable.add('kernel_outcome_unknown')
     if parent.resolution not in recoverable | {'agent_errors_exhausted'}:
         return False
     reference = Path(parent.last_child_result_ref)
@@ -32,6 +35,9 @@ def prepare(coordinator, parent, snapshot):
     if not child_id:
         return False
     child = load_session_state(coordinator.project_root, child_id)
+    if child.resolution == 'kernel_outcome_unknown':
+        from .recovery.convergence import scope
+        if not scope(kernel, 'fix:' + child_id).get('rejected_requests'): return False
     owned = coordinator.store.load_handoff(child.parent_handoff_id)
     coordinator._validated_child_handoff(child, owned)
     if (owned.parent != returned.parent or child.resolution not in recoverable | {

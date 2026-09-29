@@ -510,6 +510,8 @@ def recover_receipt(session, state):
     from .session_verification import validate_selected_contracts
     receipt = state.candidate_custody['receipt']
     admit_fresh_materialization(state)
+    from .recovery.policy import resume_rejected_diagnosis
+    if resume_rejected_diagnosis(session, state): return
     from .execution_binding import RunnerContextError
     selection_failure = None
     with session._session_verification_config():

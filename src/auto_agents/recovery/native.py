@@ -170,6 +170,11 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
             if outside:
                 verdict, reason = OutcomeKind.OWNERSHIP_CONFLICT, 'Correction exceeded approved paths: ' + ', '.join(outside)
         extra = {}
+        if model and verdict == OutcomeKind.PROTOCOL_INVALID:
+            from .rejections import request_rejection
+            rejection = request_rejection(plain)
+            if rejection and _source(owner, state) == source: extra['request_rejection'] = rejection
+            elif rejection: verdict, reason = OutcomeKind.OUTCOME_UNKNOWN, 'Source changed after a rejected request'
         if owner._recovery_policy_active:
             from .policy import result_details, parse_diagnosis
             if phase in {'verify', 'review'}: extra = result_details(store, stream, command, plain)
@@ -192,12 +197,18 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
                        {'native_result': reference, 'subject': native, 'post_source': _source(owner, state), **extra})
     executor = Executor(store, {phase: FunctionExecutor(execute)}, owner='native:' + str(os.getpid()) + ':' + uuid4().hex)
     outcome = executor.execute(stream, command.command_id)
+    if outcome.details.get('request_rejection'):
+        from .rejections import note
+        note(store, stream, command.command_id)
     if model and outcome.kind != OutcomeKind.SUCCESS:
         raise KernelError(outcome.kind.value, outcome.reason, command_id=command.command_id)
     return captured[0]
 
 
 def provider_outcome(orchestrator, result):
+    from .rejections import request_rejection
+    if request_rejection(result):
+        return OutcomeKind.PROTOCOL_INVALID, 'Provider rejected the request schema before model execution'
     reason = getattr(result.termination,'reason','') if result.termination is not None else ''
     uncertain = result.cleanup_incomplete or (not result.ok and
         (reason and reason not in {'execution_budget_exhausted','verification_environment_blocked'} or
@@ -261,7 +272,8 @@ def provider(orchestrator, request, execute):
                 prompt = compose_prompt([text], purpose='review')
                 identity = digest([domain, item['latest'], item['diagnoses']])
                 diagnostic = replace(request, prompt=prompt, prompt_spec=prompt.spec,
-                    purpose='review', sandbox_mode='read-only', response_schema=schema, writer_boundary=None,
+                    stage='diagnose', purpose='review', sandbox_mode='read-only', response_schema=schema, writer_boundary=None,
+                    resume_session_id='', resume_provider='', record_execution_incidents=False,
                     attempt_id='recovery-diagnose:' + identity,
                     output_path=request.output_path.with_name('recovery-diagnose-' + identity + '.json'),
                     usage_context={**request.usage_context, 'kernel_owned': '1'})

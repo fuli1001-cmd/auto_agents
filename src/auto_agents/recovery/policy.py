@@ -14,6 +14,8 @@ def apply(store, stream, kind, data, identity):
 def enable(store, stream):
     if 'recovery' not in store.load(stream):
         apply(store, stream, 'recovery_policy_activated', {'version': 2}, 'recovery-policy-2:' + digest(stream))
+    from .rejections import reconcile
+    reconcile(store, stream)
     snapshot = store.load(stream)
     for identity, call in snapshot['recovery']['auxiliary'].items():
         if call['status'] != 'reserved': continue
@@ -95,8 +97,9 @@ def diagnosis_input(snapshot, task_id, store=None):
     item = scope(snapshot, task_id)
     keys = failures(item)[:20]
     schema = diagnosis_schema(keys, item['latest'])
+    from .convergence import diagnosis_usage
     payload = {'observation': item['latest'], 'verification': observation_summary(item),
-               'previous_hypotheses': item['hypotheses'], 'diagnoses_remaining': max(0, 2 - item['diagnoses']),
+               'previous_hypotheses': item['hypotheses'], 'diagnoses_remaining': max(0, 2 - diagnosis_usage(item)[0]),
                'contract': snapshot['tasks'][task_id]['contract'], 'response_schema': schema}
     if store is not None:
         contract = payload['contract']
@@ -217,6 +220,37 @@ def session_stop(session, state):
     if selected['allowed'] or selected['action'] == 'diagnose': return ''
     state.resolution = 'kernel_no_progress'
     return 'Recovery stopped: ' + selected['reason'] + '; retained verification and candidate remain available.'
+
+
+def resume_rejected_diagnosis(session, state):
+    """A schema-only rejection does not invalidate its unchanged failed candidate."""
+    from .authority import installed
+    root = getattr(session, '_custody_control_root', None) or session.project_root
+    store = installed(root)
+    if store is None: return False
+    stream = store.binding(root, 'session:' + state.session_id)
+    if not stream: return False
+    snapshot = store.load(stream)
+    if 'recovery' not in snapshot: return False
+    task_id = state.mode + ':' + state.session_id
+    if task_id not in snapshot['tasks']: return False
+    item = scope(snapshot, task_id)
+    if not item.get('rejected_requests'): return False
+    session._recovery_policy_active = True
+    from .native import _source
+    source = _source(session, state)
+    observed = item['observations'].get(item['latest'], {})
+    if observed.get('source') != source or observed.get('complete'): return False
+    selected = decision(snapshot, task_id, 'implement', source)
+    if selected['action'] != 'diagnose' and not (selected['allowed'] and selected['reason'] == 'evidence_bound_correction'):
+        return False
+    rejected = snapshot['commands'][item['rejected_requests'][-1]['command_id']]
+    if rejected['source'] != source or rejected['runtime'] == (store.meta('active_runtime') or {}).get('source'):
+        return False
+    session._receipt_retry_feedback = 'The previous diagnosis request was explicitly rejected before model execution. Use the retained failed checks with the corrected request protocol.'
+    state.status, state.resolution = 'executing', ''
+    session._save(state)
+    return True
 
 
 def auxiliary_call(orchestrator, request, execute):

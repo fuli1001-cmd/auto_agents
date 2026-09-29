@@ -85,6 +85,20 @@ proofs. Parallel roles use revision-checked reservations; duplicate and unknown
 requests cannot silently invoke the provider again. A saved result can settle
 an interrupted acknowledgement on resume.
 
+Structured output requests use the supported wire subset described in the
+[OpenAI Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs).
+Nonempty values and uniqueness are checked locally. A sealed HTTP 400
+`invalid_json_schema` response with no model output, tool activity, source change
+or incomplete cleanup can settle an older unknown call as a protocol failure.
+Timeouts and ambiguous transport failures remain unknown. Consumption is never
+refunded; one request-format correction is tracked separately from diagnostic
+hypotheses. A second request-format rejection stops the window.
+
+After a verified runtime correction, an unchanged failed candidate can resume
+that rejected diagnosis from its retained evidence. It does not repeat broad
+verification merely to correct an outbound schema, and still requires normal
+verification and review of any subsequent source correction.
+
 ## Session continuation and operations
 
 Session stop decisions consult the kernel for admitted policy-2 workflows.

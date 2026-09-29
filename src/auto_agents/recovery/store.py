@@ -157,6 +157,10 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
                     baseline_aware=data['observation'].get('baseline_aware', False))),
                     'verification_observation', 'Imported observation is not the retained executor result')
         if event.kind == 'recovery_auxiliary_finished': self.verify_blob(data['result_ref'])
+        if event.kind == 'recovery_request_rejected':
+            from .rejections import request_rejection
+            require(request_rejection(self.read(data['result_ref'])) == data['rejection'],
+                    'request_rejection', 'Rejection does not match the retained provider response')
         if event.kind == 'projection_saved': self.verify_blob(data['blob'])
         if event.kind == 'projection_batch_saved':
             for row in data['entries']: self.verify_blob(row['blob'])
