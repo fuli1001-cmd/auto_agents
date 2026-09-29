@@ -9,6 +9,7 @@ def compact(value):
     if value.get('details_ref'): return value
     return {**value, 'details_ref': digest(value), 'checks': {
         key: {'id': key, 'status': row['status'],
+              **({'baseline': True} if row.get('baseline') else {}),
               **({'detail': row.get('detail', '')[:1200]} if row['status'] == 'failed' else {})}
         for key, row in value['checks'].items()}}
 
@@ -76,7 +77,7 @@ def gate_checks(gate):
     return rows
 
 
-def observation(command, result, *, verifier):
+def observation(command, result, *, verifier, baseline_aware=True):
     rows = result.get('verification_checks', [])
     units = result.get('checks') or (result.get('suite') or {}).get('checks')
     # Engine validation units carry their own immutable check identities.
@@ -96,7 +97,18 @@ def observation(command, result, *, verifier):
         prior = checks.get(key)
         # Repeated checks must agree; a flaky pass cannot close an obligation.
         checks[key] = {**row, 'status': 'blocked' if prior and prior['status'] != row['status'] else row['status']}
+    baseline = set(result.get('baseline_failures', []))
+    for key, row in checks.items() if baseline_aware else ():
+        if key in baseline: row['baseline'] = True
+        if key.startswith('command:') and row['status'] == 'failed':
+            members = [check for name, check in checks.items() if not name.startswith('command:')
+                       and check.get('command') == row.get('command')]
+            failed = [check for check in members if check['status'] == 'failed']
+            if failed and all(check['id'] in baseline for check in failed) and all(
+                    check['status'] in {'passed', 'failed', 'skipped'} for check in members):
+                row['baseline'] = True
     return {'version': 1, 'command_id': command.command_id, 'task_id': command.task_id,
+            **({'baseline_aware': True} if baseline_aware else {}),
             'source': command.source, 'contract': command.contract, 'environment': command.environment,
             'verifier': verifier, 'checks': checks, 'baseline_failures': result.get('baseline_failures', []),
             'regressions': result.get('regression_ids', []),
@@ -114,7 +126,28 @@ def validate(value, command):
             and value.get('manifest') and value.get('verifier'),
             'verification_observation', 'Observation has no verification identity')
     require(all(key == row.get('id') and row.get('status') in STATUSES
+                and type(row.get('baseline', False)) is bool
                 for key, row in value['checks'].items()), 'verification_observation', 'Invalid check result')
+
+
+def review_observation(command, result, *, verifier):
+    """Independent findings can justify diagnosis, never verified progress."""
+    review = result.get('review') or result
+    findings = review.get('findings') or []
+    allowed = set(result.get('review_requirements', [])) | {'repair-scope', 'repair-regression'}
+    rows = []
+    for finding in findings:
+        require(isinstance(finding, dict) and finding.get('requirement') in allowed
+                and all(isinstance(finding.get(key), str) and finding[key].strip()
+                        for key in ('reason', 'counterexample', 'check')),
+                'review_evidence', 'Review finding needs a bound requirement, counterexample and check')
+        key = 'review:' + digest([finding['requirement'], ' '.join(finding['check'].split())])
+        rows.append({'id': key, 'status': 'failed', 'command': '', 'detail':
+                     finding['reason'] + '\nCounterexample: ' + finding['counterexample'] + '\nCheck: ' + finding['check']})
+    if not rows: return None
+    return {**observation(command, {'ok': False, 'reason': result.get('reason', 'Independent review rejected'),
+        'verification_checks': rows, 'progress_checks': [], 'verification_manifest': 'review:' + command.contract},
+        verifier=verifier), 'basis': 'review'}
 
 
 def diagnosis_schema(failures, observation_id):

@@ -41,7 +41,7 @@ def failures(item):
     observed = item['observations'].get(item['latest'], {})
     baseline = set(observed.get('baseline_failures', []))
     return sorted(key for key, check in observed.get('checks', {}).items()
-                  if check['status'] == 'failed' and key not in baseline)
+                  if check['status'] == 'failed' and key not in baseline and not check.get('baseline'))
 
 
 def decision(state, task_id, phase, source):
@@ -75,8 +75,11 @@ def decision(state, task_id, phase, source):
         return {**base, 'reason': 'evidence_bound_correction' if permitted else 'bounded_implementation'}
     if phase == 'review':
         allowed = observed.get('complete') is True and observed.get('source') == source
-        allowed = allowed and item['reviews'].get(item['latest'], 0) < 2
-        return {**base, 'allowed': allowed, 'reason': 'verified_candidate_review' if allowed else 'review_evidence'}
+        review_key = (digest([source, observed['manifest'], observed['environment'], observed['verifier'], observed['scope']])
+                      if observed.get('baseline_aware') else item['latest'])
+        allowed = allowed and item['reviews'].get(review_key, 0) < 2
+        return {**base, **({'review_key': review_key} if observed.get('baseline_aware') else {}),
+                'allowed': allowed, 'reason': 'verified_candidate_review' if allowed else 'review_evidence'}
     if phase not in {'verify', 'deliver', 'acceptance', 'reconcile'}:
         # Read-only route/plan calls have a bounded allowance for the current
         # causal frontier. A changed prompt alone cannot renew it.
@@ -102,7 +105,7 @@ def consume(state, command):
         if item['correction']: item['correction']['used'] = True
     elif command.phase == 'diagnose': item['diagnoses'] += 1
     elif command.phase == 'review':
-        key = item['latest']; item['reviews'][key] = item['reviews'].get(key, 0) + 1
+        key = expected.get('review_key', item['latest']); item['reviews'][key] = item['reviews'].get(key, 0) + 1
     else:
         key = expected['frontier']; item['routes'][key] = item['routes'].get(key, 0) + 1
     item['revision'] += 1
@@ -115,16 +118,25 @@ def observe(state, command, observed):
     item = recovery['scopes'].setdefault(scope_id(state, command['task_id']), blank_scope())
     identity = digest(observed)
     if identity in item['observations']: return
+    if observed.get('basis') == 'review':
+        require(observed['complete'] is False and not observed['progress_checks'],
+                'review_evidence', 'Model review cannot grant verification credit')
+        item['observations'][identity] = deepcopy(observed)
+        item.update(latest=identity, correction=None, revision=item['revision'] + 1)
+        return
     previous = item['observations'].get(item['latest'])
     old_failures = set(item['seen_failures'])
     passed = {key for key, check in observed['checks'].items() if check['status'] == 'passed'}
-    failed = {key for key, check in observed['checks'].items() if check['status'] == 'failed'}
+    failed = {key for key, check in observed['checks'].items() if check['status'] == 'failed'
+              and (not observed.get('baseline_aware') or not check.get('baseline')
+                   and key not in observed.get('baseline_failures', []))}
     comparable = (previous is not None and previous['manifest'] == observed['manifest']
                   and previous['environment'] == observed['environment']
                   and previous['verifier'] == observed['verifier'])
     eligible = set(observed.get('progress_checks', []))
     if previous: eligible &= set(previous.get('progress_checks', []))
     closed = (passed & old_failures & eligible) - set(item['credited'])
+    if observed.get('baseline_aware'): closed -= set(observed.get('baseline_failures', []))
     preserved = set(item['protected']) <= passed
     previously_failed = {key for key, check in (previous or {}).get('checks', {}).items() if check['status'] == 'failed'}
     new_regressions = set(observed.get('regressions', [])) - previously_failed

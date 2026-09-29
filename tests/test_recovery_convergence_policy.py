@@ -57,8 +57,8 @@ def verify(store, contract, key, checks, *, ok=False, environment=None, source='
     return finish(store, command, outcome)
 
 
-def diagnose(store, contract, key, hypothesis='Shared diagnostic construction omits the neighbor facts'):
-    command = operation(store, contract, 'diagnose', key, model=True)
+def diagnose(store, contract, key, hypothesis='Shared diagnostic construction omits the neighbor facts', source='a'*64):
+    command = operation(store, contract, 'diagnose', key, model=True, source=source)
     item = scope(store.load('workflow'), contract.task_id)
     proposal = {'observation': item['latest'], 'hypothesis': hypothesis,
                 'failure_ids': failures(item), 'paths': ['value.py'], 'expected_result': 'All observed checks pass'}
@@ -288,3 +288,36 @@ def test_later_broad_check_regression_prevents_false_partial_progress(scene):
     verify(store, contract, 'broad', {'a': 'passed', 'b': 'failed'}, regressions=['b'])
     item = scope(store.replay('workflow'), 'fix')
     assert item['credited'] == [] and item['stalled'] == 1
+
+
+def test_review_counterexamples_allow_bounded_diagnosis_without_test_credit(scene):
+    from auto_agents.recovery.policy import result_details
+    store, contract = scene
+    verify(store, contract, 'initial', {'test': 'passed'}, ok=True)
+    source = 'a'*64
+    for i in range(2):
+        write(store, contract, 'write-' + str(i), source=source)
+        source = digest(i)
+        verify(store, contract, 'verify-' + str(i), {'test': 'passed'}, ok=True, source=source)
+        command = operation(store, contract, 'review', 'review-' + str(i), model=True, source=source)
+        result = {'ok': False, 'kind': 'candidate_rejected', 'review_requirements': list(contract.required_checks),
+                  'findings': [{'requirement': contract.required_checks[0], 'reason': 'Boundary case is missing',
+                                'counterexample': 'Negative inputs produce an invalid value', 'check': 'Check negative input'}]}
+        finish(store, command, Outcome(OutcomeKind.CANDIDATE_REJECTED, 'Review rejected',
+                                      details=result_details(store, 'workflow', command, result)))
+    before = scope(store.load('workflow'), 'fix')
+    assert before['credited'] == [] and before['stalled'] == 2
+    assert decision(store.load('workflow'), 'fix', 'implement', source)['action'] == 'diagnose'
+    diagnose(store, contract, 'diagnose', source=source)
+    write(store, contract, 'correction', source=source)
+    assert scope(store.replay('workflow'), 'fix')['credited'] == []
+
+
+def test_new_verification_command_id_does_not_renew_identical_review_allowance(scene):
+    store, contract = scene
+    for i in range(2):
+        verify(store, contract, 'verify-' + str(i), {'test': 'passed'}, ok=True)
+        command = operation(store, contract, 'review', 'review-' + str(i), model=True)
+        finish(store, command, Outcome(OutcomeKind.PROTOCOL_INVALID, 'Malformed review'))
+    verify(store, contract, 'new-id', {'test': 'passed'}, ok=True)
+    assert not decision(store.replay('workflow'), 'fix', 'review', 'a'*64)['allowed']

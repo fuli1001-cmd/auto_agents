@@ -44,6 +44,10 @@ Known failures select existing managed verification commands for early replay.
 Selection uses retained collected nodes, including pytest filters and parameter
 identities. A filename appearing only in `--deselect` is not a selected test.
 Smaller existing commands are preferred when several commands cover a failure.
+Known baseline failures, including their failed command summaries, are not new
+counterexamples. A priority probe that encounters only those failures continues
+to ordinary verification. New observations mark this distinction explicitly;
+older observations retain their original replay semantics.
 Passing those commands still leads to the ordinary affected/release checks,
 independent review, custody validation and delivery.
 
@@ -57,6 +61,10 @@ source paths and an expected result. The same validator runs before result
 settlement and during journal replay.
 
 A successful diagnosis permits one correction of the exact observed source.
+Validated independent review findings can also supply a bound counterexample
+for diagnosis. They cannot close test obligations or grant verification credit.
+Review allowances bind source and verification inputs, so changing an operation
+ID cannot renew an exhausted format-correction allowance.
 The writer is confined by the existing project contract and its proposed path
 set. Rephrasing a request, changing source, or generating a new operation ID does
 not reset the window. A successful verification permits review of that same

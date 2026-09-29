@@ -73,6 +73,7 @@ def observation_summary(item):
     checks = observed.get('checks', {})
     failed = failures(item)
     return {'identity': item['latest'], 'source': observed.get('source'), 'reason': observed.get('reason', '')[:4000],
+            'basis': observed.get('basis', 'verification'),
             'complete': observed.get('complete', False), 'check_count': len(checks),
             'failure_count': len(failed), 'failures': [checks[key] for key in failed[:20]],
             'full_evidence': '.auto-agents/recovery-evidence/' + item['latest'] + '.json'}
@@ -102,7 +103,9 @@ def diagnosis_input(snapshot, task_id, store=None):
         payload.update(goal=json.dumps(store.read(contract['goal_ref']), ensure_ascii=False)[:4000],
                        issue=json.dumps(store.read(contract['issue_ref']), ensure_ascii=False)[:4000],
                        complete_contract='.auto-agents/recovery-evidence/' + item['latest'] + '-contract.json')
-    prompt = ('Diagnose this retained verification failure. Do not modify files or make external service calls. '
+    prompt = ('Diagnose this retained verification failure or independent review counterexample. '
+              'Review findings are information to investigate, not proof that a correction works. '
+              'Do not modify files or make external service calls. '
               'Use the concrete failed checks to identify a falsifiable cause and the smallest source correction. '
               'Keep all original verification obligations. Return exactly one JSON object matching response_schema. '
               'Read the complete evidence and original contract when the summaries are insufficient. '
@@ -125,8 +128,14 @@ def parse_diagnosis(snapshot, command, text):
 
 
 def result_details(store, stream, command, result):
-    if 'recovery' not in store.load(stream) or command.phase != 'verify': return {}
-    value = observation(command, result, verifier=command.runtime)
+    if 'recovery' not in store.load(stream): return {}
+    if command.phase == 'review' and (result.get('kind') == 'candidate_rejected' or result.get('ok') is False):
+        from .observations import review_observation
+        value = review_observation(command, result, verifier=command.runtime)
+    elif command.phase == 'verify':
+        value = observation(command, result, verifier=command.runtime)
+    else: return {}
+    if value is None: return {}
     return {'verification_observation': compact(value), 'observation_ref': store.put(value)}
 
 
@@ -156,7 +165,8 @@ def retained_failure_commands(session, state, commands):
     refs = list((prior.get('diagnostic') or {}).get('failure_ids', []))
     if not refs and 'new failure(s) introduced:' in prior.get('reason', ''):
         refs = re.findall(r'[\w./-]+\.py(?:::[\w.-]+)+', prior['reason'])
-    refs = [ref for ref in refs[:10] if '.py::' in ref]
+    baseline = set(getattr(state, 'baseline_failures', []))
+    refs = [ref for ref in refs if '.py::' in ref and ref not in baseline][:10]
     if not refs: return []
     from fnmatch import fnmatch
     from ..verification_context import current_context

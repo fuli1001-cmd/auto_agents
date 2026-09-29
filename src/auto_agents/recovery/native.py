@@ -172,7 +172,7 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
         extra = {}
         if owner._recovery_policy_active:
             from .policy import result_details, parse_diagnosis
-            if phase == 'verify': extra = result_details(store, stream, command, plain)
+            if phase in {'verify', 'review'}: extra = result_details(store, stream, command, plain)
             if phase == 'diagnose' and verdict == OutcomeKind.SUCCESS:
                 try:
                     text = plain.get('summary') or plain.get('stdout') or plain.get('text', '')
@@ -409,10 +409,18 @@ def review_candidate(owner, state, verification):
                             and all(isinstance(r,dict) and r.get('nodes') for r in coverage),
                             'protocol_invalid','Approval needs evidence for every required check')
                 else: require(bool(findings),'protocol_invalid','Rejection needs concrete findings')
+                if 'recovery' in store.load(stream):
+                    from ..repair_v2.controller import review_result
+                    from ..repair_v2.types import RepairBlocked
+                    try:
+                        review_result(raw, manifest.source, set(manifest.requirements), manifest.changes)
+                    except RepairBlocked as error:
+                        raise KernelError('protocol_invalid', str(error)) from error
                 if previous is not None:
                     require(previous.get('decision') == result['decision'] and previous.get('findings') == findings,
                             'protocol_invalid','Format correction changed the substantive judgment')
                 return {'kind':'success' if approved else 'candidate_rejected','ok':approved,'review':result,'text':raw,
+                        'review_requirements': list(business.required_checks),
                         'reason':'Independent candidate review completed' if approved else
                                  'Candidate review rejected: ' + json.dumps(findings,ensure_ascii=False)}
             except (KernelError,TypeError,ValueError) as error:

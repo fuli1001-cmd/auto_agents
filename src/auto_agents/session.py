@@ -4848,10 +4848,13 @@ class Session:
                 if not priority_gate.ok:
                     from .verification_failure import details as failure_details
                     reason, diagnostic = failure_details(priority_gate)
-                    return outcome(False, reason, retry_fix=diagnostic['comparable'],
-                        failure_kind='candidate_verification' if diagnostic['comparable'] else 'verification_inconclusive',
-                        diagnostic=diagnostic, recovery_priority_commands=priority,
-                        regression_ids=diagnostic['failure_ids'])
+                    new_failures = sorted(set(diagnostic['failure_ids']) - set(state.baseline_failures))
+                    if not diagnostic['comparable'] or new_failures:
+                        diagnostic = {**diagnostic, 'failure_ids': new_failures}
+                        return outcome(False, reason, retry_fix=diagnostic['comparable'],
+                            failure_kind='candidate_verification' if diagnostic['comparable'] else 'verification_inconclusive',
+                            diagnostic=diagnostic, recovery_priority_commands=priority,
+                            regression_ids=new_failures)
             if not plan.commands and not plan.parallel_groups:
                 return outcome(True, "no verification steps or commands configured")
             metadata = plan.metadata

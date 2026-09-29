@@ -48,3 +48,44 @@ def test_parameterized_failure_matches_its_declared_function_selector(monkeypatc
     monkeypatch.setattr(pytest_selection, 'selected_nodes', lambda *args, **kw: ({ref}, {}, []))
     monkeypatch.setattr(session_verification, '_mandatory_refs', lambda state: set())
     assert retained_failure_commands(SimpleNamespace(_recovery_policy_active=True), state, [command]) == [command]
+
+
+def test_old_baseline_errors_are_not_selected_for_new_repair(monkeypatch):
+    from auto_agents import verification_context
+    ref = 'tests/old.py::test_old'
+    state = SimpleNamespace(baseline_failures=[ref], execution_log=[{
+        'action': 'receipt_verification', 'verification': {'ok': False, 'diagnostic': {'failure_ids': [ref]}}}])
+    monkeypatch.setattr(verification_context, 'current_context',
+                        lambda *args: (_ for _ in ()).throw(AssertionError('baseline requires no recovery selection')))
+    assert retained_failure_commands(SimpleNamespace(_recovery_policy_active=True), state, ['python -m pytest tests']) == []
+
+
+def test_priority_probe_with_only_baseline_failures_still_runs_full_verification(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from auto_agents import session as session_module
+    from auto_agents.models import CommandResult, GateResult, SessionState
+    from auto_agents.orchestrator import Orchestrator
+    from auto_agents.session import Session
+    from auto_agents.recovery import observations, policy
+    from test_session_verification_ownership import project
+    root, _ = project(tmp_path)
+    session = Session(Orchestrator(root), mode='collab', auto_approve=True)
+    command = 'python -m pytest tests/test_value.py'
+    baseline = 'tests/test_value.py::test_preexisting'
+    session._current_state = SessionState('baseline', mode='collab', baseline_failures=[baseline])
+    session._recovery_policy_active = True
+    plan = SimpleNamespace(commands=[command], parallel_groups=[], metadata={})
+    monkeypatch.setattr(session, '_verification_plan_commands', lambda *args: (plan, [command]))
+    monkeypatch.setattr(session, '_session_gate_executor_context', lambda *args, **kw: nullcontext(None))
+    monkeypatch.setattr(policy, 'retained_failure_commands', lambda *args: [command])
+    monkeypatch.setattr(observations, 'retained_progress_checks', lambda *args: [])
+    calls = []
+    def run(commands, groups, root, **kwargs):
+        calls.append(list(commands))
+        return GateResult(False, [CommandResult(command, False, 1,
+            stdout='FAILED ' + baseline + ' - AssertionError',
+            executed_tests=['tests/test_value.py::test_repaired'])], summary='Only the known baseline still fails')
+    monkeypatch.setattr(session_module, 'run_gate_plan', run)
+    result = session._run_baseline_diff_verify()
+    assert calls == [[command], [command]]
+    assert result['ok'] is True

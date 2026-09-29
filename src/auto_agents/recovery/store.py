@@ -153,7 +153,8 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
             row = self.load(stream)['commands'][data['command_id']]
             command = Command(**{key: row[key] for key in Command.__dataclass_fields__})
             result = self.read(data['result_ref'])
-            require(data['observation'] == compact(observation(command, result, verifier=row['runtime'])),
+            require(data['observation'] == compact(observation(command, result, verifier=row['runtime'],
+                    baseline_aware=data['observation'].get('baseline_aware', False))),
                     'verification_observation', 'Imported observation is not the retained executor result')
         if event.kind == 'recovery_auxiliary_finished': self.verify_blob(data['result_ref'])
         if event.kind == 'projection_saved': self.verify_blob(data['blob'])

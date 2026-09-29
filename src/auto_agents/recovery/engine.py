@@ -318,7 +318,8 @@ class IsolatedEngineEffects:
         except (KernelError, ValueError, TypeError, RepairBlocked) as error:
             return self.observed(command, {'reply':reply.text,'diagnostic':str(error)},OutcomeKind.PROTOCOL_INVALID,'Review protocol does not match the manifest')
         if not reviewed.ok: self.rejected(reviewed.findings)
-        return self.observed(command,asdict(reviewed),OutcomeKind.SUCCESS if reviewed.ok else OutcomeKind.CANDIDATE_REJECTED,'Independent review completed')
+        return self.observed(command,{**asdict(reviewed), 'review_requirements': list(manifest.requirements)},
+                             OutcomeKind.SUCCESS if reviewed.ok else OutcomeKind.CANDIDATE_REJECTED,'Independent review completed')
 
 
 def deliver_runtime(store, base, candidate, progress):

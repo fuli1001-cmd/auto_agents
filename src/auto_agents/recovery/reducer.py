@@ -198,7 +198,8 @@ def decide(snapshot, event):
             else: task['status'] = 'blocked'
         if 'recovery' in state and outcome.kind != OutcomeKind.OUTCOME_UNKNOWN:
             from .convergence import observe, record_diagnosis
-            if command['phase'] == 'verify' and outcome.details.get('verification_observation'):
+            if (command['phase'] == 'verify' or command['phase'] == 'review'
+                    and outcome.kind == OutcomeKind.CANDIDATE_REJECTED) and outcome.details.get('verification_observation'):
                 observe(state, command, outcome.details['verification_observation'])
             if command['phase'] == 'diagnose' and outcome.kind == OutcomeKind.SUCCESS:
                 record_diagnosis(state, command, outcome.details.get('recovery_diagnosis'))
