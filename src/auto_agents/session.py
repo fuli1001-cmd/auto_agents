@@ -4430,6 +4430,8 @@ class Session:
         )
         if record_pytest_execution:
             executor.record_pytest_execution = True
+        elif getattr(self, '_recovery_policy_active', False):
+            executor.record_pytest_execution = 'available'
         executor.original_commands = dict(original_commands or {})
         if state is not None and state.verification_binding:
             from functools import partial
@@ -4619,13 +4621,17 @@ class Session:
         logical_commands = 0
         executed_commands = 0
         certificate_hits = 0
+        verification_checks = []
 
-        def record_gate(gate_result) -> None:
+        def record_gate(gate_result, *, baseline=False) -> None:
             nonlocal logical_commands, executed_commands, certificate_hits
             logical_commands += len(gate_result.commands)
             hits = sum(bool(result.cached) for result in gate_result.commands)
             certificate_hits += hits
             executed_commands += len(gate_result.commands) - hits
+            if not baseline and getattr(self, '_recovery_policy_active', False):
+                from .recovery.observations import gate_checks
+                verification_checks.extend(gate_checks(gate_result))
 
         def outcome(
             ok: bool,
@@ -4648,6 +4654,13 @@ class Session:
                 ),
             }
             result.update(details)
+            if getattr(self, '_recovery_policy_active', False):
+                from .recovery.observations import retained_progress_checks
+                result.update(verification_checks=verification_checks,
+                              progress_checks=retained_progress_checks(self, state, commands),
+                              verification_manifest=state.verification_binding.get('contract_fingerprint', '')
+                                  or verification_fingerprint([state.fix_verify_command, commands]),
+                              baseline_failures=list(state.baseline_failures))
             return result
 
         def run_identity_diagnostic(
@@ -4695,7 +4708,7 @@ class Session:
                     progress=self.orch._gate_progress_callback(label),
                     gate_executor=diagnostic_executor,
                 )
-            record_gate(diagnostic_gate)
+            record_gate(diagnostic_gate, baseline=bool(source_ref))
             self.orch._classify_reported_infrastructure_failures(
                 diagnostic_gate
             )
@@ -4725,7 +4738,7 @@ class Session:
                             command_timeout_seconds=min(60, self.config.gates.command_timeout_seconds),
                             gate_executor=executor,
                         )
-                    record_gate(collected)
+                    record_gate(collected, baseline=True)
                     if not collected.ok:
                         item = plan.metadata.get(command)
                         proof_ids = item.get('proof_ids', []) if isinstance(item, dict) else getattr(item, 'proof_ids', [])
@@ -4818,6 +4831,27 @@ class Session:
                                        diagnostic={"unexecuted_nodes": unexecuted})
 
             # Layer 2: baseline-diff gate check
+            from .recovery.policy import retained_failure_commands
+            priority = retained_failure_commands(self, state, commands)
+            if priority:
+                with self._session_gate_executor_context(
+                    {command: plan.metadata.get(command, {}) for command in priority},
+                ) as gate_executor:
+                    priority_gate = run_gate_plan(priority, [], self.project_root, collect_all=True,
+                        command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                        adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                        command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                        progress=self.orch._gate_progress_callback('retained failure verification'),
+                        gate_executor=gate_executor)
+                record_gate(priority_gate)
+                self.orch._classify_reported_infrastructure_failures(priority_gate)
+                if not priority_gate.ok:
+                    from .verification_failure import details as failure_details
+                    reason, diagnostic = failure_details(priority_gate)
+                    return outcome(False, reason, retry_fix=diagnostic['comparable'],
+                        failure_kind='candidate_verification' if diagnostic['comparable'] else 'verification_inconclusive',
+                        diagnostic=diagnostic, recovery_priority_commands=priority,
+                        regression_ids=diagnostic['failure_ids'])
             if not plan.commands and not plan.parallel_groups:
                 return outcome(True, "no verification steps or commands configured")
             metadata = plan.metadata
@@ -4916,7 +4950,7 @@ class Session:
                             gate_executor=baseline_executor,
                         )
                     self.orch._classify_reported_infrastructure_failures(baseline_gate)
-                    record_gate(baseline_gate)
+                    record_gate(baseline_gate, baseline=True)
                     self.orch._raise_for_baseline_termination(
                         baseline_gate,
                         context="session lazy baseline verification",
@@ -5026,6 +5060,7 @@ class Session:
                         + ", ".join(new_failures[:10])
                     ),
                     retry_fix=True,
+                    regression_ids=new_failures,
                 )
             return outcome(True, gate.summary)
         except (ConfinementPreflightError, RunnerContextError) as error:
@@ -5429,6 +5464,12 @@ class Session:
 
     def _should_stop(self, state: SessionState, reason: str) -> Optional[str]:
         """Return a stop-reason string if the session should stop, else None."""
+        from .recovery.policy import session_stop
+        recovery_stop = session_stop(self, state)
+        if recovery_stop is not None:
+            if state.consecutive_agent_errors >= SESSION_AGENT_ERROR_THRESHOLD:
+                return 'Repeated provider failures require recovery before another call.'
+            return recovery_stop or None
         if state.stall_count >= SESSION_STALL_THRESHOLD:
             return (
                 f"No progress detected for {state.stall_count} consecutive attempts "

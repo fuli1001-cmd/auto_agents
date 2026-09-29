@@ -34,10 +34,16 @@ unconfirmed external operation is never automatically sent again. Completed
 responses are reusable without another model reservation. Cancel retires only
 undispatched outbox entries and never refunds usage.
 
-Two unsuccessful candidate checks require one bounded diagnosis. Two further
+Policy 1 histories retain the following rule: two unsuccessful candidate checks require one bounded diagnosis. Two further
 unsuccessful checks stop model work. Restart, a new operation ID, or a version
 change does not reset these counters. Only a new verified obligation grants
 progress; repeated evidence for the same obligation cannot do so.
+
+Adopted policy-2 runtimes activate [evidence-driven recovery](evidence-driven-recovery.md)
+through an explicit journal event. They preserve historical consumption while
+tracking failures and verified progress per owned scope, with one-use correction
+permits and bounded diagnosis. Partial verification progress can support another
+correction without establishing final acceptance.
 
 ## Native state and migration
 

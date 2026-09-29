@@ -114,9 +114,13 @@ def decide(snapshot, event):
                 'command_active', 'A command is already active')
         budget = state['budget']
         if command.model_call:
-            require(not budget['diagnosis_due'] or command.phase == 'diagnose', 'diagnosis_required', 'One bounded diagnosis is required before further implementation')
-            require(budget['stagnant'] < 2 or command.phase == 'diagnose' and budget['diagnosis_due'],
-                    'no_progress', 'Verified progress is required before more model work')
+            if 'recovery' in state:
+                from .convergence import consume
+                consume(state, command)
+            else:
+                require(not budget['diagnosis_due'] or command.phase == 'diagnose', 'diagnosis_required', 'One bounded diagnosis is required before further implementation')
+                from .model_progress import require_progress
+                require_progress(state, command.phase)
             require(budget['limit'] is None or budget['model_calls'] < budget['limit'], 'budget_exhausted', 'Goal call limit reached')
             budget['model_calls'] += 1
             if task['contract']['kind'] == 'engine_repair' or command.phase == 'review':
@@ -161,12 +165,12 @@ def decide(snapshot, event):
                 proofs = [p.to_dict() for p in outcome.evidence]
                 task['proofs'][command['phase']] = proofs
                 budget = state['budget']
-                if command['phase'] == 'diagnose':
+                if command['phase'] == 'diagnose' and 'recovery' not in state:
                     require(budget['diagnosis_due'] and budget['rediagnoses'] == 0, 'diagnosis', 'No diagnosis credit remains')
                     budget.update(stagnant=0, rediagnoses=1, diagnosis_due=False)
                 for proof in outcome.evidence:
                     key = digest([task['contract']['goal_id'], task['contract']['required_checks'], proof.predicate])
-                    if key not in budget['progress'] and proof.phase in {'verify', 'deliver', 'acceptance'}:
+                    if 'recovery' not in state and key not in budget['progress'] and proof.phase in {'verify', 'deliver', 'acceptance'}:
                         budget['progress'].append(key)
                         budget.update(stagnant=0, rediagnoses=0, diagnosis_due=False)
                 phases = task['contract']['phases']; index = phases.index(command['phase'])
@@ -176,17 +180,28 @@ def decide(snapshot, event):
                             'completion_proof', 'Final stage does not prove its declared completion boundary')
                     task['status'] = 'completed'
             elif outcome.kind == OutcomeKind.CANDIDATE_REJECTED:
-                budget = state['budget']; budget['stagnant'] += 1
-                if budget['stagnant'] >= 2:
+                budget = state['budget']
+                if 'recovery' in state:
+                    task.update(status='ready' if 'implement' in task['contract']['phases'] else 'blocked',
+                                phase='implement' if 'implement' in task['contract']['phases'] else command['phase'])
+                else:
+                    budget['stagnant'] += 1
+                if 'recovery' not in state and budget['stagnant'] >= 2:
                     retry_phase = 'implement' if 'implement' in task['contract']['phases'] else command['phase']
                     if budget['rediagnoses'] >= 1: task.update(status='blocked', phase=retry_phase)
                     else:
                         budget['diagnosis_due'] = True
                         task.update(status='blocked', phase=retry_phase)
                         task['failure']['details'] = {**task['failure']['details'], 'next_action': 'bounded_rediagnosis'}
-                else: task.update(status='ready' if 'implement' in task['contract']['phases'] else 'blocked',
+                elif 'recovery' not in state: task.update(status='ready' if 'implement' in task['contract']['phases'] else 'blocked',
                                   phase='implement' if 'implement' in task['contract']['phases'] else command['phase'])
             else: task['status'] = 'blocked'
+        if 'recovery' in state and outcome.kind != OutcomeKind.OUTCOME_UNKNOWN:
+            from .convergence import observe, record_diagnosis
+            if command['phase'] == 'verify' and outcome.details.get('verification_observation'):
+                observe(state, command, outcome.details['verification_observation'])
+            if command['phase'] == 'diagnose' and outcome.kind == OutcomeKind.SUCCESS:
+                record_diagnosis(state, command, outcome.details.get('recovery_diagnosis'))
         parent_id = task['contract'].get('parent_task')
         if parent_id:
             parent = _task(state, parent_id)
@@ -225,7 +240,8 @@ def decide(snapshot, event):
         require(data.get('evidence_ref'), 'resume_evidence', 'Resume needs new recovery evidence')
         failure = task.get('failure') or {}
         require(failure.get('kind') != OutcomeKind.CANDIDATE_REJECTED.value
-                or state['budget']['stagnant'] < 2, 'no_progress', 'Unchanged stopped search cannot acquire another attempt')
+                or 'recovery' in state or state['budget']['stagnant'] < 2,
+                'no_progress', 'Unchanged stopped search cannot acquire another attempt')
         task['status'] = 'ready'
     elif kind == 'task_preparation_blocked':
         task = _task(state,data['task_id'])
@@ -318,6 +334,10 @@ def decide(snapshot, event):
                     'budget','Invalid explicit repair policy')
             old = budget['repair_limits'][key]
             budget['repair_limits'][key] = old if limit is None else limit if old is None else min(old,limit)
+    elif kind in {'recovery_policy_activated', 'recovery_permit_issued', 'recovery_observation_imported',
+                  'recovery_auxiliary_reserved', 'recovery_auxiliary_finished'}:
+        from .convergence import event as recovery_event
+        recovery_event(state, kind, data)
     elif kind == 'workflow_stopped':
         require(data['status'] in {'paused', 'cancelled'}, 'workflow', 'Invalid stop status')
         state['status'] = data['status']

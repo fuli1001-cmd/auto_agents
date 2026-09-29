@@ -1546,6 +1546,7 @@ class LocalGatePlanExecutor:
                 from .verification_pytest import prepare_execution_receipts
                 compiled, pytest_reports = prepare_execution_receipts(
                     compiled, sandbox, runtime_root, merged_environment,
+                    strict=self.record_pytest_execution != 'available',
                 )
                 retained_sources = [*retained_sources, Path(__file__).resolve().parent]
             traced_command = isolated_command(compiled)
@@ -1713,6 +1714,7 @@ class LocalGatePlanExecutor:
                         if not isinstance(passed, list) or not all(isinstance(node, str) for node in passed):
                             raise ValueError('invalid pytest execution nodes')
                         result.executed_tests.extend(passed)
+                        result.test_results.update(payload.get('nodes', {}))
                         result.test_timings.extend(payload.get('slowest', []))
                         relative = f'.auto-agents/runs/{self.plan_id}/gate-artifacts/{job_id}/pytest-execution-{index}.json'
                         destination = self.project_root / relative

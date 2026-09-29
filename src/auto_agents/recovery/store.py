@@ -141,6 +141,21 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
         proofs = [*data.get('proofs', []), *data.get('outcome', {}).get('evidence', [])]
         if data.get('proof'): proofs.append(data['proof'])
         for proof in proofs: self.verify_blob(proof['blob'])
+        details = data.get('outcome', {}).get('details', {})
+        if details.get('verification_observation') is not None:
+            from .observations import compact
+            value = self.read(details['observation_ref'])
+            require(details['verification_observation'] in (value, compact(value)),
+                    'verification_observation', 'Executor observation changed after sealing')
+        if event.kind == 'recovery_observation_imported':
+            from .observations import observation, compact
+            from .model import Command
+            row = self.load(stream)['commands'][data['command_id']]
+            command = Command(**{key: row[key] for key in Command.__dataclass_fields__})
+            result = self.read(data['result_ref'])
+            require(data['observation'] == compact(observation(command, result, verifier=row['runtime'])),
+                    'verification_observation', 'Imported observation is not the retained executor result')
+        if event.kind == 'recovery_auxiliary_finished': self.verify_blob(data['result_ref'])
         if event.kind == 'projection_saved': self.verify_blob(data['blob'])
         if event.kind == 'projection_batch_saved':
             for row in data['entries']: self.verify_blob(row['blob'])

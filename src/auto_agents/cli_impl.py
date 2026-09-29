@@ -2064,13 +2064,37 @@ def _triage_controlled_workflow_result(project_root, orchestrator, state, args,
     if health_runtime is not None:
         health_runtime.set_phase('triage')
     try:
-        triage = _triage_terminal_run_error(project_root, orchestrator, failure)
+        from .recovery.model_progress import stopped_search
+        stop = stopped_search(project_root, failure)
+        if stop is not None:
+            from .controlled_failure import ControlledWorkflowFailure
+            failure = ControlledWorkflowFailure({**evidence, 'kernel_stop': stop})
+            reason = ('Search stopped after failed candidate verification; correct the retained candidate '
+                      'and reverify before further model work. ' +
+                      stop.get('last_rejection', {}).get('reason', ''))
+            triage = SelfRepairTriageResult(
+                SelfRepairDecision(False, reason=reason, category='no_progress', fingerprint=failure.fingerprint),
+                source='kernel_budget', reason=reason)
+        else:
+            triage = _triage_terminal_run_error(project_root, orchestrator, failure)
     except (OSError, RuntimeError, ValueError) as error:
         record(project_root, failure, error=str(error))
         notice('diagnosis.unavailable', 'Controlled workflow diagnosis is unavailable; the original failure is retained.')
         return None
     path, owner = record(project_root, failure, triage)
     reporter = getattr(orchestrator, 'reporter', None)
+    if stop is not None:
+        from .diagnostic_output import clean_payload
+        reason = clean_payload(stop.get('last_rejection', {}).get('reason', failure.evidence['reason']))
+        if reporter is not None and reporter.language == 'zh':
+            reporter.text(f'候选验证仍未通过，已停止自动重试：{reason}')
+            reporter.text(f'请修正保留候选后重新验证；诊断记录：{path}')
+        else:
+            message = f'Candidate verification remains blocked: {reason}\nCorrect the retained candidate and reverify. Diagnostic record: {path}'
+            reporter.text(message) if reporter is not None else print(message)
+        if reporter is not None:
+            reporter.register(path, {'kind': 'terminal_triage'})
+        return None
     if reporter is not None:
         reporter.register(path, {'kind': 'terminal_triage'})
         labels = {'auto_agents': 'auto_agents 引擎', 'target_project': '目标项目',

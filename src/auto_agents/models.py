@@ -2342,6 +2342,7 @@ class CommandResult:
     network_observed: bool = False
     proof_ref: str = ""
     executed_tests: List[str] = field(default_factory=list)
+    test_results: Dict[str, object] = field(default_factory=dict)
     queue_seconds: float = 0.0
     phase_seconds: Dict[str, float] = field(default_factory=dict)
     test_timings: List[Dict[str, object]] = field(default_factory=list)

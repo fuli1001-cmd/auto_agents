@@ -8368,6 +8368,15 @@ class Orchestrator:
         return gate, reason
 
     def _run_task_gate_commands_for_commands(
+        self, *args, **kwargs,
+    ):
+        result = self._run_task_gate_commands_for_commands_owned(*args, **kwargs)
+        captured = getattr(self, '_recovery_gate_results', None)
+        if captured is not None and not kwargs.get('source_ref'):
+            captured.append(result[0])
+        return result
+
+    def _run_task_gate_commands_for_commands_owned(
         self,
         task: Optional[TaskSpec],
         commands: List[str],
@@ -33423,8 +33432,24 @@ class Orchestrator:
             return self._run_task_verify_owned(task, state=state)
         from .recovery.native import perform
         from .recovery.model import OutcomeKind
+        def execute():
+            previous = getattr(self, '_recovery_gate_results', None)
+            self._recovery_gate_results = []
+            try:
+                result = self._run_task_verify_owned(task, state=state)
+                if not getattr(self, '_recovery_policy_active', False): return result
+                from .recovery.observations import gate_checks
+                from .recovery.model import digest
+                checks = [row for gate in self._recovery_gate_results for row in gate_checks(gate)]
+                return {**result, 'verification_checks': checks,
+                        'verification_manifest': digest([getattr(task, 'task_id', ''),
+                                                         getattr(task, 'verification_refs', [])]),
+                        'progress_checks': [row['id'] for row in checks if row['id'].startswith('command:')],
+                        'baseline_failures': list(getattr(task, 'verify_baseline_failures', []))}
+            finally:
+                self._recovery_gate_results = previous
         return perform(self, 'verify', getattr(task, 'task_id', '') + ':' + str(getattr(task, 'verify_retry_epoch', 0)),
-            lambda: self._run_task_verify_owned(task, state=state),
+            execute,
             lambda result: (OutcomeKind.SUCCESS if result.get('ok') else OutcomeKind.CANDIDATE_REJECTED
                             if result.get('comparable_failures') else OutcomeKind.ENVIRONMENT_BLOCKED,
                             str(result.get('reason', 'Task verification completed'))),

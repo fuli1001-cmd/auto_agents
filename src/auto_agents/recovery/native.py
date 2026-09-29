@@ -49,6 +49,9 @@ def context(owner, usage=None):
 
 def _source(owner, state):
     from ..git_ops import worktree_fingerprint
+    if getattr(owner, '_recovery_policy_active', False):
+        from ..git_ops import head_ref
+        return digest([head_ref(owner.project_root), worktree_fingerprint(owner.project_root)])
     return digest(worktree_fingerprint(owner.project_root))
 
 
@@ -97,6 +100,9 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
     selected = context(owner, usage)
     if selected is None: return function()
     store, stream, root, kind, native, state = selected
+    from .policy import automatic
+    automatic(store, stream)
+    owner._recovery_policy_active = 'recovery' in store.load(stream)
     source = _source(owner, state)
     runtime = store.meta('active_runtime')
     require(isinstance(runtime, dict) and runtime.get('source'), 'runtime', 'Active runtime is not sealed')
@@ -128,12 +134,12 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
             require(not model or source in {prior['source'], prior['outcome']['details'].get('post_source')},
                     'reconciliation', 'Source changed after the retained model operation; reconcile its candidate before continuing')
             return store.read(prior['outcome']['details']['native_result'])
-    budget = store.load(stream)['budget']
     require(not model or not any(c['status'] in {'running', 'unknown','reserved'} and c['command_id'] != prior_id
                                 for c in store.load(stream)['commands'].values()),
             'outcome_unknown', 'An unconfirmed operation must be reconciled before another model call')
-    require(not model or budget['stagnant'] < 2 or phase == 'diagnose' and budget['diagnosis_due'],
-            'no_progress', 'No verified progress; preserve the candidate before another model call')
+    if model and not owner._recovery_policy_active:
+        from .model_progress import require_progress
+        require_progress(store.load(stream), phase)
     contract = _contract(store, stream, root, kind, native, state, phase, operation_key)
     if kind == 'fix' and phase == 'deliver':
         parent = store.load(stream)['tasks'][contract.parent_task]
@@ -141,16 +147,39 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
                     for stage in ('verify','review')), 'delivery_evidence', 'Delivery requires verification and review of the same candidate')
     command = Command('cmd:' + operation_key, stream, contract.task_id, phase, source, contract.identity,
                       environment, runtime['source'], operation_key, model_call=model)
-    _apply(store, stream, 'command_reserved', command.to_dict(), command.command_id)
+    if owner._recovery_policy_active:
+        from .policy import reserve
+        reserve(store, stream, command)
+    else:
+        _apply(store, stream, 'command_reserved', command.to_dict(), command.command_id)
     captured = []
     def execute(_command):
+        correction_snapshot = store.load(stream)
+        inspector = getattr(owner, 'orch', owner)
+        before = (inspector._worktree_change_snapshot() if model and phase == 'implement'
+                  and owner._recovery_policy_active else None)
         result = function(contract) if bind else function(); captured.append(result)
         plain = result if isinstance(result, (dict, list, str, int, float, bool)) or result is None else asdict(result)
         # Native AgentResult contains an output Path, but no executable callbacks.
         if isinstance(plain, dict) and isinstance(plain.get('output_path'), Path): plain['output_path'] = str(plain['output_path'])
         reference = store.put(plain)
         verdict, reason = classify(result)
-        if model and phase == 'review' and _source(owner, state) != source:
+        if before is not None:
+            from .policy import correction_paths
+            outside = correction_paths(correction_snapshot, command.task_id, before, inspector._worktree_change_snapshot())
+            if outside:
+                verdict, reason = OutcomeKind.OWNERSHIP_CONFLICT, 'Correction exceeded approved paths: ' + ', '.join(outside)
+        extra = {}
+        if owner._recovery_policy_active:
+            from .policy import result_details, parse_diagnosis
+            if phase == 'verify': extra = result_details(store, stream, command, plain)
+            if phase == 'diagnose' and verdict == OutcomeKind.SUCCESS:
+                try:
+                    text = plain.get('summary') or plain.get('stdout') or plain.get('text', '')
+                    extra['recovery_diagnosis'] = parse_diagnosis(store.load(stream), command, text)
+                except KernelError as error:
+                    verdict, reason = OutcomeKind.PROTOCOL_INVALID, str(error)
+        if model and phase in {'review', 'diagnose'} and _source(owner, state) != source:
             verdict, reason = OutcomeKind.OWNERSHIP_CONFLICT, 'Read-only review changed candidate inputs'
         parent = store.load(stream)['tasks'][contract.parent_task]
         predicate = parent['contract']['completion'] if not model and (phase == 'deliver' or completion) else 'phase_completed'
@@ -160,7 +189,7 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
                          source, contract.identity, environment, digest(['native-executor-v1',runtime['source']]), phase, predicate)
         evidence = (proof,) if predicate == 'phase_completed' else (proof, replace(proof, predicate='phase_completed'))
         return Outcome(verdict, reason, evidence if verdict == OutcomeKind.SUCCESS else (),
-                       {'native_result': reference, 'subject': native, 'post_source': _source(owner, state)})
+                       {'native_result': reference, 'subject': native, 'post_source': _source(owner, state), **extra})
     executor = Executor(store, {phase: FunctionExecutor(execute)}, owner='native:' + str(os.getpid()) + ':' + uuid4().hex)
     outcome = executor.execute(stream, command.command_id)
     if model and outcome.kind != OutcomeKind.SUCCESS:
@@ -187,7 +216,8 @@ def provider(orchestrator, request, execute):
             and request.stage in {'self_repair_investigator', 'self_repair_reviewer', 'self_repair_arbiter'}
             and request.sandbox_mode == 'read-only'
             and not request.record_execution_incidents):
-        return execute(request)
+        from .policy import auxiliary_call
+        return auxiliary_call(orchestrator, request, execute)
     # Test amendments likewise reserve their independent review in the
     # proof-review store. They must not become business reviews of the parent
     # collab task, nor manufacture implementation credit in a stopped search.
@@ -195,7 +225,8 @@ def provider(orchestrator, request, execute):
             and request.sandbox_mode == 'read-only'
             and request.usage_context.get('workflow_kind') == 'proof_review'
             and request.logical_call_id.startswith('proof-review:')):
-        return execute(request)
+        from .policy import auxiliary_call
+        return auxiliary_call(orchestrator, request, execute)
     selected = context(orchestrator, request.usage_context)
     if selected is None: return execute(request)
     store, stream, root, kind, native, state = selected
@@ -209,7 +240,46 @@ def provider(orchestrator, request, execute):
     key = digest([request.attempt_id or str(request.output_path),str(request.prompt),request.purpose,
                   request.response_schema,attachment_refs])
     from ..prompting import append_context
-    if store.load(stream)['budget']['diagnosis_due']:
+    from .policy import automatic
+    automatic(store, stream)
+    if 'recovery' in store.load(stream):
+        orchestrator._recovery_policy_active = True
+        from .convergence import decision, scope
+        from .policy import diagnosis_input, correction_context, materialize_observation
+        domain = kind + ':' + native
+        if domain not in store.load(stream)['tasks']:
+            _contract(store, stream, root, kind, native, state, phase, digest([kind, native, phase, key]))
+        snapshot = store.load(stream)
+        materialize_observation(orchestrator.project_root, snapshot, domain, store)
+        selected_action = decision(snapshot, domain, phase, _source(orchestrator, state))
+        if phase == 'implement' and selected_action['action'] == 'diagnose':
+            from ..prompting import compose_prompt
+            for correction in range(2):
+                snapshot = store.load(stream)
+                text, schema = diagnosis_input(snapshot, domain, store)
+                item = scope(snapshot, domain)
+                prompt = compose_prompt([text], purpose='review')
+                identity = digest([domain, item['latest'], item['diagnoses']])
+                diagnostic = replace(request, prompt=prompt, prompt_spec=prompt.spec,
+                    purpose='review', sandbox_mode='read-only', response_schema=schema, writer_boundary=None,
+                    attempt_id='recovery-diagnose:' + identity,
+                    output_path=request.output_path.with_name('recovery-diagnose-' + identity + '.json'),
+                    usage_context={**request.usage_context, 'kernel_owned': '1'})
+                try:
+                    perform(orchestrator, 'diagnose', identity, lambda: execute(diagnostic),
+                            lambda result: provider_outcome(orchestrator, result),
+                            usage=request.usage_context, model=True)
+                    break
+                except KernelError as error:
+                    if error.code != 'protocol_invalid': raise
+                    if correction:
+                        raise KernelError('no_progress', 'Bounded diagnosis did not produce a valid correction',
+                                          diagnosis_error=str(error)) from error
+        if phase == 'implement':
+            enriched = append_context(request.prompt, correction_context(store.load(stream), domain),
+                                      'Controller recovery evidence')
+            request = replace(request, prompt=enriched, prompt_spec=getattr(enriched, 'spec', None))
+    elif store.load(stream)['budget']['diagnosis_due']:
         from ..prompting import compose_prompt
         failures = [c['outcome'] for c in sorted(store.load(stream)['commands'].values(),key=lambda c:c['sequence'])
                     if (c.get('outcome') or {}).get('kind') == 'candidate_rejected'][-2:]
@@ -293,6 +363,14 @@ def review_candidate(owner, state, verification):
     require(receipt and verification.get('ok'),'review_evidence','Review requires a verified candidate')
     parent = store.load(stream)['tasks'][kind + ':' + native]
     business = Contract.read(parent['contract'])
+    if 'recovery' in store.load(stream):
+        from .policy import materialize_observation, observation_summary
+        from .convergence import scope
+        snapshot = store.load(stream)
+        materialize_observation(owner.project_root, snapshot, business.task_id, store)
+        verification = {key: value for key, value in verification.items()
+                        if key not in {'verification_checks', 'progress_checks', 'baseline_failures'}}
+        verification['observation'] = observation_summary(scope(snapshot, business.task_id))
     manifest = ReviewManifest(_source(owner,state),receipt['base_revision'],business.identity,
         business.required_checks,changes(owner.project_root,receipt['base_revision']))
     text = ('Independently review the verified candidate against the original task contract. Do not modify files. '

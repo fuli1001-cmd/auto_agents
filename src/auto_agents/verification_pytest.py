@@ -12,7 +12,7 @@ else:
     from verification_dependencies import exception_dependencies, detect_verification_dependencies
 
 
-def prepare_execution_receipts(command, checkout, scratch, environment):
+def prepare_execution_receipts(command, checkout, scratch, environment, *, strict=True):
     """Instrument retained Python pytest invocations without changing selectors."""
     from .execution_binding import test_invocations, RunnerContextError
     replacements, reports = [], []
@@ -21,6 +21,8 @@ def prepare_execution_receipts(command, checkout, scratch, environment):
         if invocation.runner != 'pytest':
             continue
         if invocation.targets is None or invocation.launcher[-2:] != ('-m', 'pytest'):
+            if not strict:
+                continue
             raise RunnerContextError('execution_receipt', 'fresh pytest receipt requires a Python module launcher', invocation.raw)
         start = command.index(invocation.raw, offset)
         end = start + invocation.option_offset
@@ -75,6 +77,7 @@ class Recorder:
         node["seconds"] += report.duration
         self.phases[report.when] = self.phases.get(report.when, 0.0) + report.duration
         if report.failed:
+            node['detail'] = str(report.longreprtext)
             self.failures.append({"nodeid": report.nodeid, "phase": report.when,
                                   "detail": str(report.longreprtext)})
         self.checkpoint(f"{report.nodeid}:{report.when}:{report.outcome}")
@@ -101,7 +104,8 @@ class Recorder:
             group = groups.setdefault(name, {"file": name, "seconds": 0.0, "tests": 0})
             group["seconds"] += data["seconds"]
             group["tests"] += 1
-        return {"version": 2, "failures": self.failures, "collected": self.collected, "passed": passed,
+        nodes = {node: self.nodes.get(node, {'phases': {}}) for node in self.collected}
+        return {"version": 2, "failures": self.failures, "collected": self.collected, "passed": passed, 'nodes': nodes,
                 "missing_dependencies": list(self.missing_dependencies.values()),
                 "groups": sorted(groups.values(), key=lambda item: item["seconds"], reverse=True),
                 "phases": {**self.phases, "collection": self.collection_seconds},

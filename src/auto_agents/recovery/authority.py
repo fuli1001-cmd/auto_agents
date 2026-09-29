@@ -305,6 +305,8 @@ def entry(method):
                 owner._kernel_subject = subject
                 stream = store.binding(self.project_root,subject)
                 if stream:
+                    from .policy import automatic
+                    automatic(store, stream)
                     state = store.load(stream)
                     if state['status'] in {'paused','cancelled'}:
                         store.apply(stream,state['revision'],Event('resume-entry:' + uuid4().hex,'workflow_resumed',{}))

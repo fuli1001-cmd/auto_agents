@@ -7,9 +7,16 @@ from .workflow_chain import WorkflowRef
 
 
 def prepare(coordinator, parent, snapshot):
-    if (parent.active_handoff_id or parent.status not in {'failed', 'blocked'}
-            or parent.resolution not in {'kernel_no_progress', 'agent_errors_exhausted'}
-            or not parent.last_child_result_ref):
+    if parent.active_handoff_id or parent.status not in {'failed', 'blocked'} or not parent.last_child_result_ref:
+        return False
+    from .recovery.authority import installed
+    store = installed(coordinator.project_root)
+    stream = store.binding(coordinator.project_root, 'session:' + parent.session_id) if store else None
+    kernel = store.load(stream) if stream else {}
+    recoverable = {'kernel_no_progress'}
+    if 'recovery' in kernel:
+        recoverable.update({'kernel_environment_blocked', 'kernel_protocol_invalid', 'verification_inconclusive'})
+    if parent.resolution not in recoverable | {'agent_errors_exhausted'}:
         return False
     reference = Path(parent.last_child_result_ref)
     if reference.parts[-4:] != ('.auto-agents', 'state', 'handoffs', reference.stem + '.json'):
@@ -17,7 +24,7 @@ def prepare(coordinator, parent, snapshot):
     returned = coordinator.store.load_handoff(reference.stem)
     if (returned.workflow_id != snapshot.workflow_id or not returned.returned_at
             or returned.parent != WorkflowRef(parent.mode, parent.session_id)
-            or returned.status != 'blocked' or returned.result.get('resolution') != 'kernel_no_progress'):
+            or returned.status != 'blocked' or returned.result.get('resolution') not in recoverable):
         return False
     original = coordinator._resolved_handoff_chain(returned, snapshot.workflow_id)[-1]
     child_id = (original.child.native_id if original.child and original.child.kind == 'fix'
@@ -27,8 +34,8 @@ def prepare(coordinator, parent, snapshot):
     child = load_session_state(coordinator.project_root, child_id)
     owned = coordinator.store.load_handoff(child.parent_handoff_id)
     coordinator._validated_child_handoff(child, owned)
-    if (owned.parent != returned.parent or child.resolution not in {
-            'kernel_no_progress', 'proof_review_unavailable', 'proof_review_interrupted', 'proof_review_invalid'}):
+    if (owned.parent != returned.parent or child.resolution not in recoverable | {
+            'proof_review_unavailable', 'proof_review_interrupted', 'proof_review_invalid'}):
         return False
     receipt = child.candidate_custody.get('receipt')
     if not receipt:
@@ -38,13 +45,17 @@ def prepare(coordinator, parent, snapshot):
     # further model work. This also recovers legacy consumed engine returns.
     from .session_candidate import validate_receipt
     validate_receipt(child)
-    from .recovery.authority import installed
-    store = installed(coordinator.project_root)
     if store is None:
         return False
     coordinator._preserve_engine_resume_budget = True
     runtime = store.meta('active_runtime') or {}
     key = digest([owned.handoff_id, receipt['fingerprint'], runtime.get('source')])
+    stream = store.binding(coordinator.project_root, 'session:' + child_id)
+    kernel = store.load(stream) if stream else {}
+    if 'recovery' in kernel:
+        from .recovery.convergence import scope
+        item = scope(kernel, 'fix:' + child_id)
+        key = digest([key, 2, item['latest'], item['diagnoses'], item['correction']])
     retry = coordinator.store.prepare_handoff(snapshot, parent=returned.parent, target='resume',
         goal=owned.goal, reason='Reverify the retained candidate after a stopped search',
         payload={'resume_handoff_id': owned.handoff_id}, handoff_id='hf-' + key[:12])

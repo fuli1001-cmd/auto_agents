@@ -108,6 +108,17 @@ def test_two_stalls_one_diagnosis_then_two_stalls_stop_across_restart(scene):
     assert not snapshot['budget']['diagnosis_due']
     with pytest.raises(KernelError, match='cannot acquire'):
         emit(store, 'task_resumed', {'task_id':'task','evidence_ref':store.put({'restart':True})})
+    # A new engine task cannot evade the same exhausted workflow budget, and
+    # admission explains the retained failure without reserving another call.
+    engine = replace(contract, task_id='engine', kind='engine_repair', phases=('plan',))
+    emit(store, 'task_bound', {'contract': engine.to_dict()})
+    before = store.replay('workflow')
+    with pytest.raises(KernelError) as failure:
+        reserve(store, engine, 'plan', 'engine-plan', True)
+    assert failure.value.code == 'no_progress'
+    assert failure.value.details['last_rejection']['command_id'] == 'verify:3'
+    assert failure.value.details['last_rejection']['reason'] == 'Same required check fails'
+    assert store.replay('workflow') == before
 
 
 def test_protocol_two_fences_stale_runtime_before_idempotent_event_lookup(scene):

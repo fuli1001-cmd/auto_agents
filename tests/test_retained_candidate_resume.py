@@ -28,9 +28,13 @@ def test_targeted_feedback_keeps_pytest_cause_hidden_by_conda_wrapper():
     assert diagnostic['comparable'] and diagnostic['command_failures'][0]['stdout_tail']
 
 
-def stopped_candidate(tmp_path, monkeypatch, *, engine_return=False):
+def stopped_candidate(tmp_path, monkeypatch, *, engine_return=False, candidate_value=1, verify_command='',
+                      stop_kind='kernel_no_progress'):
     from auto_agents import session_candidate
     root, child = project(tmp_path)
+    if verify_command:
+        child.fix_verify_command = verify_command
+        save_session_state(root, child)
     graph, snapshot, handoff = parent_workflow(root, child)
     (root/'.auto-agents/state/sessions'/child.session_id/'issue.json').write_text('{"task_id":"task-owned"}')
     store = activate(root, tmp_path/'control', monkeypatch)
@@ -47,7 +51,7 @@ def stopped_candidate(tmp_path, monkeypatch, *, engine_return=False):
                 'change_coverage': [{'change': key, 'requirement': checks[0], 'reason': 'Owned fix',
                                     'evidence': 'tests/test_owned.py::test_owned'} for key in props['change']['enum']]})
         else:
-            (request.cwd/'value.py').write_text('VALUE = 1\n')
+            (request.cwd/'value.py').write_text(f'VALUE = {candidate_value}\n')
             reply = 'Fixed\nCOMMIT_MESSAGE: Repair owned value'
         return AgentResult(True, ['local-test-transport'], request.output_path, summary=reply, stdout=reply)
     monkeypatch.setattr(Orchestrator, '_call_with_failover_owned', agent)
@@ -70,11 +74,11 @@ def stopped_candidate(tmp_path, monkeypatch, *, engine_return=False):
         if i == 1:
             perform(session, 'diagnose', 'bounded', lambda: {'cause': 'old verifier'},
                     lambda r: (OutcomeKind.SUCCESS, 'diagnosed'), model=True)
-    session._block_execution_binding(child, KernelError('no_progress', 'No verified progress'), 'kernel_no_progress')
+    session._block_execution_binding(child, KernelError(stop_kind.removeprefix('kernel_'), 'Retained workflow blocker'), stop_kind)
     snapshot = graph.load(snapshot.workflow_id)
     handoff = graph.load_handoff(handoff.handoff_id)
     graph.record_result(snapshot, handoff, status='blocked', result={'status': 'blocked',
-        'resolution': 'kernel_no_progress', 'session_id': child.session_id})
+        'resolution': stop_kind, 'session_id': child.session_id})
     graph.consume_result(snapshot, handoff, operation_id='retained-return')
     if engine_return:
         handoff = graph.prepare_handoff(snapshot, parent=handoff.parent, target='fix', goal=child.goal,
@@ -82,7 +86,7 @@ def stopped_candidate(tmp_path, monkeypatch, *, engine_return=False):
             payload={'target_repository': str(tmp_path/'engine'),
                      'issue_seed': {'failed_handoff_id': handoff.handoff_id}})
         graph.record_result(snapshot, handoff, status='blocked', result={'status': 'blocked',
-            'resolution': 'kernel_no_progress', 'session_id': child.session_id})
+            'resolution': stop_kind, 'session_id': child.session_id})
         graph.consume_result(snapshot, handoff, operation_id='engine-return')
     parent = load_session_state(root, 'parent')
     coordinator = WorkflowCoordinator(Orchestrator(root), auto_approve=True)
@@ -134,6 +138,65 @@ def test_failed_reverification_keeps_stagnation_and_never_calls_writer(tmp_path,
     assert calls == ['fix']
     assert after['model_calls'] == before['model_calls']
     assert after['rediagnoses'] == 1 and after['stagnant'] >= 2
+
+
+@pytest.mark.parametrize('legacy_parent', [False, True])
+def test_exhausted_child_reports_verification_failure_without_terminal_model_triage(
+        tmp_path, monkeypatch, capsys, legacy_parent):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from auto_agents import cli
+    from auto_agents.recovery.model_progress import require_progress
+
+    root, store, child, calls = stopped_candidate(tmp_path, monkeypatch)
+    monkeypatch.setattr(Session, '_run_verify_owned', lambda *a: {
+        'ok': False, 'retry_fix': True, 'reason': 'tests/test_owned.py::test_owned still fails'})
+    parent = Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
+    if legacy_parent:
+        parent.resolution = 'agent_errors_exhausted'
+    stream = store.binding(root, 'session:' + child.session_id)
+    before = store.replay(stream)
+    with pytest.raises(KernelError) as blocked:
+        require_progress(before, 'plan')
+    detail = blocked.value.details
+    assert blocked.value.code == 'no_progress'
+    assert detail['stagnant'] >= 2 and detail['rediagnoses'] == 1
+    assert detail['last_rejection']['task_id'] == 'fix:' + child.session_id
+    assert detail['last_rejection']['reason'] == 'tests/test_owned.py::test_owned still fails'
+    assert detail['last_rejection']['result_ref']
+    from auto_agents.recovery import engine, native
+    from auto_agents.repair_v2 import migration, scope
+    with monkeypatch.context() as patch:
+        patch.setattr(native, 'context', lambda *a: (store, stream, root, 'collab', 'parent', parent))
+        patch.setattr(scope, 'context', lambda *a: {})
+        patch.setattr(migration, 'request_from_payload', lambda *a: Mock())
+        effects = Mock(side_effect=AssertionError('stopped search must not prepare an engine environment'))
+        patch.setattr(engine, 'IsolatedEngineEffects', effects)
+        with pytest.raises(KernelError) as admission:
+            engine._submit(store, root, Mock(),
+                {'invocation': {'command': 'collab', 'session_id': 'parent'},
+                 'fingerprint': 'new-incident', 'contract': {}},
+                SimpleNamespace(command='collab'), None, Mock())
+        assert admission.value.code == 'no_progress'
+        assert admission.value.details == detail
+        effects.assert_not_called()
+        assert not (store.root/'kernel-engine').exists()
+    monkeypatch.setattr(cli, '_triage_terminal_run_error',
+                        lambda *a: pytest.fail('exhausted search must not invoke model triage'))
+    monkeypatch.setattr(cli, '_auto_repair_auto_agents_and_resume',
+                        lambda *a, **kw: pytest.fail('exhausted search must not start engine repair'))
+    foreground = Mock()
+    assert cli._triage_controlled_workflow_result(root, Orchestrator(root), parent,
+        SimpleNamespace(command='collab', auto_approve=True, full_verify=False), None, foreground) is None
+    foreground.release.assert_not_called()
+    record = json.loads((root/'.auto-agents/state/sessions/parent/terminal-triage.json').read_text())
+    assert record['triage']['source'] == 'kernel_budget'
+    assert not record['triage']['decision']['eligible']
+    assert record['failure']['kernel_stop'] == detail
+    output = capsys.readouterr()
+    assert 'tests/test_owned.py::test_owned still fails' in output.out + output.err
+    assert store.replay(stream) == before
+    assert calls == ['fix']
 
 
 def test_retained_verification_is_invalidated_by_adopted_verifier(tmp_path, monkeypatch):

@@ -30,6 +30,8 @@ class EngineRunner:
 
     def run(self, *, resume=False):
         self.emit('task_bound', {'contract':self.contract.to_dict()}, self.contract.task_id + ':bind')
+        from .policy import automatic
+        automatic(self.store, self.stream)
         initial = self.store.load(self.stream)['tasks'][self.contract.task_id]
         if resume and initial['status'] == 'blocked' and not initial['active_command'] and (initial.get('failure') or {}).get('kind') == 'environment_blocked':
             evidence = self.store.put({'environment':self.effects.environment,'failure':initial['failure'],'request':'explicit_resume'})
@@ -52,6 +54,15 @@ class EngineRunner:
             if task['status'] == 'blocked':
                 if self.contract.phases == ('diagnose',): return task
                 failure = task.get('failure') or {}
+                if 'recovery' in state and failure.get('kind') == 'candidate_rejected':
+                    from .convergence import decision
+                    selected = decision(state, self.contract.task_id, 'implement', self.effects.source())
+                    if selected['allowed'] or selected['action'] == 'diagnose':
+                        evidence = self.store.put(selected)
+                        self.emit('task_resumed', {'task_id': self.contract.task_id, 'evidence_ref': evidence},
+                                  self.contract.task_id + ':recovery:' + evidence)
+                        continue
+                    return task
                 if failure.get('kind') == 'protocol_invalid':
                     prior = [c for c in state['commands'].values() if c['task_id'] == self.contract.task_id
                              and (c.get('outcome') or {}).get('kind') == 'protocol_invalid']
@@ -60,7 +71,7 @@ class EngineRunner:
                         self.emit('task_resumed', {'task_id':self.contract.task_id,'evidence_ref':evidence},
                                   self.contract.task_id + ':protocol:' + evidence)
                         continue
-                if state['budget']['diagnosis_due']:
+                if 'recovery' not in state and state['budget']['diagnosis_due']:
                     diagnosis = replace(self.contract, task_id=self.contract.task_id + ':diagnosis',
                         completion='phase_completed', phases=('diagnose',))
                     diagnostic = EngineRunner(self.store, self.stream, diagnosis, self.effects, self.progress).run()
@@ -71,12 +82,27 @@ class EngineRunner:
                     continue
                 return task
             phase = task['phase']
+            if 'recovery' in state and phase == 'implement':
+                from .convergence import decision, scope
+                selected = decision(state, self.contract.task_id, phase, self.effects.source())
+                if selected['action'] == 'diagnose':
+                    item = scope(state, self.contract.task_id)
+                    diagnosis = replace(self.contract,
+                        task_id='diagnosis:' + digest([self.contract.task_id, item['latest'], item['diagnoses']])[:40],
+                        parent_task=self.contract.task_id, completion='phase_completed', phases=('diagnose',))
+                    result = EngineRunner(self.store, self.stream, diagnosis, self.effects, self.progress).run()
+                    if result['status'] != 'completed': return result
+                    continue
             number = sum(c['task_id'] == self.contract.task_id for c in state['commands'].values())
             identity = 'engine-command:' + digest([self.contract.task_id, phase, number])
             command = Command(identity, self.stream, self.contract.task_id, phase,
                 self.effects.source(), self.contract.identity, self.effects.environment,
                 self.store.meta('active_runtime')['source'], identity, phase in {'plan','implement','review','diagnose'})
-            self.emit('command_reserved', command.to_dict(), identity + ':reserve')
+            if 'recovery' in state:
+                from .policy import reserve
+                reserve(self.store, self.stream, command)
+            else:
+                self.emit('command_reserved', command.to_dict(), identity + ':reserve')
 
 
 class IsolatedEngineEffects:
@@ -117,11 +143,20 @@ class IsolatedEngineEffects:
         return source_identity(self.candidate)
 
     def observed(self, command, result, kind=OutcomeKind.SUCCESS, reason='Phase completed'):
+        if command.phase == 'verify' and 'recovery' in self.store.load(self.stream):
+            result = {**result, 'ok': kind == OutcomeKind.SUCCESS, 'reason': reason}
         reference = self.store.put(result)
         predicate = 'preflight_recovered' if command.phase == 'review' and kind == OutcomeKind.SUCCESS else 'phase_completed'
         proof = Evidence(reference, command.task_id, command.source, command.contract, command.environment,
             digest('isolated-engine-executor-v1'),command.phase,predicate)
-        return Outcome(kind, reason, (proof,) if kind == OutcomeKind.SUCCESS else (), {'result_ref':reference})
+        from .policy import result_details, parse_diagnosis
+        extra = result_details(self.store, self.stream, command, result)
+        if command.phase == 'diagnose' and 'recovery' in self.store.load(self.stream) and kind == OutcomeKind.SUCCESS:
+            try:
+                extra['recovery_diagnosis'] = parse_diagnosis(self.store.load(self.stream), command, result.get('text', ''))
+            except KernelError as error:
+                kind, reason = OutcomeKind.PROTOCOL_INVALID, str(error)
+        return Outcome(kind, reason, (proof,) if kind == OutcomeKind.SUCCESS else (), {'result_ref':reference, **extra})
 
     def _previous(self, phase):
         return previous_result(self.store,self.stream,self.contract.task_id,phase)
@@ -175,15 +210,35 @@ class IsolatedEngineEffects:
                 'issue':self.store.read(self.contract.issue_ref),'acceptance':[asdict(a) for a in self.accepted.acceptance],
                 'read_only_evidence':self.evidence_context,'failures':observations})
         if phase in {'plan','diagnose','implement'}:
+            if phase == 'diagnose' and 'recovery' in state:
+                from .policy import diagnosis_input, materialize_observation
+                materialize_observation(self.candidate, state, self.contract.task_id, self.store)
+                text, schema = diagnosis_input(state, self.contract.task_id, self.store)
+                before = self.source()
+                reply = self.driver.run('plan', text, self.candidate, schema=schema, progress=self.agent_progress, cancel=self.cancel)
+                require(self.source() == before, 'read_only_violation', 'Diagnosis changed protected source')
+                return self.observed(command, asdict(reply),
+                    OutcomeKind.SUCCESS if reply.ok else OutcomeKind.ENVIRONMENT_BLOCKED,
+                    'Bounded diagnosis completed' if reply.ok else reply.error)
             prefix = ('Implement only the authorized repair and preserve all existing test obligations.' if phase == 'implement'
                 else 'Inspect the original failure and propose a bounded, falsifiable repair plan. Do not modify files or run a broad test suite.')
             if phase == 'implement': require(self.scope.current(), 'scope_missing', 'Implementation requires retained necessity evidence')
             prompt = prefix + '\n' + context + '\nPlan context:\n' + evidence.render(self._previous('plan'))
+            if phase == 'implement' and 'recovery' in state:
+                from .policy import correction_context, materialize_observation
+                materialize_observation(self.candidate, state, self.contract.task_id, self.store)
+                prompt += '\nController recovery evidence:\n' + correction_context(state, self.contract.task_id)
             if phase != 'implement': prompt += '\n' + INSTRUCTION
             before = self.source()
+            from .runtime_source import inventory
+            before_paths = inventory(self.candidate) if phase == 'implement' and 'recovery' in state else None
             reply = self.driver.run('implement' if phase == 'implement' else 'plan',prompt,self.candidate,
                                     progress=self.agent_progress,cancel=self.cancel)
             after = self.source()
+            if before_paths is not None:
+                from .policy import correction_paths
+                outside = correction_paths(state, self.contract.task_id, before_paths, inventory(self.candidate))
+                require(not outside, 'read_only_violation', 'Correction exceeded approved source paths', paths=outside)
             if phase != 'implement': require(after == before, 'read_only_violation','Diagnosis changed protected source')
             if not reply.ok:
                 return self.observed(command, asdict(reply),
@@ -323,6 +378,14 @@ def _submit(store, project, orchestrator, payload, args, run_lock, progress):
     identity = 'engine:' + digest([stream,payload.get('symptom_key') or payload['fingerprint'],payload['contract']])[:40]
     task_id = identity + ':repair'
     incident_id = identity + ':incident'
+    state = store.load(stream)
+    existing = state['tasks'].get(task_id)
+    # Check before preparing an isolated environment. Existing verification and
+    # reconciliation must remain available even when model work is exhausted.
+    if 'recovery' not in state and (existing is None or (existing['status'] == 'ready' and not existing['active_command']
+                            and existing['phase'] in {'plan', 'implement', 'review', 'diagnose'})):
+        from .model_progress import require_progress
+        require_progress(state, existing['phase'] if existing else 'plan')
     working = store.root/'kernel-engine'/identity
     working.mkdir(parents=True,exist_ok=True)
     if not (working/'original-payload.json').exists():
