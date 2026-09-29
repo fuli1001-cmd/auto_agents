@@ -57,6 +57,11 @@ def gate_checks(gate):
                 rows.append({'id': node, 'status': status, 'command': command,
                              'evidence': dict(result.artifacts), 'detail': redact(value.get('detail', ''))[:4000]})
         else:
+            # Older signed certificates retain exact passed nodes even when
+            # they predate the richer phase map. Preserve those proofs too.
+            rows.extend({'id': node, 'status': 'blocked' if blocked else 'passed', 'command': command,
+                         'evidence': dict(result.artifacts), 'detail': ''}
+                        for node in result.executed_tests)
             # A failing command may expose stable test failures, but its other
             # tests are not implicitly passed. No parsing of a success summary.
             failures = extract_failure_info(type(gate)(False, [result]))
