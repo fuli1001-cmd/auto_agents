@@ -14,6 +14,10 @@ the legacy budget. Owner-specific rejection and diagnosis history seeds local
 searches. Migration imports structured executor results where available;
 historical prose does not become a passed check.
 
+Before adoption, the independent verifier streams journal events from one read
+transaction. It still compares every revision, checksum and projected result;
+memory use no longer grows with the total size of retained history.
+
 A scope derives from the original goal, owner kind, source scope and verification
 obligations. Ephemeral operation IDs and equivalent task aliases share that
 scope. Independent engine repairs do not borrow or erase product retry history.

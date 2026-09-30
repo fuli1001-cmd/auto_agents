@@ -223,15 +223,17 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
     def replay(self, stream):
         state, previous = initial(), ''
         with self.connect() as db:
-            rows = db.execute('SELECT * FROM kernel_events WHERE stream=? ORDER BY revision', (stream,)).fetchall()
-        for row in rows:
-            raw = json.loads(row['envelope']); event = Event(**raw)
-            require(row['revision'] == state['revision'] + 1 and row['previous'] == previous
-                    and row['checksum'] == digest([stream, row['revision'], previous, raw]),
-                    'journal', 'Recovery journal integrity failure')
-            state, _ = decide(state, event)
-            require(canonical(state) == row['result'], 'journal', 'Event projection does not match replay')
-            previous = row['checksum']
+            # The retained result column contains a full snapshot per event.
+            # Stream rows under the same read transaction so memory depends on
+            # one event, not on the size of the entire immutable journal.
+            for row in db.execute('SELECT * FROM kernel_events WHERE stream=? ORDER BY revision', (stream,)):
+                raw = json.loads(row['envelope']); event = Event(**raw)
+                require(row['revision'] == state['revision'] + 1 and row['previous'] == previous
+                        and row['checksum'] == digest([stream, row['revision'], previous, raw]),
+                        'journal', 'Recovery journal integrity failure')
+                state, _ = decide(state, event)
+                require(canonical(state) == row['result'], 'journal', 'Event projection does not match replay')
+                previous = row['checksum']
         require(state == self.load(stream), 'projection', 'Stored state differs from event replay')
         return state
 
