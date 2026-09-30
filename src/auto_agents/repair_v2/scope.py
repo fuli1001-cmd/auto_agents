@@ -307,7 +307,7 @@ class ScopeGuard:
         return reference
 
 
-def changes(snapshot, base, parents=()):
+def changes(snapshot, base, parents=(), *, revision=None):
     """Stable hunk IDs force review coverage of the actual delta, including metadata."""
     from .workspace import git
     def hunks(diff):
@@ -347,5 +347,6 @@ def changes(snapshot, base, parents=()):
                     upstream = signatures(commit, parent)
                     break
         inherited.update(upstream)
-    actual = hunks(git(snapshot, 'diff', '--binary', '--no-ext-diff', '--unified=3', base, '--'))
+    actual = hunks(git(snapshot, 'diff', '--binary', '--no-ext-diff', '--unified=3', base,
+                       *([revision] if revision else []), '--'))
     return {key: text for key, text in actual.items() if signature(text) not in inherited}

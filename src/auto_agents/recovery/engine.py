@@ -329,8 +329,7 @@ class IsolatedEngineEffects:
             reviewed = review_result(reply.text,command.source,set(manifest.requirements),manifest.changes)
             grant = scope_approval(parsed, scope_paths, command.source)
             if original is not None:
-                require(isinstance(original,dict) and original.get('decision') == parsed['decision']
-                        and original.get('findings') == reviewed.findings,
+                require(isinstance(original,dict) and manifest.same_judgment(original, parsed),
                         'review_changed','Protocol correction changed its substantive judgment')
         except (KernelError, ValueError, TypeError, RepairBlocked) as error:
             return self.observed(command, {'reply':reply.text,'diagnostic':str(error)},OutcomeKind.PROTOCOL_INVALID,'Review protocol does not match the manifest')

@@ -413,13 +413,18 @@ def review_candidate(owner, state, verification):
             verification['reason'] = verification['observation']['reason']
             verification['reason_full_evidence'] = verification['observation']['full_evidence']
     manifest = ReviewManifest(_source(owner,state),receipt['base_revision'],business.identity,
-        business.required_checks,changes(owner.project_root,receipt['base_revision']))
+        business.required_checks,changes(owner.project_root,receipt['base_revision'], revision=receipt.get('source_revision')))
     text = ('Independently review the verified candidate against the original task contract. Do not modify files. '
         'Return decision, findings, coverage and change_coverage using the supplied schema. Reject only '
         'demonstrated violations and provide a concrete counterexample and check for each finding.\n' +
-        json.dumps({'contract_id':business.identity,'goal':store.read(business.goal_ref),
+        json.dumps({'contract_id':business.identity,'candidate_revision':receipt.get('source_revision'),
+            'goal':store.read(business.goal_ref),
             'issue':store.read(business.issue_ref),'required_checks':business.required_checks,
             'verification':verification},ensure_ascii=False) + '\n' + manifest.instruction())
+    if receipt.get('source_revision'):
+        text += ('\nDelivery uses the immutable candidate_revision, including newly added files. '
+                 'The working index is restored after freezing; an untracked working file can still be in the '
+                 'delivery tree. Inspect git show candidate_revision:path before claiming a file is omitted.')
     if scope_paths:
         text += ('\nThese paths exceeded the diagnostic plan but remain inside the original repository: '
                  + json.dumps(scope_paths) + '. Independently assess whether each is necessary for the original goal '
@@ -473,7 +478,7 @@ def review_candidate(owner, state, verification):
                     except RepairBlocked as error:
                         raise KernelError('protocol_invalid', str(error)) from error
                 if previous is not None:
-                    require(previous.get('decision') == result['decision'] and previous.get('findings') == findings,
+                    require(manifest.same_judgment(previous, result),
                             'protocol_invalid','Format correction changed the substantive judgment')
                 grant = scope_approval(result, scope_paths, manifest.source)
                 return {'kind':'success' if approved else 'candidate_rejected','ok':approved,'review':result,'text':raw,

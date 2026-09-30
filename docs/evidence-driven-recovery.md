@@ -75,6 +75,12 @@ Validated independent review findings can also supply a bound counterexample
 for diagnosis. They cannot close test obligations or grant verification credit.
 Review allowances bind source and verification inputs, so changing an operation
 ID cannot renew an exhausted format-correction allowance.
+Native review enumerates changes from the sealed delivery commit, including
+files whose working index is intentionally untracked. Finding and coverage
+requirement IDs use the same controller sets in the schema and local validation.
+Format correction may replace an unknown requirement ID while preserving the
+decision and every substantive finding field; it cannot turn rejection into
+approval or reassign an already valid requirement.
 The writer remains confined by the existing project contract. Additional product
 paths outside the diagnostic plan are recorded atomically with its result and
 require independent review of necessity and evidence for every added path.
@@ -84,6 +90,13 @@ requirements and all pending scope amendments. Rephrasing a request, changing so
 not reset the window. A successful verification permits review of that same
 candidate, with at most one format correction. Ordinary run planning reviews
 retain their stage authority and do not require a fix-candidate receipt.
+
+Verification presentation counts logical command batches, not individual pytest
+cases. Collection preflight is one check set and stops at its first failed entry.
+Interactive terminals refresh one action with counts and active-batch elapsed
+time. Plain/file output reports changes in completed counts and a throttled
+60-second heartbeat while a batch runs. These display events never grant
+verification progress or update health-control evidence.
 
 `recovery_permit_issued` records the controller decision and exact command.
 Reservation atomically consumes the permit with budget charges and the outbox

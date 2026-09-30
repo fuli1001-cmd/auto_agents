@@ -28,7 +28,7 @@ def test_large_verification_matrix_is_available_without_embedding_in_review(scen
     owner = SimpleNamespace(project_root=tmp_path, orch=SimpleNamespace(_call_with_failover_owned=provider))
     monkeypatch.setattr(native, 'context', lambda *args: (store, 'workflow', tmp_path, 'fix', 'child', state))
     monkeypatch.setattr(native, '_source', lambda *args: 'a'*64)
-    monkeypatch.setattr(repair_scope, 'changes', lambda *args: {})
+    monkeypatch.setattr(repair_scope, 'changes', lambda *args, **kwargs: {})
     monkeypatch.setattr(native, 'perform', lambda owner, phase, key, execute, classify, **kwargs: execute())
     verification = {'ok': True, 'attestation_level': 'release',
                     'reason': reason,
@@ -61,7 +61,7 @@ def test_provider_failure_keeps_bounded_diagnostic_receipt(scene, tmp_path, monk
                              _failover_error_category=lambda result: 'provider_error'))
     monkeypatch.setattr(native, 'context', lambda *args: (store, 'workflow', tmp_path, 'fix', 'child', state))
     monkeypatch.setattr(native, '_source', lambda *args: 'a'*64)
-    monkeypatch.setattr(repair_scope, 'changes', lambda *args: {})
+    monkeypatch.setattr(repair_scope, 'changes', lambda *args, **kwargs: {})
     monkeypatch.setattr(native, 'perform', lambda owner, phase, key, execute, classify, **kwargs: execute())
     result = review_candidate(owner, state, {'ok': True, 'reason': 'real verification'})
     assert result['kind'] == 'environment_blocked'

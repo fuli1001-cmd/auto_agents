@@ -72,6 +72,11 @@ class ExecutionDisplay:
             for key, cn, en in (("failed", "失败", "failed"), ("cancelled", "取消", "cancelled")):
                 if counts.get(key):
                     parts.append(f"{cn if zh else en} {counts[key]}")
+            if checks.active:
+                name, began, state = next(iter(checks.active.values()))
+                seconds = max(0, int(time.monotonic() - began))
+                verb = ('已运行' if zh else 'running') if state == 'running' else ('等待' if zh else 'waiting')
+                parts.append(f"{name} {verb} {seconds}{' 秒' if zh else 's'}")
         last_output = self.output_times.get(task_id)
         if last_output is not None:
             seconds = max(0, int(time.monotonic() - last_output))

@@ -4753,22 +4753,29 @@ class Session:
             priority_failure = priority_check()
             if priority_failure is not None: return priority_failure
             if state.verification_binding:
+                collection = {}
                 for command in dict.fromkeys(commands):
                     collect = collection_command(command)
                     if not collect:
                         continue
-                    original_command = original_commands.get(command, command)
+                    collection[collect] = (command, original_commands.get(command, command))
+                if collection:
                     with self._session_gate_executor_context(
-                        {collect: plan.metadata.get(command, {})},
-                        original_commands={collect: original_command}, use_result_cache=False,
+                        {collect: plan.metadata.get(command, {}) for collect, (command, original) in collection.items()},
+                        original_commands={collect: original for collect, (command, original) in collection.items()},
+                        use_result_cache=False,
                     ) as executor:
                         collected = run_gate_plan(
-                            [collect], [], self.project_root, collect_all=False,
+                            list(collection), [], self.project_root, collect_all=False,
                             command_timeout_seconds=min(60, self.config.gates.command_timeout_seconds),
+                            progress=self.orch._gate_progress_callback('session verification collection',
+                                timeout_seconds=min(60, self.config.gates.command_timeout_seconds)),
                             gate_executor=executor,
                         )
                     record_gate(collected, baseline=True)
                     if not collected.ok:
+                        failed = next((result for result in collected.commands if not result.ok), None)
+                        command, original_command = collection[failed.command if failed else next(iter(collection))]
                         item = plan.metadata.get(command)
                         proof_ids = item.get('proof_ids', []) if isinstance(item, dict) else getattr(item, 'proof_ids', [])
                         owners = diagnostic_owners(state, original_command, proof_ids=proof_ids)

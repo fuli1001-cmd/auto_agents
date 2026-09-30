@@ -791,9 +791,11 @@ class Reporter:
                     ('[' + str(data['stage']) + '] ' + ('开始' if zh else 'Starting'), 'start'))
         if kind == "verification.started":
             name = "验证" if zh else "Verification"
+            if data.get('collection'):
+                name = '验证准备（收集测试）' if zh else 'Verification preparation (test collection)'
             if "baseline" in str(data.get("context", "")) or "基线" in str(data.get("context", "")):
                 name = "基线验证" if zh else "Baseline verification"
-            if owner.snapshot.kind == 'fix':
+            if owner.snapshot.kind == 'fix' and not data.get('collection'):
                 name = (('检查项目原有状态' if zh else 'Checking the original project behavior')
                         if 'baseline' in str(data.get('context', '')) or '基线' in str(data.get('context', '')) else
                         ('检查修复效果' if zh else 'Checking the project fix'))
@@ -803,6 +805,8 @@ class Reporter:
                 return "", ""
             owner._action_failures = {key for key in owner._action_failures if not (key[1] == task_id and key[3] == "verify")}
             return name, "start"
+        if kind == 'verification.progress':
+            return message, ''
         if kind in {"task.result", "verification.finished"}:
             action = str(data.get("action", "verify"))
             passed = (str(data.get("decision", "")).lower() in {"pass", "passed", "approve", "approved", "accept", "accepted"}
@@ -1348,6 +1352,9 @@ class GateObservation:
         self.activity = self.display.activities.get(self.task_id)
         self.identifier = uuid4().hex
         self._reported_results: set[int] = set()
+        self.collection = 'collection' in self.context
+        self._last_progress_at = time.monotonic()
+        self._last_progress_counts = tuple(self.counts.values())
         self.view = CheckSet(task_id=self.task_id, counts=dict(self.counts), baseline="baseline" in self.context)
         with self.owner._lock:
             if self._current():
@@ -1364,13 +1371,15 @@ class GateObservation:
             label = "当前任务" if reporter.language == "zh" else "current task"
         with self.owner._lock:
             if self._current():
-                self.reporter.emit("verification.started", context=label, task_id=self.task_id, check_set_id=self.identifier)
+                self.reporter.emit("verification.started", context=label, collection=self.collection,
+                                   task_id=self.task_id, check_set_id=self.identifier)
+                self.report_progress(initial=True)
         self.reporter.event("verification.selected", {"context": self.context, "total": total})
 
     def __call__(self, event: str, command: str, elapsed: float) -> None:
         if self.progress is not None:
             self.progress(event, command, elapsed)
-        if event not in {"start", "dispatch_serial", "dispatch_parallel", "finish", "cache_hit"}:
+        if event not in {"start", "dispatch_serial", "dispatch_parallel", "finish", "cache_hit", 'heartbeat'}:
             return
         with self.owner._lock:
             if not self._current() or self.view.finished:
@@ -1381,6 +1390,31 @@ class GateObservation:
                 self.view.active[command] = (name, time.monotonic(), state)
             elif event in {"finish", "cache_hit"}:
                 self.view.active.pop(command, None)
+            self.report_progress()
+
+    def report_progress(self, *, initial=False):
+        """Report real batch counts and periodic liveness, never verification credit."""
+        if not self._current() or self.view.finished: return
+        current = time.monotonic()
+        signature = tuple(self.counts.values())
+        if not initial and signature == self._last_progress_counts and current - self._last_progress_at < 60:
+            return
+        self._last_progress_at, self._last_progress_counts = current, signature
+        zh = self.reporter.language == 'zh'
+        name = ('验证准备' if zh else 'Test collection') if self.collection else ('基线验证' if zh else 'Baseline verification') if self.view.baseline else ('验证' if zh else 'Verification')
+        settled = self.counts['completed'] + self.counts['cancelled']
+        message = f"{name} {settled}/{self.counts['total']}"
+        for field, cn, en in [('failed', '失败', 'failed'), ('cancelled', '取消', 'cancelled')]:
+            if self.counts[field]: message += f" | {cn if zh else en} {self.counts[field]}"
+        if self.view.active:
+            check, began, state = next(iter(self.view.active.values()))
+            elapsed = max(0, int(current - began))
+            verb = ('已运行' if zh else 'running') if state == 'running' else ('等待' if zh else 'waiting')
+            message += f" | {check} | {verb} {elapsed}{' 秒' if zh else 's'}"
+        live = self.owner.presenter._live is not None
+        self.reporter.event('verification.progress', {'task_id': self.task_id,
+            'check_set_id': self.identifier, 'collection': self.collection, **self.counts},
+            audience='debug' if live else 'user', message=message)
 
     def _current(self) -> bool:
         return (self.reporter._current_lane() and not self.owner._closed and not self.reporter._closed
@@ -1401,6 +1435,7 @@ class GateObservation:
                 self.view.counts = dict(self.counts)
                 self.view.active.pop(result.command, None)
                 self.reporter.snapshot.checks = dict(self.counts)
+                self.report_progress()
         self.reporter.event("verification.result", {
             "context": self.context, "command": result.command, "ok": result.ok,
             "returncode": result.returncode, "termination_reason": result.termination_reason,
