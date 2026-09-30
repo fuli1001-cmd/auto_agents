@@ -404,6 +404,14 @@ def review_candidate(owner, state, verification):
         verification = {key: value for key, value in verification.items()
                         if key not in {'verification_checks', 'progress_checks', 'baseline_failures'}}
         verification['observation'] = observation_summary(scope(snapshot, business.task_id))
+        # A successful full suite can contain megabytes of pre-existing failure
+        # traces in its prose reason. The complete executor observation remains
+        # available at the sealed evidence path, without duplicating it in a
+        # provider request that has its own context and transport limits.
+        reason = verification.get('reason', '')
+        if isinstance(reason, str) and len(reason) > 4000:
+            verification['reason'] = verification['observation']['reason']
+            verification['reason_full_evidence'] = verification['observation']['full_evidence']
     manifest = ReviewManifest(_source(owner,state),receipt['base_revision'],business.identity,
         business.required_checks,changes(owner.project_root,receipt['base_revision']))
     text = ('Independently review the verified candidate against the original task contract. Do not modify files. '
@@ -417,6 +425,8 @@ def review_candidate(owner, state, verification):
                  + json.dumps(scope_paths) + '. Independently assess whether each is necessary for the original goal '
                  'and preserves its constraints. Approval requires scope_coverage with path, reason and concrete evidence '
                  'for every listed path; reject unrelated expansion. This does not authorize new requirements.')
+    if verification.get('reason_full_evidence'):
+        text += '\nThe verification reason was abbreviated. Read reason_full_evidence for the complete test output when needed.'
     original_review_text = text
     usage = {'workflow_kind':kind,'subject_id':native,'kernel_owned':'1'}
     previous = None
@@ -432,7 +442,14 @@ def review_candidate(owner, state, verification):
             raw = reply.summary or reply.stdout
             if not reply.ok:
                 outcome, reason = provider_outcome(owner.orch,reply)
-                return {'kind':outcome.value,'reason':reason,'text':raw}
+                from ..diagnostic_output import redact
+                return {'kind':outcome.value,'reason':reason,'text':raw,
+                        'provider_receipt': {'returncode':reply.returncode,
+                            'termination':asdict(reply.termination) if reply.termination else None,
+                            'usage':asdict(reply.usage) if reply.usage else None,
+                            'cleanup_incomplete':reply.cleanup_incomplete,
+                            'stdout_observed':bool(reply.stdout), 'summary_observed':bool(reply.summary),
+                            'stderr_excerpt':redact(reply.stderr)[-4000:]}}
             try:
                 result = manifest.validate(raw)
                 require(result.get('decision') in {'APPROVE','REJECT'} and isinstance(result.get('findings'),list),

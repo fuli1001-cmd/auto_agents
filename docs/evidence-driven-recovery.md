@@ -29,7 +29,10 @@ evidence. Skips and unexecuted checks are never inferred to pass.
 Complete observations are immutable objects. Compact check states are carried
 in the journal; models receive a bounded failure summary and a readable complete
 evidence file. Candidate review also uses this representation, so a large passing
-matrix does not exceed the provider's prompt-size limit. Baseline executions and collection-only commands do not overwrite
+matrix or a multi-megabyte baseline traceback does not inflate the provider
+request. The complete reason remains in the evidence file. Failed review
+requests retain a bounded, redacted provider diagnostic and consumption is not
+refunded. Baseline executions and collection-only commands do not overwrite
 candidate execution results.
 
 Local progress requires a previously observed failure to pass under comparable

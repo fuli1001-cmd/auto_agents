@@ -41,9 +41,9 @@ def write(store, contract, key, **kw):
     finish(store, command, success(store, command))
 
 
-def verify(store, contract, key, checks, *, ok=False, environment=None, source='a'*64, progress_checks=None, regressions=()):
+def verify(store, contract, key, checks, *, ok=False, environment=None, source='a'*64, progress_checks=None, regressions=(), reason='real verification'):
     command = operation(store, contract, 'verify', key, source=source)
-    result = {'ok': ok, 'reason': 'real verification', 'verification_manifest': 'fixed-obligations',
+    result = {'ok': ok, 'reason': reason, 'verification_manifest': 'fixed-obligations',
               'verification_checks': [{'id': k, 'status': v, 'command': 'python -m pytest tests/test_value.py'}
                                       for k, v in checks.items()]}
     if progress_checks is not None: result['progress_checks'] = progress_checks
