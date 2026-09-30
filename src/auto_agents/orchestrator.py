@@ -21465,6 +21465,7 @@ class Orchestrator:
         level: Optional[str] = None,
         changed_path_set: Optional[Iterable[str]] = None,
         required_proof_ids: Optional[Iterable[str]] = None,
+        baseline_ref: str = "HEAD",
     ) -> ResolvedGatePlan:
         """Resolve one deduplicated plan for the requested execution phase."""
         if phase not in {"implement", "final"}:
@@ -21494,6 +21495,7 @@ class Orchestrator:
                 changed_paths=candidate_paths,
                 required_proof_ids=required_proof_ids or (),
                 preserve_release_targets=required_proof_ids is not None,
+                baseline_ref=baseline_ref,
             )
             steps = selection.steps
         manual_groups = [
@@ -21503,10 +21505,29 @@ class Orchestrator:
             and (selection is None or selection.level == "release")
         ]
         if has_structured_steps:
+            if self.config.gates.verification_policy_version >= 5 and changed_path_set is not None:
+                changed_tests = any(path.startswith(('tests/', 'test/')) or Path(path).name == 'conftest.py'
+                                    for path in candidate_paths)
+                if changed_tests:
+                    # Retain frozen proof definitions; restrict only execution
+                    # capabilities until changed fixtures receive a new audit.
+                    from dataclasses import replace
+                    steps = [replace(step, parallel_safe=False, coalesce_safe=False, node_replay_safe=False) for step in steps]
+            estimates = {}
+            timing = getattr(self, '_gate_timing_store', None)
+            if self.config.gates.verification_policy_version >= 5 and timing is not None:
+                from .gates import command_from_verification_step
+                original = resolve_gate_plan_from_verification_steps(steps, self.project_root)
+                measured = timing.estimate_many(original.metadata)
+                estimates = {step.proof_id: measured.get(command_from_verification_step(step, project_root=self.project_root)) or 0
+                             for step in steps}
             resolved = resolve_gate_plan_from_verification_steps(
                 steps,
                 self.project_root,
                 phase="final" if required_proof_ids is not None else phase,
+                coalesce=self.config.gates.verification_policy_version >= 5,
+                target_seconds=self.config.gates.shard_target_seconds,
+                estimates=estimates,
             )
             commands = list(resolved.commands)
             groups = [
@@ -21593,6 +21614,7 @@ class Orchestrator:
             forced_release_reason=(
                 selection.forced_release_reason if selection is not None else ""
             ),
+            selection_reasons=selection.selection_reasons if selection is not None else {},
         )
 
     @staticmethod
@@ -41696,7 +41718,8 @@ class Orchestrator:
                 ".auto-agents/docs/requirements_audit.md, .auto-agents/docs/review.md, "
                 "project_brief.md, architecture.md, requirements_trace.json, or any other "
                 "repository files to make the plan pass.",
-                "At the root of the JSON, set verification_policy_version=4 and also define test_strategy and verification_steps.",
+                f"At the root of the JSON, set verification_policy_version={self.config.gates.verification_policy_version} and also define test_strategy and verification_steps.",
+                "For policy v5, declare impact_symbols only from reviewed component ownership. Keep release_trigger, coalesce_safe and node_replay_safe false unless independently established; never weaken retained mandatory checks.",
                 "At the root of the JSON, set oracle_proof_schema_version to 2 for all new plans. auto_agents will bind each proof to the current requirement contract hash.",
                 "At the root of the JSON, set persistence_contract_version=2. Every active task must include persistence_change. Use {'storage_transition':'none','compatibility_policy':'not_applicable'} for ordinary tasks.",
                 "A persistence task must copy storage_transition, compatibility_policy, decision_id, and target_ids from an active decision and add to_version, which is always the target runner's expected latest storage version. When a serialized payload/protocol has its own version, record it separately as contract_to_version. Declare executable migration_artifacts as {id,path,kind}, where kind is baseline, schema, data, or required_seed; declare non-migration serialized contract files separately as contract_artifacts. Existing migrations are immutable and future changes append a new migration.",
@@ -46402,6 +46425,8 @@ class Orchestrator:
             verification_policy_version = max(
                 1, int(payload.get("verification_policy_version", 1) or 1)
             )
+            if self.config.gates.verification_policy_version >= 5:
+                verification_policy_version = max(5, verification_policy_version)
             # "auto" distributed mode may still fall back to a small local
             # worker. Keep local/auto fan-out bounded; only a required cluster
             # is allowed to prepare a wider set of batches up front.
@@ -46460,6 +46485,9 @@ class Orchestrator:
                     step for step in steps if "release" not in step.levels
                 ] + normalized_release
             steps = remap_expanded_proof_dependencies(source_steps, steps)
+            if self.config.gates.verification_policy_version >= 5:
+                from .verification_migration import preserve_operator_metadata
+                steps = preserve_operator_metadata(self.config.gates, steps)
             fallback_proof_ids, unknown_fallback_ids = remap_expanded_proof_ids(
                 source_steps,
                 steps,
@@ -46505,6 +46533,7 @@ class Orchestrator:
                 and self.config.gates.commands == commands
                 and self.config.gates.parallel_groups == next_groups
                 and self.config.gates.fallback_proof_ids == fallback_proof_ids
+                and self.config.gates.verification_policy_version == verification_policy_version
             ):
                 return
             self.config.gates.steps = steps

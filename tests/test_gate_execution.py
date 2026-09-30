@@ -9,6 +9,8 @@ import subprocess
 import sys
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gate_execution import (
@@ -459,7 +461,9 @@ def test_auto_result_cache_reuses_when_only_unobserved_source_changes(
     assert not third.ok
 
 
-def test_serial_lane_preserves_ignored_producer_artifact(tmp_path: Path) -> None:
+@pytest.mark.parametrize('policy', [4, 5])
+@pytest.mark.parametrize('publisher', ['producer', 'consumer'])
+def test_serial_lane_preserves_ignored_producer_artifact(tmp_path: Path, policy, publisher) -> None:
     project = _project(tmp_path)
     producer = (
         f"{sys.executable} -c \"from pathlib import Path; "
@@ -471,13 +475,15 @@ def test_serial_lane_preserves_ignored_producer_artifact(tmp_path: Path) -> None
         "assert Path('.tmp-tests/shared.txt').read_text() == 'ready'\""
     )
     metadata = {
-        consumer: GateCommandMetadata(
+        (producer if publisher == 'producer' else consumer): GateCommandMetadata(
             artifact_globs=[".tmp-tests/shared.txt"],
         )
     }
+    config = _config(tmp_path)
+    config.verification_policy_version = policy
     with LocalGatePlanExecutor(
         project,
-        _config(tmp_path),
+        config,
         metadata,
     ) as executor:
         result = run_gate_plan(

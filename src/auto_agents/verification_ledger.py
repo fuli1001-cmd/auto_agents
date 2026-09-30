@@ -193,6 +193,7 @@ class VerificationLedger:
                        execution_seconds=result.duration_seconds, executed=1, ok=result.ok, unchanged=unchanged,
                        phases=result.phase_seconds, test_count=len(result.executed_tests), slowest=result.test_timings,
                        input_trace_complete=result.input_trace_complete, input_trace_reason=result.input_trace_reason,
+                       cache_miss_components=result.process_snapshot.get('cache_miss_components', []),
                        observed_shadow=observed_hit and input_mode == "observe")
             return result
 
@@ -209,6 +210,7 @@ def verification_summary(root=None):
     root = Path(root) if root else ledger_root()
     totals = {"requests": 0, "executed": 0, "hits": 0, "queue_seconds": 0.0, "execution_seconds": 0.0}
     misses = {}
+    components = {}
     timings = {}
     for path in root.glob("*/events.jsonl") if root.exists() else ():
         for line in path.read_text().splitlines():
@@ -226,10 +228,13 @@ def verification_summary(root=None):
             if row.get("cache") != "hit":
                 reason = row.get("cache", "unknown")
                 misses[reason] = misses.get(reason, 0) + 1
+                for name in row.get('cache_miss_components', []):
+                    components[name] = components.get(name, 0) + 1
             for item in row.get("slowest", []):
                 name = item["nodeid"]
                 timing = timings.setdefault(name, {"nodeid": name, "seconds": 0.0, "samples": 0})
                 timing["seconds"] += item.get("seconds", 0)
                 timing["samples"] += 1
     return {"scope": "user-shared verification executors", **totals, "miss_reasons": misses,
+            "miss_components": components,
             "slow_tests": sorted(timings.values(), key=lambda item: item["seconds"], reverse=True)[:10]}

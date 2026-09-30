@@ -488,7 +488,11 @@ def verification_identity(session, state, *, scope='final'):
         from .recovery.authority import installed
         store = installed(Path(getattr(session, '_custody_control_root', session.project_root)))
         if store is not None:
-            value.append({'verifier_runtime': (store.meta('active_runtime') or {}).get('source')})
+            if gates.verification_policy_version >= 5:
+                from .gate_result_cache import verification_decision_fingerprint
+                value.append({'verifier_policy': verification_decision_fingerprint()})
+            else:
+                value.append({'verifier_runtime': (store.meta('active_runtime') or {}).get('source')})
         amendments = identities(session, state)
         return fingerprint([*value, {'proof_amendments': amendments}] if amendments else value)
 
@@ -521,8 +525,10 @@ def recover_receipt(session, state):
     if resume_rejected_diagnosis(session, state): return
     from .execution_binding import RunnerContextError
     selection_failure = None
+    candidate_scope = session._candidate_verify_scope() if hasattr(session, '_candidate_verify_scope') else 'final'
     with session._session_verification_config():
-        plan, commands = session._verification_plan_commands()
+        plan, commands = (session._verification_plan_commands(candidate_scope) if candidate_scope != 'final'
+                          else session._verification_plan_commands())
         from .proof_amendments import ProofReviewRequired, ensure
         try:
             validate_selected_contracts(session, state, commands, metadata=plan.metadata)
@@ -538,7 +544,8 @@ def recover_receipt(session, state):
         except RunnerContextError as error:
             selection_failure = {'ok': False, 'reason': str(error), 'executed_commands': 0,
                                  **session._verification_preflight_failure(state, error)}
-        identity = verification_identity(session, state)
+        identity = (verification_identity(session, state, scope=candidate_scope) if candidate_scope != 'final'
+                    else verification_identity(session, state))
     retained = next((entry for entry in reversed(state.execution_log)
         if entry.get('action') == 'receipt_verification' and entry.get('identity') == identity
         and entry.get('verification', {}).get('execution_identity') == identity), None)
@@ -552,13 +559,14 @@ def recover_receipt(session, state):
         state.verification_diagnostics = {}
         with session._session_verification_context():
             session._ensure_baseline(state)
-        result = session._run_verify()
+        result = session._run_verify(scope=candidate_scope) if candidate_scope != 'final' else session._run_verify()
         session._append_verification_log(state, 'inventory_migration_verify', result)
         identity = record_verification(session, state, result, identity=identity)
     else:
         result = retained['verification']
     if result['ok']:
-        current_identity = verification_identity(session, state)
+        current_identity = (verification_identity(session, state, scope=candidate_scope) if candidate_scope != 'final'
+                            else verification_identity(session, state))
         if (not result.get('execution_identity') or result['execution_identity'] != identity
                 or identity != current_identity):
             raise ownership_error(state, 'verification inputs changed before receipt completion',
@@ -636,6 +644,7 @@ def record_receipt(session, state):
 
 def deliver_candidate(session, state, message):
     admit_fresh_materialization(state)
+    require_release_verification(session, state)
     custody = state.candidate_custody
     receipt = custody.get('receipt')
     if not receipt:
@@ -650,6 +659,27 @@ def deliver_candidate(session, state, message):
     _git(session.project_root, 'update-ref', 'refs/auto-agents/delivered/' + state.session_id, revision)
     session._save(state)
     return True
+
+
+def require_release_verification(session, state):
+    """A candidate-level success cannot authorize v5 delivery, even offline."""
+    binding = state.verification_binding
+    if binding.get('gates', {}).get('verification_policy_version', 1) < 5:
+        return
+    identity = verification_identity(session, state, scope='final')
+    required = {step['proof_id'] for step in binding['gates'].get('steps', [])
+                if step.get('proof_id') and set(step.get('levels', ['affected', 'release'])) & {'affected', 'release'}}
+    receipt = state.candidate_custody['receipt']['fingerprint']
+    valid = any(row.get('action') == 'receipt_verification'
+                and row.get('identity') == identity and row.get('receipt_fingerprint') == receipt
+                and row.get('binding_fingerprint') == binding.get('binding_fingerprint')
+                and row.get('verification', {}).get('ok')
+                and row['verification'].get('execution_identity') == identity
+                and row['verification'].get('scope') == 'final'
+                and row['verification'].get('attestation_level') == 'release'
+                and required.issubset(row['verification'].get('proof_ids', [])) for row in state.execution_log)
+    if not valid:
+        raise ownership_error(state, 'delivery requires complete release verification of the frozen candidate')
 
 
 def completed_delivery(state):

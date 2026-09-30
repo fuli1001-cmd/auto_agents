@@ -28,6 +28,7 @@ def execution_policy_fingerprint() -> str:
         "verification_input_trace.py",
         "verification_inputs.py", "verification_probes.py",
         "verification_manifest.py", "verification_pytest.py", "verification_trace.py")]
+    paths.extend(Path(__file__).with_name(name) for name in ("verification_batch_cache.py", "execution_binding.py"))
     identity = tuple((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in paths if path.exists())
     if _POLICY_CACHE[0] != identity:
         _POLICY_CACHE = (identity, _stable_hash([(path.name, hashlib.sha256(path.read_bytes()).hexdigest())
@@ -36,6 +37,14 @@ def execution_policy_fingerprint() -> str:
     # Candidate imports do not identify the already-running outer supervisor.
     # Bind its negotiated implementation as well as the selected source files.
     return _stable_hash([_POLICY_CACHE[1], owner_identity()])
+
+
+def verification_decision_fingerprint() -> str:
+    """Reassess admission/comparison changes without discarding raw test proofs."""
+    names = ('session.py', 'session_candidate.py', 'session_verification.py', 'verification_selection.py',
+             'verification_v5.py', 'verification_baseline.py', 'pytest_selection.py', 'recovery/native.py')
+    return _stable_hash([execution_policy_fingerprint(), [(name, hashlib.sha256(
+        Path(__file__).parent.joinpath(name).read_bytes()).hexdigest()) for name in names]])
 
 
 def re_full_digest(value: str) -> bool:
@@ -121,6 +130,7 @@ class GateResultCache:
         self.max_age_seconds = max(1, int(max_age_seconds))
         self.manifest_validator = manifest_validator
         self.disabled = False
+        self.miss_components: dict[str, list[str]] = {}
         self._lock = threading.Lock()
 
     def lookup(
@@ -150,6 +160,8 @@ class GateResultCache:
         result_cache_scope: str,
         metadata_signature: str,
     ) -> tuple[Optional[CommandResult], str]:
+        if self.environment_fingerprint.startswith('unavailable:'):
+            return None, 'environment_identity_unavailable'
         if self.disabled or result_cache_scope == "off":
             return None, "cache_disabled" if self.disabled else "scope_off"
         identity = _identity(
@@ -166,6 +178,7 @@ class GateResultCache:
         now = int(time.time())
         try:
             with self._lock, self._connect() as connection:
+                self._explain_miss(connection, command, source_fingerprint, context, metadata_signature)
                 certificate = connection.execute(
                     """
                     SELECT result_payload
@@ -232,6 +245,7 @@ class GateResultCache:
     ) -> None:
         if (
             self.disabled
+            or self.environment_fingerprint.startswith('unavailable:')
             or result_cache_scope == "off"
             or result.termination_reason
             or result.cleanup_incomplete
@@ -265,6 +279,12 @@ class GateResultCache:
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock, self._connect() as connection:
+                components = self._identity_components(source_fingerprint, context, metadata_signature)
+                connection.execute('CREATE TABLE IF NOT EXISTS gate_identity_components '
+                                   '(cache_key TEXT PRIMARY KEY,command TEXT NOT NULL,components TEXT NOT NULL,updated_at INTEGER NOT NULL)')
+                connection.execute('INSERT OR REPLACE INTO gate_identity_components VALUES (?,?,?,?)',
+                                   (key, command, json.dumps(components, sort_keys=True), now))
+                connection.execute('DELETE FROM gate_identity_components WHERE updated_at<?', (now - self.max_age_seconds,))
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO gate_proof_certificates (
@@ -286,6 +306,8 @@ class GateResultCache:
                                 "stderr": result.stderr[-200_000:],
                                 "comparable_failures": bool(result.comparable_failures),
                                 "executed_tests": result.executed_tests,
+                                "test_results": result.test_results,
+                                "proof_ref": result.proof_ref,
                                 "collected_tests": result.process_snapshot.get("collected_tests"),
                                 "phase_seconds": result.phase_seconds,
                                 "artifacts": result.artifacts,
@@ -352,6 +374,24 @@ class GateResultCache:
                 )
         except (OSError, sqlite3.Error, TypeError, ValueError):
             self.disabled = True
+
+    def _identity_components(self, source, context, metadata):
+        from .workers import environment_components
+        return {'source': source, 'context': context, 'metadata': metadata,
+                'environment': self.environment_fingerprint, 'verifier': execution_policy_fingerprint(),
+                'certificate_version': str(RESULT_CACHE_VERSION),
+                **{key if key.startswith('environment.') else 'environment.' + key: value
+                   for key, value in environment_components(self.environment_fingerprint).items()}}
+
+    def _explain_miss(self, connection, command, source, context, metadata):
+        connection.execute('CREATE TABLE IF NOT EXISTS gate_identity_components '
+                           '(cache_key TEXT PRIMARY KEY,command TEXT NOT NULL,components TEXT NOT NULL,updated_at INTEGER NOT NULL)')
+        row = connection.execute('SELECT components FROM gate_identity_components WHERE command=? '
+                                 'ORDER BY updated_at DESC LIMIT 1', (command,)).fetchone()
+        current = self._identity_components(source, context, metadata)
+        prior = json.loads(row[0]) if row else {}
+        self.miss_components[command] = sorted(key for key in prior.keys() | current.keys()
+                                             if prior.get(key) != current.get(key)) if prior else ['no_comparable_certificate']
 
     def _manifest_matches(self, manifest: Mapping[str, object]) -> bool:
         validator = getattr(self, 'manifest_validator', None)
@@ -462,6 +502,8 @@ class GateResultCache:
             stderr=str(payload.get("stderr", "")),
             comparable_failures=bool(payload.get("comparable_failures", False)),
             executed_tests=list(payload.get("executed_tests", [])),
+            test_results=dict(payload.get("test_results", {})),
+            proof_ref=str(payload.get('proof_ref', '')),
             process_snapshot={"collected_tests": payload.get("collected_tests")},
             phase_seconds=dict(payload.get("phase_seconds", {})),
             artifacts=dict(payload.get("artifacts", {})),

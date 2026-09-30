@@ -219,6 +219,8 @@ class Session:
                 or self.config.gates.release_verification_mode == "blocking"
             )
         )
+        optimized = self.config.gates.verification_policy_version >= 5
+        release = release or (optimized and scope == "final")
         state = self._current_state
         if state is not None and state.verification_binding:
             try:
@@ -231,6 +233,7 @@ class Session:
                         "implement", level="affected",
                         changed_path_set=sorted(set(owned_paths(self.orch, state)) | set(state.lineage_changed_paths)),
                         required_proof_ids=state.verification_binding.get('required_proof_ids', []),
+                        **({'baseline_ref': state.candidate_custody.get('base_revision') or 'HEAD'} if optimized else {}),
                     )
                 validate_plan(state, self.config.gates, plan)
                 return plan
@@ -2467,7 +2470,7 @@ class Session:
             # Keep the evaluated identity through recording and delivery.
             from .session_candidate import verification_identity
             identity = verification_identity(self, state) if state.candidate_custody.get('receipt') else None
-            verify = self._run_verify()
+            verify = self._run_verify(scope='progress') if self._candidate_verify_scope() == 'progress' else self._run_verify()
             if verify.get('failure_kind') == 'proof_review_required':
                 from .proof_amendments import ensure
                 decision = ensure(self, state)
@@ -2475,7 +2478,7 @@ class Session:
                     return state
                 if decision == 'approved':
                     state.verification_diagnostics = {}
-                    verify = self._run_verify()
+                    verify = self._run_verify(scope='progress') if self._candidate_verify_scope() == 'progress' else self._run_verify()
                 else:
                     verify = {**verify, 'retry_fix': True, 'failure_kind': 'proof_review_rejected',
                               'reason': '独立审核拒绝测试修订，请依据原需求和审核记录修正候选。'}
@@ -2537,18 +2540,21 @@ class Session:
         return False
 
     def _complete_verified_fix(self, state, verify, reply, *, identity=None):
+        candidate_scope = str(verify.get('scope', 'final'))
         if state.candidate_custody.get('receipt'):
             from .session_candidate import verification_identity
             with self._session_verification_config():
-                plan, commands = self._verification_plan_commands()
+                plan, commands = (self._verification_plan_commands(candidate_scope) if candidate_scope != 'final'
+                                  else self._verification_plan_commands())
                 validate_selected_contracts(self, state, commands, metadata=plan.metadata)
-                current_identity = verification_identity(self, state)
+                current_identity = (verification_identity(self, state, scope=candidate_scope) if candidate_scope != 'final'
+                                    else verification_identity(self, state))
                 if (not verify.get('execution_identity') or identity != verify['execution_identity']
                         or identity != current_identity):
                     raise ownership_error(state, 'verification inputs changed before completion',
                                           execution_identity=verify.get('execution_identity'),
                                           current_identity=current_identity)
-        if not self._ack_engine_recovery(state, 'verification', verification_identity=identity or ''):
+        if candidate_scope == 'final' and not self._ack_engine_recovery(state, 'verification', verification_identity=identity or ''):
             return state
         from .recovery.native import review_candidate
         review = review_candidate(self, state, verify)
@@ -2557,6 +2563,23 @@ class Session:
             state.execution_log.append({'action':'candidate_review_rejected','result':self._receipt_retry_feedback})
             self._save(state)
             return self._phase_fix_execute_owned(state)
+        if candidate_scope != 'final':
+            from .session_candidate import record_verification, require_release_verification
+            self._print('专项验证与审核已通过；开始发布验收')
+            verify = self._run_verify(scope='final')
+            self._append_verification_log(state, 'release_verify', verify)
+            identity = record_verification(self, state, verify)
+            if not verify.get('ok'):
+                self._receipt_retry_feedback = str(verify.get('reason', 'Release verification failed'))
+                if verify.get('retry_fix') is False:
+                    state.status, state.resolution = 'blocked', 'verification_inconclusive'
+                    self._save(state)
+                    return state
+                self._save(state)
+                return self._phase_fix_execute_owned(state)
+            require_release_verification(self, state)
+            if not self._ack_engine_recovery(state, 'verification', verification_identity=identity or ''):
+                return state
         self._print("Verification passed!")
         self._run_session_persistence_action(state)
         state.status, state.resolution = 'completed', 'fixed'
@@ -4293,6 +4316,10 @@ class Session:
         from .recovery.native import verification
         return verification(self, scope, lambda: self._run_verify_owned(scope))
 
+    def _candidate_verify_scope(self):
+        with self._session_verification_config():
+            return 'progress' if self.config.gates.verification_policy_version >= 5 else 'final'
+
     def _run_verify_owned(self, scope: str = "final") -> Dict[str, object]:
         from .execution_binding import RunnerContextError
         execution_identity = None
@@ -4421,7 +4448,8 @@ class Session:
             kwargs['execution_environment'] = dict(context.environment)
             kwargs['contract_fingerprint'] = verification_fingerprint([
                 state.verification_binding.get('binding_fingerprint', ''),
-                state.candidate_custody.get('receipt', {}).get('fingerprint', ''),
+                ('' if state.verification_binding.get('gates', {}).get('verification_policy_version', 1) >= 5
+                 else state.candidate_custody.get('receipt', {}).get('fingerprint', '')),
                 'session-write-boundary-v1',
                 state.verification_binding.get('proof_execution_context'),
             ])
@@ -4430,7 +4458,8 @@ class Session:
         )
         if record_pytest_execution:
             executor.record_pytest_execution = True
-        elif getattr(self, '_recovery_policy_active', False):
+        elif (getattr(self, '_recovery_policy_active', False)
+              or self.config.gates.verification_policy_version >= 5):
             executor.record_pytest_execution = 'available'
         executor.original_commands = dict(original_commands or {})
         if state is not None and state.verification_binding:
@@ -4622,6 +4651,7 @@ class Session:
         executed_commands = 0
         certificate_hits = 0
         verification_checks = []
+        changed_failure_nodes = set()
 
         def record_gate(gate_result, *, baseline=False) -> None:
             nonlocal logical_commands, executed_commands, certificate_hits
@@ -4652,6 +4682,8 @@ class Session:
                 "forced_release_reason": str(
                     getattr(plan, "forced_release_reason", "")
                 ),
+                "selection_reasons": getattr(plan, "selection_reasons", {}),
+                "release_pending": scope == 'progress' and getattr(plan, 'verification_level', '') != 'release',
             }
             result.update(details)
             if getattr(self, '_recovery_policy_active', False):
@@ -4744,6 +4776,9 @@ class Session:
             # Resolve once so targeted and affected layers share identical proof
             # metadata and therefore the same candidate certificate.
             plan, commands = self._verification_plan_commands(scope)
+            if self.config.gates.verification_policy_version >= 5:
+                title = '专项验证' if scope == 'progress' else '发布验收'
+                self._print(f'{title}：{len(plan.proof_ids)} 项证明，{len(commands)} 个计划批次；有效证据优先复用')
             original_commands = {}
             if self.mode == 'fix' and state.fix_verify_command:
                 original_commands[self._fix_verify_command_for_execution(state.fix_verify_command)] = state.fix_verify_command
@@ -4760,10 +4795,15 @@ class Session:
                         continue
                     collection[collect] = (command, original_commands.get(command, command))
                 if collection:
+                    from dataclasses import replace
+                    collection_metadata = {}
+                    for collect, (command, original) in collection.items():
+                        item = plan.metadata.get(command, {})
+                        collection_metadata[collect] = replace(item, constituents={}) if hasattr(item, 'constituents') else item
                     with self._session_gate_executor_context(
-                        {collect: plan.metadata.get(command, {}) for collect, (command, original) in collection.items()},
+                        collection_metadata,
                         original_commands={collect: original for collect, (command, original) in collection.items()},
-                        use_result_cache=False,
+                        use_result_cache=self.config.gates.verification_policy_version >= 5,
                     ) as executor:
                         collected = run_gate_plan(
                             list(collection), [], self.project_root, collect_all=False,
@@ -4892,6 +4932,12 @@ class Session:
             record_gate(gate)
             self.orch._classify_reported_infrastructure_failures(gate)
             extraction = extract_failure_info(gate)
+            if self.config.gates.verification_policy_version >= 5:
+                incomplete = sorted(node for result in gate.commands for node, value in result.test_results.items()
+                                    if not value.get('phases'))
+                if incomplete:
+                    return outcome(False, 'selected test bodies did not execute: ' + ', '.join(incomplete[:10]),
+                                   retry_fix=False, failure_kind='proof_execution_incomplete')
             from .proof_amendments import execution_evidence
             if any(not result.ok and result.command in getattr(self, '_amendment_commands', {})
                    for result in gate.commands):
@@ -4950,8 +4996,17 @@ class Session:
                         baseline_metadata,
                         source_ref=state.baseline_git_ref,
                     ) as baseline_executor:
+                        pending_commands, reused, originals, certificates = failed_commands, [], {}, None
+                        if self.config.gates.verification_policy_version >= 5 and baseline_executor is not None:
+                            from .verification_baseline import baseline_plan
+                            certificates, pending_commands, reused, originals = baseline_plan(
+                                baseline_executor, gate.commands, baseline_metadata)
+                            if reused:
+                                self._print(f'基线比较：复用 {len(reused)}/{len(failed_commands)} 批证据，需执行 {len(pending_commands)} 批')
+                            for replay, original in originals.items():
+                                baseline_executor.metadata[replay] = baseline_metadata[original]
                         baseline_gate = run_gate_plan(
-                            failed_commands,
+                            pending_commands,
                             [],
                             self.project_root,
                             collect_all=True,
@@ -4964,6 +5019,22 @@ class Session:
                             ),
                             gate_executor=baseline_executor,
                         )
+                        if certificates is not None:
+                            from .verification_baseline import failure_signatures
+                            for row in baseline_gate.commands:
+                                original = originals.get(row.command, row.command)
+                                row.command = original
+                                certificates.put_result(original, baseline_metadata.get(original, {}), row)
+                            baseline_gate.commands = [*reused, *baseline_gate.commands]
+                            baseline_gate.ok = all(row.ok for row in baseline_gate.commands)
+                            baseline_rows = {row.command: row for row in baseline_gate.commands}
+                            for row in gate.commands:
+                                if row.ok or row.command not in baseline_rows:
+                                    continue
+                                before = failure_signatures(baseline_rows[row.command])
+                                after = failure_signatures(row)
+                                changed_failure_nodes.update(node for node in before.keys() & after.keys()
+                                                             if before[node] != after[node])
                     self.orch._classify_reported_infrastructure_failures(baseline_gate)
                     record_gate(baseline_gate, baseline=True)
                     self.orch._raise_for_baseline_termination(
@@ -5066,7 +5137,7 @@ class Session:
                     failure_kind="verification_inconclusive",
                     raw_log_path=raw_log_path,
                 )
-            new_failures = sorted(set(current_failures) - set(state.baseline_failures))
+            new_failures = sorted((set(current_failures) - set(state.baseline_failures)) | changed_failure_nodes)
             if new_failures:
                 return outcome(
                     False,

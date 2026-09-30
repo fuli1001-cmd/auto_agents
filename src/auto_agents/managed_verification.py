@@ -48,6 +48,7 @@ def explain(project, *, engine=False, level="affected", tests=(), changed_from=N
     return {"ok": True, "read_only": True, "scope": "project", "level": selection.level,
             "proof_ids": selection.proof_ids, "unmapped_paths": selection.unmapped_paths,
             "forced_release_reason": selection.forced_release_reason,
+            "selection_reasons": selection.selection_reasons,
             "steps": [asdict(step) for step in selection.steps]}
 
 

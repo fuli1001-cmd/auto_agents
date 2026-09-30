@@ -385,6 +385,10 @@ class VerificationStep:
     cadence: str = "implement_and_final"
     levels: List[str] = field(default_factory=list)
     impact_paths: List[str] = field(default_factory=list)
+    impact_symbols: List[str] = field(default_factory=list)
+    release_trigger: bool = False
+    coalesce_safe: bool = False
+    node_replay_safe: bool = False
     depends_on_proofs: List[str] = field(default_factory=list)
     risk: str = "medium"
     cache_scope: str = "run_context"
@@ -416,6 +420,10 @@ class VerificationStep:
             cadence=str(data.get("cadence", "implement_and_final")),
             levels=[str(item) for item in data.get("levels", [])],
             impact_paths=[str(item) for item in data.get("impact_paths", [])],
+            impact_symbols=[str(item) for item in data.get("impact_symbols", [])],
+            release_trigger=bool(data.get("release_trigger", False)),
+            coalesce_safe=bool(data.get("coalesce_safe", False)),
+            node_replay_safe=bool(data.get("node_replay_safe", False)),
             depends_on_proofs=[
                 str(item) for item in data.get("depends_on_proofs", [])
             ],
@@ -456,6 +464,12 @@ class VerificationStep:
             "cadence": self.cadence,
             "levels": list(self.levels),
             "impact_paths": list(self.impact_paths),
+            **{key: value for key, value in {
+                "impact_symbols": list(self.impact_symbols),
+                "release_trigger": self.release_trigger,
+                "coalesce_safe": self.coalesce_safe,
+                "node_replay_safe": self.node_replay_safe,
+            }.items() if value},
             "depends_on_proofs": list(self.depends_on_proofs),
             "risk": self.risk,
             "cache_scope": self.cache_scope,

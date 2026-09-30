@@ -199,7 +199,7 @@
       "properties": {
         "verification_policy_version": {
           "type": "integer",
-          "enum": [1, 2, 3, 4]
+          "enum": [1, 2, 3, 4, 5]
         },
         "interactive_level": {"type": "string", "const": "affected"},
         "release_verification_mode": {
@@ -306,6 +306,7 @@
               "serial_reason": {
                 "type": "string",
                 "enum": [
+                  "",
                   "artifact_chain",
                   "shared_mutable_state",
                   "fixed_port",
@@ -327,6 +328,10 @@
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
               },
+              "impact_symbols": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[^:]+\\.py::[^:]+$"}},
+              "release_trigger": {"type": "boolean"},
+              "coalesce_safe": {"type": "boolean"},
+              "node_replay_safe": {"type": "boolean"},
               "depends_on_proofs": {
                 "type": "array",
                 "uniqueItems": true,

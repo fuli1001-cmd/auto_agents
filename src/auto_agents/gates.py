@@ -122,6 +122,8 @@ class GateCommandMetadata:
     serial_reason: str = ""
     cache_scope: str = "run_context"
     result_cache_scope: str = "off"
+    node_replay_safe: bool = False
+    constituents: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -137,6 +139,7 @@ class ResolvedGatePlan:
     changed_paths: List[str] = field(default_factory=list)
     unmapped_paths: List[str] = field(default_factory=list)
     forced_release_reason: str = ""
+    selection_reasons: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def unique_command_count(self) -> int:
@@ -1010,9 +1013,19 @@ def resolve_gate_plan_from_verification_steps(
     project_root: Optional[Path] = None,
     *,
     phase: str = "final",
+    coalesce: bool = False,
+    estimates: Optional[dict[str, float]] = None,
+    target_seconds: int = 300,
 ) -> ResolvedGatePlan:
     if phase not in {"implement", "final"}:
         raise ValueError(f"unsupported gate plan phase: {phase}")
+
+    original_plan = None
+    if coalesce:
+        from .verification_v5 import coalesce_steps
+        original_steps = {step.proof_id: step for step in steps}
+        original_plan = resolve_gate_plan_from_verification_steps(steps, project_root, phase=phase)
+        steps = coalesce_steps(steps, estimates=estimates, target_seconds=target_seconds)
 
     occurrences: dict[str, List[VerificationStep]] = {}
     order: List[str] = []
@@ -1150,7 +1163,15 @@ def resolve_gate_plan_from_verification_steps(
             ),
             cache_scope=cache_scope,
             result_cache_scope=result_cache_scope,
+            node_replay_safe=all(step.node_replay_safe for step in command_steps),
         )
+        if original_plan is not None and all(step.proof_id for step in command_steps):
+            from dataclasses import asdict
+            originals = {command_from_verification_step(original_steps[step.proof_id], project_root=project_root)
+                         for step in command_steps}
+            if len(originals) > 1:
+                metadata[command].constituents = {original: asdict(original_plan.metadata[original])
+                                                  for original in sorted(originals)}
         if not parallel_safe:
             sequential.append(command)
             continue

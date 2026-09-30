@@ -11,6 +11,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .verification_v5 import changed_symbols, symbol_impact
+
 from .models import GateConfig, VerificationStep
 
 
@@ -183,6 +185,7 @@ class VerificationSelection:
     unmapped_paths: list[str] = field(default_factory=list)
     proof_ids: list[str] = field(default_factory=list)
     forced_release_reason: str = ""
+    selection_reasons: dict[str, list[str]] = field(default_factory=dict)
 
 
 def select_verification_steps(
@@ -194,6 +197,7 @@ def select_verification_steps(
     changed_paths: Iterable[str] = (),
     required_proof_ids: Iterable[str] = (),
     preserve_release_targets: bool = False,
+    baseline_ref: str = "HEAD",
 ) -> VerificationSelection:
     requested_level = str(level).strip().lower()
     if requested_level not in {"affected", "release"}:
@@ -201,11 +205,16 @@ def select_verification_steps(
     changed = list(dict.fromkeys(_normalized(path) for path in changed_paths if _normalized(path)))
     indexed = {step.proof_id: step for step in steps if step.proof_id}
     required = list(dict.fromkeys(required_proof_ids))
+    optimized = gate_config.verification_policy_version >= 5
+    symbols = {path: changed_symbols(project_root, path, baseline_ref) for path in changed} if optimized else {}
+    reasons: dict[str, list[str]] = {}
     missing = set(required) - indexed.keys()
     if missing:
         raise ValueError("required proofs are unavailable: " + ", ".join(sorted(missing)))
 
     def release_selection():
+        if optimized:
+            return [step for step in steps if _step_levels(step) & {"affected", "release"}]
         eligible = [step for step in steps if "release" in _step_levels(step)]
         return eligible if preserve_release_targets else remove_release_target_overlap(eligible, steps)
 
@@ -233,23 +242,25 @@ def select_verification_steps(
         selected = []
         mapped_set: set[str] = set()
         for step in eligible:
-            declared = [*step.impact_paths, *[_target_file(item) for item in step.targets]]
+            declared = [*step.impact_paths, *[_target_file(item) for item in step.targets],
+                        *[entry.split('::', 1)[0] for entry in step.impact_symbols if '::' in entry]]
             dependencies = dependency_index.closure_for_targets(step.targets)
             matched = {
                 path
                 for path in changed
-                if any(_matches(path, pattern) for pattern in declared)
-                or path in dependencies
+                if (any(_matches(path, pattern) for pattern in declared) or path in dependencies)
+                and (not optimized or symbol_impact(step, path, symbols[path]) is not False)
             }
             if matched:
                 selected.append(step)
                 mapped_set.update(matched)
+                reasons[step.proof_id] = ["impact:" + path for path in sorted(matched)]
         # A changed test file is itself executable impact evidence. Reuse the
         # release step's runner/environment metadata but narrow it to that one
         # file, instead of falling back to unrelated smoke proofs.
         for path in changed:
             if not _is_test_path(path) or any(
-                any(_target_file(target) == path for target in step.targets)
+                any((target == path if optimized else _target_file(target) == path) for target in step.targets)
                 for step in selected
             ):
                 continue
@@ -263,7 +274,12 @@ def select_verification_steps(
                 None,
             )
             if owner is None:
-                continue
+                if not optimized:
+                    continue
+                runner = "pytest" if path.endswith(".py") else "vitest"
+                owner = next((step for step in steps if step.runner == runner and not step.command), None)
+                if owner is None:
+                    raise ValueError("changed test has no trusted runner: " + path)
             digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:10]
             selected.append(
                 replace(
@@ -273,14 +289,20 @@ def select_verification_steps(
                     cadence="implement_and_final",
                     impact_paths=[path],
                     targets=[path],
-                    depends_on_proofs=list(owner.depends_on_proofs) if preserve_release_targets else [],
+                    depends_on_proofs=list(owner.depends_on_proofs) if preserve_release_targets and not optimized else [],
+                    impact_symbols=[] if optimized else list(owner.impact_symbols),
+                    parallel_safe=False if optimized else owner.parallel_safe,
+                    coalesce_safe=False if optimized else owner.coalesce_safe,
+                    node_replay_safe=False if optimized else owner.node_replay_safe,
+                    release_trigger=False if optimized else owner.release_trigger,
                 )
             )
             mapped_set.add(path)
+            reasons[selected[-1].proof_id] = ["changed_test:" + path]
         mapped = [path for path in changed if path in mapped_set]
         unmapped = [path for path in changed if path not in mapped_set]
         if unmapped:
-            if gate_config.unmapped_change_policy == "release":
+            if optimized or gate_config.unmapped_change_policy == "release":
                 effective_level = "release"
                 selected = (selected + [step for step in release_selection() if step not in selected]
                             if preserve_release_targets else release_selection())
@@ -306,13 +328,27 @@ def select_verification_steps(
                 selected.append(step)
     selected.extend(indexed[key] for key in required if indexed[key] not in selected)
     selected = _include_dependencies(selected, indexed, strict=preserve_release_targets)
-    if effective_level == "affected" and any(step.risk == "critical" for step in selected):
+    if effective_level == "affected" and any(
+        step.release_trigger if optimized else step.risk == "critical" for step in selected
+    ):
         effective_level = "release"
         selected = (selected + [step for step in release_selection() if step not in selected]
                     if preserve_release_targets else release_selection())
         selected.extend(indexed[key] for key in required if indexed[key] not in selected)
         selected = _include_dependencies(selected, indexed, strict=preserve_release_targets)
-        forced_reason = "affected proof is classified critical"
+        forced_reason = "affected proof explicitly requires release" if optimized else "affected proof is classified critical"
+    if optimized and effective_level == "release":
+        for path in changed:
+            if not _is_test_path(path) or any(path in step.targets for step in selected):
+                continue
+            runner = "pytest" if path.endswith(".py") else "vitest"
+            owner = next((step for step in steps if step.runner == runner and not step.command), None)
+            if owner is None:
+                raise ValueError("changed test has no trusted runner: " + path)
+            selected.append(replace(owner, proof_id="affected.changed-test." + hashlib.sha256(path.encode()).hexdigest()[:10],
+                                    targets=[path], impact_paths=[path], impact_symbols=[], depends_on_proofs=[],
+                                    parallel_safe=False, coalesce_safe=False, node_replay_safe=False, release_trigger=False))
+            reasons[selected[-1].proof_id] = ["changed_test:" + path]
     proof_ids = list(dict.fromkeys(step.proof_id for step in selected if step.proof_id))
     return VerificationSelection(
         requested_level=requested_level,
@@ -323,6 +359,8 @@ def select_verification_steps(
         unmapped_paths=unmapped,
         proof_ids=proof_ids,
         forced_release_reason=forced_reason,
+        selection_reasons={step.proof_id: reasons.get(step.proof_id, ["release" if effective_level == "release" else "prerequisite_or_required"])
+                           for step in selected},
     )
 
 

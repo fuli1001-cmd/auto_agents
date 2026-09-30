@@ -419,6 +419,7 @@ def _metadata_signature(metadata: object, dependency_links: Optional[Mapping[str
         ),
         "dynamic_ports": sorted(_metadata_list(metadata, "dynamic_ports")),
         "artifact_globs": sorted(_metadata_list(metadata, "artifact_globs")),
+        "constituents": getattr(metadata, 'constituents', {}),
     }
     if dependency_links:
         payload['dependency_links'] = {key: str(value) for key, value in dependency_links.items()}
@@ -1224,6 +1225,16 @@ class LocalGatePlanExecutor:
             metadata_signature=_metadata_signature(metadata, self.dependency_links),
         )
         self._cache_miss_reasons[command] = reason
+        if (result is not None and self.gate_config.verification_policy_version >= 5
+                and _metadata_list(metadata, 'proof_ids') and 'pytest' in command
+                and '--collect-only' not in command and not result.executed_tests):
+            result = None
+            self._cache_miss_reasons[command] = 'legacy_execution_receipt_missing'
+        if result is None and getattr(metadata, 'constituents', {}):
+            from .verification_batch_cache import constituents, combine
+            cached, missing = constituents(self, command)
+            if cached and not missing:
+                result = combine(command, cached)
         if result is not None and result.backend == "result-cache-observed-inputs" and self.input_reuse_mode != "on":
             if self.input_reuse_mode == "observe":
                 self._shadow_results[command] = result
@@ -1438,10 +1449,21 @@ class LocalGatePlanExecutor:
         started = time.monotonic()
         with (self.ledger.single_flight(identity, cancelled=cancel_event.is_set if cancel_event else None)
               if self.ledger else nullcontext()):
-            result = self._run_command(command, lane=lane, timeout_seconds=timeout_seconds,
-                adaptive_timeout_enabled=adaptive_timeout_enabled, idle_timeout_seconds=idle_timeout_seconds,
-                cancel_event=cancel_event, progress=progress, environment_overrides=environment_overrides,
-                lease_held=lease_held, named_lease_held=named_lease_held)
+            def execute(actual):
+                return self._run_command(actual, lane=lane, timeout_seconds=timeout_seconds,
+                    adaptive_timeout_enabled=adaptive_timeout_enabled, idle_timeout_seconds=idle_timeout_seconds,
+                    cancel_event=cancel_event, progress=progress, environment_overrides=environment_overrides,
+                    lease_held=lease_held, named_lease_held=named_lease_held)
+            result = None
+            if self.snapshot is not None and getattr(self.metadata.get(command), 'constituents', {}):
+                from .verification_batch_cache import constituents, run_remaining, combine
+                cached, missing = constituents(self, command)
+                if cached and missing:
+                    result = run_remaining(self, command, cached, missing, execute)
+                elif cached:
+                    result = combine(command, cached)
+            if result is None:
+                result = execute(command)
             result.proof_ref = identity
             shadow = self._shadow_results.pop(command, None)
             if shadow is not None and (not result.ok or result.cleanup_incomplete):
@@ -1456,6 +1478,8 @@ class LocalGatePlanExecutor:
                 self.ledger.event(kind="verification", proof=identity, cache="hit" if result.cached else result.cache_miss_reason,
                     executed=int(not result.cached), duration_seconds=time.monotonic() - started,
                     execution_seconds=0 if result.cached else result.duration_seconds,
+                    cache_miss_components=result.process_snapshot.get('cache_miss_components', []),
+                    test_count=len(result.executed_tests), slowest=result.test_timings,
                     queue_seconds=result.queue_seconds, ok=result.ok)
             return result
 
@@ -1510,7 +1534,16 @@ class LocalGatePlanExecutor:
                 queued_at = time.monotonic()
                 resource_lease.__enter__()
                 queue_seconds = time.monotonic() - queued_at
-            sandbox, _created = self._sandbox(lane, job_id)
+            # A scheduler lane is ordering, not authority to share mutated
+            # pytest scratch. Frozen-candidate admission must see a clean view
+            # on every command, including collect-only report writers.
+            separate = (self.gate_config.verification_policy_version >= 5
+                        or getattr(self, 'validate_source_materialization', None) is not None)
+            artifact_lane = lane and any(
+                _metadata_list(item, 'artifact_globs') for item in self.metadata.values())
+            sandbox_lane = '' if separate and not artifact_lane else lane
+            cleanup = not bool(sandbox_lane)
+            sandbox, _created = self._sandbox(sandbox_lane, job_id)
             requested_profile = str(
                 dict(environment_overrides or {}).get(
                     "AUTO_AGENTS_GATE_RUNTIME_PROFILE", SHORT_RUNTIME_PROFILE
@@ -1714,6 +1747,7 @@ class LocalGatePlanExecutor:
                         if not isinstance(passed, list) or not all(isinstance(node, str) for node in passed):
                             raise ValueError('invalid pytest execution nodes')
                         result.executed_tests.extend(passed)
+                        result.process_snapshot.setdefault('collected_tests', []).extend(payload.get('collected', []))
                         result.test_results.update(payload.get('nodes', {}))
                         result.test_timings.extend(payload.get('slowest', []))
                         relative = f'.auto-agents/runs/{self.plan_id}/gate-artifacts/{job_id}/pytest-execution-{index}.json'
@@ -1730,8 +1764,10 @@ class LocalGatePlanExecutor:
                     result.returncode = result.returncode or 1
                     result.stderr += f'\npytest execution receipt unavailable: {error}'
             from .gates import reject_empty_vitest_selection
+            result.process_snapshot['cache_miss_components'] = self.result_cache.miss_components.get(command, [])
             reject_empty_vitest_selection(result, sandbox)
-            if trace_custody is not None and trace_requested and result.ok:
+            if (trace_custody is not None and trace_requested and not result.cleanup_incomplete
+                    and not result.termination_reason and not result.infrastructure_error):
                 trace_text, reason = trace_custody.consume(dispatched=True,
                     cleanup_complete=not process.cleanup_incomplete and not process.termination_reason)
                 if trace_text is not None:

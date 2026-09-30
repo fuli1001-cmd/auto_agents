@@ -517,6 +517,7 @@ def validate_verification_steps(
             and isinstance(levels, list)
             and "affected" in {str(item).strip().lower() for item in levels}
             and (not isinstance(impact_paths, list) or not impact_paths)
+            and not (policy_version >= 5 and raw_step.get('impact_symbols'))
         ):
             errors.append(
                 f"{prefix}.impact_paths is required for affected proofs under verification policy v4"
@@ -527,6 +528,24 @@ def validate_verification_steps(
                 errors.append(
                     f"{prefix}.impact_paths entries must be safe project-relative globs"
                 )
+        symbols = raw_step.get('impact_symbols', [])
+        if not isinstance(symbols, list) or any(not isinstance(item, str) for item in symbols):
+            errors.append(f'{prefix}.impact_symbols must be a list of symbol references')
+        else:
+            if len(symbols) != len(set(symbols)):
+                errors.append(f'{prefix}.impact_symbols must be unique')
+            for entry in symbols:
+                path, separator, qualified = entry.partition('::')
+                parts = qualified.split('.')
+                if (not separator or not path.endswith('.py') or not _safe_project_relative_path(path)
+                        or not qualified or any(part != '*' and not part.isidentifier() for part in parts)
+                        and qualified != '<module>'):
+                    errors.append(f'{prefix}.impact_symbols entries must be safe file.py::qualified_name references')
+        for flag in ('release_trigger', 'coalesce_safe', 'node_replay_safe'):
+            if flag in raw_step and type(raw_step[flag]) is not bool:
+                errors.append(f'{prefix}.{flag} must be a boolean')
+        if (raw_step.get('coalesce_safe') or raw_step.get('node_replay_safe')) and runner != 'pytest':
+            errors.append(f'{prefix}: node replay/coalescing requires structured pytest')
         dependencies = raw_step.get("depends_on_proofs", [])
         if dependencies is not None and (
             not isinstance(dependencies, list)
@@ -915,9 +934,9 @@ def validate_task_plan_payload(
     if (
         not isinstance(verification_policy_version, int)
         or isinstance(verification_policy_version, bool)
-        or verification_policy_version not in {1, 2, 3, 4}
+        or verification_policy_version not in {1, 2, 3, 4, 5}
     ):
-        errors.append("task plan verification_policy_version must be 1, 2, 3, or 4")
+        errors.append("task plan verification_policy_version must be 1, 2, 3, 4, or 5")
         verification_policy_version = 1
 
     test_strategy = payload.get("test_strategy")
@@ -1864,9 +1883,9 @@ def validate_project_config_payload(payload: object) -> List[str]:
         if (
             not isinstance(verification_policy_version, int)
             or isinstance(verification_policy_version, bool)
-            or verification_policy_version not in {1, 2, 3, 4}
+            or verification_policy_version not in {1, 2, 3, 4, 5}
         ):
-            errors.append("gates.verification_policy_version must be 1, 2, 3, or 4")
+            errors.append("gates.verification_policy_version must be 1, 2, 3, 4, or 5")
             verification_policy_version = 1
         commands = gates.get("commands")
         if not isinstance(commands, list) or any(not isinstance(item, str) for item in commands):

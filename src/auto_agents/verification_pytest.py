@@ -73,7 +73,12 @@ class Recorder:
 
     def pytest_runtest_logreport(self, report):
         node = self.nodes.setdefault(report.nodeid, {"phases": {}, "seconds": 0.0})
-        node["phases"][report.when] = report.outcome
+        prior = node['phases'].get(report.when)
+        # unittest/pytest subtests can emit several call reports followed by a
+        # passed parent report. A failed matrix must never become a passed node.
+        rank = {'passed': 0, 'skipped': 1, 'failed': 2}
+        if prior is None or rank.get(report.outcome, 2) > rank.get(prior, 2):
+            node['phases'][report.when] = report.outcome
         node["seconds"] += report.duration
         self.phases[report.when] = self.phases.get(report.when, 0.0) + report.duration
         if report.failed:

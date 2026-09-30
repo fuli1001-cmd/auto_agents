@@ -153,6 +153,25 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
         parent = store.load(stream)['tasks'][contract.parent_task]
         require(all(parent['proofs'].get(stage) and all(p['source'] == source for p in parent['proofs'][stage])
                     for stage in ('verify','review')), 'delivery_evidence', 'Delivery requires verification and review of the same candidate')
+        gates = getattr(state, 'verification_binding', {}).get('gates', {})
+        if gates.get('verification_policy_version', 1) >= 5:
+            required = {step['proof_id'] for step in gates.get('steps', []) if step.get('proof_id')}
+            release = False
+            snapshot = store.load(stream)
+            for row in snapshot['commands'].values():
+                outcome = row.get('outcome') or {}
+                task = snapshot['tasks'][row['task_id']]
+                if (row['phase'] != 'verify' or row['status'] != 'finished' or row['source'] != source
+                        or row['environment'] != environment or outcome.get('kind') != 'success'
+                        or task['contract'].get('parent_task') != contract.parent_task):
+                    continue
+                ref = outcome.get('details', {}).get('native_result')
+                value = store.read(ref) if ref else {}
+                if (value.get('ok') and value.get('scope') == 'final' and value.get('attestation_level') == 'release'
+                        and required.issubset(value.get('proof_ids', []))):
+                    release = True
+                    break
+            require(release, 'delivery_evidence', 'Delivery requires sealed complete release evidence')
         if owner._recovery_policy_active:
             from .scope_amendments import pending
             require(not pending(store.load(stream), contract.task_id), 'scope_review_required',

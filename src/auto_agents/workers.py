@@ -391,6 +391,14 @@ def redact_values(text: str, values: Sequence[str]) -> str:
     return result
 
 
+_ENVIRONMENT_COMPONENTS: dict[str, dict[str, str]] = {}
+_UNAVAILABLE_ENVIRONMENT_KEY = os.urandom(32)
+
+
+def environment_components(fingerprint: str) -> dict[str, str]:
+    return dict(_ENVIRONMENT_COMPONENTS.get(fingerprint, {}))
+
+
 def gate_environment_fingerprint(
     *,
     isolation_mode: str,
@@ -463,9 +471,28 @@ def gate_environment_fingerprint(
             finally:
                 temporary.unlink(missing_ok=True)
         key = key_path.read_bytes()
+        if len(key) != 32:
+            raise OSError('verification identity key is invalid')
     except OSError:
-        key = os.urandom(32)
-    return hmac.new(key, encoded, hashlib.sha256).hexdigest()
+        key = _UNAVAILABLE_ENVIRONMENT_KEY
+        available = False
+    else:
+        available = True
+    fingerprint = hmac.new(key, encoded, hashlib.sha256).hexdigest()
+    if not available:
+        fingerprint = 'unavailable:' + fingerprint
+    components = {'key_id': hashlib.sha256(key).hexdigest()}
+    def component(value):
+        return hmac.new(key, json.dumps(value, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+    for name, value in payload.items():
+        if name == 'environment':
+            components.update({'environment.' + env_name: component(env_value) for env_name, env_value in value})
+        else:
+            components[name] = component(value)
+    _ENVIRONMENT_COMPONENTS[fingerprint] = components
+    if len(_ENVIRONMENT_COMPONENTS) > 128:
+        _ENVIRONMENT_COMPONENTS.pop(next(iter(_ENVIRONMENT_COMPONENTS)))
+    return fingerprint
 
 
 def project_key(project_root: Path) -> str:
