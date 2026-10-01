@@ -805,8 +805,6 @@ class Reporter:
                 return "", ""
             owner._action_failures = {key for key in owner._action_failures if not (key[1] == task_id and key[3] == "verify")}
             return name, "start"
-        if kind == 'verification.progress':
-            return message, ''
         if kind in {"task.result", "verification.finished"}:
             action = str(data.get("action", "verify"))
             passed = (str(data.get("decision", "")).lower() in {"pass", "passed", "approve", "approved", "accept", "accepted"}
@@ -865,7 +863,7 @@ class Reporter:
                     f"Plan changed: {data['before']} → {data['total']} tasks"), ""
         if kind == "status" and "state_status" in data and data["state_status"] not in _TERMINAL:
             return ("", "") if owner.snapshot.kind == "run" else (str(data["status"]), "start")
-        if kind in {"heartbeat", "plan.ready", "task.output_received", "verification.check_failed", "repair.checks"}:
+        if kind in {"heartbeat", "plan.ready", "task.output_received", "verification.progress", "verification.check_failed", "repair.checks"}:
             return "", ""
         if kind in {"stage.rewind", "command.failed", "invocation.stopped"} or kind == "status":
             owner.presenter.finish_actions(owner)
@@ -1295,16 +1293,8 @@ class Reporter:
         output_at = observed['output_at']
         if isinstance(output_at, (int, float)):
             owner.display.output_times[''] = time.monotonic() - max(0, time.time() - output_at)
-        # Plain logs retain occasional count updates without cursor controls or
-        # per-second polling noise. Live output refreshes via the existing timer.
-        elapsed = time.monotonic() - getattr(owner, '_repair_plain_at', 0)
-        if changed:
-            owner._repair_plain_at = time.monotonic()
-        if owner.presenter._live is None and not changed and elapsed >= 60:
-            suffix = owner.display.suffix('', self.language)
-            message = prefix + name + (' | ' + suffix if suffix else '')
-            self.event('user.message', {}, audience='user', message=message)
-            owner._repair_plain_at = time.monotonic()
+        # The live presenter refreshes this action in place. Plain output keeps
+        # its initial name; polling must not append another copy of the action.
 
     def plan(self, tasks: list) -> None:
         from .models import RunState
@@ -1411,10 +1401,11 @@ class GateObservation:
             elapsed = max(0, int(current - began))
             verb = ('已运行' if zh else 'running') if state == 'running' else ('等待' if zh else 'waiting')
             message += f" | {check} | {verb} {elapsed}{' 秒' if zh else 's'}"
-        live = self.owner.presenter._live is not None
+        # Counts and liveness stay in diagnostics. Interactive terminals render
+        # the CheckSet on the existing action line; plain logs keep one heading.
         self.reporter.event('verification.progress', {'task_id': self.task_id,
             'check_set_id': self.identifier, 'collection': self.collection, **self.counts},
-            audience='debug' if live else 'user', message=message)
+            message=message)
 
     def _current(self) -> bool:
         return (self.reporter._current_lane() and not self.owner._closed and not self.reporter._closed

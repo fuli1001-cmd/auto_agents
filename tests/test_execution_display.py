@@ -408,7 +408,7 @@ def test_repair_usage_limit_explains_the_blocker():
     assert result['name'] == '模型额度已用尽；额度恢复后重试修复'
 
 
-def test_repair_plain_progress_is_periodic_and_detailed_control_stays_in_events(report, monkeypatch):
+def test_repair_plain_progress_keeps_one_action_and_detailed_control_stays_in_events(report, monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr('auto_agents.reporting.time.time', lambda: clock[0])
     monkeypatch.setattr('auto_agents.reporting.time.monotonic', lambda: clock[0])
@@ -421,7 +421,14 @@ def test_repair_plain_progress_is_periodic_and_detailed_control_stays_in_events(
     assert len(history(report).splitlines()) == 1
     clock[0] += 1
     report.repair_update(job, {'state': 'waiting'})
-    assert '1/3 | 最近输出 60 秒前' in history(report)
+    assert len(history(report).splitlines()) == 1
+    assert '1/3' in frame(report) and '最近输出 60 秒前' in frame(report)
+    clock[0] += 120
+    job['display']['checks'] = {'completed': 2, 'total': 3}
+    report.repair_update(job, {'state': 'waiting'})
+    assert len(history(report).splitlines()) == 1
+    assert len(report.presenter.stream.getvalue().splitlines()) == 1
+    assert '2/3' in frame(report) and '最近输出 180 秒前' in frame(report)
     assert '\x1b' not in report.presenter.stream.getvalue()
     assert 'command internals' not in history(report)
     assert 'command internals' in (report.root / 'events.jsonl').read_text()

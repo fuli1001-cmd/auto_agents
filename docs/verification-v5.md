@@ -70,7 +70,8 @@ logical proof IDs. Existing constituent certificates are checked before running
 uncertified members. Audits and explicit fresh execution remain effective.
 Coalescing respects dependency frontiers and the existing 300-second batch
 target. Reports distinguish selected proofs, physical batches and reused
-evidence. Plain output retains minute heartbeats.
+evidence. Interactive output refreshes the current action in place; plain output
+keeps one action heading, with counts and heartbeats retained in diagnostic events.
 
 Start audited parallel work with two workers and real CPU/memory leases.
 Independent commands receive private worktrees, database/temp state and process

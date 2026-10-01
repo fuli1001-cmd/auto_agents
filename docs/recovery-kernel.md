@@ -119,8 +119,8 @@ before the original business continuation runs in a fresh interpreter.
 Foreground repair reports preparation, planning, implementation, test collection
 and execution, original-task recovery checks, review, and delivery through the
 existing `Reporter.repair_update` presenter. Interactive terminals show live check
-counts and the age of actual provider/test output; plain logs refresh at most once
-per minute while a phase is unchanged. Account notifications and timer ticks do
+counts and the age of actual provider/test output; plain logs retain one action
+heading while a phase is unchanged. Account notifications and timer ticks do
 not count as provider output. These observations never modify kernel evidence,
 budgets or command leases. Failure details remain in the diagnostic event log;
 the normal terminal receives the established short, translated repair messages.
