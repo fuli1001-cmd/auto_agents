@@ -44,19 +44,36 @@ def stopped_search(project, failure):
         return None
     state = store.load(stream)
     if 'recovery' in state:
-        from .convergence import scope_id
+        from .convergence import scope_id, failures
         scopes = state['recovery']['scopes']
-        candidates = [(key, value) for key, value in scopes.items() if value['latest']]
-        if not candidates: return diagnostic(state)
-        key, item = max(candidates, key=lambda pair: max(
-            (c['sequence'] for c in state['commands'].values()
-             if scope_id(state, c['task_id']) == pair[0]), default=0))
-        value = item['observations'][item['latest']]
-        result = diagnostic(state)
-        result.update(policy=2, scope=key, stagnant=item['stalled'], rediagnoses=item['diagnoses'],
-                      next_action='inspect_recovery_evidence', observation=item['latest'])
-        result['last_rejection'] = {'reason': value['reason'], 'command_id': value['command_id'],
-                                    'source': value['source'], 'task_id': value['task_id']}
+        task_id = evidence['mode'] + ':' + evidence['subject_id']
+        key = scope_id(state, task_id) if task_id in state['tasks'] else None
+        candidates = [(key, value) for key, value in scopes.items() if value['latest']
+                      and not value['observations'][value['latest']]['complete']]
+        if key in scopes:
+            item = scopes[key]
+        elif candidates:
+            key, item = max(candidates, key=lambda pair: max(
+                (c['sequence'] for c in state['commands'].values()
+                 if scope_id(state, c['task_id']) == pair[0]), default=0))
+        else:
+            return {'workflow_id': state['workflow_id'], 'policy': 2,
+                    'next_action': 'inspect_recovery_evidence', 'reason': evidence['reason'][:4000]}
+        result = {'workflow_id': state['workflow_id'], 'policy': 2, 'scope': key,
+                  'stagnant': item['stalled'], 'rediagnoses': item['diagnoses'],
+                  'diagnosis_due': False, 'next_action': 'inspect_recovery_evidence',
+                  'observation': item['latest'], 'reason': evidence['reason'][:4000]}
+        value = item['observations'].get(item['latest'], {})
+        if not value.get('complete') and failures(item):
+            result['last_rejection'] = {'reason': value['reason'][:4000], 'command_id': value['command_id'],
+                                       'source': value['source'], 'task_id': value['task_id']}
+        elif item['routes']:
+            result['next_action'] = 'inspect_route_evidence'
+            result['routes'] = dict(item['routes'])
+            deferred = next((row for row in reversed(evidence.get('recent_execution', []))
+                             if row.get('action') == 'run_route_deferred'), None)
+            if deferred:
+                result['reason'] = str(deferred.get('result', ''))[:4000]
         return result
     if state['budget']['stagnant'] < 2 or state['budget']['diagnosis_due']:
         return None

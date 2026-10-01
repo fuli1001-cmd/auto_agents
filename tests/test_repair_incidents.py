@@ -47,6 +47,22 @@ def test_successful_preflight_is_not_a_failure_and_later_verify_is_current(scene
     assert context(project, wrapped) == found
 
 
+def test_run_route_refusal_is_current_failure_and_success_closes_only_routing():
+    refusal = {'action': 'run_route_deferred', 'result': 'run unused remains pending; no new run handoff was created'}
+    state = {'execution_log': [refusal, {'action': 'collab', 'result': 'Read-only investigation'}]}
+    assert latest_failure(state)[:3] == (0, refusal, 'routing')
+    state['execution_log'].append({'action': 'run_route_preflight_passed', 'result': 'unused placeholder'})
+    assert latest_failure(state) is None
+    failed = {'action': 'verify', 'ok': False, 'result': 'new test failure'}
+    state['execution_log'] += [failed, {'action': 'run_route_preflight_passed'}]
+    assert latest_failure(state)[:3] == (3, failed, 'verification')
+
+
+def test_waiting_and_successful_route_events_are_not_failures():
+    assert latest_failure({'execution_log': [{'action': 'waiting_child', 'result': 'waiting'},
+        {'action': 'run_route_preflight_passed', 'result': 'ready'}]}) is None
+
+
 def test_new_failure_does_not_reuse_old_transaction_but_restart_does(scene, tmp_path):
     project, engine, child, payload = scene
     proposal = {'decision': 'required', 'blocked_step': 'video', 'consequence': 'blocked',

@@ -570,6 +570,10 @@ class Session:
                 # Restore that durable preimage before consuming a saved route
                 # or capturing any baseline for a child workflow.
                 self._reconcile_interrupted_collab_checkpoints(state)
+                if self._coordinator is not None and state.status == 'executing':
+                    recovered = self._coordinator.recover_unstarted_run_route(self, state)
+                    if recovered is not None:
+                        return recovered
                 if state.acceptance_execution and state.acceptance_execution.get('phase') not in {'blocked', 'completed'}:
                     return self._phase_collab_loop(state)
                 routed, normalization_error = (

@@ -2069,9 +2069,10 @@ def _triage_controlled_workflow_result(project_root, orchestrator, state, args,
         if stop is not None:
             from .controlled_failure import ControlledWorkflowFailure
             failure = ControlledWorkflowFailure({**evidence, 'kernel_stop': stop})
-            reason = ('Search stopped after failed candidate verification; correct the retained candidate '
-                      'and reverify before further model work. ' +
-                      stop.get('last_rejection', {}).get('reason', ''))
+            reason = (('Search stopped after failed candidate verification; correct the retained candidate '
+                       'and reverify before further model work. ' + stop['last_rejection']['reason'])
+                      if stop.get('last_rejection') else
+                      'Recovery stopped without new evidence. ' + stop.get('reason', evidence['reason']))
             triage = SelfRepairTriageResult(
                 SelfRepairDecision(False, reason=reason, category='no_progress', fingerprint=failure.fingerprint),
                 source='kernel_budget', reason=reason)
@@ -2085,12 +2086,18 @@ def _triage_controlled_workflow_result(project_root, orchestrator, state, args,
     reporter = getattr(orchestrator, 'reporter', None)
     if stop is not None:
         from .diagnostic_output import clean_payload
-        reason = clean_payload(stop.get('last_rejection', {}).get('reason', failure.evidence['reason']))
+        candidate_failed = bool(stop.get('last_rejection'))
+        reason = clean_payload(stop.get('last_rejection', {}).get('reason') or
+                               stop.get('reason') or failure.evidence['reason'])
         if reporter is not None and reporter.language == 'zh':
-            reporter.text(f'候选验证仍未通过，已停止自动重试：{reason}')
-            reporter.text(f'请修正保留候选后重新验证；诊断记录：{path}')
+            reporter.text((f'候选验证仍未通过，已停止自动重试：{reason}' if candidate_failed else
+                           f'当前恢复步骤缺少新的执行依据，已停止自动重试：{reason}'))
+            reporter.text((f'请修正保留候选后重新验证；诊断记录：{path}' if candidate_failed else
+                           f'请检查当前路由或恢复阻断；诊断记录：{path}'))
         else:
-            message = f'Candidate verification remains blocked: {reason}\nCorrect the retained candidate and reverify. Diagnostic record: {path}'
+            message = (f'Candidate verification remains blocked: {reason}\nCorrect the retained candidate and reverify. Diagnostic record: {path}'
+                       if candidate_failed else
+                       f'Recovery stopped without new evidence: {reason}\nInspect the current routing or recovery blocker. Diagnostic record: {path}')
             reporter.text(message) if reporter is not None else print(message)
         if reporter is not None:
             reporter.register(path, {'kind': 'terminal_triage'})

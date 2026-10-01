@@ -1510,6 +1510,74 @@ class WorkflowCoordinator:
             "summary": error, "retry_fix": False, "changed_paths": [],
         } if error else {})
 
+    def _unstarted_run(self, current: RunState) -> bool:
+        """A pristine placeholder has no execution or workflow owner to resume."""
+        if current.to_dict() != RunState(current.run_id, workflow_version=current.workflow_version).to_dict():
+            return False
+        base = self.project_root / '.auto-agents/state'
+        try:
+            plan = read_json(base / 'task_plan.json', default={})
+            if not isinstance(plan, dict) or plan.get('tasks'):
+                return False
+            # Ownership can exist outside the run projection, including after
+            # a crash before resume_context was saved. Never adopt such a run.
+            reference = WorkflowRef('run', current.run_id).to_dict()
+            for path in [*(base / 'workflows').glob('*/workflow.json'),
+                         *(base / 'handoffs').glob('*.json')]:
+                if path.is_symlink():
+                    return False
+                row = read_json(path)
+                if not isinstance(row, dict) or any(row.get(key) == reference
+                        for key in ('root', 'active_frame', 'parent', 'child')):
+                    return False
+            run_root = self.project_root / '.auto-agents/runs' / current.run_id
+            if run_root.exists() or run_root.is_symlink():
+                return False
+        except (OSError, ValueError, RuntimeError):
+            return False
+        return True
+
+    def recover_unstarted_run_route(self, session, state):
+        """Replay a controller-refused route after fixing placeholder admission.
+
+        No new provider turn or route permit is needed to consume this retained
+        response. A later user message or child entry supersedes the refusal.
+        """
+        if (state.active_handoff_id or state.acceptance_execution
+                and state.acceptance_execution.get('phase') not in {'blocked', 'completed'}):
+            return None
+        if not self._unstarted_run(load_run_state(self.project_root)):
+            return None
+        refusal = next((row for row in reversed(state.execution_log)
+                        if row.get('action') in {'run_route_deferred', 'run_route_preflight_passed', 'child_returned'}), None)
+        if not refusal or refusal.get('action') != 'run_route_deferred':
+            return None
+        current = load_run_state(self.project_root)
+        expected = f'run {current.run_id} remains pending; no new run handoff was created'
+        if refusal.get('result') != expected:
+            return None
+        for index in range(len(state.conversation) - 1, 0, -1):
+            message = state.conversation[index]
+            if message.get('role') == 'user':
+                return None
+            if message.get('role') != 'orchestrator' or message.get('content') != expected:
+                continue
+            previous = state.conversation[index - 1]
+            if previous.get('role') not in {'agent', 'assistant'}:
+                return None
+            route, error = session._parse_workflow_route(previous.get('content', ''))
+            if error or not route or route.get('target') != 'run':
+                return None
+            routed, error = session._route_collab_workflow_reply(state, previous['content'])
+            if routed is not None and not error and state.active_handoff_id:
+                state.execution_log.append({'action': 'run_route_placeholder_reconciled',
+                    'result': current.run_id, 'handoff_id': state.active_handoff_id,
+                    'timestamp': session._now()})
+                session._save(state)
+                return routed
+            return None
+        return None
+
     def prepare_run_route(self, payload: Optional[Dict[str, object]] = None) -> tuple[bool, str]:
         """Clear a verified engine blocker before a run handoff is created."""
 
@@ -1520,6 +1588,8 @@ class WorkflowCoordinator:
         current = load_run_state(self.project_root)
         if current.status == "completed":
             return True, ""
+        if self._unstarted_run(current):
+            return True, f'run {current.run_id} is an unstarted placeholder'
         if not self.orch._prepare_installed_self_repair_resume(current):
             engine_error = self._engine_blocker_error(current)
             if engine_error is not None:
@@ -1616,6 +1686,7 @@ class WorkflowCoordinator:
             handoff.child is None
             and current.status != "completed"
             and not existing_same_handoff
+            and not self._unstarted_run(current)
         ):
             return {
                 "status": "blocked",
@@ -1696,10 +1767,17 @@ class WorkflowCoordinator:
                     else {}
                 ),
             }
-            state = self.orch._start_new_iteration(
-                current,
-                resume_context_updates=successor_context,
-            )
+            if self._unstarted_run(current):
+                # Bind the existing unused identity directly. It has no
+                # completed work to archive and must never be marked complete.
+                current.resume_context = successor_context
+                save_run_state(self.project_root, current)
+                state = current
+            else:
+                state = self.orch._start_new_iteration(
+                    current,
+                    resume_context_updates=successor_context,
+                )
             self._record_completed_run_archive_recovery(
                 snapshot,
                 handoff,

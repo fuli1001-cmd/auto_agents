@@ -95,6 +95,10 @@ def latest_failure(state):
             if active and active[2] == 'preflight':
                 active = None
             continue
+        if action == 'run_route_preflight_passed':
+            if active and active[2] == 'routing':
+                active = None
+            continue
         if action in VERIFY and (row.get('ok') is True or row.get('result') == 'pass'):
             if active and active[2] == 'verification':
                 active = None
@@ -106,10 +110,11 @@ def latest_failure(state):
         text = str(row.get('result') or row.get('reason') or '')
         if 'auto_agents engine self-repair required' in text:
             continue
-        phase = ('preflight' if action == 'execution_preflight_blocked' else
+        phase = ('routing' if action == 'run_route_deferred' else
+                 'preflight' if action == 'execution_preflight_blocked' else
                  'verification' if action in VERIFY else
                  'proof_review' if action in {'proof_review_rejected', 'proof_review_failed'} else 'execution')
-        failed = (action in {'execution_preflight_blocked', 'quick_verify_fail', 'error', 'proof_review_rejected', 'proof_review_failed'}
+        failed = (action in {'execution_preflight_blocked', 'quick_verify_fail', 'error', 'proof_review_rejected', 'proof_review_failed', 'run_route_deferred'}
                   or action in VERIFY and bool(row.get('failure_kind') or row.get('ok') is False or text)
                   or action == 'child_returned' and bool(row.get('failure_kind') or row.get('diagnostic')))
         if failed:
