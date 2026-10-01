@@ -108,7 +108,8 @@ try:
  else:
   result=release.verify_current_journal(s,r,json.loads(sys.argv[5]))
 except KernelError as error:
- print('RUNTIME_FAILURE:'+json.dumps({'diagnostic':str(error),**failure})); raise SystemExit(3)
+ print('RUNTIME_FAILURE:'+json.dumps({'diagnostic':str(error),'verifier_code':error.code,
+       **error.details,**failure})); raise SystemExit(3)
 print('RUNTIME_RECEIPT:'+json.dumps(result))
 '''
     lifecycle.register(store, trusted)
@@ -120,7 +121,8 @@ print('RUNTIME_RECEIPT:'+json.dumps(result))
                                 stdout=subprocess.PIPE, text=True)
     failures = [json.loads(line[len('RUNTIME_FAILURE:'):]) for line in result.stdout.splitlines() if line.startswith('RUNTIME_FAILURE:')]
     require(result.returncode == 0, 'runtime_verification',
-            '新源码验证未通过；本次命令尚未启动，原运行版本仍被保留', **(failures[-1] if failures else {}))
+            '新源码验证未通过；本次命令尚未启动，原运行版本仍被保留',
+            **{'verifier_returncode':result.returncode, 'phase':action, **(failures[-1] if failures else {})})
     lines = [line[len('RUNTIME_RECEIPT:'):] for line in result.stdout.splitlines() if line.startswith('RUNTIME_RECEIPT:')]
     require(len(lines) == 1, 'upgrade_receipt', 'Independent verifier did not return one receipt')
     return json.loads(lines[0])
@@ -191,6 +193,7 @@ def cutover(store, runtime, receipt):
             for manifest in checked['projects']:
                 apply_project(store, manifest)
                 import_repairs(store, store.root, manifest['project'])
+            notice('回放现有业务历史，核对切换边界')
             receipt = oracle(store, runtime, 'journal', receipt)
             result = activate(store, runtime, receipt, migration_manifests=checked['projects'])
             for manifest in checked['projects']: activate_project(store, manifest['project'])
@@ -260,7 +263,8 @@ def ensure_current_runtime(store, source=None, *, automatic=True, retry=False):
             notice('已采用源码 ' + wanted[:12])
             return runtime
         except BaseException as error:
-            _transaction(store, transaction, status='failed', error=str(error))
+            _transaction(store, transaction, status='failed', error=str(error),
+                         diagnostic_code=getattr(error, 'code', ''), diagnostic=getattr(error, 'details', {}))
             if key and isinstance(error, KernelError) and error.details.get('deterministic'):
                 store.set_meta('runtime_failure:' + key, error.details)
             if isinstance(error, KernelError) and error.code == 'source_changed' and attempt < 2: continue
@@ -395,7 +399,11 @@ if __name__ == '__main__':
         notice(str(error)); code = 3
         details = getattr(error, 'details', {})
         if details.get('check'): notice('失败检查：' + details['check'])
-        if details.get('log'): notice('诊断日志：' + str(store.blob_path(details['log'])))
+        if details.get('phase'): notice('失败阶段：' + details['phase'])
+        if details.get('diagnostic'): notice('原因：' + details['diagnostic'])
+        if 'returncode' in details: notice('回放退出码：' + str(details['returncode']))
+        log = details.get('log') or details.get('log_ref')
+        if log: notice('诊断日志：' + str(store.blob_path(log)))
     finally:
         manager_token = os.environ.get('AUTO_AGENTS_MANAGER_USE')
         if manager_token:

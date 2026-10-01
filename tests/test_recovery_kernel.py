@@ -219,6 +219,33 @@ def test_journal_tamper_is_detected(scene):
     with pytest.raises(KernelError, match='integrity'): store.replay('workflow')
 
 
+def test_replay_checks_intermediate_projections_even_if_final_state_is_valid(scene):
+    store, _ = scene
+    with store.connect() as db:
+        db.execute("UPDATE kernel_events SET result='{}' WHERE stream='workflow' AND revision=1")
+    with pytest.raises(KernelError, match='projection does not match'):
+        store.replay('workflow')
+
+
+def test_replay_checks_the_stored_final_projection(scene):
+    store, _ = scene
+    with store.connect() as db:
+        db.execute("UPDATE kernel_streams SET snapshot='{}' WHERE id='workflow'")
+    with pytest.raises(KernelError, match='Stored state differs'):
+        store.replay('workflow')
+
+
+def test_normal_decision_keeps_input_snapshot_and_wire_normalization(scene):
+    store, _ = scene
+    snapshot = store.load('workflow')
+    before = json.dumps(snapshot, sort_keys=True)
+    event = Event('pause-pure', 'workflow_stopped', {'status':'paused'})
+    result, _ = decide(snapshot, event)
+    assert result['status'] == 'paused' and snapshot['status'] == 'active'
+    assert json.dumps(snapshot, sort_keys=True) == before
+    assert store.replay('workflow') == snapshot
+
+
 def test_large_blob_is_streamed_and_content_verified(tmp_path, monkeypatch):
     store = KernelStore(tmp_path / 'control'); source = tmp_path / 'large'
     source.write_bytes(b'x' * (34 * 1024 * 1024))

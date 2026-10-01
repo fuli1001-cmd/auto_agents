@@ -251,6 +251,28 @@ def test_deterministic_failure_is_cached_but_explicit_retry_rechecks(installatio
     assert check.call_count == 2
 
 
+def test_oracle_preserves_journal_failure_details(installation, monkeypatch):
+    store, source = installation
+    runtime = adopt_fixture(store, source)
+    store.set_meta('trusted_verifier_runtime', runtime)
+    original = subprocess.run
+    def failed(command, **kwargs):
+        if len(command) > 2 and command[1] == '-c' and 'RUNTIME_RECEIPT:' in command[2]:
+            # The independent driver must export the underlying error details.
+            assert '**error.details' in command[2]
+            return subprocess.CompletedProcess(command, 3, stdout='RUNTIME_FAILURE:' + json.dumps({
+                'diagnostic':'Proposed runtime cannot replay current business history',
+                'verifier_code':'upgrade_journal', 'log_ref':'a'*64, 'returncode':130}) + '\n')
+        return original(command, **kwargs)
+    monkeypatch.setattr(subprocess, 'run', failed)
+    with pytest.raises(KernelError) as caught:
+        manager.oracle(store, runtime, 'journal', {})
+    assert caught.value.details['phase'] == 'journal'
+    assert caught.value.details['returncode'] == 130
+    assert caught.value.details['verifier_returncode'] == 3
+    assert caught.value.details['log_ref'] == 'a'*64
+
+
 def test_interrupted_cutover_restores_mode_without_replaying_business(installation):
     store, source = installation
     first = adopt_fixture(store, source)

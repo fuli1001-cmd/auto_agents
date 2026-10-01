@@ -106,3 +106,20 @@ installed-runtime handoff. The final executor/v5 check passed 44 tests, excludin
 that input-manifest case and an existing fixed-job-name test whose temporary
 runtime directory was already occupied. Neither exclusion establishes a
 full-suite pass.
+
+## Runtime adoption and large journals
+
+Passing the 11 static upgrade gates is followed by replay of the installation's
+actual business history. A large journal could exceed the independent verifier's
+unchanged 120-second replay limit, leaving the previous runtime active despite
+all static checks passing. Replay now mutates one privately owned state through
+the same transition rules and compares every intermediate canonical projection
+inside SQLite. Normal decisions remain pure; event checksums, projection checks
+and final-state equality remain mandatory. No history or budget is reset.
+
+For the observed 519-event workflow, the largest stored snapshot was about
+67 MB and the installation database about 4 GB. Read-only host replay fell from
+68.65 seconds to 27.85 seconds with the same history frontier. This host timing
+does not replace the installation's independent container gate. Upgrade logs
+now announce real-history replay and retain its phase, exit code and sealed log
+reference when it fails.

@@ -46,6 +46,12 @@ def _projection(state, data):
 def decide(snapshot, event):
     """Return a new snapshot and an outbox; never perform any side effect."""
     state = deepcopy(snapshot) if snapshot else initial()
+    state, outbox = _decide_owned(state, event)
+    return json.loads(canonical(state)), outbox
+
+
+def _decide_owned(state, event):
+    """Apply the same rules to a private replay state with no outside owners."""
     data, kind, outbox = dict(event.data), event.kind, []
     if kind == 'workflow_registered':
         identifier(data['workflow_id']); identifier(data['goal_id'])
@@ -384,4 +390,4 @@ def decide(snapshot, event):
     else:
         require(False, 'event', 'Unknown recovery event', kind=kind)
     state['revision'] += 1
-    return json.loads(canonical(state)), outbox
+    return state, outbox

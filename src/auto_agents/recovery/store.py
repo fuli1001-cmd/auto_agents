@@ -221,19 +221,24 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
             return state
 
     def replay(self, stream):
+        from .reducer import _decide_owned
         state, previous = initial(), ''
         with self.connect() as db:
-            # The retained result column contains a full snapshot per event.
-            # Stream rows under the same read transaction so memory depends on
-            # one event, not on the size of the entire immutable journal.
-            for row in db.execute('SELECT * FROM kernel_events WHERE stream=? ORDER BY revision', (stream,)):
+            # Keep one private state, and compare every full projection inside
+            # SQLite instead of copying its text into Python as well. Neither
+            # the event chain nor intermediate projection checks are skipped.
+            for row in db.execute('SELECT revision,envelope,previous,checksum FROM kernel_events '
+                                  'WHERE stream=? ORDER BY revision', (stream,)):
                 raw = json.loads(row['envelope']); event = Event(**raw)
                 require(row['revision'] == state['revision'] + 1 and row['previous'] == previous
                         and row['checksum'] == digest([stream, row['revision'], previous, raw]),
                         'journal', 'Recovery journal integrity failure')
-                state, _ = decide(state, event)
-                require(canonical(state) == row['result'], 'journal', 'Event projection does not match replay')
+                state, _ = _decide_owned(state, event)
+                matched = db.execute('SELECT result=? FROM kernel_events WHERE stream=? AND revision=?',
+                                     (canonical(state), stream, row['revision'])).fetchone()
+                require(matched and matched[0] == 1, 'journal', 'Event projection does not match replay')
                 previous = row['checksum']
+        state = json.loads(canonical(state))
         require(state == self.load(stream), 'projection', 'Stored state differs from event replay')
         return state
 
