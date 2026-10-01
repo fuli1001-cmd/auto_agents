@@ -180,6 +180,8 @@ def execution_checkout(session, state):
     execution.adapter = previous.adapter
     if hasattr(previous, '_repair_registration'):
         execution._repair_registration = previous._repair_registration
+    if hasattr(previous, '_invocation_context'):
+        execution._invocation_context = dict(previous._invocation_context)
     # Instance-installed provider transports are also used by embedders.
     if '_call_with_failover' in previous.__dict__:
         execution._call_with_failover = previous.__dict__['_call_with_failover']
@@ -197,6 +199,8 @@ def execution_checkout(session, state):
     session.project_root = destination
     session.orch = execution
     session._execution_binding = context
+    from .repair_client import EngineRepairRequired
+    repair_requested = False
     try:
         if state.mode == 'fix' and custody.get('receipt'):
             previous_state = session._current_state
@@ -206,8 +210,19 @@ def execution_checkout(session, state):
             finally:
                 session._current_state = previous_state
         yield
+    except EngineRepairRequired:
+        repair_requested = True
+        raise
     finally:
-        session._save(state)
+        # Engine admission can raise its control signal while product custody
+        # is active. The foreground submitter resumes on the original
+        # orchestrator and must retain that controller-created scope receipt.
+        if hasattr(execution, '_repair_scope_receipt'):
+            previous._repair_scope_receipt = execution._repair_scope_receipt
+        # Admission captured the already-saved controller record. Updating
+        # even its timestamp here would invalidate whole-document witnesses.
+        if not repair_requested:
+            session._save(state)
         session.project_root = root
         session.orch = previous
         session._execution_binding = previous_context

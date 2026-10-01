@@ -637,6 +637,12 @@ class Session:
             state.resolution = "interrupted_by_user"
             self._save(state)
         except RuntimeError as exc:
+            from .repair_client import EngineRepairRequired
+            if isinstance(exc, EngineRepairRequired):
+                # This is a handoff to the independent repair controller.
+                # Reclassifying it as failure would mutate the just-admitted
+                # control evidence before the foreground can submit it.
+                raise
             if reporter is not None:
                 reporter.exception(exc)
             state.resume_phase = (
@@ -2059,6 +2065,9 @@ class Session:
                 proof_resume = True
         from .repair_v2.scope import ScopeGuard, context as scope_context
         from .repair_v2.types import RepairBlocked
+        # Product execution may be inside private custody. Repair admission
+        # belongs to the durable workflow and its controller-owned evidence.
+        control_root = Path(getattr(self, '_custody_control_root', self.project_root))
         necessity = payload.get('necessity') or (payload.get('issue_seed') or payload.get('spec_seed') or {}).get('necessity')
         if isinstance(necessity, dict) and necessity.get('decision') == 'skip':
             state.status = 'executing'
@@ -2067,8 +2076,8 @@ class Session:
         if isinstance(necessity, dict) and necessity.get('decision') == 'needs_user':
             from .scope_decisions import session_choice
             invocation = {'session_id': state.session_id, 'workflow_id': state.workflow_id, 'engine_route': payload}
-            incoming = {'project': str(self.project_root), 'invocation': invocation}
-            context = scope_context(self.project_root, incoming)
+            incoming = {'project': str(control_root), 'invocation': invocation}
+            context = scope_context(control_root, incoming)
             choice = session_choice(self, state, context, necessity,
                                     {'kind': 'route', 'target': target, 'reason': reason, 'payload': payload})
             if choice != 'approve':
@@ -2086,11 +2095,11 @@ class Session:
             self.orch._repair_scope_receipt = None
             if isinstance(necessity, dict):
                 from .self_repair import auto_agents_repo_root
-                incoming = {'project': str(self.project_root), 'invocation': {
+                incoming = {'project': str(control_root), 'invocation': {
                     'session_id': state.session_id, 'workflow_id': state.workflow_id, 'engine_route': payload}}
                 try:
-                    guard = ScopeGuard(self.project_root / '.auto-agents/state/repair-scope' / state.session_id,
-                                       incoming, self.project_root, auto_agents_repo_root())
+                    guard = ScopeGuard(control_root / '.auto-agents/state/repair-scope' / state.session_id,
+                                       incoming, control_root, auto_agents_repo_root())
                     reference = guard.admit(necessity)
                     self.orch._repair_scope_receipt = guard.store.read(reference)
                 except RepairBlocked as error:

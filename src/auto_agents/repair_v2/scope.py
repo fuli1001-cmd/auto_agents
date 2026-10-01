@@ -178,7 +178,15 @@ def witnesses(refs, target, source):
                 continue
             root = Path(root).resolve()
             path = root / relative
-            if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(root):
+            if path.is_symlink() or not path.resolve().is_relative_to(root):
+                continue
+            from ..recovery.authority import read_projection, NOT_MANAGED
+            # Managed display files can be absent or contain only an identity
+            # wrapper. Both pointer and whole-document witnesses authenticate
+            # the same logical record, as exported into frozen repair input.
+            document = read_projection(path)
+            managed = document is not NOT_MANAGED and document is not None
+            if managed or path.is_file():
                 pointer = selected.get('pointer', '')
                 if pointer:
                     # Extract an exact retained JSON value, including diagnostic
@@ -187,7 +195,7 @@ def witnesses(refs, target, source):
                             or re.search(r'~(?![01])', pointer)):
                         raise RepairBlocked('scope_evidence', '失败事件定位无效。')
                     try:
-                        value = json.loads(path.read_text())
+                        value = document if managed else json.loads(path.read_text())
                         for token in pointer[1:].split('/'):
                             token = token.replace('~1', '/').replace('~0', '~')
                             if isinstance(value, list):
@@ -207,9 +215,7 @@ def witnesses(refs, target, source):
                     # can contain large candidate preimages; hashing them must
                     # not load or inject that payload into model context.
                     value = hashlib.sha256()
-                    from ..recovery.authority import read_projection, NOT_MANAGED
-                    document = read_projection(path)
-                    if document is not NOT_MANAGED and document is not None:
+                    if managed:
                         # Frozen diagnostics hydrate the projection using this
                         # canonical encoding. Bind the logical record, not its
                         # disposable on-disk display wrapper.
