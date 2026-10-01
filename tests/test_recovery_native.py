@@ -170,17 +170,26 @@ def test_projection_authority_survives_missing_view_and_exports_hydrated_snapsho
     assert json.loads(target.read_text())['execution_log'] == child.execution_log
 
 
-def test_real_fix_resumes_and_delivers_under_kernel(tmp_path, monkeypatch):
+@pytest.mark.parametrize('invalid_coverage', [False, True])
+def test_real_fix_resumes_and_delivers_under_kernel(tmp_path, monkeypatch, invalid_coverage):
     root, child = project(tmp_path)
     store = activate(root, tmp_path/'control', monkeypatch)
+    if invalid_coverage:
+        from auto_agents.recovery.policy import enable
+        enable(store, store.binding(root, 'session:' + child.session_id))
     calls = []
     def local(self, request):
         calls.append(request)
         if request.purpose == 'review':
+            first_review = sum(call.purpose == 'review' for call in calls) == 1
+            if invalid_coverage and not first_review:
+                assert '"invalid_rows":[0]' in str(request.prompt)
+                assert 'evidence digests are not test nodes' in str(request.prompt)
             props = request.response_schema['properties']['change_coverage']['items']['properties']
             checks = props['requirement']['enum'][:-1]
             text = json.dumps({'decision':'APPROVE','findings':[],
-                'coverage':[{'requirement':check,'nodes':['tests/test_owned.py::test_owned']} for check in checks],
+                'coverage':[{'requirement':check,'nodes':['0bbc6fa7bea96edd' if invalid_coverage and first_review
+                                                        else 'tests/test_owned.py::test_owned']} for check in checks],
                 'change_coverage':[{'change':key,'requirement':checks[0],'reason':'Original task','evidence':'verified test'}
                                    for key in props['change'].get('enum',[])]})
             request.output_path.write_text(text)
@@ -194,10 +203,10 @@ def test_real_fix_resumes_and_delivers_under_kernel(tmp_path, monkeypatch):
     result = Session(Orchestrator(root), mode='fix', auto_approve=True).resume(child.session_id)
     assert result.status == 'completed', result.to_dict()
     assert result.candidate_custody['delivered_revision']
-    assert len(calls) == 2
+    assert len(calls) == (3 if invalid_coverage else 2)
     again = Session(Orchestrator(root), mode='fix', auto_approve=True).resume(child.session_id)
     assert again.status == 'completed'
-    assert len(calls) == 2
+    assert len(calls) == (3 if invalid_coverage else 2)
     stream = store.binding(root, 'session:' + child.session_id)
     state = store.replay(stream)
     assert {'implement','verify','review','deliver'} <= {c['phase'] for c in state['commands'].values()}

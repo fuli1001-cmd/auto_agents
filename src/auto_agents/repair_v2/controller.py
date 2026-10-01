@@ -24,6 +24,15 @@ REVIEW_SCHEMA = {'type': 'object', 'properties': {
     'required': ['decision', 'findings', 'coverage'], 'additionalProperties': False}
 
 
+def review_test_node(node, requirements):
+    """Coverage names concrete relative tests, never evidence or change IDs."""
+    declared_paths = {r.partition('::')[0] for r in requirements if isinstance(r, str)
+                      and '/' in r and not r.startswith('/') and '..' not in r.split('/')}
+    if not isinstance(node, str) or node.startswith('/') or '..' in node.split('/'):
+        return False
+    return node.startswith('tests/') or node.partition('::')[0] in declared_paths
+
+
 def review_result(text, snapshot, requirements, changes=None):
     """Local envelope handling; a malformed verdict is never approval."""
     value = text.strip()
@@ -46,16 +55,11 @@ def review_result(text, snapshot, requirements, changes=None):
     coverage = result.get('coverage', [])
     # Native contracts may bind frontend test files directly. Keep arbitrary
     # paths out of review evidence while accepting those exact frozen targets.
-    declared_paths = {r.partition('::')[0] for r in requirements if isinstance(r, str)
-                      and '/' in r and not r.startswith('/') and '..' not in r.split('/')}
-    def test_node(node):
-        if not isinstance(node, str) or node.startswith('/') or '..' in node.split('/'): return False
-        return node.startswith('tests/') or node.partition('::')[0] in declared_paths
     if result['decision'] == 'APPROVE' and not findings:
         if (not isinstance(coverage, list) or len(coverage) != len(requirements)
                 or any(not isinstance(row, dict) or row.get('requirement') not in requirements
                        or not isinstance(row.get('nodes'), list) or not row['nodes']
-                       or any(not test_node(n) for n in row['nodes']) for row in coverage)
+                       or any(not review_test_node(n, requirements) for n in row['nodes']) for row in coverage)
                 or {row['requirement'] for row in coverage} != requirements):
             raise RepairBlocked('review_format', 'approval needs concrete test coverage for every requirement')
     change_coverage = result.get('change_coverage', [])

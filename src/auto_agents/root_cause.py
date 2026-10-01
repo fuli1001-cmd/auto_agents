@@ -869,6 +869,7 @@ class RootCauseCoordinator:
             # evidence. Diagnostic snapshot paths and diagnosis IDs are
             # intentionally ephemeral and must never defeat an exact replay.
             certificate_key = self._certificate_key(evidence)
+            self._diagnostic_certificate_key = certificate_key
             diagnostic_evidence = self._replace_repository_roots(evidence)
             if evidence.get("diagnostic_attachments"):
                 diagnostic_evidence["diagnostic_attachments"] = copy_diagnostic_attachments(
@@ -1346,6 +1347,8 @@ class RootCauseCoordinator:
             cwd=self.diagnostic_auto_root,
             output_path=output_path,
             attempt_id=f"root-cause-{role}",
+            logical_call_id=(f"root-cause:{self._diagnostic_certificate_key}:{role}"
+                             if getattr(self, "_diagnostic_certificate_key", "") else ""),
             diagnostic_output=(reporter.capture(
                 stage=f"self_repair_{role}", attempt_id=f"root-cause-{role}", kind="provider",
             ) if reporter is not None else None),

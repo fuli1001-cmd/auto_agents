@@ -606,6 +606,13 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
             self.assertTrue(diagnosis.repair_approved)
             self.assertEqual(len(fake.requests), 2)
+
+            for request in fake.requests:
+                self.assertTrue(request.logical_call_id.startswith('root-cause:'))
+                self.assertEqual(request.logical_call_id.rsplit(':', 1)[-1],
+                                 request.stage.removeprefix('self_repair_'))
+            self.assertEqual(fake.requests[0].logical_call_id.rsplit(':', 1)[0],
+                             fake.requests[1].logical_call_id.rsplit(':', 1)[0])
             self.assertEqual(
                 [item.stage for item in fake.requests],
                 ["self_repair_investigator", "self_repair_reviewer"],

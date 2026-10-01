@@ -277,7 +277,13 @@ def auxiliary_call(orchestrator, request, execute):
     anchor = digest([subjects[0], request.stage,
                      request.logical_call_id.rsplit(':', 1)[0] if request.logical_call_id else
                      invocation.get('controlled_failure') or invocation.get('engine_route') or request.purpose])
-    identity = digest([anchor, request.logical_call_id, request.attempt_id, str(request.prompt)])
+    # The root-cause coordinator binds the original evidence, source and policy
+    # in this call ID. Temporary snapshot paths must not cause paid redispatch
+    # or exhaust a different incident's bounded role allowance.
+    identity = (digest([anchor, request.logical_call_id])
+                if request.stage in {'self_repair_investigator', 'self_repair_reviewer', 'self_repair_arbiter'}
+                and request.logical_call_id.startswith('root-cause:') else
+                digest([anchor, request.logical_call_id, request.attempt_id, str(request.prompt)]))
     def commit(kind, data, key):
         for attempt in range(5):
             try: return apply(store, stream, kind, data, key)

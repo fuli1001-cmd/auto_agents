@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import replace
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -60,6 +61,26 @@ def test_declared_frontend_nodes_are_valid_coverage_but_unrelated_paths_are_not(
     for node in ['workbench/src/other.test.tsx', '/tmp/private.tsx', 'tests/../../private.py']:
         value['coverage'][0]['nodes'] = [node]
         with pytest.raises(RepairBlocked): review_result(json.dumps(value), 'source', {target}, {})
+
+
+def test_coverage_schema_and_correction_distinguish_test_nodes_from_evidence_ids():
+    from auto_agents.repair_v2.controller import review_test_node
+    targets = ('tests/test_owned.py::test_owned', 'workbench/src/home.test.tsx')
+    manifest = ReviewManifest('source', 'base', 'contract', targets, {})
+    nodes = manifest.schema(REVIEW_SCHEMA)['properties']['coverage']['items']['properties']['nodes']
+    assert nodes['minItems'] == 1
+    for node in [*targets, targets[1] + '::renders', 'tests/test_other.py::test_other',
+                 '0bbc6fa7bea96edd', '/tmp/test.py', 'workbench/src/other.test.tsx']:
+        assert bool(re.fullmatch(nodes['items']['pattern'], node)) == review_test_node(node, targets)
+    # Traversal remains a local safety check; wire regexes use simple syntax.
+    assert not review_test_node('tests/../../private.py', targets)
+    value = {'decision': 'APPROVE', 'findings': [], 'change_coverage': [], 'coverage': [
+        {'requirement': targets[0], 'nodes': ['0bbc6fa7bea96edd']}]}
+    details = manifest.coverage_diagnostics(value)
+    assert details['invalid_rows'] == [0] and details['missing'] == [targets[1]]
+    correction = manifest.correction('original', json.dumps(value), 'invalid coverage')
+    assert '"coverage":' in correction and '"invalid_rows":[0]' in correction
+    assert 'tests/test_value.py::test_value' in correction
 
 
 def test_native_review_includes_untracked_file_from_frozen_delivery_tree(scene, tmp_path, monkeypatch):

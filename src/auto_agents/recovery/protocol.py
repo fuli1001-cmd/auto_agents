@@ -1,6 +1,7 @@
 """One controller manifest drives prompts, schemas and response diagnostics."""
 from dataclasses import dataclass
 import json
+import re
 
 from .model import KernelError, canonical, digest, require
 
@@ -28,6 +29,15 @@ class ReviewManifest:
         if self.requirements and 'coverage' in schema['properties']:
             schema['properties']['coverage']['items']['properties']['requirement'] = {
                 'type': 'string', 'enum': list(self.requirements)}
+        if 'coverage' in schema['properties']:
+            paths = sorted({r.partition('::')[0] for r in self.requirements
+                            if '/' in r and not r.startswith(('/', 'tests/')) and '..' not in r.split('/')})
+            prefixes = ['tests/.+', *[re.escape(path) + r'(?:::.+)?' for path in paths]]
+            schema['properties']['coverage']['items']['properties']['nodes'] = {
+                'type': 'array', 'minItems': 1, 'items': {'type': 'string',
+                    'description': 'Relative test file or node ID, such as tests/test_value.py::test_value. '
+                                   'Evidence digests and change IDs belong in change_coverage.',
+                    'pattern': r'^(?:' + '|'.join(prefixes) + ')$'}}
         allowed = sorted(self.changes)
         change = {'type': 'string', 'enum': allowed} if allowed else {'type': 'string'}
         schema['properties']['change_coverage'] = {'type': 'array', 'minItems': len(allowed),
@@ -50,7 +60,22 @@ class ReviewManifest:
                 + '\nUse only the supplied change IDs, never filenames or line numbers. '
                   'For behavior-only review, change_coverage MUST be []. Historical/upstream '
                   'diffs are background, not additional items in this manifest. '
-                  'Behavioral requirement coverage is still mandatory.')
+                  'Behavioral requirement coverage is still mandatory: include each required check exactly once. '
+                  'coverage[].nodes names relative test files or node IDs, such as tests/test_value.py::test_value, '
+                  'or exact declared frontend test targets. Change IDs and evidence digests are not test nodes; '
+                  'put those references in change_coverage evidence.')
+
+    def coverage_diagnostics(self, value):
+        from ..repair_v2.controller import review_test_node
+        rows = value.get('coverage')
+        covered = [row.get('requirement') for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        return {'field': 'coverage', 'expected': 'array' if not isinstance(rows, list) else None,
+                'required': list(self.requirements),
+                'missing': sorted(set(self.requirements) - {item for item in covered if isinstance(item, str)}),
+                'invalid_rows': [index for index, row in enumerate(rows if isinstance(rows, list) else [])
+                    if not isinstance(row, dict) or row.get('requirement') not in self.requirements
+                    or not isinstance(row.get('nodes'), list) or not row['nodes']
+                    or any(not review_test_node(node, self.requirements) for node in row['nodes'])]}
 
     def finding_diagnostics(self, value):
         allowed = {*self.requirements, 'repair-scope', 'repair-regression'}
@@ -114,7 +139,8 @@ class ReviewManifest:
     def correction(self, response_id, text, problem):
         try:
             value = json.loads(text)
-            details = {**self.diagnose(value), 'findings': self.finding_diagnostics(value)}
+            details = {**self.diagnose(value), 'findings': self.finding_diagnostics(value),
+                       'coverage': self.coverage_diagnostics(value)}
         except (ValueError, TypeError, AttributeError): details = {'field': 'envelope', 'expected': 'JSON object'}
         return (self.instruction() + '\nCorrect the response protocol once. Preserve the substantive '
                 'verdict and findings; replace invalid identifiers with exact manifest IDs. '
@@ -122,5 +148,9 @@ class ReviewManifest:
                 'findings[].requirement must be an exact allowed_finding_requirements ID. '
                 'Replace an unknown requirement ID only; preserve every other finding field verbatim. '
                 'When allowed_change_ids is empty, remove only the inapplicable change_coverage rows.\n'
+                'coverage must include each required check exactly once; coverage[].nodes must name '
+                'concrete relative test files or test node IDs (tests/test_value.py::test_value), '
+                'or the exact declared frontend test target. Never put change IDs, command IDs, '
+                'observation IDs or evidence digests in nodes. Keep those references in change_coverage evidence.\n'
                 + canonical({'response_id': response_id, 'schema_version': self.schema_version,
                              'problem': str(problem), 'details': details}) + '\nPrevious response:\n' + text)

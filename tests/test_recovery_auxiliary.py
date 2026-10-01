@@ -93,3 +93,42 @@ def test_durable_auxiliary_result_settles_after_acknowledgement_crash(tmp_path, 
     enable(store, stream)
     assert provider(orch, req, lambda r: pytest.fail('receipt must settle without redispatch')).ok
     assert store.replay(stream)['budget']['model_calls'] == 1
+
+
+def test_root_cause_evidence_identity_reuses_roles_and_separates_new_failures(tmp_path, monkeypatch):
+    from dataclasses import replace
+    root, store, stream, orch = setup(tmp_path, monkeypatch)
+    calls = []
+    def execute(req):
+        calls.append(req.logical_call_id)
+        return AgentResult(True, ['local'], req.output_path, summary='Evidence checked')
+    # Exhaust the historical generic diagnosis allowance, as in the incident.
+    for index in range(2):
+        provider(orch, replace(request(root, tmp_path), prompt='Old failure ' + str(index)), execute)
+    with pytest.raises(KernelError, match='Auxiliary role exhausted'):
+        provider(orch, replace(request(root, tmp_path), prompt='New failure without identity'), execute)
+    before = store.replay(stream)
+    for evidence in ['a'*64, 'b'*64]:
+        for role in ['investigator', 'reviewer', 'arbiter']:
+            req = replace(request(root, tmp_path, role), logical_call_id='root-cause:' + evidence + ':' + role)
+            assert provider(orch, req, execute).ok
+            # Recreating diagnostic snapshots changes prompt paths, not evidence.
+            resumed = replace(req, prompt='Inspect /tmp/a-new-snapshot', output_path=tmp_path/'new-report')
+            assert provider(orch, resumed, lambda r: pytest.fail('same evidence must reuse its role receipt')).ok
+    after = store.replay(stream)
+    assert len(calls) == 8 and len(after['recovery']['auxiliary']) == 8
+    assert after['budget']['model_calls'] == before['budget']['model_calls'] + 6
+    assert after['tasks'] == before['tasks'] and after['commands'] == before['commands']
+
+
+def test_root_cause_snapshot_change_cannot_redispatch_unknown_role(tmp_path, monkeypatch):
+    from dataclasses import replace
+    root, store, stream, orch = setup(tmp_path, monkeypatch)
+    req = replace(request(root, tmp_path), logical_call_id='root-cause:' + 'a'*64 + ':investigator')
+    def crash(req): raise KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt): provider(orch, req, crash)
+    before = store.replay(stream)
+    with pytest.raises(KernelError, match='reconciliation'):
+        provider(orch, replace(req, prompt='Inspect another snapshot'),
+                 lambda r: pytest.fail('unknown role must not be repeated'))
+    assert store.replay(stream) == before
