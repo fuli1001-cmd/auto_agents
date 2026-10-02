@@ -165,7 +165,7 @@ def release_process():
 
 def policy(root):
     """Limits apply only to idle images; pins and live users always win."""
-    values = {'keep': 2, 'retention_days': 14, 'max_unused': 4, 'max_unused_bytes': 8 << 30}
+    values = {'keep': 1, 'retention_days': 1, 'max_unused': 1, 'max_unused_bytes': 2 << 30}
     path = root.parent / 'policy.json'
     if path.exists():
         document = json.loads(path.read_text())

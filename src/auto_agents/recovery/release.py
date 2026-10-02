@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 
 from .model import digest, require
 from .store import KernelStore
@@ -115,6 +116,11 @@ def prepare_runtime(store, source):
     return build(store.root / 'kernel-releases', source, source_identity(source), {'kernel_schema': 1, 'rpc': 2})
 
 
+def journal_replay_timeout(database_bytes):
+    """Bound replay while allowing full projection checks on large journals."""
+    return min(1800, 120 + (database_bytes + (16 << 20) - 1) // (16 << 20))
+
+
 def verify_current_journal(store, runtime, receipt):
     """The proposed core must replay the actual history at the cutover fence."""
     from .upgrade import check_receipt
@@ -129,20 +135,49 @@ def verify_current_journal(store, runtime, receipt):
             source.execute('BEGIN')
             frontier = digest({r['id']:r['revision'] for r in source.execute('SELECT id,revision FROM kernel_streams')})
             source.backup(target)
-        script = "import sys\nsys.path.insert(0,'/work/src')\nfrom auto_agents.recovery.store import KernelStore\ns=KernelStore('/state',readonly=True)\nwith s.connect() as db:\n ids=[r['id'] for r in db.execute('SELECT id FROM kernel_streams')]\nfor identity in ids: s.replay(identity)\nprint(s.frontier())\n"
+        database_bytes = (directory / 'control.sqlite3').stat().st_size
+        timeout = journal_replay_timeout(database_bytes)
+        script = '''import sys,threading,time
+sys.path.insert(0,'/work/src')
+from auto_agents.recovery.store import KernelStore
+s=KernelStore('/state',readonly=True)
+started=time.monotonic(); stopped=threading.Event()
+print('Journal replay started',flush=True)
+def heartbeat():
+ while not stopped.wait(10):
+  print('Journal replay running: '+str(round(time.monotonic()-started))+' seconds',flush=True)
+worker=threading.Thread(target=heartbeat,daemon=True); worker.start()
+try:
+ with s.connect() as db:
+  ids=[r['id'] for r in db.execute('SELECT id FROM kernel_streams')]
+ for identity in ids:
+  print('Replaying stream: '+identity,flush=True)
+  s.replay(identity)
+finally:
+ stopped.set(); worker.join()
+print(s.frontier(),flush=True)
+'''
         command = ['docker','run','--rm','--init','--network','none','--read-only','--user',f'{os.getuid()}:{os.getgid()}',
             *REPLAY_ISOLATION['standard'],'--memory','1g','--pids-limit','128','--tmpfs','/tmp:rw,nosuid,mode=1777,size=256m',
             '-e','PYTHONDONTWRITEBYTECODE=1','-e','PYTHONPATH=/work/src',
             '--mount',f'type=bind,src={runtime["path"]},dst=/work,readonly',
             '--mount',f'type=bind,src={directory},dst=/state,readonly',image,'python','-c',script]
-        code, output = run(command,timeout=120,output=directory/'replay.log')
+        observation = {}
+        started = time.monotonic()
+        code, output = run(command,timeout=timeout,output=directory/'replay.log',observation=observation)
+        execution = {'termination':observation.get('termination', ''), 'timeout_seconds':timeout,
+                     'elapsed_seconds':round(time.monotonic() - started, 3), 'database_bytes':database_bytes}
+        if execution['termination']:
+            with (directory / 'replay.log').open('a') as log:
+                log.write('\nJournal replay stopped: ' + json.dumps(execution) + '\n')
         log_ref = store.put_file(directory/'replay.log')
         require(code == 0 and output.strip().splitlines()[-1:] == [frontier],
-                'upgrade_journal','Proposed runtime cannot replay current business history',
-                log_ref=log_ref,returncode=code,detail=output[-2000:])
+                'upgrade_journal', 'Current business history replay timed out' if execution['termination'] == 'timeout'
+                else 'Proposed runtime cannot replay current business history',
+                log_ref=log_ref,returncode=code,detail=output[-2000:],**execution)
         require(store.frontier() == frontier,'upgrade_journal','Business history changed while replaying')
         proof = {**fixture,'ok':True,'state_frontier':frontier,'fixture_proof':receipt['checks']['journal_replay'],
-                 'log':log_ref}
+                 'log':log_ref, 'execution':execution}
         updated = {**receipt,'state_frontier':frontier,'checks':{**receipt['checks'],'journal_replay':store.put(proof)}}
         reference = store.put(updated)
         store.set_meta('verified_upgrades',[*store.meta('verified_upgrades',[]),reference])

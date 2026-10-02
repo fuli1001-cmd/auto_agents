@@ -10,6 +10,24 @@ import time
 
 from .model import Event, KernelError, canonical, checksum, digest, require
 from .reducer import decide, initial
+from .journal_storage import FORMAT, PROJECTION, pack, unpack, projection, stored_projection
+
+
+def _matches_json(db, table, column, rowid, encoded):
+    """Compare all retained bytes without binding another full projection."""
+    if hasattr(db, 'blobopen'):
+        # SQLite's incremental blob reader also supports TEXT columns. Reading
+        # them as UTF-8 bytes preserves canonical JSON's exact comparison.
+        with db.blobopen(table, column, rowid, readonly=True) as stored:
+            if len(stored) != len(encoded): return False
+            for offset in range(0, len(encoded), 1024 * 1024):
+                if stored.read(1024 * 1024) != encoded[offset:offset + 1024 * 1024]:
+                    return False
+            return True
+    # Python 3.9/3.10 do not expose SQLite's incremental reader.
+    row = db.execute(f'SELECT {column}=? FROM {table} WHERE rowid=?',
+                     (encoded.decode(), rowid)).fetchone()
+    return bool(row and row[0] == 1)
 
 
 class KernelStore:
@@ -49,6 +67,9 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_uses(
 CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
  id TEXT PRIMARY KEY, payload TEXT NOT NULL);
 ''')
+            if not db.execute("SELECT 1 FROM kernel_meta WHERE key='kernel_storage_format'").fetchone():
+                legacy = db.execute('SELECT 1 FROM kernel_events LIMIT 1').fetchone()
+                db.execute("INSERT INTO kernel_meta VALUES('kernel_storage_format',?)", ('1' if legacy else str(FORMAT),))
         self.path.chmod(0o600)
 
     @contextmanager
@@ -136,6 +157,25 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
 
     def apply(self, stream, expected_revision, event, *, expected_epoch=None):
         require(not self.readonly, 'readonly', 'Read-only store cannot change state')
+        # A sealed duplicate is independent of expired diagnostic attachments.
+        # Epoch and draining fences still precede returning its recorded state.
+        with self.connect() as db:
+            if db.execute('SELECT 1 FROM kernel_events WHERE event_id=?', (event.event_id,)).fetchone():
+                db.execute('BEGIN IMMEDIATE')
+                if event.kind == 'command_reserved':
+                    mode = db.execute("SELECT value FROM kernel_meta WHERE key='mode'").fetchone()
+                    require(mode is None or json.loads(mode[0]) != 'draining',
+                            'upgrade_draining', 'New operations are fenced during core adoption')
+                if expected_epoch is not None:
+                    epoch = db.execute("SELECT value FROM kernel_meta WHERE key='epoch'").fetchone()
+                    require(expected_epoch == (json.loads(epoch[0]) if epoch else 0),
+                            'stale_epoch', 'Runtime generation changed; worker must rebind')
+                previous = db.execute('SELECT stream,revision,envelope,result FROM kernel_events WHERE event_id=?',
+                                      (event.event_id,)).fetchone()
+                require(previous['stream'] == stream and unpack(previous['envelope']) == canonical(event.to_dict()),
+                        'event_collision', 'Event identity was reused with different input')
+                if not previous['result'].startswith(PROJECTION): return json.loads(previous['result'])
+                return self.replay(stream, through=previous['revision'])
         # Referenced proofs are sealed before a transaction is made visible.
         data = event.data
         proofs = [*data.get('proofs', []), *data.get('outcome', {}).get('evidence', [])]
@@ -143,17 +183,18 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
         for proof in proofs: self.verify_blob(proof['blob'])
         details = data.get('outcome', {}).get('details', {})
         if details.get('verification_observation') is not None:
-            from .observations import compact
+            from .observations import compact, compact_for_storage
             value = self.read(details['observation_ref'])
-            require(details['verification_observation'] in (value, compact(value)),
+            require(details['verification_observation'] in (value, compact(value), compact_for_storage(value)),
                     'verification_observation', 'Executor observation changed after sealing')
         if event.kind == 'recovery_observation_imported':
-            from .observations import observation, compact
+            from .observations import observation, compact, compact_for_storage
             from .model import Command
             row = self.load(stream)['commands'][data['command_id']]
             command = Command(**{key: row[key] for key in Command.__dataclass_fields__})
             result = self.read(data['result_ref'])
-            require(data['observation'] == compact(observation(command, result, verifier=row['runtime'],
+            compact_observation = compact_for_storage if data['observation'].get('compact_version') == 2 else compact
+            require(data['observation'] == compact_observation(observation(command, result, verifier=row['runtime'],
                     baseline_aware=data['observation'].get('baseline_aware', False))),
                     'verification_observation', 'Imported observation is not the retained executor result')
         if event.kind == 'recovery_auxiliary_finished': self.verify_blob(data['result_ref'])
@@ -178,12 +219,19 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
                 row = db.execute("SELECT value FROM kernel_meta WHERE key='epoch'").fetchone()
                 require(expected_epoch == (json.loads(row['value']) if row else 0),
                         'stale_epoch', 'Runtime generation changed; worker must rebind')
-            previous = db.execute('SELECT stream,envelope,result FROM kernel_events WHERE event_id=?', (event.event_id,)).fetchone()
+            previous = db.execute('SELECT stream,revision,envelope,result FROM kernel_events WHERE event_id=?', (event.event_id,)).fetchone()
             envelope = canonical(event.to_dict())
             if previous:
-                require(previous['stream'] == stream and previous['envelope'] == envelope,
+                require(previous['stream'] == stream and unpack(previous['envelope']) == envelope,
                         'event_collision', 'Event identity was reused with different input')
-                return json.loads(previous['result'])
+                if not previous['result'].startswith(PROJECTION): return json.loads(previous['result'])
+                current = db.execute('SELECT revision,snapshot FROM kernel_streams WHERE id=?', (stream,)).fetchone()
+                if current and current['revision'] == previous['revision']:
+                    state = json.loads(current['snapshot'])
+                    require(projection(canonical(state).encode()) == previous['result'],
+                            'journal', 'Event projection does not match replay')
+                    return state
+                return self.replay(stream, through=previous['revision'])
             row = db.execute('SELECT snapshot,revision FROM kernel_streams WHERE id=?', (stream,)).fetchone()
             state = json.loads(row['snapshot']) if row else initial()
             require(state['revision'] == expected_revision, 'stale_transition', 'Concurrent transition won; reload state')
@@ -192,8 +240,12 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
             previous_hash = prior['checksum'] if prior else ''
             record_hash = digest([stream, state['revision'], previous_hash, event.to_dict()])
             encoded = canonical(state)
+            storage = db.execute("SELECT value FROM kernel_meta WHERE key='kernel_storage_format'").fetchone()
+            compact = storage and json.loads(storage[0]) >= FORMAT
             db.execute('INSERT INTO kernel_events VALUES(?,?,?,?,?,?,?)',
-                       (stream, state['revision'], event.event_id, previous_hash, record_hash, envelope, encoded))
+                       (stream, state['revision'], event.event_id, previous_hash, record_hash,
+                        pack(envelope) if compact else envelope,
+                        projection(encoded.encode()) if compact else encoded))
             db.execute('INSERT INTO kernel_streams VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,snapshot=excluded.snapshot',
                        (stream, state['revision'], encoded))
             if event.kind == 'projection_saved' and data['name'].startswith('run:'):
@@ -220,27 +272,35 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
                 db.execute("UPDATE kernel_outbox SET state='cancelled' WHERE stream=? AND state='pending'", (stream,))
             return state
 
-    def replay(self, stream):
+    def replay(self, stream, *, through=None):
         from .reducer import _decide_owned
         state, previous = initial(), ''
         with self.connect() as db:
-            # Keep one private state, and compare every full projection inside
-            # SQLite instead of copying its text into Python as well. Neither
-            # the event chain nor intermediate projection checks are skipped.
-            for row in db.execute('SELECT revision,envelope,previous,checksum FROM kernel_events '
-                                  'WHERE stream=? ORDER BY revision', (stream,)):
-                raw = json.loads(row['envelope']); event = Event(**raw)
+            # Keep one private state and read every full retained projection in
+            # bounded chunks. Neither event nor projection checks are skipped.
+            for row in db.execute('SELECT rowid,revision,envelope,previous,checksum FROM kernel_events '
+                                  'WHERE stream=? AND (? IS NULL OR revision<=?) ORDER BY revision', (stream, through, through)):
+                raw = json.loads(unpack(row['envelope'])); event = Event(**raw)
                 require(row['revision'] == state['revision'] + 1 and row['previous'] == previous
                         and row['checksum'] == digest([stream, row['revision'], previous, raw]),
                         'journal', 'Recovery journal integrity failure')
                 state, _ = _decide_owned(state, event)
-                matched = db.execute('SELECT result=? FROM kernel_events WHERE stream=? AND revision=?',
-                                     (canonical(state), stream, row['revision'])).fetchone()
-                require(matched and matched[0] == 1, 'journal', 'Event projection does not match replay')
+                encoded = canonical(state).encode()
+                expected = stored_projection(db, row['rowid'])
+                require(hashlib.sha256(encoded).hexdigest() == expected if expected else
+                        _matches_json(db, 'kernel_events', 'result', row['rowid'], encoded),
+                        'journal', 'Event projection does not match replay')
+                del encoded
                 previous = row['checksum']
-        state = json.loads(canonical(state))
-        require(state == self.load(stream), 'projection', 'Stored state differs from event replay')
-        return state
+            encoded = canonical(state).encode()
+            if through is not None:
+                require(state['revision'] == through, 'journal', 'Recovery journal revision is missing')
+                return json.loads(encoded)
+            final = db.execute('SELECT rowid FROM kernel_streams WHERE id=?', (stream,)).fetchone()
+            require(_matches_json(db, 'kernel_streams', 'snapshot', final['rowid'], encoded)
+                    if final else state == initial(),
+                    'projection', 'Stored state differs from event replay')
+        return json.loads(encoded)
 
     def bind(self, project, name, stream):
         with self.connect() as db:

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional
 from uuid import uuid4
 
+MAX_CAPTURE_BYTES = 8 * 1024 * 1024
+TRUNCATED_CAPTURE = b'[earlier diagnostic output omitted to limit disk usage]\n'
 
 _SECRET_KEY = re.compile(r"(?i)(?:api.?key|authorization|password|secret|(?:^|[_-])(?:access.?|refresh.?)?token(?:$|[_-]))")
 _SECRET = re.compile(
@@ -139,6 +141,23 @@ class OutputCapture:
             path = self.root / f"{stream}.txt"
             with path.open("a", encoding="utf-8") as output:
                 output.write(redact(text, self._secrets))
+            if path.stat().st_size > MAX_CAPTURE_BYTES:
+                with path.open('rb') as output:
+                    output.seek(-(MAX_CAPTURE_BYTES - len(TRUNCATED_CAPTURE)), 2)
+                    tail = output.read()
+                # Decode at a character boundary; redaction happened before the
+                # cutoff. The provider/runner's returned result is independent.
+                tail = tail.decode('utf-8', errors='ignore').encode()
+                temporary = path.with_name('.bounded-' + uuid4().hex)
+                try:
+                    temporary.write_bytes(TRUNCATED_CAPTURE + tail)
+                    temporary.replace(path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                self.metadata.setdefault('truncated_streams', [])
+                if stream not in self.metadata['truncated_streams']:
+                    self.metadata['truncated_streams'].append(stream)
+                self._write_metadata()
             self._register(path, self.metadata)
         except Exception as error:
             self._disabled = True

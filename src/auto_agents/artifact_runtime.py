@@ -176,7 +176,7 @@ def schedule(*, completed=False):
     try:
         with store.locked(), store.connect(True) as db:
             previous = db.execute("SELECT data FROM maintenance WHERE key='scheduled'").fetchone()
-            if not completed and previous and time.time() - json.loads(previous[0])["time"] < 3600:
+            if not completed and previous and time.time() - json.loads(previous[0])["time"] < 600:
                 return
             db.execute("INSERT OR REPLACE INTO maintenance VALUES('scheduled',?)", (json.dumps({"time": time.time()}),))
         environment = dict(os.environ)

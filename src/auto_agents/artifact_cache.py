@@ -44,7 +44,12 @@ def maintain_caches(store, deadline, scope=None):
                     # SQLite alone owns journal/WAL lifecycle. Busy checkpoint or
                     # legacy non-incremental DB simply defers physical shrinkage.
                     db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    db.execute("PRAGMA incremental_vacuum(128)")
+                    free = db.execute('PRAGMA freelist_count').fetchone()[0]
+                    pages = db.execute('PRAGMA page_count').fetchone()[0]
+                    if free > 256 and free > pages // 4 and time.monotonic() < deadline:
+                        db.execute('VACUUM')
+                    else:
+                        db.execute("PRAGMA incremental_vacuum(128)")
             results.append({"id": row["id"], "result": "cache_rows_pruned"})
         except (OSError, ValueError, sqlite3.Error) as error:
             results.append({"id": row["id"], "result": "deferred", "reason": str(error)})

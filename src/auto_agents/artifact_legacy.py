@@ -119,6 +119,7 @@ def enclosing_protection(store, path):
             "SELECT data FROM artifacts WHERE json_extract(data,'$.state')!='deleted' AND "
             "(path=? OR substr(?,1,length(path)+1)=path||'/' OR substr(path,1,length(?)+1)=?||'/')",
             (str(path), str(path), str(path), str(path)))]
+    retained = ''
     for row in rows:
         if row['state'] == 'deleted': continue
         owner = Path(row['path'])
@@ -126,8 +127,8 @@ def enclosing_protection(store, path):
             if row['pin'] or row['references'] or any(alive(p) for p in row['leases']):
                 return 'enclosing_artifact_in_use_or_pinned'
             if path == owner or path in owner.parents:
-                return 'registered_resource_uses_normal_retention'
-    return ''
+                retained = 'registered_resource_uses_normal_retention'
+    return retained
 
 
 def consumers_finished(db, job):

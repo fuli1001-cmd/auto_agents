@@ -6,12 +6,23 @@ STATUSES = {'passed', 'failed', 'skipped', 'unexecuted', 'blocked'}
 
 def compact(value):
     """Keep complete output in a blob, not in every subsequent journal snapshot."""
+    if value.get('compact_version') == 2: return compact_for_storage(value)
     if value.get('details_ref'): return value
     return {**value, 'details_ref': digest(value), 'checks': {
         key: {'id': key, 'status': row['status'],
               **({'baseline': True} if row.get('baseline') else {}),
               **({'detail': row.get('detail', '')[:1200]} if row['status'] == 'failed' else {})}
         for key, row in value['checks'].items()}}
+
+
+def compact_for_storage(value):
+    """New events explicitly choose v2; legacy replay keeps its original rules."""
+    return {**value, 'compact_version': 2, 'details_ref': value.get('details_ref') or digest(value),
+            'reason': value.get('reason', '')[:1200], 'checks': {
+                key: {'id': key, 'status': row['status'],
+                      **({'baseline': True} if row.get('baseline') else {}),
+                      **({'detail': row.get('detail', '')[:600]} if row['status'] == 'failed' else {})}
+                for key, row in value['checks'].items()}}
 
 
 def retained_progress_checks(session, state, commands):

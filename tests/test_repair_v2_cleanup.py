@@ -49,7 +49,7 @@ def test_image_gc_keeps_pending_repairs_and_recent_images(tmp_path, monkeypatch)
         return 0, ''
     with patch('auto_agents.repair_v2.docker.run', side_effect=run), \
          patch('auto_agents.repair_v2.images.shutil.which', return_value='/usr/bin/docker'):
-        assert images.maintain() == ['sha256:1']
+        assert images.maintain() == ['sha256:2', 'sha256:1']
     assert ['docker', 'image', 'rm', 'image:1'] in calls
     assert not any('volume' in c for c in calls)
 
@@ -83,8 +83,8 @@ def test_recent_idle_images_are_bounded_but_pins_and_preparation_survive(tmp_pat
     images.pin('sha256:0', tmp_path / 'pending')
     images.acquire('image:1')
     image_daemon(monkeypatch)
-    assert set(images.maintain()) == {'sha256:2', 'sha256:3'}
-    assert len(list((images.registry() / 'images').glob('*.json'))) == 6  # 4 idle + 2 protected
+    assert set(images.maintain()) == {'sha256:2', 'sha256:3', 'sha256:4', 'sha256:5', 'sha256:6'}
+    assert len(list((images.registry() / 'images').glob('*.json'))) == 3  # 1 idle + 2 protected
 
 
 def test_image_budget_and_retention_are_configurable(tmp_path, monkeypatch):
@@ -97,7 +97,7 @@ def test_image_budget_and_retention_are_configurable(tmp_path, monkeypatch):
     assert set(images.maintain()) == {'sha256:0', 'sha256:1'}
 
 
-@pytest.mark.parametrize('value', [None, {'keep': -1}, {'max_unused': 1}, {'retention_days': True}])
+@pytest.mark.parametrize('value', [None, {'keep': -1}, {'max_unused': 0}, {'retention_days': True}])
 def test_invalid_image_policy_reports_error_without_deletion(tmp_path, monkeypatch, value):
     monkeypatch.setenv('AUTO_AGENTS_STORAGE_ROOT', str(tmp_path / 'storage'))
     root = images.registry()

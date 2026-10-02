@@ -123,3 +123,29 @@ For the observed 519-event workflow, the largest stored snapshot was about
 does not replace the installation's independent container gate. Upgrade logs
 now announce real-history replay and retain its phase, exit code and sealed log
 reference when it fails.
+
+The later 572-event history grew to an 8.92 GB database and an 87.9 MB final
+snapshot. Full replay in the pinned, network-free container with its unchanged
+1 GiB memory limit passed in 129.20 seconds, peaking at 535.90 MiB and preserving
+the history frontier. The 120-second limit would still interrupt this valid
+history. The replay deadline now scales with the copied database size: 120
+seconds plus one second per rounded-up 16 MiB, capped at 1,800 seconds (652
+seconds for this database). The 11 mandatory gates and all integrity checks
+remain in force. The driver emits startup, stream and heartbeat messages and
+records timeout, elapsed time and database size in the sealed diagnostic log.
+
+Projection comparison uses SQLite's incremental reader where available, with
+exact UTF-8 byte comparison in 1 MiB chunks; Python 3.9/3.10 retain the SQL
+comparison fallback. Final snapshot checking avoids loading a second complete
+state. Regression checks cover multi-byte corruption beyond the first chunk,
+the legacy fallback, timeout diagnostics, wrong frontiers and concurrent
+history changes.
+
+The installed oracle executes its sealed driver, so changing the editable
+`release.py` alone cannot repair an existing installation's deadline. This
+requires a separate installation maintenance update: preserve the installed
+oracle's tests and gate inventory, copy its immutable source, replace only the
+journal replay driver and its timeout helper, seal a new runtime and atomically
+update the trusted runtime/policy pair under the adoption lock. Candidate
+adoption then runs every static gate and a fresh real-history replay through
+that installed oracle. Existing runtime snapshots are never edited in place.

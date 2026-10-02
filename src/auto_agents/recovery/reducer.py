@@ -53,7 +53,12 @@ def decide(snapshot, event):
 def _decide_owned(state, event):
     """Apply the same rules to a private replay state with no outside owners."""
     data, kind, outbox = dict(event.data), event.kind, []
-    if kind == 'workflow_registered':
+    if kind == 'history_compacted':
+        from .journal_storage import compact_state
+        require(data == {'format': 2, 'before': digest(state), 'after': digest(compact_state(state))},
+                'storage_compaction', 'History compaction is not bound to the current state')
+        state = compact_state(state)
+    elif kind == 'workflow_registered':
         identifier(data['workflow_id']); identifier(data['goal_id'])
         require(not state['workflow_id'], 'workflow', 'Workflow already exists')
         require(bool(data['project']), 'workflow', 'Project identity is required')

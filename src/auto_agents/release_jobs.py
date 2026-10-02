@@ -12,6 +12,11 @@ from typing import Iterable, Iterator, Mapping, Optional
 from .git_ops import head_ref, worktree_fingerprint
 
 
+def _encode_failure(value):
+    from .recovery.journal_storage import pack
+    return pack(json.dumps(dict(value), ensure_ascii=False))
+
+
 def release_jobs_path(project_root: Path) -> Path:
     return Path(project_root) / ".auto-agents" / "state" / "release_jobs.sqlite3"
 
@@ -59,7 +64,8 @@ class ReleaseJobStore:
             connection.execute(
                 """
                 UPDATE release_jobs
-                   SET status = 'superseded', superseded_by = ?, updated_at = ?
+                   SET status = 'superseded', superseded_by = ?, updated_at = ?,
+                       failure_payload = '{}', reason = substr(reason, 1, 1200)
                  WHERE candidate_id <> ? AND status IN ('pending', 'running', 'recovering')
                 """,
                 (job_id, now, candidate_id),
@@ -174,8 +180,8 @@ class ReleaseJobStore:
         return self._update(
             job_id,
             status="recovering",
-            failure_payload=json.dumps(dict(failure_payload), ensure_ascii=False),
-            reason=reason,
+            failure_payload=_encode_failure(failure_payload),
+            reason=reason[:1200],
             recovery_attempts=int(job.get("recovery_attempts", 0)) + 1,
         )
 
@@ -190,8 +196,8 @@ class ReleaseJobStore:
         return self._update(
             job_id,
             status="pending",
-            failure_payload=json.dumps(dict(failure_payload), ensure_ascii=False),
-            reason=reason,
+            failure_payload=_encode_failure(failure_payload),
+            reason=reason[:1200],
             infrastructure_attempts=int(job.get("infrastructure_attempts", 0)) + 1,
             queued_at=time.time(),
         )
@@ -218,10 +224,8 @@ class ReleaseJobStore:
             logical_commands=int(result.get("logical_commands", 0)),
             executed_commands=int(result.get("executed_commands", 0)),
             certificate_hits=int(result.get("certificate_hits", 0)),
-            reason=str(result.get("reason", "")),
-            failure_payload=json.dumps(
-                {} if bool(result.get("ok")) else dict(result), ensure_ascii=False
-            ),
+            reason=str(result.get("reason", ""))[:1200],
+            failure_payload=_encode_failure({} if bool(result.get("ok")) else result),
             completed_at=time.time(),
             recovery_commit=recovery_commit,
         )
@@ -236,8 +240,8 @@ class ReleaseJobStore:
         return self._update(
             job_id,
             status="needs_user",
-            reason=reason,
-            failure_payload=json.dumps(dict(failure_payload or {}), ensure_ascii=False),
+            reason=reason[:1200],
+            failure_payload=_encode_failure(failure_payload or {}),
             completed_at=time.time(),
         )
 
@@ -245,6 +249,7 @@ class ReleaseJobStore:
         return self._update(
             job_id,
             status="superseded",
+            failure_payload='{}',
             superseded_by=superseded_by,
             completed_at=time.time(),
         )
@@ -348,13 +353,16 @@ class ReleaseJobStore:
                 );
                 """
             )
+            connection.execute("UPDATE release_jobs SET failure_payload='{}', reason=substr(reason,1,1200) "
+                               "WHERE status='superseded' AND (failure_payload!='{}' OR length(reason)>1200)")
 
     @staticmethod
     def _row(row: sqlite3.Row) -> dict[str, object]:
         result = dict(row)
         for key in ("affected_proof_ids", "release_proof_ids", "failure_payload"):
             try:
-                result[key] = json.loads(str(result.get(key, "")))
+                from .recovery.journal_storage import unpack
+                result[key] = json.loads(unpack(str(result.get(key, ""))))
             except json.JSONDecodeError:
                 result[key] = [] if key.endswith("proof_ids") else {}
         for key in ("queued_at", "updated_at", "started_at", "completed_at"):

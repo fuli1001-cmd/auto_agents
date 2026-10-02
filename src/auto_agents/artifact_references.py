@@ -168,7 +168,8 @@ def protection(row):
                 reason = owner_protection(metadata)
                 if reason:
                     return reason
-            reason = project_protection(project, recovery=row["kind"] in {"recovery", "evidence", "log", "worktree", "environment"})
+            reason = project_protection(project, recovery=not metadata.get('workflow_artifact') and
+                                        row["kind"] in {"recovery", "evidence", "log", "worktree", "environment"})
             if reason:
                 return reason
             if row["kind"] in {"log", "evidence", "recovery", "worktree"}:

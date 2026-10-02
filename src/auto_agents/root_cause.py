@@ -1206,17 +1206,24 @@ class RootCauseCoordinator:
             relative_parts = current_path.relative_to(source).parts
             if relative_parts[:2] == ('.auto-agents', 'state'):
                 ignored.extend(name for name in names if re.fullmatch(r'.+\.json(?:l)?\.\d+\.[0-9a-f]+\.tmp', name))
+                # These indexed caches are rebuildable and otherwise multiply
+                # into every diagnostic copy together with SQLite sidecars.
+                caches = ('gate_baseline_cache.sqlite3', 'requirements_audit_cache.sqlite3')
+                ignored.extend(name for name in names if any(name == cache or name.startswith(cache + '-')
+                                                            for cache in caches))
             # Next.js caches can be hundreds of MiB per snapshot. Omit them
             # only when Git confirms the directory is generated, and never
             # omit tracked files or dirty changes under a similarly named path.
-            if ".next" in names and (source / ".git").exists():
-                relative = (current_path / ".next").relative_to(source).as_posix()
-                tracked = subprocess.run(["git", "ls-files", "-z", "--", relative],
-                                         cwd=source, capture_output=True)
-                generated = subprocess.run(["git", "check-ignore", "-q", "--", relative],
-                                           cwd=source, capture_output=True)
-                if tracked.returncode == 0 and not tracked.stdout and generated.returncode == 0:
-                    ignored.append(".next")
+            if (source / ".git").exists():
+                for name in ('.next', '.tmp', '.pytest_cache', '.mypy_cache', '.ruff_cache'):
+                    if name not in names: continue
+                    relative = (current_path / name).relative_to(source).as_posix()
+                    tracked = subprocess.run(["git", "ls-files", "-z", "--", relative],
+                                             cwd=source, capture_output=True)
+                    generated = subprocess.run(["git", "check-ignore", "-q", "--", relative],
+                                               cwd=source, capture_output=True)
+                    if tracked.returncode == 0 and not tracked.stdout and generated.returncode == 0:
+                        ignored.append(name)
             if current_path.parent.name == "sessions" and "logs" in names:
                 ignored.append("logs")
             if current_path.name == ".auto-agents":
@@ -1272,11 +1279,12 @@ class RootCauseCoordinator:
                     _restore_index_image(destination, _capture_index_image(source))
             if not cloned and destination.exists():
                 shutil.rmtree(destination, ignore_errors=True)
+        from .artifact_compaction import copy_snapshot_file
         shutil.copytree(
             source,
             destination,
             ignore=ignore,
-            copy_function=admitted_copy,
+            copy_function=lambda source_file, target_file: copy_snapshot_file(source_file, target_file, admitted_copy),
             symlinks=True,
             dirs_exist_ok=cloned,
         )

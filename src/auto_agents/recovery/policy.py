@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .model import Command, Event, KernelError, digest, require
 from .convergence import decision, scope, failures, record_diagnosis
-from .observations import observation, diagnosis_schema, compact
+from .observations import observation, diagnosis_schema, compact_for_storage
 
 
 def apply(store, stream, kind, data, identity):
@@ -40,7 +40,7 @@ def enable(store, stream):
         if not isinstance(result, dict): continue
         command = Command(**{key: row[key] for key in Command.__dataclass_fields__})
         full = observation(command, result, verifier=row['runtime'])
-        value = compact(full)
+        value = compact_for_storage(full)
         if not value['checks']: continue
         store.put(full)
         apply(store, stream, 'recovery_observation_imported',
@@ -140,7 +140,7 @@ def result_details(store, stream, command, result):
         value = observation(command, result, verifier=command.runtime)
     else: return {}
     if value is None: return {}
-    return {'verification_observation': compact(value), 'observation_ref': store.put(value)}
+    return {'verification_observation': compact_for_storage(value), 'observation_ref': store.put(value)}
 
 
 def correction_context(snapshot, task_id):

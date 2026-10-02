@@ -23,7 +23,15 @@ def managed_report(store, report, scope):
     with report.open('x', encoding='utf-8') as journal:
         identity = store.register(report, kind='log', scope=scope or 'user')
         try: yield journal, identity
-        finally: store.release(identity)
+        finally:
+            # A concurrent producer can briefly hold the registry lock. The
+            # process lease is still reaped after exit if release must defer.
+            for attempt in range(5):
+                try:
+                    store.release(identity)
+                    break
+                except (BlockingIOError, sqlite3.OperationalError):
+                    if attempt < 4: time.sleep(.05)
 
 
 def clean(*, store=None, scope=None, seconds=None, progress=None):
@@ -50,7 +58,7 @@ def _clean(store, scope, started, deadline, progress):
     name = 'cleanup-' + uuid4().hex + '.jsonl'
     report = store.root / name
     complete = True
-    phase_seconds = (deadline - started) / 3 if math.isfinite(deadline) else float('inf')
+    phase_seconds = (deadline - started) / 4 if math.isfinite(deadline) else float('inf')
     with managed_report(store, report, scope) as (journal, report_id):
         def record(item):
             nonlocal total, retained, measured
@@ -63,6 +71,12 @@ def _clean(store, scope, started, deadline, progress):
             if progress: progress(dict(results), total)
 
         maintain_caches(store, min(deadline, time.monotonic() + 5), scope)
+        from .storage_admission import windows_backing_roots
+        try:
+            backing_pressure = any(shutil.disk_usage(path).free < shutil.disk_usage(path).total * .1
+                                   for path in windows_backing_roots())
+        except RuntimeError:
+            backing_pressure = False
         # Capture a finite inventory: concurrent producers need not finish for
         # this command to complete. Automatic rounds rotate by last scan time.
         rows = [r for r in store.rows(scope, oldest=True) if r['id'] != report_id]
@@ -73,7 +87,7 @@ def _clean(store, scope, started, deadline, progress):
             if time.monotonic() >= registry_deadline:
                 complete = False; break
             budget = policy['budgets'].get(row['scope'].split(':', 1)[0], policy['budgets']['user'])
-            pressure = totals.get(row['scope'], 0) > budget
+            pressure = backing_pressure or totals.get(row['scope'], 0) > budget
             try:
                 usage = shutil.disk_usage(Path(row.get('trash') or row['path']).parent)
                 pressure = pressure or usage.free < usage.total * .1
@@ -90,7 +104,17 @@ def _clean(store, scope, started, deadline, progress):
             if time.monotonic() >= deadline: complete = False; break
             if KernelStore(root, readonly=True).meta('active_runtime'):
                 for item in maintain_runtimes(KernelStore(root), deadline=deadline): record(item)
+                if KernelStore(root, readonly=True).meta('kernel_storage_format') == 2 and time.monotonic() < deadline:
+                    from .recovery.evidence_maintenance import collect_objects
+                    try:
+                        item = collect_objects(KernelStore(root), deadline=min(deadline, time.monotonic() + phase_seconds))
+                        record({**item,'kind':'kernel_objects','result':'collected' if item['ok'] else 'deferred'})
+                    except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                        record({'result':'deferred','reason':'kernel_object_collection: '+str(error),'freed_bytes':0})
         complete = clean_legacy(store, roots, min(deadline, time.monotonic() + phase_seconds), record, scope) and complete
+        from .artifact_compaction import compact_repair_copies
+        if roots and time.monotonic() < deadline:
+            complete = compact_repair_copies(store, roots, min(deadline, time.monotonic() + phase_seconds), record) and complete
         if time.monotonic() < deadline:
             try: _clean_docker(store, roots, scope, deadline, record)
             except (OSError, ValueError, RuntimeError) as error:
