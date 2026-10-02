@@ -1636,12 +1636,31 @@ def _allow_empty_task_plan_before_plan(project_root: Path) -> bool:
     if not isinstance(state_payload, dict):
         return False
     context = state_payload.get("resume_context", {})
-    # Both completed-run iterations and blocked-run restarts intentionally
-    # materialize their new task plan at the plan stage.
-    if not isinstance(context, dict) or not any(
+    # Iterations, restarts and a controller-bound first run materialize tasks
+    # at the plan stage. A bare handoff ID is not sufficient ownership.
+    if not isinstance(context, dict):
+        return False
+    archived_iteration = any(
         str(context.get(key, "")).strip()
         for key in ("previous_run_id", "restarted_blocked_run_id")
-    ):
+    )
+    routed_first_run = False
+    handoff_id = context.get("parent_handoff_id", "")
+    if isinstance(handoff_id, str) and re.fullmatch(r"hf-[a-zA-Z0-9_-]+", handoff_id):
+        try:
+            handoff = read_json(project_root / '.auto-agents/state/handoffs' / (handoff_id + '.json'), default={})
+        except (OSError, ValueError):
+            return False
+        routed_first_run = (
+            isinstance(handoff, dict)
+            and handoff.get('handoff_id') == handoff_id
+            and handoff.get('target') == 'run'
+            and bool(context.get('workflow_id'))
+            and handoff.get('workflow_id') == context['workflow_id']
+            and handoff.get('child') == {'kind': 'run', 'native_id': state_payload.get('run_id')}
+            and not state_payload.get('tasks')
+        )
+    if not (archived_iteration or routed_first_run):
         return False
     summaries = state_payload.get("stage_summaries", {})
     if isinstance(summaries, dict) and "plan" in summaries:

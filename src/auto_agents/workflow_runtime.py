@@ -17,6 +17,8 @@ from .config import (
     load_session_state,
     save_run_state,
     save_session_state,
+    save_task_plan,
+    task_plan_path,
 )
 from .git_ops import (
     amend_only_paths,
@@ -1578,6 +1580,88 @@ class WorkflowCoordinator:
             return None
         return None
 
+    def _unstarted_routed_run(self, current, handoff):
+        """Prove that binding and startup preflight are this run's only work."""
+        expected_error = 'preflight validation failed:\n- missing task plan file: ' + str(task_plan_path(self.project_root))
+        if (handoff.target != 'run' or handoff.child != WorkflowRef('run', current.run_id)
+                or current.resume_context.get('parent_handoff_id') != handoff.handoff_id
+                or current.resume_context.get('workflow_id') != handoff.workflow_id
+                or current.status not in {'pending', 'failed'}
+                or current.status == 'failed' and current.last_error != expected_error):
+            return False
+        payload = current.to_dict()
+        payload.update(resume_context={}, status='pending', last_error='')
+        return payload == RunState(current.run_id, workflow_version=current.workflow_version).to_dict()
+
+    def _initialize_routed_run_plan(self, current, handoff):
+        if not self._unstarted_routed_run(current, handoff):
+            return False
+        path = task_plan_path(self.project_root)
+        if path.is_symlink():
+            return False
+        if not path.exists():
+            # The adopted placeholder has nothing to archive. Create only the
+            # controller scaffold; the plan stage still owns actual tasks.
+            save_task_plan(self.project_root, {'tasks': []})
+        try:
+            return read_json(path, default=None) == {'tasks': []}
+        except (OSError, ValueError):
+            return False
+
+    def recover_missing_run_plan(self, session, state):
+        """Resume the exact child refused before its first provider turn."""
+        if (state.active_handoff_id or not state.workflow_id
+                or state.acceptance_execution and state.acceptance_execution.get('phase') not in {'blocked', 'completed'}):
+            return None
+        current = load_run_state(self.project_root)
+        if current.status != 'failed':
+            return None
+        expected_error = 'preflight validation failed:\n- missing task plan file: ' + str(task_plan_path(self.project_root))
+        latest = next((row for row in reversed(state.execution_log)
+                       if row.get('action') in {'child_returned', 'workflow_routed', 'run_route_deferred'}), None)
+        if not latest or latest.get('action') != 'child_returned' or latest.get('result') != expected_error[:500]:
+            return None
+        try:
+            handoff = self.store.load_handoff(str(latest.get('handoff_id', '')))
+            if (handoff.parent != WorkflowRef(state.mode, state.session_id)
+                    or handoff.workflow_id != state.workflow_id or handoff.status != 'failed'
+                    or handoff.goal != state.goal or not handoff.returned_at
+                    or handoff.result.get('summary') != expected_error
+                    or handoff.result.get('run_id') != current.run_id
+                    or not self._unstarted_routed_run(current, handoff)):
+                return None
+            # Later user input supersedes the retained route.
+            returned = next((index for index in range(len(state.conversation) - 1, -1, -1)
+                             if f'Child workflow run returned handoff_id={handoff.handoff_id} '
+                             in str(state.conversation[index].get('content', ''))), None)
+            if returned is None or any(row.get('role') == 'user' for row in state.conversation[returned + 1:]):
+                return None
+            spec = Path(str(current.resume_context.get('spec_file', '')))
+            if (not spec.is_file() or spec.is_symlink()
+                    or hashlib.sha256(spec.read_bytes()).hexdigest() != current.resume_context.get('iteration_spec_sha256')):
+                return None
+            if not self._initialize_routed_run_plan(current, handoff):
+                return None
+            from .validation import validation_report
+            if not validation_report(self.project_root)['ok']:
+                return None
+        except (OSError, ValueError, RuntimeError):
+            return None
+        from .repair_control import digest
+        snapshot = self.store.load(state.workflow_id)
+        # A deterministic continuation preserves the failed return and all
+        # attempt/acceptance budgets, including across interrupted recovery.
+        continuation = self.store.prepare_handoff(snapshot, parent=handoff.parent, target='resume',
+            goal=handoff.goal, reason='Resume the bound run after task-plan initialization',
+            payload={'resume_handoff_id': handoff.handoff_id},
+            handoff_id='hf-' + digest(['missing-run-plan', handoff.handoff_id])[:12])
+        state.active_handoff_id = continuation.handoff_id
+        state.status, state.resolution, state.return_phase = 'waiting_child', '', ''
+        state.execution_log.append({'action': 'run_plan_preflight_reconciled',
+            'handoff_id': continuation.handoff_id, 'result': current.run_id, 'timestamp': session._now()})
+        session._save(state)
+        return state
+
     def prepare_run_route(self, payload: Optional[Dict[str, object]] = None) -> tuple[bool, str]:
         """Clear a verified engine blocker before a run handoff is created."""
 
@@ -1787,6 +1871,9 @@ class WorkflowCoordinator:
             self.store.bind_child(snapshot, handoff, child)
         else:
             state = load_run_state(self.project_root)
+
+        if handoff.target == 'run':
+            self._initialize_routed_run_plan(state, handoff)
 
         if (
             handoff.child is not None

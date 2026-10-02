@@ -571,6 +571,9 @@ class Session:
                 # or capturing any baseline for a child workflow.
                 self._reconcile_interrupted_collab_checkpoints(state)
                 if self._coordinator is not None and state.status == 'executing':
+                    recovered = self._coordinator.recover_missing_run_plan(self, state)
+                    if recovered is not None:
+                        return recovered
                     recovered = self._coordinator.recover_unstarted_run_route(self, state)
                     if recovered is not None:
                         return recovered
