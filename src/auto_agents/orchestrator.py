@@ -3663,6 +3663,8 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            from .run_handoff_context import restore as restore_handoff_context
+            spec_file = restore_handoff_context(self.project_root, state, spec_file)
             authorization_policy = authorization_policy_for_state(
                 auto_approve=bool(auto_approve),
                 payload=(
@@ -4278,6 +4280,9 @@ class Orchestrator:
     @staticmethod
     def _is_iteration_run(state: RunState) -> bool:
         if any(task.status == "done" for task in state.tasks):
+            return True
+        handoff_id = state.resume_context.get('routed_iteration_handoff_id')
+        if handoff_id and handoff_id == state.resume_context.get('parent_handoff_id'):
             return True
         return bool(str(state.resume_context.get("previous_run_id", "")).strip())
 
@@ -5340,6 +5345,11 @@ class Orchestrator:
         *,
         auto_approve: bool = False,
     ) -> RunState:
+        if state.status == 'waiting_user':
+            # Explicit resume has re-entered execution. Actual input waits
+            # publish waiting_user through _prompt_clarify_user again.
+            state.status = 'pending'
+            save_run_state(self.project_root, state)
         history_path = conversation_history_path(self.project_root, state.run_id)
         history = []
         if history_path.exists():
@@ -5347,6 +5357,11 @@ class Orchestrator:
                 history = json.loads(read_text(history_path))
             except Exception:
                 pass
+
+        from .run_handoff_context import RESTORE, reconcile_history
+        context_restored = reconcile_history(state, spec_file, history)
+        if context_restored:
+            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
         post_rejection = False
         direct_generate_from_rejection = False
@@ -5378,10 +5393,14 @@ class Orchestrator:
         # but the brief was never generated (we wouldn't be here otherwise).
         # Instead of discarding the conversation, re-prompt the user.
         resume_to_confirm = False
-        if not post_rejection and history:
+        if not post_rejection and history and not context_restored:
             for msg in reversed(history):
                 if not isinstance(msg, dict):
                     continue
+                if msg.get(RESTORE):
+                    # A crash after saving restored context must not reuse
+                    # readiness emitted against the old incomplete request.
+                    break
                 role = str(msg.get("role", "")).lower()
                 if role in ("agent", "assistant"):
                     if "READY_TO_GENERATE" in str(msg.get("content", "")):
@@ -5476,6 +5495,10 @@ class Orchestrator:
                     "Your goal is to extract the target scope, requirements, constraints, and non-goals.",
                     "Ask the user questions to clarify the requirements if needed.",
                     "If the spec is already well-defined, ask for confirmation.",
+                    "For a Workflow Continuation spec, inherit the retained scope, steps, existing project identity, contract references and explicit constraints. "
+                    "The parent Goal records the overall outcome; it does not replace the child scope. "
+                    "Do not reopen already resolved choices or infer permission to redesign from historical contract text. "
+                    "When these inputs suffice, report readiness to generate the execution contract; ask only about unresolved decisions or concrete new conflicts.",
                     self._document_language_instruction(),
                     "Only output 'READY_TO_GENERATE' on a line by itself at the very end when ALL of the following are true: "
                     "(1) you have explicitly answered every question in the user's most recent message, "
@@ -38028,6 +38051,10 @@ class Orchestrator:
                 "parent_handoff_id",
                 "iteration_spec_sha256",
                 "iteration_spec_commit",
+                "iteration_spec_context_restore",
+                "routed_iteration_handoff_id",
+                "authorization_policy",
+                "goal_execution_environment",
                 _EXECUTION_RECOVERY_IDENTITY_MIGRATIONS_CONTEXT,
                 self.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
                 self.INSTALLED_ENGINE_RECOVERY_CONTEXT,

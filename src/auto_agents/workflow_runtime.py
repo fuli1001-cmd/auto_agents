@@ -1822,7 +1822,9 @@ class WorkflowCoordinator:
                 operation_id=f"spec-{handoff.handoff_id}",
                 details=dict(spec),
             )
+            from .run_handoff_context import existing_scope
             successor_context = {
+                **existing_scope(handoff, seed),
                 "spec_file": str(self.project_root / spec["path"]),
                 "workflow_id": snapshot.workflow_id,
                 "parent_handoff_id": handoff.handoff_id,

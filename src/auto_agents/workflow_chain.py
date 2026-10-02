@@ -818,8 +818,16 @@ class IterationSpecBuilder:
         if path.exists():
             existing = read_text(path)
             if sha256_text(existing) != digest:
-                raise RuntimeError(f"iteration spec already exists with different content: {relative}")
-        else:
+                legacy = self.render(handoff, seed, title=title, legacy=True)
+                if existing != legacy:
+                    raise RuntimeError(f"iteration spec already exists with different content: {relative}")
+                # Keep the old committed request as evidence. A renderer
+                # upgrade publishes an immutable successor, never rewrites it.
+                relative = relative.with_name(relative.stem + '-context-' + digest[:12] + '.md')
+                path = self.project_root / relative
+                if path.exists() and read_text(path) != content:
+                    raise RuntimeError(f"iteration spec already exists with different content: {relative}")
+        if not path.exists():
             write_text(path, content)
         commit_sha = commit_only_paths(
             self.project_root,
@@ -842,10 +850,15 @@ class IterationSpecBuilder:
         seed: Dict[str, object],
         *,
         title: str,
+        legacy: bool = False,
     ) -> str:
         goal = str(seed.get("goal") or handoff.goal).strip()
         gap = str(seed.get("gap") or seed.get("actual") or handoff.reason).strip()
         capability = str(seed.get("capability") or seed.get("requested_change") or goal).strip()
+        if not legacy:
+            goal = str(handoff.goal).strip()
+            if not (seed.get('capability') or seed.get('requested_change')):
+                capability = str(seed.get('goal') or seed.get('summary') or seed.get('user_summary') or handoff.reason or goal).strip()
         acceptance = _string_list(seed.get("acceptance"))
         non_goals = _string_list(seed.get("non_goals"))
         evidence = _string_list(seed.get("evidence"))
@@ -884,7 +897,8 @@ class IterationSpecBuilder:
             "",
             "## Acceptance Criteria",
             "",
-            *(_markdown_items(acceptance) or ["- Clarify and derive executable acceptance criteria before implementation."]),
+            *(_markdown_items(acceptance) or (["- Clarify and derive executable acceptance criteria before implementation."]
+                if legacy else ["- Derive executable checks for the retained scope and steps below; preserve the parent goal's acceptance criteria."])),
             "",
             "## Non-goals",
             "",
@@ -899,6 +913,25 @@ class IterationSpecBuilder:
             *(_markdown_items(open_decisions) or ["- None recorded; clarify any newly discovered product decisions before implementation."]),
             "",
         ]
+        if not legacy:
+            lines.extend([
+                '## Workflow Continuation', '',
+                'The Goal is the parent workflow outcome. Requested Capability and the retained steps define this child\'s scope. '
+                'Use the existing project identity when supplied; do not restart work already evidenced by the handoff. '
+                'Inspect the referenced contracts and earlier user decisions. Preserve explicit constraints; '
+                'a reference label is not permission to redesign, reset data, expand scope, or repeat paid requests. '
+                'Do not ask the user to choose again among paths already specified by the retained handoff. '
+                'Ask only about unresolved decisions or a concrete new conflict with explicit user instructions.', '',
+            ])
+            for heading, key in [('Execution Steps', 'steps'), ('Constraints', 'constraints'),
+                                 ('Approved Contract References', 'approved_contract_refs')]:
+                values = _string_list(seed.get(key))
+                if values:
+                    lines.extend(['## ' + heading, '', *_markdown_items(values), ''])
+            # Preserve every field, including extensions unknown to this
+            # renderer. These are retained facts, not fresh user approvals.
+            lines.extend(['## Retained Handoff Inputs', '', '```json',
+                json.dumps(seed, ensure_ascii=False, sort_keys=True, indent=2), '```', ''])
         return "\n".join(lines)
 
 
