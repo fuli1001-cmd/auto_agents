@@ -307,7 +307,10 @@ def user_design_assets(project_root: Path, trace_payload: object, *, spec_text: 
 
 def load_frontend_design_lock(project_root: Path) -> dict:
     payload = read_json(frontend_design_lock_path(project_root), default={})
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    from .frontend_contract_reuse import bind
+    return bind(project_root, payload)
 
 
 def frontend_design_contract_payload(lock_payload: Mapping[str, object]) -> Dict[str, object]:
@@ -360,6 +363,12 @@ def frontend_design_contract_requirement_ids(lock_payload: object) -> List[str]:
         for item in raw_ids:
             requirement_id = str(item).strip()
             if requirement_id and requirement_id not in requirement_ids:
+                requirement_ids.append(requirement_id)
+    # These IDs bind current implementation to approved visual bytes. They do
+    # not approve new designs or certify requirement/test completion.
+    for ids in getattr(lock_payload, 'implementation_bindings', {}).values():
+        for requirement_id in ids:
+            if requirement_id not in requirement_ids:
                 requirement_ids.append(requirement_id)
     return requirement_ids
 

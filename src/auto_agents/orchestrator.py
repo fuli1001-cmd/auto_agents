@@ -3665,6 +3665,9 @@ class Orchestrator:
             state = load_run_state(self.project_root)
             from .run_handoff_context import restore as restore_handoff_context
             spec_file = restore_handoff_context(self.project_root, state, spec_file)
+            from .frontend_contract_reuse import recover as recover_frontend_reuse
+            if recover_frontend_reuse(self.project_root, state):
+                sync_agent_instructions(self.project_root)
             authorization_policy = authorization_policy_for_state(
                 auto_approve=bool(auto_approve),
                 payload=(
@@ -4253,6 +4256,18 @@ class Orchestrator:
             ),
         )
         if report["ok"]:
+            if state.status == 'failed' and not state.active_blocker and not state.active_execution_incident_id:
+                stale_preflight = state.last_error.startswith('preflight validation failed:\n')
+                if not state.last_error and not state.tasks and state.resume_context.get('parent_handoff_id'):
+                    from .workflow_chain import WorkflowRef, WorkflowStore
+                    context = state.resume_context
+                    original = WorkflowStore(self.project_root).resolve_handoff_chain(
+                        context['parent_handoff_id'], workflow_id=context['workflow_id'])[-1]
+                    stale_preflight = (original.child == WorkflowRef('run', state.run_id)
+                        and str(original.result.get('summary', '')).startswith('preflight validation failed:\n'))
+                if stale_preflight:
+                    state.status, state.last_error = 'pending', ''
+                    save_run_state(self.project_root, state)
             return
 
         error_lines = [f"- {item}" for item in report["errors"]]
@@ -38055,6 +38070,7 @@ class Orchestrator:
                 "routed_iteration_handoff_id",
                 "authorization_policy",
                 "goal_execution_environment",
+                "frontend_contract_reuse_recovery",
                 _EXECUTION_RECOVERY_IDENTITY_MIGRATIONS_CONTEXT,
                 self.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
                 self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
@@ -41632,6 +41648,10 @@ class Orchestrator:
                 "For every frontend_surfaces entry associated with frontend_scope.requested=true, create active mandatory requirements that preserve the page-level visual contract from the prototype, including layout, copy, component hierarchy, and explicit forbidden old UI/style patterns. Use oracle_type='mixed' unless a stronger single oracle is clearly appropriate, and require deterministic DOM/CSS evidence plus screenshot/runtime visual evidence; optional judge_model evidence may supplement but must not be the only proof.",
                 "If frontend_scope.requested=true but no prototype/design artifact exists yet, omit frontend_surfaces or set it empty; the next workflow stage will create it. Still create active mandatory visual requirements for the requested surfaces, using acceptance language that requires conformance to the subsequently approved DESIGN.md and static prototype.",
                 "If the project has no frontend scope, set frontend_scope.requested=false and do not invent visual fidelity requirements.",
+                "Separate implementation against an existing approved prototype from changing that prototype. "
+                "For the former, set frontend_scope.design_action='reuse_approved' and reference the exact approved page and viewports in frontend_surfaces; "
+                "current behavioral and validation requirement IDs do not create a new visual approval. "
+                "For an explicit visual change, set design_action='redesign'; do not label changed pages or new design references as reuse.",
                 "If a requirement needs one external provider protocol or official API doc, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/. If it needs several provider docs, set provider_references to local paths under that directory and keep provider_reference empty or set to the primary path.",
                 "Use oracle_type to name the primary proof mechanism (for example deterministic_test, integration_test, runtime_evidence, judge_model, benchmark, human_review, or mixed). Use oracle_strength to record the minimum acceptable fidelity (proxy, behavioral, semantic, or human). Use evidence_boundary to say where proof must come from (internal_state, system_boundary, or external_side_effect). Record any checks that must NOT be treated as sufficient in forbidden_proxy_oracles.",
                 "For requirements that remove, forbid, or replace old behavior, add precise forbidden_patterns regexes for stale terms or old semantic claims so requirements audit can scan code, tests, and docs. Prefer narrow patterns that catch positive stale claims without matching the new negative requirement text. Never combine DOTALL with unbounded .* or .+ spans; use explicit bounded spans such as [\\s\\S]{0,500}? when cross-line context is required.",
