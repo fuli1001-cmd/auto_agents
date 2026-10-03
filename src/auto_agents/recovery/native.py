@@ -96,7 +96,7 @@ def _contract(store, stream, root, kind, native, state, phase, key):
     return contract
 
 
-def perform(owner, phase, key, function, classify, *, usage=None, model=False, bind=False, completion=False):
+def perform(owner, phase, key, function, classify, *, usage=None, model=False, bind=False, completion=False, read_only=False):
     selected = context(owner, usage)
     if selected is None: return function()
     store, stream, root, kind, native, state = selected
@@ -222,7 +222,7 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
                     extra['recovery_diagnosis'] = parse_diagnosis(store.load(stream), command, text)
                 except KernelError as error:
                     verdict, reason = OutcomeKind.PROTOCOL_INVALID, str(error)
-        if model and phase in {'review', 'diagnose'} and _source(owner, state) != source:
+        if model and (phase in {'review', 'diagnose'} or read_only) and _source(owner, state) != source:
             verdict, reason = OutcomeKind.OWNERSHIP_CONFLICT, 'Read-only review changed candidate inputs'
         parent = store.load(stream)['tasks'][contract.parent_task]
         predicate = parent['contract']['completion'] if not model and (phase == 'deliver' or completion) else 'phase_completed'
@@ -279,7 +279,7 @@ def provider(orchestrator, request, execute):
     selected = context(orchestrator, request.usage_context)
     if selected is None: return execute(request)
     store, stream, root, kind, native, state = selected
-    phase = ('review' if 'review' in request.purpose else 'acceptance' if 'acceptance' in request.purpose
+    phase = ('acceptance' if 'acceptance' in request.purpose else 'review' if 'review' in request.purpose
              else 'implement' if request.purpose in {'fix', 'implement'}
              else 'route' if request.purpose == 'collab' else 'research' if kind == 'provider_resolve' else 'plan')
     attachment_refs = []
@@ -361,7 +361,8 @@ def provider(orchestrator, request, execute):
                         usage_context={**request.usage_context,'kernel_owned':'1'})
         return execute(bound)
     result = perform(orchestrator, phase, key, bound_call,
-        lambda r: provider_outcome(orchestrator,r), usage=request.usage_context, model=True, bind=True)
+        lambda r: provider_outcome(orchestrator,r), usage=request.usage_context, model=True, bind=True,
+        read_only=request.sandbox_mode == 'read-only')
     if isinstance(result, dict):
         from ..models import AgentResult, AgentUsage, AgentTermination
         result = {**result, 'output_path': request.output_path,

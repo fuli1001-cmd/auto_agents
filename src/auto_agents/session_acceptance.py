@@ -217,6 +217,12 @@ def drive(session, state):
                 'Runtime data and evidence may be written. Respect the original authorization, spending limits and real/simulated environment. No fake media or proxy-only evidence.',
                 *operation_policy_lines(),
                 'Inspect any existing execution ledger, project IDs and runtime evidence before making provider calls; reuse prior results. Never repeat an externally charged operation whose outcome is unknown.',
+                'For an existing project, inspect its actual UI and persisted recovery eligibility before declaring recovery capability absent. '
+                'Distinguish a missing feature from a hidden/ineligible action, an unreachable old workbench, a stale service or code-version mismatch. '
+                'Record the reachable route, rendered controls, eligibility/blocking reason and service code revision. '
+                'Earlier specs, completed-task claims and approved prototype HTML alone do not establish which behavior this running version implements.',
+                'Any retained development draft is unverified work. Do not import, execute or treat it as delivered solely because it exists in the runtime source repository. '
+                'Diagnose whether an existing delivered implementation already satisfies the goal before recommending a code change.',
                 'This execution was interrupted; reconcile prior outcomes before any new external operation.' if interrupted else '',
                 'On a defect or missing prerequisite, return blocked with evidence; do not start implementation or broaden the goal.',
                 'For a decision only the user can make, return needs_user with decision_class (goal_choice, credential, rights_attestation, unbudgeted_external_cost, destructive_change, irreversible_product_decision, or external_observation) and a short plain-language question and recommendation, without internal IDs, paths or implementation jargon.',

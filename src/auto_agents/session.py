@@ -2051,6 +2051,15 @@ class Session:
         reason: str,
         payload: Dict[str, object],
     ) -> SessionState:
+        from .collab_goal_scope import route_error
+        scope_error = route_error(self, state, target, payload)
+        if scope_error:
+            state.conversation.append({'role': 'orchestrator', 'content': scope_error})
+            state.execution_log.append({'action': 'collab_acceptance_scope_deferred',
+                'result': scope_error, 'target': target, 'timestamp': self._now()})
+            state.status, state.return_phase = 'executing', ''
+            self._save(state)
+            return state
         from .workflow_chain import WorkflowRef, WorkflowStore
         from .execution_binding import repository_binding_error
 
@@ -3945,6 +3954,7 @@ class Session:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         consolidated = self._consolidate_goal(state)
+        from .collab_goal_scope import acceptance_only, INSTRUCTION
         lines = [
             f"Project root: {self.project_root}",
             f"Project brief: {brief}",
@@ -3955,6 +3965,7 @@ class Session:
             "",
             *self._goal_environment_prompt_lines(state),
             *runtime_prompt_lines(self),
+            *([INSTRUCTION] if acceptance_only(state.goal) else []),
             "",
             "--- Conversation History ---",
         ]

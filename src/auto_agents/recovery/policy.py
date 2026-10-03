@@ -219,6 +219,11 @@ def session_stop(session, state):
     session._recovery_policy_active = True
     from .native import _source
     phase = 'implement' if state.mode == 'fix' else 'route' if state.mode == 'collab' else 'research'
+    if (state.mode == 'collab' and not state.active_handoff_id
+            and state.acceptance_execution.get('phase') in {'pending', 'executing', 'reviewing', 'waiting_user'}):
+        # Acceptance consumes the same user budget and unknown-effect fences,
+        # but is not another diagnostic route or code-candidate review.
+        phase = 'acceptance'
     selected = decision(snapshot, task_id, phase, _source(session, state))
     if selected['allowed'] or selected['action'] == 'diagnose': return ''
     state.resolution = 'kernel_no_progress'

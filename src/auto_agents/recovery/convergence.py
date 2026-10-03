@@ -114,7 +114,7 @@ def consume(state, command):
     elif command.phase == 'diagnose': item['diagnoses'] += 1
     elif command.phase == 'review':
         key = expected.get('review_key', item['latest']); item['reviews'][key] = item['reviews'].get(key, 0) + 1
-    else:
+    elif 'frontier' in expected:
         key = expected['frontier']; item['routes'][key] = item['routes'].get(key, 0) + 1
     item['revision'] += 1
 
