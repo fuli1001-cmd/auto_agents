@@ -31,7 +31,8 @@ def capture(state):
         relevant = acceptance if evidence['resolution'].startswith('acceptance_') else {}
         result, review = relevant.get('result') or {}, relevant.get('review') or {}
         recent = list(getattr(state, 'execution_log', []) or [])[-5:]
-        recent_reason = next((str(item['result']) for item in reversed(recent)
+        recent_reason = next(((item['result'].get('summary') or str(item['result']))
+                              if isinstance(item['result'], dict) else str(item['result']) for item in reversed(recent)
                               if item.get('result') and item.get('action') != 'session_stopped'), '')
         evidence.update(
             mode=state.mode, workflow_id=getattr(state, 'workflow_id', ''),

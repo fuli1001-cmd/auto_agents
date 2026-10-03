@@ -221,6 +221,8 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
                 else:
                     verdict, reason = OutcomeKind.OWNERSHIP_CONFLICT, 'Correction crossed a protected boundary: ' + ', '.join(outside)
         extra = {}
+        if not model and phase == 'acceptance' and isinstance(plain, dict) and plain.get('blocker_observation'):
+            extra.update(acceptance_observation=plain['blocker_observation'], observation_ref=reference)
         if predecessor:
             extra.update(quota_predecessor=predecessor, provider=(usage or {})['kernel_provider'])
         if scope_paths: extra['scope_amendment_required'] = scope_paths
@@ -420,7 +422,31 @@ def delivery(owner, state, execute):
 
 
 def acceptance(owner, state):
-    from ..session_acceptance import completed
+    from ..session_acceptance import completed, _directory, _evidence
+    saved = state.acceptance_execution
+    if (state.mode == 'collab' and saved.get('phase') == 'blocked'
+            and saved.get('result', {}).get('status') == 'blocked'):
+        usage = {'workflow_kind': state.mode, 'subject_id': state.session_id}
+        selected = context(owner, usage)
+        if selected is None: return
+        store, stream, root, kind, native, _ = selected
+        from .policy import automatic
+        automatic(store, stream)
+        owner._recovery_policy_active = 'recovery' in store.load(stream)
+        directory = _directory(owner, state)
+        try:
+            checksums = _evidence(directory, saved['result'])
+        except (ValueError, OSError):
+            return
+        source = _source(owner, state)
+        anchor = {'domain': kind + ':' + native, 'source': source, 'goal': digest(state.goal),
+            'authorization': digest(state.authorization_policy), 'environment': digest(state.goal_execution_environment)}
+        observed = {**anchor, 'identity': digest(anchor), 'evidence': {
+            name: {'sha256': checksum, 'blob': store.put_file(directory / name)} for name, checksum in checksums.items()}}
+        perform(owner, 'acceptance', 'blocked:' + observed['identity'],
+            lambda: {'blocker_observation': observed, 'result': saved['result']},
+            lambda result: (OutcomeKind.ENVIRONMENT_BLOCKED, saved['result']['summary']), usage=usage)
+        return
     if state.status != 'completed' or not state.acceptance_execution: return
     perform(owner,'acceptance',state.acceptance_execution['identity'],
         lambda: {'ok':completed(owner,state),'acceptance':state.acceptance_execution},

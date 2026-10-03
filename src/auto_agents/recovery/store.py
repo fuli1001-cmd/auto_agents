@@ -182,6 +182,20 @@ CREATE TABLE IF NOT EXISTS kernel_runtime_adoptions(
         if data.get('proof'): proofs.append(data['proof'])
         for proof in proofs: self.verify_blob(proof['blob'])
         details = data.get('outcome', {}).get('details', {})
+        if details.get('acceptance_observation'):
+            observed = details['acceptance_observation']
+            result = self.read(details['observation_ref'])
+            row = self.load(stream)['commands'][data['command_id']]
+            require(result.get('blocker_observation') == observed and row['phase'] == 'acceptance'
+                    and not row['model_call'] and observed['source'] == row['source']
+                    and observed['domain'] == self.load(stream)['tasks'][row['task_id']]['contract'].get('parent_task')
+                    and data['outcome']['kind'] == 'environment_blocked' and bool(observed.get('evidence'))
+                    and observed['identity'] == digest({k: observed[k] for k in
+                        ('domain', 'source', 'goal', 'authorization', 'environment')}),
+                    'acceptance_observation', 'Blocker observation must be sealed against its original task')
+            for artifact in observed['evidence'].values():
+                require(hashlib.sha256(self.read_bytes(artifact['blob'])).hexdigest() == artifact['sha256'],
+                        'acceptance_observation', 'Blocker artifact does not match its sealed checksum')
         if details.get('verification_observation') is not None:
             from .observations import compact, compact_for_storage
             value = self.read(details['observation_ref'])

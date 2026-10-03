@@ -35,7 +35,7 @@ def runtime_prompt_lines(session):
 def resumable_blocker(state):
     return (state.mode == 'collab' and state.status == 'blocked'
             and state.resolution in {'acceptance_blocked', 'acceptance_review_rejected',
-                                     'acceptance_evidence_invalid', 'acceptance_input_changed'}
+                                     'acceptance_evidence_invalid', 'acceptance_input_changed', 'kernel_no_progress'}
             and state.acceptance_execution.get('phase') == 'blocked'
             and not state.active_handoff_id)
 
@@ -58,6 +58,15 @@ def begin_recovery(session, state, *, automatic=False):
                 return True
         return False
     saved = state.acceptance_execution
+    if saved.get('result', {}).get('status') == 'blocked':
+        from .recovery.native import acceptance
+        from .session_candidate import execution_checkout
+        from contextlib import nullcontext
+        try:
+            with execution_checkout(session, state) if state.candidate_custody else nullcontext():
+                acceptance(session, state)
+        except (ValueError, OSError):
+            return False
     if automatic and (saved.get('recovery_started')
                       or session._should_stop(state, 'acceptance recovery')):
         return False
@@ -262,8 +271,7 @@ def drive(session, state):
                 return drive(session, state)
             saved['result'] = result
             saved['phase'] = 'reviewing' if result['status'] == 'passed' else 'blocked'
-            if result['status'] == 'passed':
-                saved['evidence'] = _evidence(directory, result)
+            saved['evidence'] = _evidence(directory, result)
             session._save(state)
         if saved['result']['status'] == 'blocked':
             state.status, state.resolution = 'blocked', 'acceptance_blocked'

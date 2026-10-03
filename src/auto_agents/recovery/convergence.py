@@ -92,6 +92,17 @@ def decision(state, task_id, phase, source):
         # Read-only route/plan calls have a bounded allowance for the current
         # causal frontier. A changed prompt alone cannot renew it.
         frontier = digest([source, state['recovery']['frontier'], phase])
+        if kind == 'collab' and phase == 'route':
+            # A sealed browser failure is new information for diagnosis, not
+            # a passed verification or permission to reset the writer budget.
+            observations = [(c['sequence'], (c.get('outcome') or {}).get('details', {}).get('acceptance_observation'))
+                for c in state['commands'].values() if c['status'] == 'finished'
+                and c['phase'] == 'acceptance' and not c['model_call'] and c['source'] == source
+                and (c.get('outcome') or {}).get('kind') == 'environment_blocked']
+            for _, observed in sorted(observations, key=lambda pair: pair[0], reverse=True):
+                if observed and observed['domain'] == owner(state, task_id) and observed['source'] == source:
+                    frontier = digest([frontier, observed['identity']])
+                    break
         return {**base, 'frontier': frontier, 'allowed': item['routes'].get(frontier, 0) < 2,
                 'reason': 'bounded_route'}
     return base
