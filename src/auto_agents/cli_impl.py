@@ -2061,6 +2061,25 @@ def _triage_controlled_workflow_result(project_root, orchestrator, state, args,
     else:
         invocation.update(session_id='', run_id=state.run_id)
     orchestrator._invocation_context = invocation
+    from .recovery.rejections import quota_blocker
+    quota = quota_blocker(project_root, failure)
+    if quota:
+        from .self_repair import SelfRepairJudgment
+        triage = SelfRepairTriageResult(
+            SelfRepairDecision(False, category='provider_quota', reason=quota['reason'],
+                fingerprint=failure.fingerprint, requires_candidate_proof=False),
+            source='provider_receipt', reason=quota['reason'],
+            judgment=SelfRepairJudgment('NO_SELF_REPAIR', 'external_provider', False, False,
+                1.0, 'provider_quota', quota['reason'], [quota['result_ref']]))
+        path, _ = record(project_root, failure, triage)
+        reporter = getattr(orchestrator, 'reporter', None)
+        if reporter is not None:
+            reporter.text(('模型服务用量已耗尽，本次调用在执行前被拒绝。额度恢复后可继续同一 session。'
+                           if reporter.language == 'zh' else
+                           'Provider quota is exhausted; execution did not start. Resume this session after quota is available.'))
+            reporter.text(quota['reason'])
+            reporter.register(path, {'kind': 'terminal_triage'})
+        return None
     if health_runtime is not None:
         health_runtime.set_phase('triage')
     try:

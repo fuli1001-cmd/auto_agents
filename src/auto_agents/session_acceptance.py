@@ -13,6 +13,7 @@ from .git_ops import head_ref
 from .prompting.core import ContextBlock, compose_prompt
 from .repair_v2.store import digest
 from .session_operation_policy import operation_policy_lines
+from .recovery.model import KernelError
 
 
 def runtime_context(session):
@@ -42,6 +43,19 @@ def resumable_blocker(state):
 def begin_recovery(session, state, *, automatic=False):
     """Return to diagnosis once per blocked acceptance, retaining evidence/budget."""
     if not resumable_blocker(state):
+        if (not automatic and state.mode == 'collab' and state.status == 'blocked'
+                and state.resolution == 'kernel_environment_blocked' and not state.active_handoff_id
+                and state.acceptance_execution.get('phase') in {'executing', 'reviewing'}):
+            from .controlled_failure import capture
+            from .recovery.rejections import quota_blocker
+            root = getattr(session, '_custody_control_root', None) or session.project_root
+            if quota_blocker(root, capture(state)):
+                state.status, state.resolution, state.resume_phase = 'executing', '', ''
+                state.execution_log.append({'action': 'acceptance_provider_resume',
+                    'result': 'Explicitly resume the acceptance call rejected by provider quota; retain all budgets',
+                    'timestamp': session._now()})
+                session._save(state)
+                return True
         return False
     saved = state.acceptance_execution
     if automatic and (saved.get('recovery_started')
@@ -282,6 +296,11 @@ def drive(session, state):
                                     'review': saved.get('review'), 'directory': str(directory), 'timestamp': session._now()})
         state.conversation.append({'role': 'agent', 'content': 'Acceptance result: ' + json.dumps(
             {'result': saved['result'], 'review': saved.get('review')}, ensure_ascii=False)})
+    except KernelError as error:
+        # Preserve execution/review phase for explicit resume. A transport or
+        # quota blocker cannot send acceptance back to diagnostic routing.
+        error.diagnostic = {'failure_kind': error.code, **error.details, 'retry_fix': False}
+        return session._block_execution_binding(state, error, 'kernel_' + error.code)
     except (ValueError, TypeError, KeyError, OSError) as error:
         saved['error'] = str(error)
         saved['phase'] = 'blocked'

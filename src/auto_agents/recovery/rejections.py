@@ -10,7 +10,7 @@ from dataclasses import asdict, is_dataclass
 from .model import Event, Outcome, OutcomeKind, require
 
 
-def request_rejection(result):
+def _pre_execution_objects(result):
     value = result if isinstance(result, dict) else {key: getattr(result, key, None) for key in
         ('ok', 'cleanup_incomplete', 'stdout', 'summary', 'stderr', 'termination', 'usage')}
     if value.get('ok') or value.get('cleanup_incomplete') or value.get('stdout') or value.get('summary'):
@@ -42,7 +42,11 @@ def request_rejection(result):
         if isinstance(nested, str):
             try: objects.append(json.loads(nested))
             except ValueError: pass
-    for item in objects:
+    return objects
+
+
+def request_rejection(result):
+    for item in _pre_execution_objects(result) or []:
         if not isinstance(item, dict): continue
         error = item.get('error') or {}
         if (item.get('status') == 400 and isinstance(error, dict)
@@ -51,6 +55,51 @@ def request_rejection(result):
             return {'status': 400, 'code': error['code'], 'parameter': error['param'],
                     'message': str(error.get('message', 'Invalid output schema'))[:2000]}
     return None
+
+
+def quota_rejection(result):
+    """Accept only a complete Codex turn rejected before any agent activity."""
+    value = result if isinstance(result, dict) else asdict(result)
+    attempts, metadata = value.get('usage_attempts') or [], value.get('prompt_metadata') or {}
+    if not isinstance(attempts, list) or not isinstance(metadata, dict) or len(attempts) > 1 or metadata.get('resumed'):
+        return None
+    objects = _pre_execution_objects(value) or []
+    if (not all(isinstance(item, dict) for item in objects)
+            or [item.get('type') for item in objects] != ['thread.started', 'turn.started', 'error', 'turn.failed']):
+        return None
+    message = objects[2].get('message')
+    error = objects[3].get('error')
+    if (not isinstance(message, str) or not isinstance(error, dict) or error.get('message') != message
+            or not re.match(r"^You[’']ve hit your usage limit\.", message)):
+        return None
+    return {'code': 'usage_limit', 'message': message[:2000]}
+
+
+def quota_reason(rejection):
+    return 'Provider quota exhausted before execution: ' + rejection['message']
+
+
+def quota_blocker(project, failure):
+    """Attribute the latest failed operation using its sealed provider receipt."""
+    from .authority import installed
+    store = installed(project)
+    if store is None: return None
+    evidence = failure.evidence
+    stream = store.binding(project, evidence['kind'] + ':' + evidence['subject_id'])
+    if not stream: return None
+    commands = store.load(stream)['commands'].values()
+    command = max(commands, key=lambda row: row['sequence'], default={})
+    outcome = command.get('outcome') or {}
+    details = outcome.get('details') or {}
+    if (command.get('status') != 'finished' or not command.get('model_call')
+            or outcome.get('kind') != 'environment_blocked' or details.get('subject') != evidence['subject_id']
+            or not details.get('provider_quota') or not details.get('native_result')
+            or details.get('post_source') != command.get('source')):
+        return None
+    rejection = quota_rejection(store.read(details['native_result']))
+    if rejection != details['provider_quota']: return None
+    return {'reason': quota_reason(rejection), 'result_ref': details['native_result'],
+            'command_id': command['command_id']}
 
 
 def note(store, stream, command_id):
@@ -77,10 +126,17 @@ def reconcile(store, stream, *, record=True):
         if (command['status'] != 'unknown' or not command['model_call'] or not reference
                 or details.get('post_source') != command['source']):
             continue
-        rejection = request_rejection(store.read(reference))
-        if not rejection: continue
-        result = Outcome(OutcomeKind.PROTOCOL_INVALID, 'Provider rejected the request before model execution',
-                         details={**details, 'request_rejection': rejection})
+        native = store.read(reference)
+        rejection = request_rejection(native)
+        quota = quota_rejection(native)
+        if rejection:
+            result = Outcome(OutcomeKind.PROTOCOL_INVALID, 'Provider rejected the request before model execution',
+                             details={**details, 'request_rejection': rejection})
+        elif quota:
+            result = Outcome(OutcomeKind.ENVIRONMENT_BLOCKED, quota_reason(quota),
+                             details={**details, 'provider_quota': quota})
+        else:
+            continue
         executor = Executor(store, {command['phase']: FunctionExecutor(
             lambda c: None, lambda c, result=result: result)})
         executor.reconcile(stream, command['command_id'])

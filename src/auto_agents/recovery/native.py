@@ -213,6 +213,11 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
             rejection = request_rejection(plain)
             if rejection and _source(owner, state) == source: extra['request_rejection'] = rejection
             elif rejection: verdict, reason = OutcomeKind.OUTCOME_UNKNOWN, 'Source changed after a rejected request'
+        if model and verdict == OutcomeKind.ENVIRONMENT_BLOCKED:
+            from .rejections import quota_rejection
+            quota = quota_rejection(plain)
+            if quota and _source(owner, state) == source: extra['provider_quota'] = quota
+            elif quota: verdict, reason = OutcomeKind.OUTCOME_UNKNOWN, 'Source changed after a quota rejection'
         if owner._recovery_policy_active:
             from .policy import result_details, parse_diagnosis
             if phase in {'verify', 'review'}: extra.update(result_details(store, stream, command, plain))
@@ -244,9 +249,12 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
 
 
 def provider_outcome(orchestrator, result):
-    from .rejections import request_rejection
+    from .rejections import request_rejection, quota_rejection, quota_reason
     if request_rejection(result):
         return OutcomeKind.PROTOCOL_INVALID, 'Provider rejected the request schema before model execution'
+    quota = quota_rejection(result)
+    if quota:
+        return OutcomeKind.ENVIRONMENT_BLOCKED, quota_reason(quota)
     reason = getattr(result.termination,'reason','') if result.termination is not None else ''
     uncertain = result.cleanup_incomplete or (not result.ok and
         (reason and reason not in {'execution_budget_exhausted','verification_environment_blocked'} or
