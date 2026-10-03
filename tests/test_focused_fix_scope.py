@@ -1,18 +1,121 @@
 """A repair's requirement association must not adopt unfinished product work."""
 from copy import deepcopy
 import json
+from unittest.mock import patch
 
 import pytest
 
 from auto_agents.config import load_project_config, load_task_plan, save_session_state, load_session_state
 from auto_agents.models import VerificationStep
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.repair_control import digest
 from auto_agents.session import Session
 from auto_agents.session_verification import _task_scope, bind_session, session_gates, SessionOwnershipError
-from auto_agents.workflow_chain import IssueBriefBuilder
+from auto_agents.workflow_chain import IssueBriefBuilder, WorkflowRef
+from auto_agents.workflow_runtime import WorkflowCoordinator
 from test_engine_child_recovery import parent_workflow
 from test_multilayer_engine_recovery import replay
 from test_session_verification_ownership import project, _retain_contract
+
+
+def seeded_focused_child(tmp_path, command='python -m pytest -q tests/test_owned.py::test_owned'):
+    root, _ = project(tmp_path)
+    coordinator = WorkflowCoordinator(Orchestrator(root), auto_approve=True)
+    snapshot = coordinator.store.create_root(WorkflowRef('collab', 'parent'))
+    handoff = coordinator.store.prepare_handoff(
+        snapshot, parent=snapshot.root, target='fix', goal='Repair owned issue',
+        reason='focused repair', payload={'issue_seed': {
+            'summary': 'repair owned issue', 'verification_scope': {'mode': 'focused_fix'},
+            'verification_command': command}})
+    session = Session(coordinator.orch, mode='fix', auto_approve=True, coordinator=coordinator)
+    with patch.object(coordinator, '_drive_session', side_effect=lambda _session, state, *_args, **_kw: state):
+        state = coordinator.start_seeded_session(session, snapshot=snapshot, handoff=handoff)
+    return root, coordinator, snapshot, handoff, state
+
+
+def test_seeded_focused_command_is_bound_before_first_preflight(tmp_path):
+    root, _, _, handoff, state = seeded_focused_child(tmp_path)
+    command = handoff.payload['issue_seed']['verification_command']
+    assert state.fix_verify_command == command
+    assert load_session_state(root, state.session_id).fix_verify_command == command
+    assert _task_scope(Session(Orchestrator(root), mode='fix'), state)['mode'] == 'focused_fix'
+    assert state.current_attempt == 0 and not state.candidate_custody
+
+
+@pytest.mark.parametrize('change', ['valid', 'missing', 'conflicting', 'candidate'])
+def test_seeded_focused_retained_command_recovery_requires_original_authority(tmp_path, change):
+    root, coordinator, snapshot, handoff, state = seeded_focused_child(tmp_path)
+    command = state.fix_verify_command
+    state.fix_verify_command = ''
+    state.status, state.resolution = 'blocked', 'verification_ownership'
+    state.execution_log.append({'action': 'execution_preflight_blocked',
+        'failure_kind': 'verification_ownership', 'result': 'missing command', 'retry_fix': False})
+    if change == 'missing':
+        handoff.payload['issue_seed']['verification_command'] = ''
+        coordinator.store.save_handoff(handoff)
+        issue = root / '.auto-agents/state/sessions' / state.session_id / 'issue.json'
+        data = json.loads(issue.read_text())
+        data['verification_command'] = ''
+        issue.write_text(json.dumps(data))
+    elif change == 'conflicting':
+        handoff.payload['issue_seed']['verification_command'] = 'python -m pytest -q tests/test_other.py'
+        coordinator.store.save_handoff(handoff)
+    elif change == 'candidate':
+        state.candidate_paths = {'app.py': 'modified'}
+    save_session_state(root, state)
+    session = Session(coordinator.orch, mode='fix', auto_approve=True, coordinator=coordinator)
+    with patch.object(coordinator, '_drive_session', side_effect=lambda _session, saved, *_args, **_kw: saved):
+        resumed = coordinator.start_seeded_session(session, snapshot=snapshot, handoff=handoff)
+    if change == 'valid':
+        assert resumed.fix_verify_command == command
+        assert _task_scope(session, resumed)['mode'] == 'focused_fix'
+    else:
+        assert not resumed.fix_verify_command
+        assert resumed.current_attempt == 0
+        if change != 'missing':
+            assert resumed.resolution == 'verification_ownership'
+
+
+@pytest.mark.parametrize('change', ['same', 'conflicting', 'task'])
+def test_seeded_focused_never_replaces_existing_command_or_adopts_task(tmp_path, change):
+    root, coordinator, snapshot, handoff, state = seeded_focused_child(tmp_path)
+    original = state.fix_verify_command
+    if change == 'conflicting':
+        handoff.payload['issue_seed']['verification_command'] = 'python -m pytest -q tests/test_other.py'
+    elif change == 'task':
+        handoff.payload['task_id'] = 'unrelated'
+    coordinator.store.save_handoff(handoff)
+    session = Session(coordinator.orch, mode='fix', auto_approve=True, coordinator=coordinator)
+    with patch.object(coordinator, '_drive_session', side_effect=lambda _session, saved, *_args, **_kw: saved):
+        resumed = coordinator.start_seeded_session(session, snapshot=snapshot, handoff=handoff)
+    assert resumed.fix_verify_command == original
+    assert load_session_state(root, state.session_id).fix_verify_command == original
+    if change == 'same':
+        assert resumed.resolution != 'verification_ownership'
+    else:
+        assert resumed.resolution == 'verification_ownership'
+
+
+def test_engine_preflight_recheck_restores_seeded_focused_command(tmp_path):
+    root, coordinator, snapshot, handoff, state = seeded_focused_child(tmp_path)
+    command = state.fix_verify_command
+    state.fix_verify_command = ''
+    state.status, state.resolution = 'blocked', 'verification_ownership'
+    state.execution_log.append({'action': 'execution_preflight_blocked',
+        'failure_kind': 'verification_ownership', 'result': 'missing command', 'retry_fix': False})
+    save_session_state(root, state)
+    route = {'failed_handoff_id': handoff.handoff_id,
+             'original_handoff_id': handoff.handoff_id}
+    coordinator.orch._verified_engine_routes = {digest(route): {'receipt_digest': 'verified-repair'}}
+    observed = []
+    with patch('auto_agents.session_verification.bind_session',
+               side_effect=lambda _session, saved: observed.append(saved.fix_verify_command)), \
+         patch.object(coordinator, '_drive_session', side_effect=lambda _session, saved, *_args, **_kw: saved):
+        coordinator._resume_engine_bound_child(route, snapshot)
+    saved = load_session_state(root, state.session_id)
+    assert observed == [command]
+    assert saved.fix_verify_command == command
+    assert any(entry.get('action') == 'engine_preflight_recheck' for entry in saved.execution_log)
 
 
 def focused_scene(tmp_path, legacy=False):

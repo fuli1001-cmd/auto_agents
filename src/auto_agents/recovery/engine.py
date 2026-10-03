@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import threading
+from uuid import uuid4
 
 from .executor import Executor, FunctionExecutor
 from .model import Command, Contract, Event, Evidence, KernelError, Outcome, OutcomeKind, digest, require
@@ -45,9 +46,17 @@ class EngineRunner:
                 current = state['commands'][command_id]
                 if self.progress is not None:
                     self.progress.command(current, task)
-                executor = Executor(self.store, {current['phase']:FunctionExecutor(self.effects.execute)})
+                executor = Executor(self.store, {current['phase']:FunctionExecutor(
+                    self.effects.execute, getattr(self.effects, 'reconcile', None))},
+                    owner='native:' + str(os.getpid()) + ':' + uuid4().hex)
                 if current['status'] == 'reserved': executor.execute(self.stream, command_id)
-                else: executor.reconcile(self.stream, command_id)
+                else:
+                    outcome = executor.reconcile(self.stream, command_id)
+                    if resume and outcome.details.get('verification_interrupted'):
+                        evidence = self.store.put({'interrupted_command': command_id,
+                            'source': current['source'], 'request': 'explicit_resume'})
+                        self.emit('task_resumed', {'task_id': self.contract.task_id, 'evidence_ref': evidence},
+                                  command_id + ':resume-interrupted-verification')
                 task = self.store.load(self.stream)['tasks'][self.contract.task_id]
                 if task['active_command']: return task
                 continue
@@ -141,6 +150,28 @@ class IsolatedEngineEffects:
     def source(self):
         from ..repair_v2.workspace import source_identity
         return source_identity(self.candidate)
+
+    def reconcile(self, command):
+        """A dead local verifier permits a fresh check, never a passed proof."""
+        from ..artifact_store import alive
+        from ..repair_v2.runtime_artifact import verify
+        from ..repair_v2.workspace import source_identity
+        row = self.store.load(self.stream)['commands'][command.command_id]
+        identity = row.get('dispatch_identity') or {}
+        if (command.phase != 'verify' or command.model_call or self.contract.kind != 'engine_repair'
+                or not identity.get('pid') or identity.get('boot') in {None, '', 'unknown'}
+                or identity.get('ticks') in {None, '', 'unknown'} or alive(identity)):
+            return None
+        implementation = self._previous('implement')
+        if not implementation or not implementation.get('artifact'): return None
+        artifact = implementation['artifact']
+        verify(artifact)
+        if artifact['source'] != command.source or source_identity(Path(artifact['path'])) != command.source or self.source() != command.source:
+            return None
+        outcome = self.observed(command, {'ok': False, 'verification_interrupted': True,
+            'identity': identity, 'candidate': artifact, 'progress_credit': False},
+            OutcomeKind.ENVIRONMENT_BLOCKED, 'Isolated verification owner exited without a final result; retained candidate needs rechecking')
+        return replace(outcome, details={**outcome.details, 'verification_interrupted': True})
 
     def observed(self, command, result, kind=OutcomeKind.SUCCESS, reason='Phase completed'):
         if command.phase == 'verify' and 'recovery' in self.store.load(self.stream):

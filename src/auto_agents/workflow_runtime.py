@@ -78,6 +78,56 @@ class WorkflowCoordinator:
         session._fresh_session_id = state.session_id
         return state
 
+    def _bind_focused_seed_command(self, state, handoff, *, recovering=False):
+        """Bind only the command recorded by this child's original focused handoff."""
+        from .session_verification import ownership_error, preimplementation_failure
+
+        seed = handoff.payload.get('issue_seed', {})
+        if not isinstance(seed, dict) or not isinstance(seed.get('verification_scope'), dict) or seed['verification_scope'].get('mode') != 'focused_fix':
+            return
+        if (state.mode != 'fix' or state.workflow_id != handoff.workflow_id
+                or state.parent_handoff_id != handoff.handoff_id
+                or handoff.child != WorkflowRef('fix', state.session_id)
+                or handoff.payload.get('child_session_id') != state.session_id
+                or state.source_descriptor != dict(handoff.payload.get('source_descriptor', {}))):
+            raise ownership_error(state, 'focused fix child identity conflicts with seeded handoff')
+        try:
+            issue = read_json(self.project_root / '.auto-agents/state/sessions'
+                              / state.session_id / 'issue.json', default={})
+        except (OSError, ValueError, TypeError) as error:
+            raise ownership_error(state, 'focused fix issue is unreadable') from error
+        command = seed.get('verification_command', '')
+        if not isinstance(command, str):
+            raise ownership_error(state, 'focused fix handoff command is malformed')
+        routed_command = handoff.payload.get('verification_command')
+        if routed_command is not None and routed_command != command:
+            raise ownership_error(state, 'focused fix handoff declares conflicting verification commands')
+        if any(handoff.payload.get(key) for key in ('task_id', 'task_ids', 'requirement_ids')) or any(
+                source.get('task_id') or source.get('task_ids') for source in (seed, issue if isinstance(issue, dict) else {})):
+            raise ownership_error(state, 'focused fix conflicts with explicit task adoption')
+        if issue and (not isinstance(issue, dict) or issue.get('source_handoff_id') != handoff.handoff_id
+                or issue.get('issue_id') != f'issue-{state.session_id}'
+                or issue.get('verification_scope') != seed.get('verification_scope')
+                or issue.get('verification_command') != command.strip()
+                or any(issue.get(key) != seed.get(key) for key in
+                       ('task_id', 'task_ids', 'requirement_ids', 'retained_task_relation'))):
+            raise ownership_error(state, 'focused fix issue conflicts with original handoff command or source')
+        if state.fix_verify_command:
+            if command.strip() and state.fix_verify_command != command.strip():
+                raise ownership_error(state, 'focused fix command conflicts with original handoff')
+            return
+        if not command.strip():
+            return  # The existing scope preflight rejects a missing command.
+        if not issue:
+            raise ownership_error(state, 'focused fix issue is unavailable for command recovery')
+        if (state.verification_binding or state.candidate_custody or state.candidate_paths
+                or state.lineage_changed_paths or state.current_attempt
+                or state.persistence_actions
+                or (recovering and preimplementation_failure(state) is None)):
+            raise ownership_error(state, 'focused fix command cannot be restored after implementation')
+        state.fix_verify_command = command.strip()
+        save_session_state(self.project_root, state)
+
     @staticmethod
     def _engine_blocker_error(state: object) -> RuntimeError | None:
         blocker = (
@@ -220,6 +270,8 @@ class WorkflowCoordinator:
         snapshot: WorkflowSnapshot,
         handoff: WorkflowHandoff,
     ):
+        from .session_verification import SessionOwnershipError
+
         child_id = str(handoff.payload.get("child_session_id", "")).strip()
         retained_child = False
         if child_id:
@@ -245,6 +297,10 @@ class WorkflowCoordinator:
             if any(getattr(state, key) != value for key, value in expected.items()):
                 return session._block_execution_binding(state, ownership_error(
                     state, 'retained child identity conflicts with seeded handoff'), 'verification_ownership')
+            try:
+                self._bind_focused_seed_command(state, handoff, recovering=True)
+            except SessionOwnershipError as error:
+                return session._block_execution_binding(state, error, 'verification_ownership')
             if not session._retain_resume_authority(state):
                 return state
             return self._drive_session(session, state, snapshot, root=False)
@@ -294,6 +350,10 @@ class WorkflowCoordinator:
             seed.setdefault("reported_goal", state.goal)
             seed.setdefault("source_handoff_id", handoff.handoff_id)
             IssueBriefBuilder(self.project_root, state.session_id).materialize(seed)
+            try:
+                self._bind_focused_seed_command(state, handoff)
+            except SessionOwnershipError as error:
+                return session._block_execution_binding(state, error, 'verification_ownership')
         return self._drive_session(session, state, snapshot, root=False)
 
     def resume_session(self, session: object, session_id: str):
@@ -1384,9 +1444,10 @@ class WorkflowCoordinator:
                 state.execution_log.append({'action': 'engine_preflight_recheck_started',
                                             **recovery, 'timestamp': parent_session_now()})
                 save_session_state(self.project_root, state)
-            if not session._retain_resume_authority(state):
-                return self._session_result(state, original)
             try:
+                self._bind_focused_seed_command(state, original, recovering=True)
+                if not session._retain_resume_authority(state):
+                    return self._session_result(state, original)
                 self._handoff_exit_ownership(state, original)
                 session._fix_verify_command_for_execution(state.fix_verify_command)
                 bind_session(session, state)
