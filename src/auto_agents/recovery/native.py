@@ -96,6 +96,13 @@ def _contract(store, stream, root, kind, native, state, phase, key):
     return contract
 
 
+def _environment(owner, state, phase, usage, runtime):
+    return digest({'python': os.sys.executable, 'path': os.environ.get('PATH', ''),
+        'proof_context': getattr(state, 'verification_binding', {}).get('proof_execution_context', {}),
+        'provider': (usage or {}).get('kernel_provider') or getattr(owner.config, 'active_provider', ''),
+        'verifier_runtime': runtime['source'] if phase in {'verify', 'review', 'deliver', 'acceptance'} else None})
+
+
 def perform(owner, phase, key, function, classify, *, usage=None, model=False, bind=False, completion=False, read_only=False):
     selected = context(owner, usage)
     if selected is None: return function()
@@ -104,12 +111,10 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
     automatic(store, stream)
     owner._recovery_policy_active = 'recovery' in store.load(stream)
     source = _source(owner, state)
+    predecessor = (usage or {}).get('quota_predecessor')
     runtime = store.meta('active_runtime')
     require(isinstance(runtime, dict) and runtime.get('source'), 'runtime', 'Active runtime is not sealed')
-    environment = digest({'python': os.sys.executable, 'path': os.environ.get('PATH', ''),
-                          'proof_context': getattr(state, 'verification_binding', {}).get('proof_execution_context', {}),
-                          'provider': getattr(owner.config, 'active_provider', ''),
-                          'verifier_runtime':runtime['source'] if phase in {'verify','review','deliver','acceptance'} else None})
+    environment = _environment(owner, state, phase, usage, runtime)
     operation_key = digest([kind,native,phase,key] if model and phase != 'review' else
                            [kind,native,phase,key,source,environment])
     prior_id = store.load(stream)['operations'].get(operation_key)
@@ -145,6 +150,16 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
     require(not model or not any(c['status'] in {'running', 'unknown','reserved'} and c['command_id'] != prior_id
                                 for c in store.load(stream)['commands'].values()),
             'outcome_unknown', 'An unconfirmed operation must be reconciled before another model call')
+    if predecessor:
+        from .rejections import quota_rejection
+        prior = store.load(stream)['commands'].get(predecessor, {})
+        details = (prior.get('outcome') or {}).get('details') or {}
+        require(prior.get('status') == 'finished' and prior.get('model_call') and prior.get('phase') == phase
+                and details.get('subject') == native and prior.get('source') == source
+                and details.get('post_source') == source and details.get('native_result')
+                and details.get('provider_quota') == quota_rejection(store.read(details['native_result']))
+                and bool(details.get('provider_quota')),
+                'reconciliation', 'Provider switch requires a settled quota refusal on unchanged inputs')
     if model and not owner._recovery_policy_active:
         from .model_progress import require_progress
         require_progress(store.load(stream), phase)
@@ -206,6 +221,8 @@ def perform(owner, phase, key, function, classify, *, usage=None, model=False, b
                 else:
                     verdict, reason = OutcomeKind.OWNERSHIP_CONFLICT, 'Correction crossed a protected boundary: ' + ', '.join(outside)
         extra = {}
+        if predecessor:
+            extra.update(quota_predecessor=predecessor, provider=(usage or {})['kernel_provider'])
         if scope_paths: extra['scope_amendment_required'] = scope_paths
         if isinstance(plain, dict) and plain.get('scope_approval'): extra['scope_approval'] = plain['scope_approval']
         if model and verdict == OutcomeKind.PROTOCOL_INVALID:
@@ -357,27 +374,30 @@ def provider(orchestrator, request, execute):
         summary = diagnosis.get('summary', '') if isinstance(diagnosis, dict) else diagnosis.summary
         enriched = append_context(request.prompt, summary, 'Bounded recovery diagnosis')
         request = replace(request, prompt=enriched, prompt_spec=getattr(enriched, 'spec', None))
-    def bound_call(contract):
+    def bound_call(contract, selected_request):
         parent = store.load(stream)['tasks'][contract.parent_task]
-        prompt = append_context(request.prompt, json.dumps({'contract_id': parent['contract_id'],
+        prompt = append_context(selected_request.prompt, json.dumps({'contract_id': parent['contract_id'],
             'execution_contract': contract.identity, 'task_id': contract.parent_task,
             'goal': store.read(contract.goal_ref), 'issue': store.read(contract.issue_ref),
             'constraints': contract.constraints, 'required_checks': contract.required_checks}, ensure_ascii=False),
             'Controller task contract')
-        bound = replace(request, prompt=prompt, prompt_spec=getattr(prompt, 'spec', None),
-                        logical_call_id=request.logical_call_id or 'kernel:' + digest([stream, contract.task_id]),
-                        usage_context={**request.usage_context,'kernel_owned':'1'})
+        bound = replace(selected_request, prompt=prompt, prompt_spec=getattr(prompt, 'spec', None),
+                        logical_call_id=selected_request.logical_call_id or 'kernel:' + digest([stream, contract.task_id]),
+                        usage_context={**selected_request.usage_context,'kernel_owned':'1'})
         return execute(bound)
-    result = perform(orchestrator, phase, key, bound_call,
-        lambda r: provider_outcome(orchestrator,r), usage=request.usage_context, model=True, bind=True,
-        read_only=request.sandbox_mode == 'read-only')
-    if isinstance(result, dict):
-        from ..models import AgentResult, AgentUsage, AgentTermination
-        result = {**result, 'output_path': request.output_path,
-            'usage': AgentUsage(**result['usage']) if result.get('usage') else None,
-            'termination': AgentTermination(**result['termination']) if result.get('termination') else None}
-        return AgentResult(**result)
-    return result
+    def dispatch(selected_request, attempt_key):
+        return perform(orchestrator, phase, attempt_key,
+            lambda contract: bound_call(contract, selected_request),
+            lambda r: provider_outcome(orchestrator,r), usage=selected_request.usage_context, model=True, bind=True,
+            read_only=selected_request.sandbox_mode == 'read-only')
+    def identity(attempt_key, candidate):
+        parts = [kind, native, phase, attempt_key]
+        if phase == 'review':
+            parts.extend([_source(orchestrator, state), _environment(orchestrator, state, phase,
+                {**request.usage_context, 'kernel_provider': candidate}, store.meta('active_runtime'))])
+        return digest(parts)
+    from .provider_failover import call
+    return call(orchestrator, request, key, dispatch, identity, store, stream)
 
 
 def verification(owner, scope, execute):

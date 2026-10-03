@@ -45170,6 +45170,13 @@ class Orchestrator:
         untried = [k for k in rest if k not in health]
         retryable = [k for k in rest if k in health]
         order = [first] + untried + retryable
+        pinned = request.usage_context.get('kernel_provider')
+        if request.usage_context.get('kernel_owned') == '1' and pinned:
+            # The kernel has already settled the preceding refusal and owns
+            # the reservation for this provider; do not try another here.
+            if pinned not in self.config.providers:
+                raise ValueError('Kernel selected an unconfigured provider')
+            order = [pinned]
 
         tried: List[str] = []
         last_error = ""
