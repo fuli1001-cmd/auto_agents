@@ -53,6 +53,43 @@ def test_consumer_changes_request_local_assessment_without_network_or_invalidati
     assert lock['references']['provider']['retrieved_at'] == original['references']['provider']['retrieved_at']
 
 
+@pytest.mark.parametrize('identity', ['truncated', 'historical', 'missing', 'invalid'])
+def test_review_identity_failure_is_specific_and_does_not_admit_or_change_evidence(tmp_path, identity):
+    trace, lock = scene(tmp_path)
+    trace['requirements'][0]['text'] = 'Local browser recovery policy'
+    context = review.prepare(tmp_path, trace, lock, [REF], now=NOW)
+    entry = lock['references']['provider']
+    entry['review'] = decision(context=context)
+    expected = context[REF]['review_id']
+    entry['review']['review_id'] = {'truncated': expected[:51], 'historical': 'f'*64,
+                                  'missing': None, 'invalid': 'private-invalid-value'}[identity]
+    before = deepcopy(lock)
+    errors = review.validate(lock, trace, context)
+    assert len(errors) == 1 and 'review.review_id mismatch' in errors[0]
+    assert expected in errors[0] and 'context.review_id' in errors[0]
+    assert 'private-invalid-value' not in errors[0]
+    assert lock == before
+    entry['review']['review_id'] = expected
+    assert review.validate(lock, trace, context) == []
+
+
+def test_research_prompt_indexes_current_identities_before_historical_evidence(tmp_path):
+    from auto_agents.orchestrator import Orchestrator
+    trace, lock = scene(tmp_path)
+    trace['requirements'][0]['text'] = 'Local recovery policy'
+    context = review.prepare(tmp_path, trace, lock, [REF], now=NOW)
+    controller = Orchestrator.__new__(Orchestrator)
+    controller._provider_reference_review_context = context
+    prompt = controller._provider_reference_review_prompt()
+    index = prompt.split('Current review identity index (not historical reviews):\n')[1].split('\nRetained evidence')[0]
+    import json
+    index = json.loads(index)
+    path = tmp_path / index[REF]['input_file']
+    retained = json.loads(path.read_text())
+    assert index[REF]['review_id'] == retained['context']['review_id'] == context[REF]['review_id']
+    assert index[REF]['requirement_ids'] == context[REF]['requirement_ids']
+
+
 def test_due_age_schedules_review_without_revoking_validity(tmp_path):
     trace, lock = scene(tmp_path)
     entry = lock['references']['provider']

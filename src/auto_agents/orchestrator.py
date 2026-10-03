@@ -41380,10 +41380,14 @@ class Orchestrator:
         write_json(provider_references_lock_path(self.project_root), lock)
 
     def _provider_reference_review_prompt(self) -> str:
-        from .provider_reference_review import INSTRUCTION
-        return INSTRUCTION + "\nRetained evidence and controller source observations:\n" + json.dumps(
-            getattr(self, "_provider_reference_review_context", {}), ensure_ascii=False
-        )
+        from .provider_reference_review import INSTRUCTION, HISTORY
+        context = getattr(self, "_provider_reference_review_context", {})
+        identities = {ref: {'review_id': item['review_id'],
+            'input_file': f'{HISTORY}/reviews/{item["review_id"]}.json',
+            'requirement_ids': item['requirement_ids']} for ref, item in context.items()}
+        return (INSTRUCTION + '\nCurrent review identity index (not historical reviews):\n'
+            + json.dumps(identities, ensure_ascii=False, indent=2)
+            + "\nRetained evidence and controller source observations:\n" + json.dumps(context, ensure_ascii=False))
 
     def _build_provider_research_prompt(self, requirements: List[dict]) -> str:
         trace_path = requirements_trace_path(self.project_root)

@@ -219,6 +219,9 @@ def prepare(project, trace, lock, references, *, requirement_ids=None, fetch=Tru
 
 
 INSTRUCTION = '''REFERENCE REVIEW POLICY:
+Review identities are controller-owned. Copy review_id programmatically from the
+supplied retained input file (context.review_id); never abbreviate, reconstruct or
+substitute a historical review_id. Preserve that input file without edits.
 First read the retained local evidence and historical approvals. A new requirement ID,
 changed retry budget or consumer hash is a reason to assess applicability, not proof
 that provider documentation expired. Map each required protocol fact to existing
@@ -306,8 +309,14 @@ def validate(lock, trace, context):
             continue
         applicability = review.get('applicability')
         freshness = review.get('freshness')
-        if (review.get('review_id') != baseline['review_id']
-                or applicability not in {'covered', 'gap', 'conflict'}
+        if review.get('review_id') != baseline['review_id']:
+            actual = review.get('review_id')
+            displayed = repr(actual) if isinstance(actual, str) and re.fullmatch(r'[a-f0-9]{1,64}', actual) else '<missing or invalid>'
+            errors.append(f'{reference}: supply a scoped applicability/freshness review against retained evidence; '
+                          f'review.review_id mismatch: expected {baseline["review_id"]}, received {displayed}. '
+                          'Copy context.review_id from the controller-retained input; do not reconstruct it.')
+            continue
+        if (applicability not in {'covered', 'gap', 'conflict'}
                 or not isinstance(review.get('reason'), str) or not review['reason'].strip()
                 or not isinstance(review.get('evidence_refs'), list) or not review['evidence_refs']
                 or any(not isinstance(v, str) or not v.strip() for v in review['evidence_refs'])
