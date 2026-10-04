@@ -11,7 +11,106 @@ import sys
 from pathlib import Path
 from contextlib import ExitStack
 import runpy
+import re
+import shutil
+import subprocess
 from unittest.mock import patch
+
+
+def restore_private_sources(target, route, inputs=()):
+    """Rebuild only committed, registered sources in the disposable replay."""
+    from auto_agents.execution_binding import route_sources
+    from auto_agents.session_verification import fingerprint
+    from auto_agents.models import SessionState
+    from auto_agents.session_source import register_checkout
+    restored = []
+    ids = {s.get('child_session_id') for s in route_sources(route) if s.get('child_session_id')}
+    for source in route_sources(route):
+        for key in ('failed_handoff_id', 'original_handoff_id', 'resume_handoff_id'):
+            handoff_id = source.get(key)
+            seen = set()
+            while handoff_id and handoff_id not in seen:
+                seen.add(handoff_id)
+                if not isinstance(handoff_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', handoff_id):
+                    raise ValueError('invalid private replay handoff')
+                handoff = json.loads((target / '.auto-agents/state/handoffs' / (handoff_id + '.json')).read_text())
+                child = handoff.get('child') or {}
+                if child.get('kind') == 'fix': ids.add(child['native_id'])
+                handoff_id = (handoff.get('payload') or {}).get('resume_handoff_id')
+    for child_id in sorted(ids):
+        if not isinstance(child_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', child_id):
+            raise ValueError('invalid private replay child')
+        child = json.loads((target / '.auto-agents/state/sessions' / child_id / 'session_state.json').read_text())
+        source = child.get('source_descriptor') or {}
+        if not source: continue
+        source_id = source.get('source_id')
+        if (source_id != fingerprint({k:v for k,v in source.items() if k != 'source_id'})
+                or json.loads((target / '.auto-agents/state/sources' / (source_id + '.json')).read_text()) != source):
+            raise ValueError('private replay source descriptor changed')
+        for item in (child.get('parent_handoff_id'), source.get('session_id')):
+            if not isinstance(item, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', item):
+                raise ValueError('invalid private replay authority identity')
+        handoff = json.loads((target / '.auto-agents/state/handoffs' / (child['parent_handoff_id'] + '.json')).read_text())
+        parent = json.loads((target / '.auto-agents/state/sessions' / source['session_id'] / 'session_state.json').read_text())
+        custody = parent.get('candidate_custody') or {}
+        delivery = custody.get('consumed_delivery') or {}
+        if (source.get('repository') != str(target) or source.get('workflow_id') != child.get('workflow_id')
+                or parent.get('workflow_id') != child.get('workflow_id')
+                or source.get('handoff_id') != child.get('parent_handoff_id')
+                or handoff.get('payload', {}).get('source_descriptor') != source
+                or handoff.get('parent', {}).get('native_id') != parent.get('session_id')
+                or handoff.get('child', {}).get('native_id') != child_id
+                or fingerprint(child.get('authorization_policy')) != source.get('authorization_fingerprint')
+                or custody.get('checkout') != source.get('checkout')
+                or custody.get('base_revision') != source.get('revision')
+                or delivery.get('revision') != source.get('revision')
+                or fingerprint(delivery) != source.get('delivery_fingerprint') or custody.get('receipt')):
+            raise ValueError('private replay source is not a committed consumed delivery')
+        checkout = Path(source['checkout'])
+        if (not checkout.is_absolute() or not checkout.is_relative_to('/tmp')
+                or len(checkout.relative_to('/tmp').parts) != 2
+                or not checkout.parent.name.startswith('auto-agents-candidate-') or checkout.name != 'project'):
+            raise ValueError('private replay source cannot be safely reconstructed')
+        if checkout.exists():
+            if any(x['checkout'] == str(checkout) for x in restored): continue
+            raise ValueError('private replay checkout already exists')
+        stored = json.loads((target / '.auto-agents/state/custody' / (fingerprint(str(checkout)) + '.json')).read_text())
+        if any(stored.get(k) != v for k,v in {'checkout': str(checkout), 'repository': str(target),
+                                              'session_id': parent['session_id']}.items()):
+            raise ValueError('private replay checkout registration changed')
+        checkout.parent.mkdir(parents=True)
+        subprocess.run(['git', '-c', 'advice.detachedHead=false', 'clone', '-q', '--no-local',
+                        '--no-hardlinks', str(target), str(checkout)], check=True, capture_output=True)
+        def git(*args):
+            return subprocess.check_output(['git', '-c', 'core.hooksPath=/dev/null', '-C', str(checkout), *args], text=True).strip()
+        supplied = next((item for item in inputs if item.get('source_id') == source_id), None)
+        origin = target
+        if supplied:
+            if (supplied.get('checkout') != str(checkout) or supplied.get('revision') != source['revision']
+                    or supplied.get('tree') != source['tree']
+                    or supplied.get('contract_revision') != source['contract_revision']
+                    or supplied.get('prefix') != '/opt/repair/private-sources/' + source_id):
+                raise ValueError('private Git input belongs to another retained source')
+            origin = Path(supplied['prefix'])
+        git('fetch', '-q', '--no-tags', str(origin), source['revision'], source['contract_revision'])
+        git('checkout', '-q', '--detach', source['revision'])
+        if git('rev-parse', 'HEAD^{tree}') != source['tree']:
+            raise ValueError('private replay source tree changed')
+        git('cat-file', '-e', source['contract_revision'] + '^{commit}')
+        # The frozen domain records retain authority; their Git revisions keep
+        # historical verification inputs available without any host checkout.
+        shutil.copytree(target / '.auto-agents', checkout / '.auto-agents', dirs_exist_ok=True, symlinks=True)
+        (checkout / '.auto-agents/state/recovery-kernel.json').unlink(missing_ok=True)
+        for name in ('.conda', 'workbench/node_modules'):
+            dependency = target / name
+            if dependency.is_dir():
+                link = checkout / name
+                if not link.exists() and not link.is_symlink():
+                    link.parent.mkdir(parents=True, exist_ok=True); link.symlink_to(dependency)
+        register_checkout(target, SessionState.from_dict(parent), checkout)
+        restored.append({'checkout': str(checkout), 'source_id': source_id, 'revision': source['revision'],
+                         'tree': source['tree']})
+    return restored
 
 
 def main() -> dict[str, object]:
@@ -100,6 +199,12 @@ def main() -> dict[str, object]:
         return acknowledge(self, state, stage, **details)
 
     drive = WorkflowCoordinator._drive_session
+    reenter = getattr(WorkflowCoordinator, '_resume_engine_bound_child', None)
+    def observe_reentry(self, *args, **kwargs):
+        recovery['engine_reentry_count'] = recovery.get('engine_reentry_count', 0) + 1
+        result = reenter(self, *args, **kwargs)
+        recovery['engine_reentry_result'] = {key: result.get(key) for key in ('status', 'resolution', 'summary')}
+        return result
     def observe_drive(self, session, state, workflow, *, root):
         frames.append(state)
         try:
@@ -152,6 +257,7 @@ def main() -> dict[str, object]:
     project = Path(target)
     try:
         runtime_report = identity['observe_engine'](engine, expected_commit=approved.get('engine_commit'))
+        recovery['private_sources'] = restore_private_sources(project, expected_route, approved.get('private_source_inputs', []))
         from auto_agents.workflow_chain import WorkflowStore
         initial = load_session_state(project, session_id)
         root_ref = WorkflowStore(project).load(initial.workflow_id).root if initial.workflow_id else None
@@ -173,6 +279,8 @@ def main() -> dict[str, object]:
             if acknowledge is not None:
                 patches.enter_context(patch.object(Session, '_ack_engine_recovery', observe_acknowledgement))
             patches.enter_context(patch.object(WorkflowCoordinator, '_drive_session', observe_drive))
+            if reenter is not None:
+                patches.enter_context(patch.object(WorkflowCoordinator, '_resume_engine_bound_child', observe_reentry))
             patches.enter_context(patch.object(Session, '_phase_collab_loop', observe_parent_phase))
             patches.enter_context(patch.object(repair_client, 'engine_route', observe_route))
             patches.enter_context(patch.object(session_verification, '_session_reference_kind', observe_reference))
@@ -189,6 +297,10 @@ def main() -> dict[str, object]:
         payload = {"ok": True, "status": "next_provider_boundary", "session_id": session_id}
     except Exception as error:
         payload = {"ok": False, "status": "failed", "error": str(error), "error_type": type(error).__name__}
+        import traceback
+        payload['error_code'] = getattr(error, 'code', '')
+        payload['error_frames'] = [{'file': frame.filename, 'line': frame.lineno, 'function': frame.name}
+                                 for frame in traceback.extract_tb(error.__traceback__)[-8:]]
         runtime_report = getattr(error, 'report', runtime_report)
         if hasattr(error, 'diagnostic'):
             payload['diagnostic'] = error.diagnostic
@@ -208,6 +320,9 @@ def main() -> dict[str, object]:
             if boundary_state.get('session_id') == child_id:
                 after = boundary_state
             binding = after.get('verification_binding', {})
+            recovery['changed_child_fields'] = [key for key in ('goal', 'source_descriptor',
+                'goal_execution_environment', 'authorization_policy', 'auto_approve', 'full_verify')
+                if after.get(key) != before_child.get(key)]
             history_preserved = after['execution_log'][:len(before_child['execution_log'])] == before_child['execution_log']
             new_events = after['execution_log'][len(before_child['execution_log']):] if history_preserved else []
             recovery.update(child_status=after['status'],

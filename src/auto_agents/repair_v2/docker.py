@@ -191,8 +191,19 @@ class DockerVerifier:
                                'runtime_identity': Path(__file__).parent.parent.joinpath('repair_runtime_identity.py').read_text(),
                                'replay_environment': Path(__file__).with_name('replay_environment.py').read_text(),
                                'budget_recovery': Path(__file__).with_name('budget_recovery.py').read_text(),
+                               'private_replay': Path(__file__).with_name('private_replay.py').read_text(),
                                'replay_isolation': REPLAY_ISOLATION,
                                'kernel': os.uname().release, 'policy': 8, 'init': True})
+        import inspect
+        self.suite_runtime = digest({'image': identity_text.strip(), 'driver': driver,
+            'docker': server.strip(), 'uid': os.getuid(), 'gid': os.getgid(),
+            'memory': '1g', 'tmpfs': 'exec,4g', 'replay_isolation': REPLAY_ISOLATION,
+            'kernel': os.uname().release, 'init': True, 'policy': 1,
+            'executor': [inspect.getsource(getattr(DockerVerifier, name)) for name in
+                ('execute', '_execute', 'suite_units', 'validate_suite', 'validate')],
+            'dependencies': Path(__file__).with_name('dependencies.py').read_text(),
+            'workspace': Path(__file__).with_name('workspace.py').read_text(),
+            'storage': Path(__file__).with_name('storage.py').read_text()})
         self.image = identity_text.strip()  # A mutable tag is not a verification input.
 
     def concurrency(self):
@@ -422,7 +433,9 @@ class DockerVerifier:
 
     def boundary_inputs(self, target, payload):
         from .replay_environment import prepare
-        return [item.describe() for item in prepare(self.root / 'replay-environments', target, payload)]
+        from .private_replay import prepare as private_inputs
+        return [*[item.describe() for item in prepare(self.root / 'replay-environments', target, payload)],
+                *private_inputs(self.root / 'private-replay-inputs', target, payload)]
 
     def boundary(self, snapshot_id, snapshot, frozen_target, payload, cancel):
         """One deterministic, credential-free replay at the original boundary."""
@@ -454,11 +467,14 @@ class DockerVerifier:
                 # Dissociate diagnostic Git objects before entering Docker;
                 # the real/frozen project is never mounted into the container.
                 if (target / '.git').exists():
-                    git(target, 'repack', '-a', '-d')
+                    git(target, 'repack', '-q', '-a', '-d')
                     (target / '.git/objects/info/alternates').unlink(missing_ok=True)
                 environments = prepare_environment(self.root / 'replay-environments', frozen_target, payload)
+                from .private_replay import prepare as private_inputs
+                sources = private_inputs(self.root / 'private-replay-inputs', frozen_target, payload)
                 atomic_json(output / 'request.json', {**payload, 'commit': git(source, 'rev-parse', 'HEAD'),
                                                      'replay_environments': [item.describe() for item in environments],
+                                                     'private_source_inputs': sources,
                                                      '_replay_project': str(project_path)})
                 # This run recovery executes managed verification, which uses
                 # the same nested user/mount namespaces as session recovery.
@@ -476,6 +492,8 @@ class DockerVerifier:
                     '--mount', f'type=bind,src={output},dst=/result']
                 for environment in environments:
                     command += ['--mount', f'type=bind,src={environment.root},dst={environment.prefix},readonly']
+                for entry in sources:
+                    command += ['--mount', f'type=bind,src={entry["root"]},dst={entry["prefix"]},readonly']
                 for script in (Path(__file__).with_name('boundary_driver.py'),
                                Path(__file__).with_name('diagnostic_replay.py'),
                                Path(__file__).parent.parent / 'session_replay.py',

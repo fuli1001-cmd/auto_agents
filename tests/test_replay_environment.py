@@ -100,6 +100,21 @@ def test_only_retained_owned_child_commands_supply_environment_inputs(tmp_path, 
     assert not (target / '.conda').exists()  # The frozen scene stays immutable.
 
 
+def test_missing_seeded_command_uses_only_its_owned_focused_handoff(tmp_path):
+    target = tmp_path / 'frozen'; state = target / '.auto-agents/state'
+    atomic_json(state / 'sessions/root/session_state.json', {'workflow_id': 'wf', 'active_handoff_id': 'original'})
+    command = './.conda/bin/python -m pytest -q tests/test_owned.py'
+    handoff = {'target': 'fix', 'workflow_id': 'wf', 'child': {'kind': 'fix', 'native_id': 'child'},
+        'payload': {'child_session_id': 'child', 'issue_seed': {'verification_scope': {'mode': 'focused_fix'},
+                                                             'verification_command': command}}}
+    path = state / 'handoffs/original.json'; atomic_json(path, handoff)
+    atomic_json(state / 'sessions/child/session_state.json', {'workflow_id': 'wf', 'fix_verify_command': ''})
+    payload = {'invocation': {'session_id': 'root', 'workflow_id': 'wf'}}
+    assert commands(target, payload) == [command]
+    handoff['payload']['child_session_id'] = 'unrelated'; atomic_json(path, handoff)
+    assert commands(target, payload) == []
+
+
 def test_ready_run_task_supplies_direct_python_environment_without_old_sessions(tmp_path, environment):
     target = tmp_path / 'frozen'
     state = target / '.auto-agents/state'

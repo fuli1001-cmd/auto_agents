@@ -318,8 +318,17 @@ class IsolatedEngineEffects:
                 self.rejected(findings)
                 return self.observed(command, {'findings':findings},OutcomeKind.CANDIDATE_REJECTED,'Candidate weakens retained tests')
             self.phase('full_suite')
-            units = self.verifier.suite_units(snapshot, self.accepted)
-            suite = self.verifier.validate_suite(command.source,snapshot,units,self.cancel)
+            from ..repair_v2.proofs import once
+            from ..repair_v2.store import Store
+            from ..repair_v2.types import ValidationResult
+            inputs = {'artifact': artifact, 'contract': self.contract.identity,
+                'acceptance': [asdict(item) for item in self.accepted.acceptance], 'base': self.payload['base'],
+                'runtime': getattr(self.verifier, 'suite_runtime', self.verifier.runtime)}
+            inputs = json.loads(json.dumps(inputs))
+            def verify_suite():
+                units = self.verifier.suite_units(snapshot, self.accepted)
+                return asdict(self.verifier.validate_suite(command.source, snapshot, units, self.cancel))
+            suite = ValidationResult(**once(Store(self.root), 'engine-suite', inputs, verify_suite))
             if not suite.ok:
                 self.rejected(suite.failures)
                 from ..verification_dependencies import detect_verification_dependencies
@@ -330,7 +339,14 @@ class IsolatedEngineEffects:
                     'Verification prerequisites are unavailable' if missing else 'Mandatory verification failed')
             from ..repair_v2.integration import _boundaries
             self.phase('boundary')
-            boundary = _boundaries(self.verifier,self.root,command.source,snapshot,self.payload,self.cancel)
+            try:
+                boundary = _boundaries(self.verifier,self.root,command.source,snapshot,self.payload,self.cancel)
+            except RepairBlocked as error:
+                return self.observed(command, {'suite': asdict(suite), 'code': error.code,
+                    'boundary': {'ok': False, 'cases': getattr(error, 'boundary_results', [])},
+                    'recovery_failure': getattr(error, 'failure', None)},
+                    OutcomeKind.NEED_INPUT if error.code.startswith('scope_') else OutcomeKind.ENVIRONMENT_BLOCKED,
+                    str(error))
             if not boundary['ok']:
                 self.rejected([{'unit': 'original-boundary', 'infrastructure': boundary.get('infrastructure', False)}])
             return self.observed(command, {'suite':asdict(suite),'boundary':boundary},

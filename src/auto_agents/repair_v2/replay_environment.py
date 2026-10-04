@@ -112,6 +112,15 @@ def commands(target, payload):
             if child.get('kind') in ('fix', 'collab', 'provider_resolve'):
                 pending.append(('session', child.get('native_id')))
             routes(data.get('payload') or {})
+            stored = data.get('payload') or {}
+            seed = stored.get('issue_seed') or {}
+            if (data.get('target') == 'fix' and child.get('kind') == 'fix'
+                    and stored.get('child_session_id') == child.get('native_id')
+                    and isinstance(seed, dict) and isinstance(seed.get('verification_scope'), dict)
+                    and seed['verification_scope'].get('mode') == 'focused_fix'):
+                command = seed.get('verification_command')
+                if isinstance(command, str) and command.strip():
+                    result.append(command)
     return list(dict.fromkeys(result))
 
 

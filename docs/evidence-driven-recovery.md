@@ -133,6 +133,22 @@ remain charged; no model result or passing proof is created. Every changed path
 requires independent necessity review after verification. Running the original
 business command then continues from this candidate's verification.
 
+Native engine verification seals a passing complete suite before attempting the
+original-task recovery boundary. Its checkpoint binds the immutable candidate,
+contract, acceptance commands, baseline and suite execution environment. Retrying
+the recovery boundary reuses that stage only under identical inputs. Changes to
+the candidate, obligations or suite executor require another suite execution;
+boundary-driver corrections do not. Recovery errors retain the complete suite
+receipt and original boundary diagnostics while remaining unsuccessful overall.
+
+Diagnostic copies preserve tracked working-tree deletions on repeated Git clones,
+including deliberately removed host-core bindings. Offline recovery can reconstruct
+a consumed private delivery from a registered, immutable Git snapshot: source
+identity, registration, revisions and tree must agree with the frozen handoff.
+The live private checkout is never mounted. A retained verified engine reply
+resumes its original child before another parent-model call, preserving parent
+attempts and the original child contract.
+
 A completed legacy writer rejected solely for exceeding its diagnostic path
 plan can resume without another model call. Recovery validates its sealed success
 result, original custody, reconstructed input fingerprint, unchanged output and

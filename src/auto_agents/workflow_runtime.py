@@ -465,7 +465,32 @@ class WorkflowCoordinator:
         self._ensure_completed_session_commit(session, state)
         snapshot = self.store.load(snapshot.workflow_id)
         self._resume_blocked_engine_handoff(state, snapshot)
+        self._resume_pending_engine_route(session, state, snapshot)
         return self._drive_session(session, state, snapshot, root=True)
+
+    def _resume_pending_engine_route(self, session, state, snapshot):
+        """Dispatch a retained verified engine reply before another parent call."""
+        if (state.mode != 'collab' or state.parent_handoff_id or state.active_handoff_id
+                or state.status != 'executing' or not state.conversation
+                or not session._goal_environment_confirmed(state)):
+            return
+        latest = state.conversation[-1]
+        if str(latest.get('role', '')).lower() not in {'agent', 'assistant'}:
+            return
+        reply = str(latest.get('content', ''))
+        route, error = session._parse_workflow_route(reply)
+        if error or not route or route.get('target') != 'fix':
+            return
+        payload = session._fix_workflow_payload(route)
+        from .execution_binding import repository_binding_error
+        if not repository_binding_error(self.project_root, payload):
+            return
+        if self._execution_binding_result(payload).get('resolution') != 'verified_engine_repair':
+            return
+        child_id = self._engine_child_id(payload, snapshot)
+        if not child_id:
+            return
+        session._route_collab_workflow_reply(state, reply)
 
     def _pending_engine_resume(self, state, session=None):
         """Admit a bound engine return before ordinary resume resets budgets."""

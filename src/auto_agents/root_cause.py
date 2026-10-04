@@ -1261,6 +1261,16 @@ class RootCauseCoordinator:
                     probe = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=source, capture_output=True)
                     cloned = probe.returncode != 0
                 if cloned:
+                    # Checkout restores HEAD, including tracked files deleted
+                    # from this frozen worktree. Preserve those deletions on
+                    # repeated snapshots before overlaying its retained inputs.
+                    tracked = subprocess.run(["git", "ls-files", "-z"], cwd=source,
+                                             capture_output=True, text=True, check=True)
+                    for relative in filter(None, tracked.stdout.split('\0')):
+                        original, copied = source / relative, destination / relative
+                        if not original.exists() and not original.is_symlink():
+                            if copied.is_file() or copied.is_symlink():
+                                copied.unlink()
                     # Shared clones contain the objects, but not private
                     # checkpoint ref names or the original staged index.
                     # Both are needed to replay retained worktree ownership.

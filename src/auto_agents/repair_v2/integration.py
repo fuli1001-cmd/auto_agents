@@ -55,6 +55,7 @@ def _boundaries(verifier, root, identity, source, payload, cancel):
         if failure['domain'] != 'candidate':
             error = RepairBlocked(failure['code'], failure['message'])
             error.failure = failure
+            error.boundary_results = results
             raise error
     return {'ok': all(r['ok'] for r in results), 'snapshot': identity, 'runtime': verifier.runtime,
             'infrastructure': any(r.get('infrastructure') for r in results),

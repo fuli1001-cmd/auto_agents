@@ -716,6 +716,7 @@ def main():
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(json.dumps({'route_digest': digest(invocation['engine_route']),
                                           'engine_route': invocation['engine_route'],
+                                          'private_source_inputs': request.get('private_source_inputs', []),
                                           'engine_commit': request['commit']}))
             os.environ['AUTO_AGENTS_REPAIR_ROUTE_PROBE'] = str(marker)
         sys.argv = ['session_replay', '/work', str(target), invocation['session_id'],

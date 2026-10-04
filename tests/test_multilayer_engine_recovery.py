@@ -86,6 +86,34 @@ def assert_recovery_budget(observed, reservations):
 
 
 @pytest.mark.parametrize('receipt', ['matching', 'mismatch'])
+def test_saved_verified_engine_reply_reenters_child_before_exhausted_parent(tmp_path, receipt):
+    root, child, store, snapshot, original, _, repair, old = retained_recovery(tmp_path, wrapped=False)
+    parent = load_session_state(root, 'parent')
+    parent.active_handoff_id = ''
+    parent.status, parent.resolution, parent.return_phase = 'executing', '', 'after_child'
+    parent.last_child_result_ref = str(store.handoff_path(original.handoff_id))
+    parent.current_attempt, parent.attempt_epoch, parent.hard_ceiling = 27, 14, 25
+    route = {'target': 'fix', 'reason': 'Resume retained engine repair', **repair.payload}
+    from auto_agents.session import Session
+    repair.payload = Session._fix_workflow_payload(route)
+    store.save_handoff(repair)
+    parent.conversation.append({'role': 'assistant', 'content': 'ROUTE_WORKFLOW v1: ' + json.dumps(route)})
+    save_session_state(root, parent)
+    snapshot.active_handoff_id = ''; store.save(snapshot)
+    report = replay(root, repair.payload, tmp_path, receipt=receipt)
+    assert report['ok'] is (receipt == 'matching'), report
+    saved_parent = load_session_state(root, 'parent')
+    assert saved_parent.current_attempt == 27 and saved_parent.hard_ceiling == 25
+    assert len(list((root / '.auto-agents/state/sessions').iterdir())) == 2
+    if receipt == 'matching':
+        assert saved_parent.attempt_epoch == 14
+        assert report['recovery_observation']['boundary_session_id'] == child.session_id
+        assert_recovery_budget(report['recovery_observation'], 1)
+    else:
+        assert load_session_state(root, child.session_id).to_dict() == child.to_dict()
+
+
+@pytest.mark.parametrize('receipt', ['matching', 'mismatch'])
 def test_returned_engine_recovery_precedes_later_parent_route(tmp_path, receipt):
     root, child, store, snapshot, original, active, route, _ = incident(tmp_path)
     store.record_result(snapshot, active, status='blocked', result={
