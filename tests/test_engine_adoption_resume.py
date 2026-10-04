@@ -17,8 +17,8 @@ from test_runtime_adoption import installation
 from test_session_verification_ownership import project
 
 
-@pytest.fixture
-def pending(installation, tmp_path, monkeypatch):
+@pytest.fixture(params=['runtime-only', 'retained-controller-evidence'])
+def pending(installation, tmp_path, monkeypatch, request):
     store, source = installation
     # This fixture tests adoption, not the host's WSL disk observation bridge.
     monkeypatch.setattr('auto_agents.storage_admission.windows_backing_roots', lambda: ())
@@ -27,7 +27,19 @@ def pending(installation, tmp_path, monkeypatch):
         (package / name).write_text('# fixture runtime\n')
     base = capture(store, source)
     (source / 'value.py').write_text('VALUE = 2\n')
-    candidate = capture(store, source)
+    if request.param == 'retained-controller-evidence':
+        from auto_agents.repair_v2.runtime_artifact import build
+        from auto_agents.repair_v2.workspace import Workspace, inventory, overlay, git, source_identity
+        evidence = source / '.auto-agents/recovery-evidence/original.json'
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text('{"original_failure":"retained, not runtime source"}')
+        workspace = Workspace(tmp_path / 'candidate-with-evidence', source, git(source, 'rev-parse', 'HEAD'))
+        checkout = workspace.prepare()
+        overlay(source, checkout, inventory(source))
+        workspace.checkpoint()
+        candidate = build(store.root, checkout, source_identity(checkout), {})
+    else:
+        candidate = capture(store, source)
     (source / 'value.py').write_text('VALUE = 1\n')
     (source / 'removed.py').write_text('UNRELATED = True\n')
     root, child = project(tmp_path)
@@ -165,6 +177,21 @@ def test_later_adopted_runtime_must_preserve_the_accepted_patch(pending, monkeyp
     (p.source / 'value.py').write_text('VALUE = 1\n')
     p.adopt(p.store.root, p.source)
     assert not adopted(p.store, p.stream, incident)
+
+
+def test_candidate_controller_evidence_still_binds_accepted_identity(pending, monkeypatch):
+    from auto_agents.recovery.engine_adoption import record
+    p = pending
+    resume_pending(p, monkeypatch)
+    evidence = Path(p.candidate['path']) / '.auto-agents/recovery-evidence/original.json'
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text('{"original_failure":"replaced after review"}')
+    state = p.store.load(p.stream)
+    with pytest.raises(KernelError) as failure:
+        record(p.store, p.stream, state['incidents'][p.identifier], p.base['path'],
+               p.candidate, p.store.meta('active_runtime'))
+    assert failure.value.code == 'engine_evidence'
+    assert p.store.load(p.stream) == state
 
 
 def test_pending_adoption_rejects_a_different_route_before_submission(pending):

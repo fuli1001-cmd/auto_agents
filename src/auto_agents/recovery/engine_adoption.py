@@ -19,7 +19,8 @@ def record(store, stream, incident, base, candidate, runtime):
     require(receipt.get('source') == runtime['source'] and receipt.get('runtime') == runtime['artifact_id'],
             'adoption_required', 'Engine delivery adoption receipt belongs to another runtime')
     before, after = inventory(base), inventory(candidate['path'])
-    require(candidate['source'] == incident['required_runtime'] == digest(after),
+    from ..repair_v2.workspace import inventory as candidate_inventory
+    require(candidate['source'] == incident['required_runtime'] == digest(candidate_inventory(candidate['path'])),
             'engine_evidence', 'Delivered candidate differs from the resolved engine repair')
     changes = {name: after.get(name) for name in before.keys() | after.keys()
                if before.get(name) != after.get(name)}
