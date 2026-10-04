@@ -31,6 +31,9 @@ def test_kernel_stages_and_periodic_plain_counts_follow_existing_style(report, m
         clock[0] += 1
         progress.refresh()
         assert '202/292' in history(report) and '最近输出 60 秒前' in history(report)
+        periodic = history(report)
+        progress.refresh()
+        assert history(report) == periodic
         progress.phase('boundary')
         progress.rejected([{'unit': 'original-boundary'}])
         progress.command({'phase': 'implement'}, {'attempts': 2, 'failure': {'kind': 'candidate_rejected'}})
@@ -71,6 +74,10 @@ def test_live_provider_output_and_parallel_checks_clear_between_phases(report, s
         list(pool.map(lambda _: progress.check('check_output', {}), range(8)))
     progress.check('check_finished', {'completed': 3, 'total': 4, 'failed_count': 1, 'cancelled_count': 1})
     assert '3/4' in frame(report) and '取消 1' in frame(report)
+    before = history(report)
+    clock[0] += 60
+    progress.refresh()
+    assert history(report) == before
     assert history(report).count('完整验证') == 1
     progress.phase('boundary')
     assert '3/4' not in frame(report) and '最近输出' not in frame(report)

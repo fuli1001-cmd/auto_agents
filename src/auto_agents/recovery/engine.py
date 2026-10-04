@@ -15,7 +15,16 @@ from .model import Command, Contract, Event, Evidence, KernelError, Outcome, Out
 
 
 def previous_result(store, stream, task_id, phase):
-    rows = [c for c in store.load(stream)['commands'].values() if c['task_id'] == task_id
+    state = store.load(stream)
+    candidate = state['tasks'][task_id].get('candidate')
+    if phase == 'implement' and candidate:
+        retained = store.read(candidate['receipt'])
+        artifact = retained.get('artifact') or {}
+        require(digest(artifact) == candidate['candidate_id']
+                and artifact.get('source') == candidate['source'],
+                'candidate_evidence', 'Retained engine candidate receipt changed')
+        return retained
+    rows = [c for c in state['commands'].values() if c['task_id'] == task_id
             and c['phase'] == phase and c['status'] == 'finished' and c['outcome']['kind'] == 'success']
     latest = max(rows,key=lambda row:row['sequence']) if rows else None
     return store.read(latest['outcome']['details']['result_ref']) if latest else None

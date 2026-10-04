@@ -854,6 +854,8 @@ class Reporter:
                     '[Self-repair] Investigation ended; no repair started'), ''
         if kind == 'repair.action':
             return message, 'finish' if data.get('terminal') else 'start'
+        if kind == 'repair.progress':
+            return message, ''
         if kind == 'repair.control' and getattr(owner, '_repair_display_managed', False):
             return '', ''  # Full control details remain in events.jsonl.
         if kind == "stage.retry":
@@ -1271,6 +1273,7 @@ class Reporter:
         identity = (observed['identity'], owner._repair_problem)
         changed = identity != getattr(owner, '_repair_display_identity', None)
         if changed:
+            owner._repair_plain_progress_at = time.monotonic()
             prior = owner.action_lines.get('')
             continuing = bool(prior and prior.name == prefix + name and not observed['terminal'])
             if not continuing:
@@ -1293,8 +1296,15 @@ class Reporter:
         output_at = observed['output_at']
         if isinstance(output_at, (int, float)):
             owner.display.output_times[''] = time.monotonic() - max(0, time.time() - output_at)
-        # The live presenter refreshes this action in place. Plain output keeps
-        # its initial name; polling must not append another copy of the action.
+        # Interactive terminals update in place. Redirected output needs sparse
+        # progress observations so a long verification is visible in its log.
+        current = time.monotonic()
+        if (display.get('phase') == 'full_suite' and counts and counts.get('total')
+                and owner.presenter._live is None
+                and current - getattr(owner, '_repair_plain_progress_at', current) >= 60):
+            owner._repair_plain_progress_at = current
+            self.event('repair.progress', {'checks': counts}, audience='user',
+                       message=prefix + owner.display.suffix('', self.language))
 
     def plan(self, tasks: list) -> None:
         from .models import RunState

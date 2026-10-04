@@ -286,9 +286,10 @@ else:
     raise AssertionError('current catalog did not retain the structured failure')
 finally:
     verification._retained_reference_bytes = read_bytes
-baseline = subprocess.run(['git', '-C', str(root), 'show',
-    'c4906fee7becfbda6c06fb96be6df6843d36754a:src/auto_agents/session_verification.py'],
-    check=True, capture_output=True).stdout
+# Runtime snapshots have their own Git history. Retain the exact historical
+# counterexample as test data instead of depending on a developer checkout.
+baseline = (root / 'tests/fixtures/runtime_identity/session_verification_c4906fee.py.txt').read_bytes()
+assert hashlib.sha256(baseline).hexdigest() == '7ce4bf8bc800716f73ceecbb2356951f607dedbe622bc5fa6e4d3c013d513d5e'
 namespace = verification.__dict__ if sys.argv[2] == 'module' else dict(verification.__dict__)
 exec(compile(baseline, str(path), 'exec', dont_inherit=True), namespace)
 if sys.argv[2] == 'catalog_only':

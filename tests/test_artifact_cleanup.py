@@ -168,11 +168,14 @@ def legacy(store, tmp_path, monkeypatch):
     return root, job
 
 
-def test_legacy_build_cache_is_removed_without_candidate_or_evidence_loss(store, legacy):
+def test_legacy_build_cache_is_removed_without_candidate_or_evidence_loss(store, legacy, monkeypatch):
     root, make_job = legacy
     directory, project, cache = make_job()
     proof = project / '.auto-agents/state'; proof.mkdir(parents=True)
     (proof / 'session.json').write_text('{"pending":true}')
+    def unexpected_mount_query():
+        raise AssertionError('metadata-only copies need no database/blob consumer query')
+    monkeypatch.setattr('auto_agents.repair_v2.docker.container_mounts', unexpected_mount_query)
     result = clean(store=store)
     assert result['ok'] and not cache.exists()
     assert (project / 'source.py').read_text() == 'SOURCE = 1\n'

@@ -38,7 +38,7 @@ def control(store, args):
     for state in store.status()['workflows']:
         if args.project and state['project'] != str(Path(args.project).resolve()): continue
         if args.job and args.job != state['workflow_id'] and not any(
-                args.job == row['incident_id'] or args.job in row.get('legacy_jobs', [row.get('legacy_job')])
+                args.job in (row['incident_id'], row['task_id']) or args.job in row.get('legacy_jobs', [row.get('legacy_job')])
                 for row in state['incidents'].values()): continue
         selected.append(state)
     require(selected and (args.job or args.project), 'workflow_selection', 'Select a retained --job or --project')
@@ -51,6 +51,11 @@ def control(store, args):
         return {'ok': all(r['ok'] for r in results), 'status':'cancelled', 'processes':results}
     require(len(selected) == 1, 'workflow_selection', 'Select one retained workflow with --job')
     state = selected[0]
+    if args.repair_action == 'reverify':
+        from .engine_correction import retain
+        require(args.runtime and args.job, 'candidate_selection',
+                'Reverification requires --job and a committed --runtime candidate')
+        return retain(store, state['workflow_id'], args.job, Path(args.runtime))
     if args.repair_action == 'retry-publish':
         from .publication import retry
         return retry(store, state, args.job)

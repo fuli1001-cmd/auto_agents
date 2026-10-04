@@ -123,6 +123,16 @@ that rejected diagnosis from its retained evidence. It does not repeat broad
 verification merely to correct an outbound schema, and still requires normal
 verification and review of any subsequent source correction.
 
+For a stopped engine repair, `repair reverify --job <engine-task-or-incident>
+--runtime <committed-correction-checkout>` retains an explicit local correction
+and selects verification as the next phase. The checkout must descend from the
+retained candidate, preserve the original tests and protected control files, and
+have no uncommitted changes. Unresolved operations and unretained producer work
+block this operation. Original attempts, consumption, diagnoses and stagnation
+remain charged; no model result or passing proof is created. Every changed path
+requires independent necessity review after verification. Running the original
+business command then continues from this candidate's verification.
+
 A completed legacy writer rejected solely for exceeding its diagnostic path
 plan can resume without another model call. Recovery validates its sealed success
 result, original custody, reconstructed input fingerprint, unchanged output and

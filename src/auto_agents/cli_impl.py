@@ -2147,7 +2147,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     repair_parser = subparsers.add_parser("repair", help="Inspect and control durable engine repairs")
-    repair_parser.add_argument("repair_action", choices=("status", "resume", "cancel", "abandon", "retry-publish", "migrate", "upgrade"))
+    repair_parser.add_argument("repair_action", choices=("status", "resume", "reverify", "cancel", "abandon", "retry-publish", "migrate", "upgrade"))
     repair_parser.add_argument("--job", default="")
     repair_parser.add_argument("--project", default="")
     repair_parser.add_argument("--check", action="store_true")

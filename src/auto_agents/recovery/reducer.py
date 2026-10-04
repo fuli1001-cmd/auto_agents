@@ -86,6 +86,31 @@ def _decide_owned(state, event):
         require(old is None or old['candidate_id'] == data['candidate_id'] or data.get('parent') == old['candidate_id'],
                 'candidate_lineage', 'Candidate replacement must preserve its parent')
         task['candidate'] = {k: data.get(k) for k in ('candidate_id', 'source', 'base', 'receipt', 'parent')}
+    elif kind == 'candidate_reverification_requested':
+        task = _task(state, data['task_id'])
+        candidate = task.get('candidate') or {}
+        require(task['contract']['kind'] == 'engine_repair'
+                and task['status'] in {'ready', 'blocked'} and task['active_command'] is None
+                and task['phase'] in {'implement', 'verify', 'review'}
+                and 'verify' in task['contract']['phases'],
+                'reverification_owner', 'Only an idle retained engine candidate may be reverified')
+        require(candidate.get('receipt') and candidate.get('source')
+                and candidate['receipt'] == data.get('receipt') and candidate['source'] == data.get('source')
+                and data.get('evidence_ref'),
+                'candidate_evidence', 'Reverification must bind the corrected candidate custody')
+        if 'recovery' in state:
+            from .convergence import scope_id, blank_scope
+            from .scope_amendments import product_paths
+            paths = data.get('paths') or []
+            require(product_paths(paths), 'scope_review_required',
+                    'Explicit correction requires independently reviewable source paths')
+            item = state['recovery']['scopes'].setdefault(scope_id(state, data['task_id']), blank_scope())
+            for path in paths:
+                item.setdefault('scope_changes', {})[path] = {'receipt': data['receipt'], 'source': data['source']}
+            item['revision'] += 1
+        task.update(phase='verify', status='ready')
+        task['proofs'].pop('verify', None)
+        task['proofs'].pop('review', None)
     elif kind == 'task_restored':
         task = _task(state, data['task_id'])
         require(data['manifest'] in state['imports'] and task['active_command'] is None,

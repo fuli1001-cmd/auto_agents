@@ -108,7 +108,8 @@ def _compact_repair_copies(store, roots, deadline, record):
     present = False
     for root in roots:
         for pattern in ('*/evidence', '*/working-evidence', '*/continuous/target-evidence', '*/subscriber-*/evidence'):
-            if any((copy / '.auto-agents/state').is_dir() for copy in (root / 'jobs').glob(pattern)):
+            if any(_has_compactable_data(copy / '.auto-agents/state')
+                   for copy in (root / 'jobs').glob(pattern)):
                 present = True; break
         if present: break
     if not present: return True
@@ -170,3 +171,12 @@ def _compact_repair_copies(store, roots, deadline, record):
                 with store.connect(True) as registry:
                     registry.execute('INSERT OR REPLACE INTO maintenance VALUES(?,?)', (cursor_key, json.dumps(identity)))
     return complete
+
+
+def _has_compactable_data(state_root):
+    """Query consumers only when there is database/blob work to protect."""
+    if any(path.name in DATABASES and path.is_file() and not path.is_symlink()
+           for path in state_root.glob('**/*.sqlite3')):
+        return True
+    return any(path.is_file() and not path.is_symlink()
+               for path in (state_root / 'checkpoint_blobs').glob('*/*'))
