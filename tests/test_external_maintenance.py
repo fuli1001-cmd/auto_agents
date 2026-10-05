@@ -24,6 +24,34 @@ from auto_agents_watch.process import cycle, run
 from auto_agents_watch.git_delivery import git, commit, publish
 
 
+@pytest.mark.parametrize('crashed',[False,True])
+def test_offline_check_reclaims_its_copy_and_preserves_input_and_report(tmp_path,crashed):
+    from auto_agents_watch.verification import Verifier
+    snapshot=tmp_path/'snapshot';snapshot.mkdir();(snapshot/'input').write_text('original')
+    root=tmp_path/'verification';root.mkdir()
+    copies=[]
+    class Sandbox:
+        def verify(self,argv,candidate,evidence,result,log,*,project):
+            copies.append(project)
+            assert (project/'input').read_text()=='original'
+            (project/'input').write_text('private verification change')
+            log.write_text(json.dumps({'ok':False,'blocked_step_cleared':False,
+                                      'external_calls':0,'category':'engine','type':'KeyError'})+'\n')
+            if crashed:raise RuntimeError('container failure')
+            return {'ok':False,'returncode':3,'reason':''}
+    verifier=object.__new__(Verifier);verifier.root=root;verifier.sandbox=Sandbox()
+    for attempt in range(3):
+        if crashed:
+            with pytest.raises(RuntimeError,match='container failure'):
+                verifier.recover(tmp_path,snapshot,{'project':'/original'})
+        else:
+            assert verifier.recover(tmp_path,snapshot,{'project':'/original'})['status']=='failed'
+        assert not list(root.glob('recovery-*'))
+        assert (snapshot/'input').read_text()=='original'
+        assert json.loads((root/'recovery.log').read_text())['type']=='KeyError'
+    assert len(set(copies))==3
+
+
 def test_business_state_is_local_and_rejects_stale_writes(tmp_path):
     store=BusinessStore(tmp_path)
     value={'session_id':'s','mode':'collab','status':'paused','goal':'original'}

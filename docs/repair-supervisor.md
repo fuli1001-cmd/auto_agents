@@ -72,6 +72,9 @@ inode registration changes. Goals, source descriptors and call receipts remain
 constraints. Unregistered sources and ownership conflicts stop as state errors,
 without starting an engine repair. Offline checks do not send notifications.
 Unconfirmed external requests require reconciliation before automatic recovery.
+Each offline recovery check uses a temporary working copy and removes it on
+success or failure. The original snapshot and diagnostic reports remain retained
+for resume; correction commits do not accumulate additional project copies.
 The original defect must reproduce before editing. The writer changes one engine
 candidate. Verification first checks the original offline resume boundary, then
 the fixed regression manifest from the admission commit. An independent reviewer

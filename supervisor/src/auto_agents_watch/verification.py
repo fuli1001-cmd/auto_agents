@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import subprocess
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 
 from .git_delivery import git
@@ -37,24 +38,26 @@ class Verifier:
         return {'ok':not forbidden,'paths':forbidden}
 
     def recover(self, candidate, snapshot, token):
-        private = self.root / ('recovery-' + git(candidate,'rev-parse','HEAD')[:12])
-        if private.exists(): shutil.rmtree(private)
-        shutil.copytree(snapshot,private,symlinks=True)
-        # Materialized records make the copy self-contained; live paths are not mounted.
-        token_file=self.root/'resume-token.json'; atomic(token_file,token)
-        output=self.root/'recovery-result'; log=self.root/'recovery.log'
-        result=self.sandbox.verify(['python','-m','auto_agents','resume-check','--project',token['project'],
-            '--resume-token','/evidence/resume-token.json'],candidate,self.root,output,log,project=private)
-        value=None
-        for line in log.read_text(errors='replace').splitlines():
-            try: row=json.loads(line)
-            except ValueError: continue
-            if isinstance(row,dict) and 'blocked_step_cleared' in row: value=row
-        passed=result['ok'] and value and value.get('ok') and value.get('external_calls')==0
-        status='passed' if passed else 'failed'
-        if not value or result.get('reason') or value.get('category') in {'state','environment','reconciliation'}:
-            status='unknown'
-        return {'id':'original-boundary','status':status,'report':value,'log':str(log)}
+        # Recovery mutates only a disposable copy. Its input snapshot and
+        # diagnostic reports remain available for a stopped task to resume.
+        with tempfile.TemporaryDirectory(prefix='recovery-', dir=self.root) as temporary:
+            private = Path(temporary) / 'project'
+            shutil.copytree(snapshot,private,symlinks=True)
+            # Materialized records make the copy self-contained; live paths are not mounted.
+            token_file=self.root/'resume-token.json'; atomic(token_file,token)
+            output=self.root/'recovery-result'; log=self.root/'recovery.log'
+            result=self.sandbox.verify(['python','-m','auto_agents','resume-check','--project',token['project'],
+                '--resume-token','/evidence/resume-token.json'],candidate,self.root,output,log,project=private)
+            value=None
+            for line in log.read_text(errors='replace').splitlines():
+                try: row=json.loads(line)
+                except ValueError: continue
+                if isinstance(row,dict) and 'blocked_step_cleared' in row: value=row
+            passed=result['ok'] and value and value.get('ok') and value.get('external_calls')==0
+            status='passed' if passed else 'failed'
+            if not value or result.get('reason') or value.get('category') in {'state','environment','reconciliation'}:
+                status='unknown'
+            return {'id':'original-boundary','status':status,'report':value,'log':str(log)}
 
     def regression(self,candidate):
         checks=[]
