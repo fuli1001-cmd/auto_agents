@@ -272,6 +272,14 @@ def namespace_exec(payload):
 def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), write_roots=(), path_entries=(),
                       python_paths=(), node_paths=(), library_paths=(), execution_environment=None,
                       supervisor_checks=False, trace_custody=None, gate_environment_overrides=None):
+    from .supervision_api import _active
+    observer = _active.get()
+    if (observer and observer.offline and os.environ.get('AUTO_AGENTS_WATCH_ISOLATED') == '1'
+            and Path('/.dockerenv').exists()):
+        # The public offline check already runs inside the credential-free,
+        # network-free Docker boundary on a private project. No nested launcher.
+        yield list(argv)
+        return
     root, target = Path(cwd).resolve(), Path(real_project).resolve()
     from auto_agents.verification_input_trace import owner_identity
     owner = owner_identity()

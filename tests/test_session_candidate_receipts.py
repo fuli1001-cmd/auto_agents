@@ -17,7 +17,7 @@ from auto_agents.session import Session
 import auto_agents.session as session_module
 import auto_agents.session_candidate as candidate
 from test_session_verification_ownership import project, git
-from test_engine_child_recovery import (parent_workflow, ObservationBoundary,
+from workflow_support import (parent_workflow, ObservationBoundary,
     configure_local_writer, REAL_PROVIDER_CALL)
 
 
@@ -260,6 +260,7 @@ def test_clean_filter_mismatch_blocks_with_owned_diagnostic(tmp_path, monkeypatc
         # Also reach the actual gate-cache shortcut with the real earlier
         # result still eligible. Only the higher-level receipt result is absent.
         monkeypatch.delenv('GIT_CONFIG_COUNT')
+        state = load_session_state(root, state.session_id)
         state.execution_log = [e for e in state.execution_log if e.get('action') != 'receipt_verification']
         save_session_state(root, state)
         cached_result = LocalGatePlanExecutor.cached_result

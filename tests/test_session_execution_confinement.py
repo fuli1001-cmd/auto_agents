@@ -148,7 +148,7 @@ def _public_metadata_preflight_failure(tmp_path, monkeypatch, failure, *, varian
     from auto_agents.orchestrator import Orchestrator
     from auto_agents.session import Session
     from execution_marker import ExecutionMarker
-    from test_engine_child_recovery import configure_local_writer, REAL_PROVIDER_CALL
+    from workflow_support import configure_local_writer, REAL_PROVIDER_CALL
 
     root, hook = shared_environment(tmp_path)
     child = load_session_state(root, 'owned-child')

@@ -10,7 +10,7 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.session_verification import SessionOwnershipError
 from auto_agents.workflow_chain import WorkflowRef
 from auto_agents.workflow_runtime import WorkflowCoordinator
-from test_engine_child_recovery import parent_workflow
+from workflow_support import parent_workflow
 from test_session_verification_ownership import project, git
 
 

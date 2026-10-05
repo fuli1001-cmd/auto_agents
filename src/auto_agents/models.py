@@ -1158,80 +1158,6 @@ class SmartTimeoutConfig:
         return asdict(self)
 
 
-@dataclass
-class HealthWatchConfig:
-    enabled: bool = True
-    agent_triage_enabled: bool = True
-    poll_seconds: int = 30
-    heartbeat_timeout_seconds: int = 120
-    goal_stall_lease_multiplier: float = 2.0
-    oscillation_repeat_limit: int = 3
-    recovery_churn_limit: int = 3
-    max_interventions_per_root: int = 3
-    quiesce_timeout_seconds: int = 600
-    boundary_replay_timeout_seconds: int = 1200
-
-    # Read-only compatibility attributes. Legacy input keys are ignored and
-    # these values are deliberately absent from ``to_dict``.
-    @property
-    def sidecar_enabled(self) -> bool:
-        return self.enabled
-
-    @property
-    def sidecar_grace_seconds(self) -> int:
-        return 0
-
-    @property
-    def max_sidecar_restarts_per_run(self) -> int:
-        return 0
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, object]) -> "HealthWatchConfig":
-        legacy = sorted(
-            key
-            for key in (
-                "sidecar_enabled",
-                "sidecar_grace_seconds",
-                "max_sidecar_restarts_per_run",
-            )
-            if key in data
-        )
-        if legacy:
-            warnings.warn(
-                "health_watch legacy settings are ignored and will not be saved: "
-                + ", ".join(legacy),
-                FutureWarning,
-                stacklevel=2,
-            )
-        return cls(
-            enabled=bool(data.get("enabled", True)),
-            agent_triage_enabled=bool(data.get("agent_triage_enabled", True)),
-            poll_seconds=max(5, int(data.get("poll_seconds", 30))),
-            heartbeat_timeout_seconds=max(
-                15, int(data.get("heartbeat_timeout_seconds", 120))
-            ),
-            goal_stall_lease_multiplier=max(
-                1.0, float(data.get("goal_stall_lease_multiplier", 2.0))
-            ),
-            oscillation_repeat_limit=max(
-                2, int(data.get("oscillation_repeat_limit", 3))
-            ),
-            recovery_churn_limit=max(
-                2, int(data.get("recovery_churn_limit", 3))
-            ),
-            max_interventions_per_root=max(
-                1, int(data.get("max_interventions_per_root", 3))
-            ),
-            quiesce_timeout_seconds=max(
-                60, int(data.get("quiesce_timeout_seconds", 600))
-            ),
-            boundary_replay_timeout_seconds=max(
-                60, int(data.get("boundary_replay_timeout_seconds", 1200))
-            ),
-        )
-
-    def to_dict(self) -> Dict[str, object]:
-        return asdict(self)
 
 
 @dataclass
@@ -1266,44 +1192,6 @@ class ProviderFailoverConfig:
         return asdict(self)
 
 
-@dataclass
-class SelfRepairDiagnosisConfig:
-    mode: str = "all_terminal"
-    investigator_timeout_seconds: int = 900
-    reviewer_timeout_seconds: int = 600
-    arbiter_timeout_seconds: int = 600
-    command_timeout_seconds: int = 300
-    max_dynamic_commands: int = 12
-    confidence_threshold: float = 0.85
-    arbiter_confidence_threshold: float = 0.90
-    max_repair_cycles: int = 2
-    network_enabled: bool = False
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, object]) -> "SelfRepairDiagnosisConfig":
-        return cls(
-            mode=str(data.get("mode", "all_terminal")).strip() or "all_terminal",
-            investigator_timeout_seconds=int(
-                data.get("investigator_timeout_seconds", 900)
-            ),
-            reviewer_timeout_seconds=int(
-                data.get("reviewer_timeout_seconds", 600)
-            ),
-            arbiter_timeout_seconds=int(
-                data.get("arbiter_timeout_seconds", 600)
-            ),
-            command_timeout_seconds=int(data.get("command_timeout_seconds", 300)),
-            max_dynamic_commands=int(data.get("max_dynamic_commands", 12)),
-            confidence_threshold=float(data.get("confidence_threshold", 0.85)),
-            arbiter_confidence_threshold=float(
-                data.get("arbiter_confidence_threshold", 0.90)
-            ),
-            max_repair_cycles=int(data.get("max_repair_cycles", 2)),
-            network_enabled=bool(data.get("network_enabled", False)),
-        )
-
-    def to_dict(self) -> Dict[str, object]:
-        return asdict(self)
 
 
 @dataclass
@@ -1400,6 +1288,45 @@ class SessionLimitsConfig:
 
 
 @dataclass
+class SupervisionConfig:
+    mode: str = "auto"
+    no_progress_limit: int = 2
+    loop_repeat_limit: int = 3
+    heartbeat_timeout_seconds: int = 120
+    max_model_calls: Optional[int] = None
+    max_duration_seconds: Optional[int] = None
+    publish: bool = True
+
+    @property
+    def enabled(self):
+        return self.mode != "off"
+
+    @enabled.setter
+    def enabled(self, value):
+        self.mode = "auto" if value else "off"
+
+    @classmethod
+    def from_dict(cls, data):
+        mode = data.get("mode", "auto")
+        if mode not in {"auto", "off"}:
+            raise ValueError("execution.supervision.mode must be auto or off")
+        values = dict(data)
+        values.pop("mode", None)
+        for key in ("no_progress_limit", "loop_repeat_limit", "heartbeat_timeout_seconds"):
+            if key in values and (type(values[key]) is not int or values[key] < 1):
+                raise ValueError("execution.supervision." + key + " must be a positive integer")
+        for key in ("max_model_calls", "max_duration_seconds"):
+            if values.get(key) is not None and (type(values[key]) is not int or values[key] < 1):
+                raise ValueError("execution.supervision." + key + " must be positive or null")
+        if "publish" in values and type(values["publish"]) is not bool:
+            raise ValueError("execution.supervision.publish must be boolean")
+        return cls(mode=mode, **values)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
 class ExecutionConfig:
     acceleration: AccelerationConfig = field(default_factory=AccelerationConfig)
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
@@ -1407,12 +1334,9 @@ class ExecutionConfig:
     requirements_audit: RequirementsAuditConfig = field(default_factory=RequirementsAuditConfig)
     evidence_preflight: EvidencePreflightConfig = field(default_factory=EvidencePreflightConfig)
     smart_timeout: SmartTimeoutConfig = field(default_factory=SmartTimeoutConfig)
-    health_watch: HealthWatchConfig = field(default_factory=HealthWatchConfig)
+    supervision: SupervisionConfig = field(default_factory=SupervisionConfig)
     provider_failover: ProviderFailoverConfig = field(
         default_factory=ProviderFailoverConfig
-    )
-    self_repair_diagnosis: SelfRepairDiagnosisConfig = field(
-        default_factory=SelfRepairDiagnosisConfig
     )
     autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
     session_limits: SessionLimitsConfig = field(default_factory=SessionLimitsConfig)
@@ -1436,14 +1360,9 @@ class ExecutionConfig:
             smart_timeout=SmartTimeoutConfig.from_dict(
                 dict(data.get("smart_timeout", {}))
             ),
-            health_watch=HealthWatchConfig.from_dict(
-                dict(data.get("health_watch", {}))
-            ),
+            supervision=SupervisionConfig.from_dict(dict(data.get("supervision", {})) or {"mode": "off" if data.get("self_repair_diagnosis", {}).get("mode") == "off" else "auto"}),
             provider_failover=ProviderFailoverConfig.from_dict(
                 dict(data.get("provider_failover", {}))
-            ),
-            self_repair_diagnosis=SelfRepairDiagnosisConfig.from_dict(
-                dict(data.get("self_repair_diagnosis", {}))
             ),
             autonomy=AutonomyConfig.from_dict(dict(data.get("autonomy", {}))),
             session_limits=SessionLimitsConfig.from_dict(
@@ -1465,9 +1384,8 @@ class ExecutionConfig:
             "requirements_audit": self.requirements_audit.to_dict(),
             "evidence_preflight": self.evidence_preflight.to_dict(),
             "smart_timeout": self.smart_timeout.to_dict(),
-            "health_watch": self.health_watch.to_dict(),
+            "supervision": self.supervision.to_dict(),
             "provider_failover": self.provider_failover.to_dict(),
-            "self_repair_diagnosis": self.self_repair_diagnosis.to_dict(),
             "autonomy": self.autonomy.to_dict(),
             "session_limits": self.session_limits.to_dict(),
             "user_input": self.user_input.to_dict(),

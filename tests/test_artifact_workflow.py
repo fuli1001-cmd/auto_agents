@@ -138,13 +138,13 @@ def test_plan_apply_rechecks_workflow_and_archives_only_on_apply(store, tmp_path
 def test_interrupted_reference_retirement_and_delete_are_retryable(store, tmp_path, monkeypatch):
     project, session, _, _, checkout, identity = candidate(store, tmp_path)
     from auto_agents import artifact_workflow, artifact_store
-    write = artifact_workflow.atomic_json
+    write = artifact_workflow._persist
     with monkeypatch.context() as patch:
         def fail_reference(path, value):
             if Path(path).name == 'session_state.json':
                 raise OSError('reference write interrupted')
             write(path, value)
-        patch.setattr(artifact_workflow, 'atomic_json', fail_reference)
+        patch.setattr(artifact_workflow, '_persist', fail_reference)
         assert not clean(store=store)['ok']
     assert checkout.exists()
     assert load_session_state(project, session.session_id).candidate_custody
@@ -294,7 +294,7 @@ def test_lock_replacement_and_new_reference_after_plan_block_cleanup(store, tmp_
     import hashlib
     import tempfile
     project, session, _, _, checkout, identity = candidate(store, tmp_path)
-    lock = Path(tempfile.gettempdir()) / 'auto-agents-run-locks' / (hashlib.sha256(str(project).encode()).hexdigest() + '.lock')
+    lock = project / '.auto-agents/state/run.lock'
     lock.parent.mkdir(exist_ok=True)
     with lock.open('a+') as handle:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -311,22 +311,3 @@ def test_lock_replacement_and_new_reference_after_plan_block_cleanup(store, tmp_
     checkout.parent.mkdir()
     assert store.clean_artifact(identity)['result'] == 'retained'
     assert (moved / 'project/product.txt').read_text() == 'delivered'
-
-
-def test_repair_records_protect_candidate_after_workflow_completion(store, tmp_path):
-    from auto_agents.repair_control import Store
-    _, _, _, _, checkout, identity = candidate(store, tmp_path)
-    control = tmp_path / 'repair'
-    repair = Store(control)
-    (control / 'operator.json').write_text(json.dumps({'root': str(control)}))
-    managed = store.register(control / 'operator.json', kind='permanent', metadata={'repair_root': str(control)})
-    store.release(managed)
-    with repair.connect() as db:
-        db.execute('INSERT INTO verification_contexts VALUES(?,?)',
-                   ('frozen', json.dumps({'source_root': str(checkout)})))
-    result = store.clean_artifact(identity)
-    assert result['result'] == 'retained' and 'referenced_repair_candidate' in result['reason']
-    assert checkout.exists()
-    with repair.connect() as db:
-        db.execute('DELETE FROM verification_contexts')
-    assert store.clean_artifact(identity)['result'] == 'deleted'

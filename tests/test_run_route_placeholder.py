@@ -131,16 +131,9 @@ def failed_plan_scene(scene, monkeypatch):
     return state, session
 
 
-@pytest.mark.parametrize('managed', [False, True])
-def test_retained_missing_plan_failure_resumes_same_child_without_model_route(scene, monkeypatch, managed):
+def test_retained_missing_plan_failure_resumes_same_child_without_model_route(scene, monkeypatch):
     root, coordinator, snapshot, handoff = scene
     state, session = failed_plan_scene(scene, monkeypatch)
-    if managed:
-        from test_recovery_native import activate
-        from auto_agents.config import load_session_state
-        activate(root, root.parent / 'control', monkeypatch)
-        state = load_session_state(root, state.session_id)
-        handoff = coordinator.store.load_handoff(handoff.handoff_id)
     before = handoff.to_dict()
     retained = load_run_state(root)
     spec = root / retained.resume_context['spec_file']

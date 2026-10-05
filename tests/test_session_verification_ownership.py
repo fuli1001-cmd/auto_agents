@@ -129,73 +129,8 @@ def test_candidate_verification_excludes_foreign_dirty_changes(tmp_path, monkeyp
                                    delivery['base_revision'], delivery['delivered_revision'])
 
 
-@pytest.mark.parametrize('routed', [False, True])
-def test_resume_recovers_expired_snapshot_contract_from_saved_head(tmp_path, monkeypatch, routed):
-    from test_engine_child_recovery import parent_workflow, resume_to_observation
-
-    root, state = project(tmp_path)
-    original_gates = load_project_config(root).gates.to_dict()
-    state.baseline_git_ref = 'refs/auto-agents/gate-snapshots/expired'
-    state.baseline_failures = ['tests/test_old.py::test_old']
-    save_session_state(root, state)
-    if routed:
-        from auto_agents.repair_control import digest
-        _, _, handoff = parent_workflow(root, state, engine=True)
-        receipt = tmp_path / 'route-probe.json'
-        receipt.write_text(json.dumps({'route_digest': digest(handoff.payload)}))
-        monkeypatch.setenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE', str(receipt))
-    config = load_project_config(root)
-    config.gates.steps[0].targets = ['tests/test_future.py::test_future']
-    save_project_config(root, config)
-    save_task_plan(root, {'tasks': [{'task_id': 'task-foreign', 'title': 'Foreign task', 'status': 'pending',
-                                   'verification_refs': ['tests/test_future.py::test_future']}]})
-    plan_bytes = (root / '.auto-agents/state/task_plan.json').read_bytes()
-    # Advance HEAD too: recovery must use the saved source, not the current plan.
-    git(root, 'add', '-A')
-    git(root, 'commit', '-m', 'start another workflow contract')
-    calls = []
-    if routed:
-        def action(child, prompt, candidate_root):
-            calls.append(child.session_id)
-            (candidate_root / 'value.py').write_text('VALUE = 1\n')
-            return 'Repaired value.\nCOMMIT_MESSAGE: Repair owned value'
-        resume_to_observation(root, monkeypatch, action)
-    else:
-        _, calls, _ = run_session(root, monkeypatch)
-    saved = load_session_state(root, state.session_id)
-    assert saved.status == 'completed', saved.to_dict()
-    assert len(calls) == 1
-    assert saved.baseline_git_ref != state.baseline_git_ref
-    assert saved.baseline_failures == []
-    assert saved.verification_binding['gates'] == original_gates
-    assert saved.verification_binding['tasks'][0]['task_id'] == 'task-owned'
-    assert (root / '.auto-agents/state/task_plan.json').read_bytes() == plan_bytes
-    assert load_project_config(root).gates.steps[0].targets == ['tests/test_future.py::test_future']
 
 
-def test_child_resume_without_contract_history_blocks_before_agent_work(tmp_path, monkeypatch):
-    from test_engine_child_recovery import parent_workflow, resume_to_observation
-    from auto_agents.repair_control import digest
-
-    root, child = project(tmp_path)
-    child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/expired'
-    child.baseline_head_ref = ''
-    child.lineage_head_ref = ''
-    _, _, handoff = parent_workflow(root, child, engine=True)
-    receipt = tmp_path / 'route-probe.json'
-    receipt.write_text(json.dumps({'route_digest': digest(handoff.payload)}))
-    monkeypatch.setenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE', str(receipt))
-    before = head_ref(root)
-    def action(state, prompt, candidate_root):
-        pytest.fail('A child without recoverable contract history must not execute')
-    resume_to_observation(root, monkeypatch, action)
-    saved = load_session_state(root, child.session_id)
-    assert saved.status == 'blocked'
-    assert saved.resolution == 'verification_ownership'
-    assert saved.verification_binding == {}
-    assert any('contract revision is unavailable' in str(entry) for entry in saved.execution_log)
-    assert head_ref(root) == before
-    assert (root / 'value.py').read_text() == 'VALUE = 0\n'
 
 
 def test_missing_entry_preflight_reports_session_task_requirement_and_contract(tmp_path, monkeypatch):
@@ -292,7 +227,7 @@ def test_missing_or_unexecuted_required_checks_cannot_attest_success(tmp_path, m
 
 @pytest.mark.parametrize('candidate', ['product', 'provider_doc'])
 def test_child_rollback_preserves_foreign_index_worktree_and_untracked_bytes(tmp_path, monkeypatch, candidate):
-    from test_engine_child_recovery import parent_workflow, resume_to_observation
+    from workflow_support import parent_workflow, resume_to_observation
     root, child = project(tmp_path, missing=True)
     store, _, handoff = parent_workflow(root, child)
     (root / 'foreign.py').write_text('VALUE = 8\n')
@@ -358,7 +293,16 @@ def test_overlapping_or_unknown_ownership_blocks_destructive_rollback(tmp_path, 
     if ownership == 'overlapping':
         test_overlapping_ownership_blocks_without_discarding_foreign_changes(tmp_path, monkeypatch)
     else:
-        test_child_resume_without_contract_history_blocks_before_agent_work(tmp_path, monkeypatch)
+        root, child = project(tmp_path)
+        child.baseline_git_ref = 'refs/auto-agents/gate-snapshots/expired'
+        child.baseline_head_ref = ''
+        child.lineage_head_ref = ''
+        save_session_state(root, child)
+        result, calls, _ = run_session(root, monkeypatch)
+        assert result.status == 'blocked'
+        assert calls == []
+        assert (root / 'value.py').read_text() == 'VALUE = 0\n'
+
 
 
 @pytest.mark.parametrize('waiver', ['reference_deletion', 'cached_success', 'empty_owned', 'artifact_only',
@@ -812,13 +756,12 @@ def test_public_resume_accepts_typed_executable_reference(tmp_path, monkeypatch,
         if target_kind == 'vitest_configured_filter':
             # Model a local installation with writable bundler scratch while
             # reusing the provisioned packages without changing their bytes.
+            import shutil
             modules = root / 'node_modules'
             packages = modules.resolve()
             modules.unlink()
-            modules.mkdir()
-            for package in packages.iterdir():
-                if package.name != '.vite-temp':
-                    (modules / package.name).symlink_to(package, target_is_directory=package.is_dir())
+            shutil.copytree(packages,modules,symlinks=True,
+                            ignore=shutil.ignore_patterns('.vite-temp','.vite'))
             (root / 'vitest.config.js').write_text('export default ' + json.dumps(
                 {'test': {'include': ['tests/*.check.ts'], 'exclude': ['**/control*']}}) + ';\n')
         (root / vitest_source).write_text(
@@ -1284,7 +1227,7 @@ def test_public_resume_preserves_existing_foreign_pending_regression_prerequisit
 
 @pytest.mark.parametrize('history', ['retained', 'unavailable', 'missing_plan', 'unmatched_requirement'])
 def test_public_resume_before_first_baseline_uses_child_history(tmp_path, monkeypatch, history):
-    from test_engine_child_recovery import parent_workflow, resume_to_observation
+    from workflow_support import parent_workflow, resume_to_observation
 
     root, child = project(tmp_path)
     if history == 'missing_plan':
@@ -1315,7 +1258,7 @@ def test_public_resume_before_first_baseline_uses_child_history(tmp_path, monkey
     save_session_state(root, parent)
     # Stop only after production handoff consumption returns to the parent;
     # the parent's next implementation cycle is outside this child proof.
-    from test_engine_child_recovery import ObservationBoundary
+    from workflow_support import ObservationBoundary
     collab_loop = Session._phase_collab_loop
     def parent_boundary(self, state):
         if state.session_id == 'parent':
@@ -2697,7 +2640,7 @@ def _assert_binding_blocked_before_execution(root, monkeypatch, *, parent=False)
         pytest.fail('Unresolved session authority must block before baseline capture')
     monkeypatch.setattr(Session, '_ensure_baseline', baseline)
     if parent:
-        from test_engine_child_recovery import ObservationBoundary, resume_to_observation
+        from workflow_support import ObservationBoundary, resume_to_observation
         collab_loop = Session._phase_collab_loop
         def parent_boundary(self, state):
             if state.session_id == 'parent':
@@ -2797,7 +2740,7 @@ def test_public_legacy_resume_without_history_rejects_ambient_plan(tmp_path, mon
                                      'nested_issue', 'foreign_task', 'foreign_requirement'])
 def test_public_child_binding_rejects_conflicting_task_authority(tmp_path, monkeypatch, conflict):
     from auto_agents.config import load_task_plan
-    from test_engine_child_recovery import parent_workflow
+    from workflow_support import parent_workflow
 
     root, child = project(tmp_path)
     plan = load_task_plan(root)
@@ -2843,7 +2786,7 @@ def test_public_child_binding_rejects_conflicting_task_authority(tmp_path, monke
 def test_public_resume_rejects_conflicting_handoff_child_identities(tmp_path, monkeypatch, binding_version):
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
-    from test_engine_child_recovery import parent_workflow
+    from workflow_support import parent_workflow
 
     root, child = project(tmp_path)
     store, snapshot, handoff = parent_workflow(root, child)
@@ -2880,7 +2823,7 @@ def test_public_child_reconciles_task_and_requirement_authority(
     from copy import deepcopy
     from auto_agents.config import load_task_plan
     from auto_agents.session_verification import fingerprint
-    from test_engine_child_recovery import parent_workflow, resume_to_observation
+    from workflow_support import parent_workflow, resume_to_observation
 
     root, child = project(tmp_path)
     store, snapshot, handoff = parent_workflow(root, child)
@@ -2925,7 +2868,7 @@ def test_public_child_reconciles_task_and_requirement_authority(
     ambient = _switch_ambient_binding_plan(root)
     handoff_bytes = (root / '.auto-agents/state/handoffs' / (handoff.handoff_id + '.json')).read_bytes()
     if matching is True:
-        from test_engine_child_recovery import ObservationBoundary
+        from workflow_support import ObservationBoundary
         # Stop after the public parent consumes the child result, before
         # starting the ambient workflow's separate implementation phase.
         collab_loop = Session._phase_collab_loop
@@ -2969,7 +2912,7 @@ def test_public_legacy_upgrade_preserves_conflicting_retained_handoff(tmp_path, 
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
     from auto_agents.workflow_chain import WorkflowRef
-    from test_engine_child_recovery import parent_workflow
+    from workflow_support import parent_workflow
 
     root, child = project(tmp_path)
     store, snapshot, original = parent_workflow(root, child)
@@ -3076,7 +3019,7 @@ def _supervised_public_resume(tmp_path, monkeypatch, scope, *, recover):
     from auto_agents.session_verification import fingerprint
     from auto_agents.verification_input_trace import owner_identity, resolved_trace
     from auto_agents.verification_supervisor_checks import observation, LEGACY_SHA256
-    from test_engine_child_recovery import (
+    from workflow_support import (
         configure_local_writer, parent_workflow, resume_to_observation, ObservationBoundary,
     )
 
@@ -3329,7 +3272,7 @@ def _assert_reused_session_authority(tmp_path, monkeypatch):
 def _assert_public_missing_scope_recovery(tmp_path, monkeypatch, shape):
     from copy import deepcopy
     from auto_agents.session_verification import fingerprint
-    from test_engine_child_recovery import parent_workflow, resume_to_observation, ObservationBoundary
+    from workflow_support import parent_workflow, resume_to_observation, ObservationBoundary
 
     root, child = project(tmp_path)
     store, snapshot, handoff = parent_workflow(root, child)
@@ -3482,7 +3425,7 @@ def test_candidate_receipt_excludes_intervening_foreign_content_index_and_modes(
     import stat
     import auto_agents.session as session_module
     from auto_agents.session_candidate import GateSnapshotManager
-    from test_engine_child_recovery import parent_workflow, resume_to_observation, configure_local_writer
+    from workflow_support import parent_workflow, resume_to_observation, configure_local_writer
 
     root, child = project(tmp_path, missing=failure)
     owned_test = root / 'tests/test_owned.py'
@@ -3574,7 +3517,7 @@ def test_candidate_publication_preserves_foreign_edit_after_final_snapshot(tmp_p
 
 
 def test_verification_snapshot_contains_only_owned_candidate_changes(tmp_path, monkeypatch):
-    from test_engine_child_recovery import configure_local_writer, REAL_PROVIDER_CALL
+    from workflow_support import configure_local_writer, REAL_PROVIDER_CALL
     root, child = project(tmp_path)
     configure_local_writer(root, child, "Path('value.py').write_text('VALUE = 1\\n')")
     (root / 'foreign.py').write_text('VALUE = 88\n')
@@ -3669,7 +3612,7 @@ def test_public_resume_validates_registered_runtime_and_retains_legacy_custody(t
 def test_public_unbound_handoff_preserves_foreign_work_after_checkpoint(tmp_path, monkeypatch, handoff_history):
     from auto_agents.workflow_runtime import WorkflowCoordinator
     from auto_agents.session_verification import candidate_snapshot
-    from test_engine_child_recovery import parent_workflow, ObservationBoundary
+    from workflow_support import parent_workflow, ObservationBoundary
 
     root, child = project(tmp_path)
     store, snapshot, handoff = parent_workflow(root, child)
@@ -3762,8 +3705,8 @@ def test_overlapping_or_unknown_ownership_blocks_without_overwriting_foreign_wor
 
 
 def test_parent_consumes_delivered_child_revision_without_shared_copyback(tmp_path, monkeypatch):
-    from test_engine_child_recovery import parent_workflow, ObservationBoundary
-    from test_engine_child_recovery import configure_local_writer, REAL_PROVIDER_CALL
+    from workflow_support import parent_workflow, ObservationBoundary
+    from workflow_support import configure_local_writer, REAL_PROVIDER_CALL
     root, child = project(tmp_path)
     configure_local_writer(root, child, "Path('value.py').write_text('VALUE = 1\\n')")
     store, _, handoff = parent_workflow(root, child)
@@ -3967,7 +3910,7 @@ def test_unborn_session_freezes_initial_source_without_shared_publication(
 @pytest.mark.parametrize('entrypoint', ['session', 'workflow'])
 def test_completed_parent_resume_preserves_shared_work_after_private_delivery(tmp_path, monkeypatch, entrypoint):
     from auto_agents.workflow_runtime import WorkflowCoordinator
-    from test_engine_child_recovery import parent_workflow
+    from workflow_support import parent_workflow
 
     root, child = project(tmp_path)
     # Retain the executable proof unchanged while exercising completion recovery.
@@ -4042,7 +3985,7 @@ def test_completed_parent_resume_preserves_shared_work_after_private_delivery(tm
 def test_public_child_receipt_materializes_directory_to_file_replacement(tmp_path, monkeypatch, staged):
     import base64
     import shutil
-    from test_engine_child_recovery import parent_workflow, resume_to_observation, configure_local_writer
+    from workflow_support import parent_workflow, resume_to_observation, configure_local_writer
 
     root, child = project(tmp_path)
     (root / 'assets').mkdir()
@@ -4110,7 +4053,7 @@ def test_directory_symlink_receipt_never_claims_or_chmods_foreign_descendants(
     import stat
     import auto_agents.session_candidate as custody
     import auto_agents.gate_execution as gates
-    from test_engine_child_recovery import parent_workflow, resume_to_observation, configure_local_writer
+    from workflow_support import parent_workflow, resume_to_observation, configure_local_writer
 
     root, child = project(tmp_path)
     (root / 'assets/nested').mkdir(parents=True)

@@ -65,7 +65,7 @@ def project_protection(project, *, recovery=True):
     deadline = time.monotonic() + 0.5
     root = Path(project)
     key = hashlib.sha256(str(root).encode()).hexdigest()
-    lock = Path(tempfile.gettempdir()) / "auto-agents-run-locks" / (key + ".lock")
+    lock = root / ".auto-agents/state/run.lock"
     if lock.exists():
         with lock.open("r") as handle:
             try:
@@ -190,44 +190,7 @@ def protection(row):
         if row["kind"] in {"recovery", "evidence"} and not metadata.get("disposable"):
             return "evidence_contract_requires_retention"
         if metadata.get("repair_root"):
-            root = Path(metadata["repair_root"])
-            path = Path(row['path'])
-            from .recovery.runtime_lifecycle import owns_path
-            if owns_path(root, path): return 'managed_runtime_lifecycle'
-            merge = path.with_name(path.name + '.source.json')
-            if path.parent == root / 'runtimes' and path.name.startswith('source-merge-') and merge.is_file():
-                if _json(merge).get('pending', True):
-                    return 'source_merge_pending'
-            config = _json(root / "operator.json")
-            if config.get('source_root'):
-                source = Path(config['source_root'])
-                if path.is_relative_to(source) and not path.is_relative_to(source / '.auto-agents'):
-                    return 'source_repository'
-            if config.get("implementation_root") == row["path"]:
-                return "installed_controller_runtime"
-            if row["kind"] not in {"incomplete", "cache"}:
-                with contextlib.closing(sqlite3.connect((root / "control.sqlite3").as_uri() + "?mode=ro", uri=True)) as db:
-                    if path.is_relative_to(root / 'jobs') and len(path.relative_to(root / 'jobs').parts) > 1:
-                        job = path.relative_to(root / 'jobs').parts[0]
-                        current = db.execute('SELECT state FROM jobs WHERE id=?', (job,)).fetchone()
-                        if not current: return 'unknown_reference: repair job is missing'
-                        if current[0] not in ('completed', 'cancelled'): return 'repair_or_recovery_pending'
-                        if (current[0] == 'cancelled' and (root / 'jobs' / job / 'continuous/repair').exists()
-                                and job not in delivered_repair_candidates(root, db)):
-                            return 'cancelled_repair_candidate_retained'
-                        if db.execute("SELECT 1 FROM subscribers WHERE job=? AND state NOT IN ('finished','cancelled') LIMIT 1", (job,)).fetchone():
-                            return 'subscriber_pending'
-                        if db.execute("SELECT 1 FROM outbox WHERE job=? AND state NOT IN ('published','invalidated','cancelled') LIMIT 1", (job,)).fetchone():
-                            return 'publication_pending'
-                    else:
-                        if db.execute("SELECT 1 FROM jobs WHERE state NOT IN ('completed','cancelled') LIMIT 1").fetchone():
-                            return "repair_or_recovery_pending"
-                        if retained_repair_candidates(root, db):
-                            return 'cancelled_repair_candidate_retained'
-                        if db.execute("SELECT 1 FROM subscribers WHERE state NOT IN ('finished','cancelled') LIMIT 1").fetchone():
-                            return "subscriber_pending"
-                        if db.execute("SELECT 1 FROM outbox WHERE state NOT IN ('published','invalidated','cancelled') LIMIT 1").fetchone():
-                            return "publication_pending"
+            return "legacy_archive"
         if metadata.get("worker_root"):
             root = Path(metadata["worker_root"])
             for path in (root / "jobs").glob("*.json"):
@@ -269,7 +232,7 @@ def deletion_guard(row, *, store=None):
         locks = []
         if metadata.get("project"):
             key = hashlib.sha256(metadata["project"].encode()).hexdigest()
-            locks.append(Path(tempfile.gettempdir()) / "auto-agents-run-locks" / (key + ".lock"))
+            locks.append(Path(metadata["project"]) / ".auto-agents/state/run.lock")
         if metadata.get("repair_root"):
             locks.append(Path(metadata["repair_root"]) / "repository.lock")
         if metadata.get("lock_path"):

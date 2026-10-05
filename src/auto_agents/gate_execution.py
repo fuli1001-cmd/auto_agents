@@ -1442,7 +1442,7 @@ class LocalGatePlanExecutor:
         named_lease_held: bool = False,
     ) -> CommandResult:
         from contextlib import nullcontext
-        from .repair_control import digest
+        from .local_io import digest
         identity = digest([command, self.snapshot.tree_sha if self.snapshot else "",
                            _metadata_signature(self.metadata.get(command), self.dependency_links),
                            self.result_cache.environment_fingerprint, self.result_cache.context_fingerprint])

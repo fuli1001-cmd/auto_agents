@@ -12,7 +12,7 @@ import pytest
 from auto_agents.models import SessionState
 from auto_agents.execution_binding import RunnerContextError, test_invocations as parse_test_invocations
 from auto_agents.pytest_selection import selected_nodes
-from auto_agents.repair_v2.workspace import git
+from auto_agents.local_io import git
 from auto_agents.session_verification import (_validate_required_node_selection,
     planned_pytest_execution_nodes, SessionOwnershipError)
 from auto_agents.verification_context import VerificationExecutionContext

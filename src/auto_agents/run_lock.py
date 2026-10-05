@@ -25,8 +25,6 @@ from .process_supervision import (
 RUN_LOCK_FD_ENV = "AUTO_AGENTS_RUN_LOCK_FD"
 RUN_LOCK_KEY_ENV = "AUTO_AGENTS_RUN_LOCK_KEY"
 RUN_LOCK_TOKEN_ENV = "AUTO_AGENTS_RUN_TOKEN"
-SELF_REPAIR_HANDOFF_ENV = "AUTO_AGENTS_SELF_REPAIR_LAST_FINGERPRINT"
-SELF_REPAIR_HEALTH_REBASE_ENV = "AUTO_AGENTS_SELF_REPAIR_HEALTH_REBASE"
 
 
 _ACQUIRED_PROJECT_LOCKS: dict[Path, list["ProjectRunLock"]] = {}
@@ -45,20 +43,18 @@ class RunAlreadyActiveError(RuntimeError):
 
 
 class ProjectRunLock:
-    """Process lock for a target project, with explicit self-repair handoff support."""
+    """Project process lock, optionally inherited from an external owner."""
 
     def __init__(self, project_root: Path, *, environ: Optional[Mapping[str, str]] = None) -> None:
         self.project_root = project_root.expanduser().resolve()
         self._environ = os.environ if environ is None else environ
         self.key = hashlib.sha256(str(self.project_root).encode("utf-8")).hexdigest()
-        self.path = Path(tempfile.gettempdir()) / "auto-agents-run-locks" / f"{self.key}.lock"
+        self.path = self.project_root / ".auto-agents/state/run.lock"
         self.control_path = self.path.with_suffix(".processes.json")
         self._fd: Optional[int] = None
         self._acquired_pid = 0
         self._interrupted_snapshot: dict[str, object] = {}
         self.run_token = str(self._environ.get(RUN_LOCK_TOKEN_ENV, "")).strip() or uuid.uuid4().hex
-        self.health_lease_token = self.run_token
-        self.health_boundary_rebased = False
         self.workflow_kind = "run"
         self.subject_id = ""
         self._started_at = datetime.now(timezone.utc).isoformat()
@@ -77,18 +73,6 @@ class ProjectRunLock:
         if inherited_fd is not None:
             self._fd = inherited_fd
             self._acquired_pid = os.getpid()
-            explicit_health_rebase = str(
-                self._environ.get(SELF_REPAIR_HEALTH_REBASE_ENV, "")
-            ).strip().lower() in {"1", "true", "yes"}
-            if explicit_health_rebase or str(
-                self._environ.get(SELF_REPAIR_HANDOFF_ENV, "")
-            ).strip():
-                # The OS lock remains inherited under its original token, but health
-                # observers and their durable action mailbox need a new lease after
-                # code replacement. A legacy sidecar exits when the manifest token
-                # changes, providing a mixed-version handoff without signaling it.
-                self.health_lease_token = uuid.uuid4().hex
-                self.health_boundary_rebased = True
             self._write_owner(inherited_fd)
             ACTIVE_PROCESSES.configure(self.project_root, self.run_token, self.control_path)
             _register_project_lock(self)
@@ -110,12 +94,6 @@ class ProjectRunLock:
         self._acquired_pid = os.getpid()
         previous_owner = _read_json_path(self.path)
         previous_control = read_process_control(self.control_path)
-        previous_health = _read_json_path(
-            self.project_root
-            / ".auto-agents"
-            / "state"
-            / "health-watch-control.json"
-        )
         orphaned = _live_control_processes(self.control_path, expected_project=str(self.project_root))
         if orphaned:
             self.release()
@@ -124,33 +102,14 @@ class ProjectRunLock:
                 f"orphaned auto_agents subprocesses are still active for {self.project_root} "
                 f"({details}); run `python auto_agents.py stop --project {self.project_root}`"
             )
-        prior_health_unexpected = bool(
-            str(previous_health.get("project", "")) == str(self.project_root)
-            and str(previous_health.get("run_token", "")).strip()
-            and str(previous_health.get("process_phase", "")) != "terminal"
-            and not process_identity_matches(
-                _safe_int(previous_health.get("owner_pid", 0)),
-                _safe_int(previous_health.get("owner_start_ticks", 0)),
-            )
-        )
         if (
             previous_control
             and str(previous_control.get("project", "")) == str(self.project_root)
-        ) or prior_health_unexpected:
+        ):
             self._interrupted_snapshot = {
                 "detected_at": datetime.now(timezone.utc).isoformat(),
                 "owner": previous_owner,
-                "control": (
-                    previous_control
-                    if previous_control
-                    else {
-                        "project": str(self.project_root),
-                        "run_token": str(previous_health.get("run_token", "")),
-                        "updated_at": str(previous_health.get("updated_at", "")),
-                        "processes": [],
-                    }
-                ),
-                "health": previous_health if prior_health_unexpected else {},
+                "control": previous_control,
             }
         self._write_owner(fd)
         ACTIVE_PROCESSES.configure(self.project_root, self.run_token, self.control_path)
@@ -247,8 +206,6 @@ class ProjectRunLock:
     def release(self) -> None:
         if self._fd is None:
             return
-        from .repair_client import release as release_repair_control
-        release_repair_control(self)
         fd, self._fd = self._fd, None
         self._acquired_pid = 0
         _unregister_project_lock(self)
@@ -451,16 +408,6 @@ def stop_project_run(
     grace_seconds: float = 10.0,
     kill_grace_seconds: float = 5.0,
 ) -> tuple[dict[str, object], int]:
-    from .repair_client import enabled
-    if enabled():
-        from .repair_control import operator_root, rpc
-        for config_path in operator_root().glob("*/operator.json"):
-            try:
-                rpc(json.loads(config_path.read_text()), {"op": "cancel", "project": str(project_root.resolve())})
-            except (OSError, RuntimeError, ValueError):
-                # Persist cancellation even while the supervisor is down.
-                from .repair_control import Store
-                Store(config_path.parent).cancel(project=str(project_root.resolve()))
     lock = ProjectRunLock(project_root, environ={})
     project = str(lock.project_root)
     owner = lock.owner_payload()

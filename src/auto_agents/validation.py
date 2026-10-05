@@ -2339,54 +2339,15 @@ def validate_project_config_payload(payload: object) -> List[str]:
                         errors.append(f"execution.project_runtime.{key} must be a boolean")
                 if project_runtime.get("root", ".auto-agents/runtime") != ".auto-agents/runtime":
                     errors.append("execution.project_runtime.root must be .auto-agents/runtime")
-            diagnosis = execution.get("self_repair_diagnosis", {})
-            if not isinstance(diagnosis, dict):
-                errors.append("execution.self_repair_diagnosis must be an object")
+            supervision = execution.get("supervision", {})
+            if not isinstance(supervision, dict):
+                errors.append("execution.supervision must be an object")
             else:
-                if diagnosis.get("mode", "all_terminal") not in {
-                    "off",
-                    "all_terminal",
-                }:
-                    errors.append(
-                        "execution.self_repair_diagnosis.mode must be one of: "
-                        "off, all_terminal"
-                    )
-                for key, default in {
-                    "investigator_timeout_seconds": 900,
-                    "reviewer_timeout_seconds": 600,
-                    "arbiter_timeout_seconds": 600,
-                    "command_timeout_seconds": 300,
-                    "max_dynamic_commands": 12,
-                    "max_repair_cycles": 2,
-                }.items():
-                    value = diagnosis.get(key, default)
-                    if (
-                        not isinstance(value, int)
-                        or isinstance(value, bool)
-                        or value < 1
-                    ):
-                        errors.append(
-                            f"execution.self_repair_diagnosis.{key} "
-                            "must be an integer >= 1"
-                        )
-                for key, default in {
-                    "confidence_threshold": 0.85,
-                    "arbiter_confidence_threshold": 0.90,
-                }.items():
-                    value = diagnosis.get(key, default)
-                    if (
-                        isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not 0.0 <= float(value) <= 1.0
-                    ):
-                        errors.append(
-                            f"execution.self_repair_diagnosis.{key} "
-                            "must be between 0 and 1"
-                        )
-                if not isinstance(diagnosis.get("network_enabled", False), bool):
-                    errors.append(
-                        "execution.self_repair_diagnosis.network_enabled must be a boolean"
-                    )
+                from .models import SupervisionConfig
+                try:
+                    SupervisionConfig.from_dict(supervision)
+                except (ValueError, TypeError) as error:
+                    errors.append("execution.supervision: " + str(error))
             autonomy = execution.get("autonomy", {})
             if not isinstance(autonomy, dict):
                 errors.append("execution.autonomy must be an object")
@@ -2446,70 +2407,6 @@ def validate_project_config_payload(payload: object) -> List[str]:
                         errors.append(
                             f"execution.autonomy.{key} must be a boolean"
                         )
-            health_watch = execution.get("health_watch", {})
-            if not isinstance(health_watch, dict):
-                errors.append("execution.health_watch must be an object")
-            else:
-                for key in ("enabled", "agent_triage_enabled"):
-                    if not isinstance(health_watch.get(key, True), bool):
-                        errors.append(
-                            f"execution.health_watch.{key} must be a boolean"
-                        )
-                integer_minimums = {
-                    "poll_seconds": 5,
-                    "heartbeat_timeout_seconds": 15,
-                    "oscillation_repeat_limit": 2,
-                    "recovery_churn_limit": 2,
-                    "max_interventions_per_root": 1,
-                    "quiesce_timeout_seconds": 60,
-                    "boundary_replay_timeout_seconds": 60,
-                }
-                for key, minimum in integer_minimums.items():
-                    value = health_watch.get(
-                        key,
-                        {
-                            "poll_seconds": 30,
-                            "heartbeat_timeout_seconds": 120,
-                            "oscillation_repeat_limit": 3,
-                            "recovery_churn_limit": 3,
-                            "max_interventions_per_root": 3,
-                            "quiesce_timeout_seconds": 600,
-                            "boundary_replay_timeout_seconds": 1200,
-                        }[key],
-                    )
-                    if (
-                        not isinstance(value, int)
-                        or isinstance(value, bool)
-                        or value < minimum
-                    ):
-                        errors.append(
-                            f"execution.health_watch.{key} must be an integer >= {minimum}"
-                        )
-                multiplier = health_watch.get("goal_stall_lease_multiplier", 2.0)
-                if (
-                    isinstance(multiplier, bool)
-                    or not isinstance(multiplier, (int, float))
-                    or float(multiplier) < 1.0
-                ):
-                    errors.append(
-                        "execution.health_watch.goal_stall_lease_multiplier "
-                        "must be a number >= 1.0"
-                    )
-                poll_seconds = health_watch.get("poll_seconds", 30)
-                heartbeat_timeout = health_watch.get(
-                    "heartbeat_timeout_seconds", 120
-                )
-                if (
-                    isinstance(poll_seconds, int)
-                    and not isinstance(poll_seconds, bool)
-                    and isinstance(heartbeat_timeout, int)
-                    and not isinstance(heartbeat_timeout, bool)
-                    and heartbeat_timeout < poll_seconds * 3
-                ):
-                    errors.append(
-                        "execution.health_watch.heartbeat_timeout_seconds must be "
-                        ">= 3 * poll_seconds"
-                    )
             smart_timeout = execution.get("smart_timeout", {})
             if not isinstance(smart_timeout, dict):
                 errors.append("execution.smart_timeout must be an object")

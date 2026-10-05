@@ -14,7 +14,7 @@ from auto_agents.git_ops import head_ref
 from auto_agents.models import AgentResult, VerificationStep
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.session import Session
-from test_engine_child_recovery import ObservationBoundary, parent_workflow, resume_to_observation
+from workflow_support import ObservationBoundary, parent_workflow, resume_to_observation
 from test_session_verification_ownership import git, project, run_session
 
 
@@ -224,64 +224,3 @@ def test_mixed_command_execution_preserves_conditional_actions(tmp_path, monkeyp
     assert saved.status == 'completed', saved.to_dict()
     assert saved.fix_verify_command == child.fix_verify_command
     assert marker.exists() is executes_action
-
-
-@pytest.mark.parametrize('status,renewed_receipt', [
-    pytest.param(status, renewed, id=status if renewed else 'unverified-' + status)
-    for renewed in (True, False) for status in ('paused', 'waiting_user', 'waiting_child')
-])
-def test_engine_child_nonterminal_receipt_stays_active_until_same_child_finishes(tmp_path, monkeypatch, status, renewed_receipt):
-    from auto_agents.repair_control import digest
-
-    root, child = project(tmp_path)
-    store, _, handoff = parent_workflow(root, child, engine=True)
-    receipt = tmp_path / 'route-probe.json'
-    receipt.write_text(json.dumps({'route_digest': digest(handoff.payload)}))
-    monkeypatch.setenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE', str(receipt))
-    ready = False
-    visits = []
-    drive = Session._drive_local
-    def child_boundary(self, state):
-        if state.session_id == child.session_id:
-            visits.append(state.session_id)
-            if not ready:
-                # Model the native session boundary emitted by an asynchronous
-                # prerequisite. Public resume must keep its durable route.
-                state.status = status
-                state.resolution = 'prerequisite_pending'
-                save_session_state(root, state)
-                return state
-            # The prerequisite signals readiness; execution and verification
-            # below use the real session driver and isolated provider writer.
-            state.status, state.resolution = 'executing', ''
-        return drive(self, state)
-    monkeypatch.setattr(Session, '_drive_local', child_boundary)
-    calls = []
-    def provider(self, request):
-        if request.purpose.startswith('collab'):
-            raise ObservationBoundary()
-        calls.append(request.purpose)
-        (request.cwd / 'value.py').write_text('VALUE = 1\n')
-        return result(request)
-    monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
-    parent = Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
-    pending = store.load_handoff(handoff.handoff_id)
-    assert parent.status == 'waiting_child'
-    assert parent.active_handoff_id == handoff.handoff_id
-    assert pending.status == status and not pending.returned_at
-    assert pending.result['session_id'] == child.session_id
-    assert calls == []
-    ready = True
-    if not renewed_receipt:
-        monkeypatch.delenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE')
-        stopped = Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
-        assert stopped.status == 'blocked' and stopped.resolution == 'execution_binding_mismatch'
-        assert visits == [child.session_id] and calls == []
-        return
-    with pytest.raises(ObservationBoundary):
-        Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
-    assert visits == [child.session_id, child.session_id]
-    assert calls == ['fix']
-    assert load_session_state(root, child.session_id).status == 'completed'
-    assert store.load_handoff(handoff.handoff_id).returned_at
-    assert len(list((root / '.auto-agents/state/sessions').iterdir())) == 2

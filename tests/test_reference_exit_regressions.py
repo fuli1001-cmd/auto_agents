@@ -18,7 +18,7 @@ from auto_agents.session_verification import (
     SessionOwnershipError, _reference_kind, bind_session, selected_requirement_contracts,
 )
 from auto_agents.workflow_runtime import WorkflowCoordinator
-from test_engine_child_recovery import parent_workflow, resume_to_observation
+from workflow_support import parent_workflow, resume_to_observation
 from test_session_verification_ownership import project, git, run_session, _retain_contract, _binding_fixture
 
 
@@ -141,7 +141,7 @@ def test_zero_candidate_preflight_preserves_dirty_workspace_and_first_diagnostic
     refs, head = git(root, 'show-ref'), head_ref(root)
     def forbidden(*args, **kwargs):
         pytest.fail('A proved pre-implementation failure must not invoke rollback or a child writer')
-    from test_engine_child_recovery import ObservationBoundary
+    from workflow_support import ObservationBoundary
     def observe_parent(self, state):
         assert state.session_id == 'parent'
         raise ObservationBoundary()
@@ -204,7 +204,7 @@ def test_empty_binding_never_authorizes_unknown_candidate_rollback(tmp_path, amb
 
 
 def test_resume_retains_attempt_evidence_before_resetting_local_counter(tmp_path, monkeypatch):
-    from test_engine_child_recovery import ObservationBoundary
+    from workflow_support import ObservationBoundary
     root, child = reference_project(tmp_path, proof='missing.report.json')
     child.current_attempt = 1
     assert child.execution_log == [] and child.candidate_custody == {}
@@ -350,65 +350,6 @@ def test_reference_role_migration_is_atomic_and_preserves_authority(tmp_path, co
             assert child.verification_binding[key] == retained[key]
 
 
-@pytest.mark.parametrize('receipt', ['matching', 'mismatch', 'missing'])
-@pytest.mark.parametrize('proof', ['owned.contract', 'missing.report.json'])
-@pytest.mark.parametrize('route_reference', ['child', 'handoff'])
-def test_engine_return_rechecks_blocked_child_without_resetting_budget(tmp_path, monkeypatch, receipt, proof, route_reference):
-    from auto_agents.repair_control import digest
-    root, child = reference_project(tmp_path, proof=proof)
-    store, snapshot, handoff = parent_workflow(root, child, engine=True)
-    child = load_session_state(root, child.session_id)
-    if route_reference == 'handoff':
-        handoff.payload.pop('child_session_id')
-        handoff.payload['issue_seed'].update(failed_handoff_id=child.parent_handoff_id, evidence_base=str(root))
-        store.save_handoff(handoff)
-    child.status, child.resolution = 'blocked', 'verification_ownership'
-    failure = {'action': 'execution_preflight_blocked', 'result': 'legacy reference classification failure',
-               'failure_kind': child.resolution, 'retry_fix': False,
-               'diagnostic': {'verification_ref': REFERENCE}}
-    child.execution_log.append(failure)
-    save_session_state(root, child)
-    expected = {key: deepcopy(getattr(child, key)) for key in (
-        'session_id', 'parent_handoff_id', 'workflow_id', 'goal', 'goal_execution_environment',
-        'authorization_policy', 'current_attempt', 'attempt_epoch', 'attempts_since_progress',
-        'hard_ceiling', 'max_attempts', 'conversation')}
-    if receipt != 'missing':
-        probe = tmp_path / 'verified-route.json'
-        probe.write_text(json.dumps({'route_digest': digest(handoff.payload) if receipt == 'matching' else 'another-route'}))
-        monkeypatch.setenv('AUTO_AGENTS_REPAIR_ROUTE_PROBE', str(probe))
-    dispatched = []
-    drive = WorkflowCoordinator._drive_session
-    def observe(self, session, state, workflow, *, root):
-        if state.session_id != child.session_id:
-            return drive(self, session, state, workflow, root=root)
-        dispatched.append(state.session_id)
-        assert state.status == 'executing'
-        assert {key: getattr(state, key) for key in expected} == expected
-        assert failure in state.execution_log
-        state.status = 'paused'
-        save_session_state(self.project_root, state)
-        return state
-    def forbidden(*args, **kwargs):
-        pytest.fail('This observation ends before the child writer or shared rollback')
-    monkeypatch.setattr(WorkflowCoordinator, '_drive_session', observe)
-    monkeypatch.setattr(WorkflowCoordinator, '_rollback_handoff_uncommitted', forbidden)
-    monkeypatch.setattr(Orchestrator, '_call_with_failover', forbidden)
-    from test_engine_child_recovery import ObservationBoundary
-    def parent_boundary(self, state):
-        assert state.session_id == 'parent'
-        raise ObservationBoundary()
-    monkeypatch.setattr(Session, '_phase_collab_loop', parent_boundary)
-    try:
-        Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
-    except ObservationBoundary:
-        pass
-    saved = load_session_state(root, child.session_id)
-    reopened = receipt == 'matching' and proof == 'owned.contract'
-    assert dispatched == ([child.session_id] if reopened else [])
-    assert saved.status == ('paused' if reopened else 'blocked')
-    assert {key: getattr(saved, key) for key in expected} == expected
-    assert failure in saved.execution_log
-    assert len([row for row in saved.execution_log if row['action'] == 'engine_preflight_recheck']) == int(reopened)
 
 
 @pytest.mark.parametrize('reference,pattern', [
@@ -448,7 +389,7 @@ def test_explicit_output_artifact_role_precedes_filename_inference(reference, pa
 @pytest.mark.parametrize('reply_kind', ['legacy', 'structured'])
 def test_confirmed_not_a_bug_handoff_reports_completed_without_candidate(tmp_path, monkeypatch, route, reply_kind):
     from auto_agents.models import AgentResult
-    from test_engine_child_recovery import ObservationBoundary
+    from workflow_support import ObservationBoundary
     from test_session_verification_ownership import _prepare_binding_child_resume
 
     # Keep read-only Git queries from refreshing the fixture's index stat

@@ -169,7 +169,7 @@ def execution_checkout(session, state):
         validate_custody_binding(state)
     elif custody['session_id'] != state.session_id or custody['repository'] != str(root.resolve()):
         raise ownership_error(state, 'candidate custody conflicts with session authority')
-    from .recovery.scope_amendments import recover_writer
+    from .business_calls import recover_writer
     recover_writer(root, state)
     validate_receipt(state)
     context = (SessionExecutionBinding.for_checkout(session, state, destination)
@@ -199,8 +199,10 @@ def execution_checkout(session, state):
     session.project_root = destination
     session.orch = execution
     session._execution_binding = context
-    from .repair_client import EngineRepairRequired
+    from .engine_fault import EngineFault as EngineRepairRequired
     repair_requested = False
+    from .business_state import _record_owner
+    owner_token = _record_owner.set((root, destination))
     try:
         if state.mode == 'fix' and custody.get('receipt'):
             previous_state = session._current_state
@@ -227,6 +229,7 @@ def execution_checkout(session, state):
         session.orch = previous
         session._execution_binding = previous_context
         del session._custody_control_root
+        _record_owner.reset(owner_token)
 
 
 @contextmanager
@@ -500,7 +503,7 @@ def verification_identity(session, state, *, scope='final'):
         from .proof_amendments import identities
         value = ['execution-bound-receipt-v3', scope, contracts, commands, receipt['fingerprint'], receipt['source_revision'],
                  state.verification_binding, state.fix_verify_command, state.full_verify, environment]
-        from .recovery.authority import installed
+        from .business_state import installed
         store = installed(Path(getattr(session, '_custody_control_root', session.project_root)))
         if store is not None:
             if gates.verification_policy_version >= 5:
@@ -536,7 +539,7 @@ def recover_receipt(session, state):
     from .session_verification import validate_selected_contracts
     receipt = state.candidate_custody['receipt']
     admit_fresh_materialization(state)
-    from .recovery.policy import resume_rejected_diagnosis
+    from .business_calls import resume_rejected_diagnosis
     if resume_rejected_diagnosis(session, state): return
     from .execution_binding import RunnerContextError
     selection_failure = None
@@ -591,8 +594,6 @@ def recover_receipt(session, state):
                 entry.get('action') == 'receipt_completion' and entry.get('identity') == identity
                 and entry.get('delivered_revision') == state.candidate_custody['delivered_revision']
                 for entry in state.execution_log):
-            if not session._ack_engine_recovery(state, 'verification', verification_identity=identity):
-                return
             state.status, state.resolution = 'completed', 'fixed'
             session._save(state)
             return

@@ -29,7 +29,7 @@ def test_copy_checks_again_after_admission_before_writing(tmp_path):
 
 @pytest.mark.parametrize('tracked', [False, True])
 def test_diagnostic_snapshot_excludes_only_generated_next_builds(tmp_path, tracked):
-    from auto_agents.root_cause import RootCauseCoordinator
+    from auto_agents.supervision_api import snapshot
     import subprocess
     def git(root, *args):
         return subprocess.check_output(['git', '-c', 'user.name=test', '-c', 'user.email=test@localhost',
@@ -44,7 +44,7 @@ def test_diagnostic_snapshot_excludes_only_generated_next_builds(tmp_path, track
     git(source, 'commit', '-qm', 'baseline')
     if tracked: (cache / 'artifact.bundle').write_text('dirty tracked work')
     target = tmp_path / 'diagnosis'
-    RootCauseCoordinator._copy_diagnostic_tree(source, target)
+    snapshot(source,target)
     assert (target / 'web/.next/cache/artifact.bundle').exists() == tracked
     if tracked:
         assert (target / 'web/.next/cache/artifact.bundle').read_text() == 'dirty tracked work'

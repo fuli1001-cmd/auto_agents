@@ -8,13 +8,12 @@ import pytest
 from auto_agents.config import load_project_config, load_task_plan, save_session_state, load_session_state
 from auto_agents.models import VerificationStep
 from auto_agents.orchestrator import Orchestrator
-from auto_agents.repair_control import digest
+from auto_agents.local_io import digest
 from auto_agents.session import Session
 from auto_agents.session_verification import _task_scope, bind_session, session_gates, SessionOwnershipError
 from auto_agents.workflow_chain import IssueBriefBuilder, WorkflowRef
 from auto_agents.workflow_runtime import WorkflowCoordinator
-from test_engine_child_recovery import parent_workflow
-from test_multilayer_engine_recovery import replay
+from workflow_support import parent_workflow
 from test_session_verification_ownership import project, _retain_contract
 
 
@@ -96,26 +95,6 @@ def test_seeded_focused_never_replaces_existing_command_or_adopts_task(tmp_path,
         assert resumed.resolution == 'verification_ownership'
 
 
-def test_engine_preflight_recheck_restores_seeded_focused_command(tmp_path):
-    root, coordinator, snapshot, handoff, state = seeded_focused_child(tmp_path)
-    command = state.fix_verify_command
-    state.fix_verify_command = ''
-    state.status, state.resolution = 'blocked', 'verification_ownership'
-    state.execution_log.append({'action': 'execution_preflight_blocked',
-        'failure_kind': 'verification_ownership', 'result': 'missing command', 'retry_fix': False})
-    save_session_state(root, state)
-    route = {'failed_handoff_id': handoff.handoff_id,
-             'original_handoff_id': handoff.handoff_id}
-    coordinator.orch._verified_engine_routes = {digest(route): {'receipt_digest': 'verified-repair'}}
-    observed = []
-    with patch('auto_agents.session_verification.bind_session',
-               side_effect=lambda _session, saved: observed.append(saved.fix_verify_command)), \
-         patch.object(coordinator, '_drive_session', side_effect=lambda _session, saved, *_args, **_kw: saved):
-        coordinator._resume_engine_bound_child(route, snapshot)
-    saved = load_session_state(root, state.session_id)
-    assert observed == [command]
-    assert saved.fix_verify_command == command
-    assert any(entry.get('action') == 'engine_preflight_recheck' for entry in saved.execution_log)
 
 
 def focused_scene(tmp_path, legacy=False):
@@ -146,26 +125,6 @@ def focused_scene(tmp_path, legacy=False):
     return root, child, store, original, engine
 
 
-@pytest.mark.parametrize('legacy', [False, True])
-def test_focused_engine_resume_keeps_original_task_and_skips_unadopted_future_work(tmp_path, legacy):
-    root, child, store, original, engine = focused_scene(tmp_path, legacy)
-    before = {p: (root / p).read_bytes() for p in ('.auto-agents/state/task_plan.json',
-                                                '.auto-agents/config.json', 'foreign.py')}
-    report = replay(root, engine.payload, tmp_path)
-    assert report['ok'], report
-    saved = load_session_state(root, child.session_id)
-    scope = saved.verification_binding['task_scope']
-    assert scope == {'mode': 'focused_fix', 'task_ids': [], 'requirement_ids': [],
-                     'associated_requirement_ids': ['REQ-related'],
-                     'verification_refs': ['tests/test_owned.py::test_owned']}
-    assert saved.verification_binding['required_proof_ids'] == ['owned.contract']
-    session = Session(Orchestrator(root), mode='fix', auto_approve=True)
-    assert 'future.feature' not in {s.proof_id for s in session_gates(session, saved).steps}
-    assert report['recovery_observation']['boundary_kind'] == 'implementation'
-    assert report['recovery_observation']['retained_constraints'] is True
-    assert saved.execution_log[:len(child.execution_log)] == child.execution_log
-    assert {p: (root / p).read_bytes() for p in before} == before
-    assert not (root / 'tests/test_future.py').exists()
 
 
 @pytest.mark.parametrize('conflict', ['task', 'requirements', 'missing_command'])

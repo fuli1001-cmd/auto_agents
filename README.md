@@ -1,5 +1,7 @@
 # auto-agents
 
+Engine maintenance now uses the optional, independently installed `auto-agents-watch` package. See [External maintenance](docs/repair-supervisor.md) for startup, configuration, migration and Git conflict handling. Business commands also run with `--no-supervisor`.
+
 `auto-agents` is a quality-first local orchestrator for AI-assisted project delivery.
 
 V1 scope:
@@ -201,8 +203,7 @@ Before starting another implementation cycle, an adaptive read-only judge return
 `REPLAN`, or `STOP`. Deterministic no-progress checks and `execution.recovery.max_rounds` remain hard
 limits even if the judge requests more work. A terminal lineage can open a new epoch only after its
 contract or repository evidence fingerprint changes. Product-code and generated-test failures stay
-owned by the target project; auto_agents self-repair is considered only when terminal meta-triage
-finds strong source, runtime, or structured recovery evidence of a generic engine defect.
+owned by the target project; reproducible engine exceptions are handled by the optional external watcher.
 
 The top-level `verify` stage still runs the full configured verification suite before release. If
 that full suite fails, auto_agents now treats it as a recovery signal instead of immediately
@@ -392,14 +393,7 @@ python3 -m auto_agents performance --project /tmp/demo
 python3 -m auto_agents performance --project /tmp/demo --session <session-id>
 ```
 
-Self-repair records `self_repair:*` phase totals in the owning run's trace: repair design,
-candidate generation/correction, contract reanalysis, semantic review, focused/integration
-verification and focused baseline comparison, boundary replay,
-diagnosis differential, full-suite wall time, and proof sealing. Failed and interrupted phases
-are timed too. Metadata identifies the candidate and repair root; timing write failures do not
-interrupt recovery. Full-suite time includes overlapping base/candidate work once.
-See [the iteration performance review](docs/performance-review.md) for measured bottlenecks,
-controlled benchmarks, and the limits of those measurements.
+External maintenance records its calls, candidate, checks and publication outcome in the independent watcher store. See [External maintenance](docs/repair-supervisor.md).
 
 Each run also writes `.auto-agents/runs/<run-id>/performance.json`, containing stage wall time,
 per-command gate duration, invocation and cache-hit counts, and the slowest commands. Set
@@ -738,8 +732,8 @@ to the changes. Routine use does not require users to classify project complexit
 | review | `balanced` | auto-escalated | Automatically escalated to `deep` for risky diffs |
 | visual_judge | `balanced` | conditional | Evaluates frontend visual evidence |
 | verify | `balanced` | `balanced` | Runs local commands, no LLM reasoning needed |
-| self_repair | `deep` | `deep` | Generates auto_agents repair candidates after eligible orchestrator-owned failures |
-| self_repair_review | `max` | `max` | Performs root-cause judgment and the complete pre-validation semantic review |
+| self_repair | `deep` | `deep` | Implements an external engine-repair candidate with the selected provider |
+| self_repair_review | `max` | `max` | Independently reviews a verified external engine-repair candidate |
 | arbiter | `balanced` | `balanced` | Resolves workflow disagreements |
 | incident_judge | `max` | conditional | Judges infrastructure incidents |
 | evidence_preflight | `balanced` | conditional | Checks high-risk proof feasibility before code changes |
@@ -1073,7 +1067,7 @@ built-in browser-verification marker, plus literal project markers configured un
 `gates.reported_infrastructure_markers`. A reported infrastructure failure is retried once on each
 currently eligible worker, up to `reported_infrastructure_max_workers`; if every worker fails,
 ownership diagnosis routes target-project/verification defects to a scoped repair task,
-auto_agents defects to self-repair, and unknown ownership to a blocked run. These failures are
+engine defects to a durable engine checkpoint, and unknown ownership to a blocked run. These failures are
 non-comparable and are never counted as new test failures against a command-level baseline.
 
 Browser infrastructure failures additionally use a managed `chrome/cdp-v1` recovery driver. It
@@ -1127,7 +1121,7 @@ superseded, while partially executed children pause for review so worktree chang
 Every incident recovery round must run a fresh implementation attempt before verification. Reusing
 the same recovery task clears its implementation-resume marker and starts a new verify lifecycle;
 reaching verification without that attempt is an engine invariant violation eligible for the
-existing bounded self-repair path. Incident policy/schema v5 reopens affected v4 reported-
+optional external maintenance path. Incident policy/schema v5 reopens affected v4 reported-
 infrastructure incidents and returns the final round that the older policy could consume by
 verification-only reuse.
 
@@ -1139,21 +1133,10 @@ bounded by `execution.recovery.max_rounds`; inconclusive or exhausted recovery p
 looping. A host-level `SIGKILL` still requires a later CLI invocation because no in-process code can
 continue after the host has removed the process.
 
-Incidents are persisted under `.auto-agents/runs/<run-id>/recovery_incidents/`. Every terminal
-exception and controlled `blocked` or `failed` result receives a full read-only root-cause
-investigation before the CLI exits. One investigator checks logs, state, staged/unstaged Git data,
-attempt history, checkpoints, and source; a second investigator independently derives and tries to
-falsify the same causal chain in parallel. Disagreement invokes an arbiter. Exact diagnoses are
-certificate-cached only while code, candidate, policy, and failure evidence remain identical, and
-large evidence is referenced through a content-hashed diagnostic manifest rather than duplicated in
-both prompts. Automatic repair requires evidence consensus that the mechanism is
-a generic, safely testable auto_agents defect. Approved defects enter isolated verified self-repair,
-restore only checkpoint-backed protected target paths, and resume the same run in a new process.
-Target-project failures keep bounded task recovery, while credentials, destructive production
-decisions, unavailable external services, and unsupported host repairs stop for the appropriate
-owner. Root-cause artifacts live under
-`.auto-agents/runs/<run-id>/root-cause/<diagnosis-id>/`. Recovery never weakens checks, changes
-credentials/global environment, or raises the absolute safety ceiling.
+Business incidents remain under `.auto-agents/runs/<run-id>/recovery_incidents/`.
+Engine exceptions pause execution with a durable checkpoint. The optional external
+watcher owns engine maintenance; it uses one writer, fixed verification and an
+independent reviewer. See [External maintenance](docs/repair-supervisor.md).
 
 Forbidden-pattern requirements use timeout-capable regex matching with per-pattern/file and total
 audit limits. Broad DOTALL wildcards and nested unbounded quantifiers fail closed with a diagnostic;
@@ -1194,17 +1177,14 @@ acceleration switches provide one rollback boundary for the additional fast path
     "evidence_preflight": {
       "mode": "high_risk"
     },
-    "self_repair_diagnosis": {
-      "mode": "all_terminal",
-      "investigator_timeout_seconds": 900,
-      "reviewer_timeout_seconds": 600,
-      "arbiter_timeout_seconds": 600,
-      "command_timeout_seconds": 300,
-      "max_dynamic_commands": 12,
-      "confidence_threshold": 0.85,
-      "arbiter_confidence_threshold": 0.9,
-      "max_repair_cycles": 2,
-      "network_enabled": false
+    "supervision": {
+      "mode": "auto",
+      "no_progress_limit": 2,
+      "loop_repeat_limit": 3,
+      "heartbeat_timeout_seconds": 120,
+      "max_model_calls": null,
+      "max_duration_seconds": null,
+      "publish": true
     },
     "autonomy": {
       "mode": "max",
@@ -1316,7 +1296,7 @@ state JSON only in debug mode; other structured command results remain on stdout
 Session progress names the work in plain language: goal clarification, failure diagnosis,
 starting a project fix, checking the fix, executing acceptance, and reviewing the observed result.
 Stage names use brackets, such as `[修复]`, `[验收]`, and `[自修复]` (`[Self-repair]` in English).
-Project fixes and self-repair announce the problem once at the start; later lines show only progress.
+Project fixes announce the problem once at the start; later lines show progress. External maintenance logs are retained by the watcher.
 The same console suppresses duplicate descriptions during private checkout handoffs and polling.
 A fresh command shows the explanation again so a resumed console is understandable on its own.
 Preparation is distinct from actual repair work, and a blocked prerequisite says that repair has
@@ -1423,40 +1403,10 @@ when workflow health supervision and continuations are attached. Historical `tim
 Antigravity's native CLI still receives `--print-timeout 14460s` as a separate compatibility limit.
 Removing that CLI-owned deadline is deferred; it is independent of engine progress supervision.
 
-Run-health supervision is also enabled by default. Smart timeout answers whether one provider
-attempt is active; health watch answers whether the whole workflow is making durable progress.
-Provider output, CPU use, tool calls, and workspace changes count as activity only. Completed
-stages, accepted task lineages, verified requirement proofs, resolved incident roots, and verified
-checkpoints form the durable progress vector.
-
-The in-process coordinator publishes telemetry, performs a fast advisory check, and consumes
-durable action requests. An independent sidecar reconstructs semantic progress from raw persisted
-run or session state and compares it with the in-process report. It detects goal stalls,
-stage/recovery oscillation, repeated recovery without postcondition improvement, unexplained
-regression, retry pressure, self-repair stagnation, and observer disagreement. A confirmed incident
-is routed back to the foreground process and uses the same read-only investigator/reviewer/arbiter
-consensus as terminal self-repair. Only a generic, evidence-backed `auto_agents` defect can enter
-isolated candidate repair; target-project, provider, infrastructure, requirements, and user input
-causes keep their existing recovery routes.
-`health_watch.agent_triage_enabled` authorizes this health-case use of the shared diagnosis pipeline;
-`self_repair_diagnosis.mode=off` remains the global kill switch for provider diagnosis.
-
-`run`, `fix`, and `collab` start the sidecar by default. It never signals, cleans, or restarts the
-main process. A normal exit or Ctrl+C moves the manifest to `terminal`, after which the sidecar drains
-one final observation and exits. If the owner disappears unexpectedly, the sidecar waits three
-seconds, revalidates the PID identity, records `unexpected_owner_exit` plus a
-`pending_manual_resume` request, sends at most one notification, and exits. Recovery begins only with
-the next user-started foreground command.
-
-Use `auto-agents health-watch start --project PATH`, `stop`, or `status` to control the complete
-health subsystem for the currently active workflow; no run ID is needed. `start` and `stop` are
-runtime-only and do not rewrite project configuration. Pass `--no-health-watch` to `run`, `fix`, or
-`collab` to begin without proactive semantic monitoring. A tiny control channel remains available so
-monitoring can be enabled later without interrupting the active provider or tool. Legacy
-`sidecar_enabled`, `sidecar_grace_seconds`, and `max_sidecar_restarts_per_run` input keys are ignored
-and omitted when configuration is saved.
-
-**How it works**
+The optional external watcher detects repeated steps without verified progress.
+It has no semantic health sidecar or continuous model observer. User waits pause
+loop detection; heartbeat loss preserves the checkpoint for inspection.
+[External maintenance](docs/repair-supervisor.md) describes the public protocol.
 
 1. Each agent call tries providers in a prioritized order.
 2. On the first call, `active_provider` goes first, followed by the others.
@@ -1731,10 +1681,8 @@ Interrupted implementation work is resumable:
 
 ## Failure and resume behavior
 
-Progress is persisted in two files:
-
-- `.auto-agents/state/run_state.json`
-- `.auto-agents/state/task_plan.json`
+Business records and call receipts are persisted in `.auto-agents/state/business.sqlite3`.
+The run-state JSON and task-plan files provide the usual status and planning views.
 
 If a run fails because of a bug, provider error, network issue, or token exhaustion, the usual
 recovery path is simply to fix the underlying issue and rerun the same command:
@@ -1790,56 +1738,18 @@ clarification blocker if active requirements and repository tests disagree in a 
 oracles cannot resolve. After the configured recovery budget is exhausted, auto_agents rewinds to
 `clarify` instead of looping indefinitely.
 
-When a stateful `run`, `fix`, `collab`, or answer-resume workflow reaches a blocking terminal state,
-the CLI collects a versioned evidence bundle before
-changing blocker ownership. It includes full relevant attempt timelines, run state, incident and
-audit evidence, staged and unstaged diffs, worker capabilities, and durable ownership checkpoints.
-The investigator and reviewer run against a sanitized read-only shared Git clone, so bounded history
-and byte-level checkpoints remain inspectable without exposing operator inputs or `.env` files.
-High-confidence, reversible auto_agents defects may set `safe_to_attempt` even before integration is
-proven. In the default `max` mode, auto_agents generates isolated candidates, uses semantic
-non-improvement to trigger strategy correction, rejects duplicate diffs and weakened tests, runs
-base/candidate differential checks, and replays a frozen failure checkpoint in a private target clone.
-Deterministic test deletion, skip/xfail, and invalid pytest-selector findings receive one bounded
-in-place correction in the same provider session when available before the candidate is rejected.
-Candidate-added tests are also applied to base
-engine code so a newly added regression must actually fail without the implementation fix;
-missing test collection and environment failures do not count as that proof. An
-adversarial read-only code review is required before expensive validation. Missing proof that is
-owned by a downstream gate is deferred rather than treated as a code failure. The candidate agent
-runs only focused checks; the orchestrator owns the single authoritative broad-suite execution and
-then deterministically seals all required proof before approval. For the final component, the
-pre-validation review covers the complete integrated repair. Its approval is reused at the
-integration boundary only while the candidate commit is clean and its frozen contract, component,
-and blocking findings remain identical; otherwise a fresh integration review is required.
+Engine exceptions produce a durable checkpoint for the optional external watcher.
+The watcher retains one candidate, verifies the original offline recovery boundary
+and fixed tests, obtains an independent review, commits locally and restarts the
+original command. Two consecutive corrections without verified improvement stop.
+Unknown external-call outcomes require explicit reconciliation. A dirty engine
+checkout blocks maintenance admission and preserves user changes.
 
-Candidates are attempted sequentially and the first candidate that crosses every proof gate wins;
-this is not a relative majority vote. If none is approved, auto_agents reports and retains the
-candidate that reached the deepest verification stage instead of merely returning the last attempt.
-Proof from a selected parent is inherited by its descendant, so a completed component becomes the
-base of the next dependent component instead of being regenerated from an older candidate. Failed
-focused, integration, and full-suite commands are persisted as a sticky regression set and run
-before every later candidate's component-specific checks.
-Recent candidate context includes bounded, redacted verification failure output, including both
-stdout and stderr tails, so later attempts receive the failing assertions as well as command names.
-Base and candidate full suites use the same progress lease and final safety ceiling. Test files are
-checkpointed independently; historically slow files are split into stable node batches, related and
-high-risk shards run first, and only shards with no detected shared-process/environment risk may run
-in parallel. Completed shard plans and results are content-addressed by the source tree and Python /
-pytest environment. A successful shard may cross candidate trees only when a conservative static
-dependency closure proves every local input unchanged; unknown or dynamic inputs force a real run.
-The baseline suite runs in the background while the candidate full suite executes. Both suites
-share a bounded resource pool; conflicting resources are reserved before dispatch so waiting shards
-do not occupy executor threads that could run independent work. Incomplete proof retains the same candidate under
-`pending-validation`, and the next self-repair run resumes unfinished shards before generating code.
-`execution.acceleration.mode=observe|off` retains sequential base/candidate comparison and fresh
-integration reviews; phase timing remains available for comparison.
-
-The independent repair supervisor now owns the default update, repair, recovery and
-publication path. It checks the trusted remote before generating code, preserves a
-continuous repair workspace, and validates each subscribing project's recovery.
-Developer checkouts remain untouched. See [repair supervisor](docs/repair-supervisor.md)
-for operator policy, commands, cancellation, concurrency and publication behavior.
+Business records and call receipts are authoritative in
+`.auto-agents/state/business.sqlite3`; JSON files are display projections. Legacy
+controller data requires explicit, backed-up migration. See
+[External maintenance](docs/repair-supervisor.md) for installation, migration,
+cancellation, limits and Git publication across machines.
 
 Generated files use a shared ownership and retention registry. Use `auto-agents storage status`
 to inspect recorded usage, `storage plan --project PATH` to preview a cleanup, and
@@ -1847,45 +1757,6 @@ to inspect recorded usage, `storage plan --project PATH` to preview a cleanup, a
 outside the workflow process, with per-scope soft budgets. Active work, recovery evidence, pinned
 versions and unregistered historical files are protected. See [storage maintenance](docs/storage-maintenance.md)
 for retention defaults, quarantine restore, worker acknowledgments and configuration.
-
-For the legacy in-process compatibility path, an approved candidate is not immediately merged. The real workflow first resumes from the approved
-candidate worktree. Only after the original blocker fingerprint disappears is the candidate promoted
-to the local auto_agents branch. A dirty main checkout is preserved byte-for-byte and promotion is
-recorded as pending until it becomes clean. Remote publication happens after local recovery; push or
-network failure is recorded as `publish_pending` and never blocks the target workflow.
-The configured `max_dynamic_commands` is a soft investigation budget; a completed valid report is
-accepted within a small hard-ceiling grace of 25% (minimum two tools) so post-hoc accounting does not
-discard a useful diagnosis for a one-command overage.
-The repaired process then reconciles only protected paths named by a durable attempt checkpoint and
-restarts the original stateful command. Task-scoped blockers remain localized while independent task
-lineages continue. Self-repair persists a Pareto frontier and retains its current working
-candidate when deeper diagnosis changes the strategy. After
-`max_consecutive_non_improving_candidates` non-improving attempts or rejected reviews of the
-same component, it corrects the strategy or component decomposition. Closing a previously
-resolved finding on another branch does not earn fresh progress. If another attempt window
-fails without accepted component or root-proof progress, the search returns `search_stalled`
-with its code and evidence preserved. Resuming the same unchanged stopped search does not
-silently grant another retry window; a changed engine, frozen contract, or accepted component
-opens a new correction window. Candidate, review, replay, and test
-operations retain provider/tool/no-progress leases plus final safety ceilings; ordinary activity no
-longer loses work at a short absolute deadline. Normal interruption persists the candidate before
-worktree cleanup. Irreversible production actions, missing
-credentials/authorization, and product semantics that cannot be derived from requirements always
-remain explicit human boundaries, including in `max` mode.
-
-An explicit `collab --session ID` retains the original collab entrypoint across self-repair.
-Missing control files can be recovered from a validated journal/checkpoint boundary for that exact
-session, with a restartable restoration receipt. An unrelated saved run cannot replace that
-session's failure or receive its repair result. Experiment schema v4 separates component receipts
-from whole-repair proof and preserves legacy artifacts for revalidation. See
-[collab recovery and repair evidence](docs/collab-self-repair-recovery.md) for the recovery protocol
-and isolated operational check.
-
-Use `--autonomy off|guarded|max` to override the project setting for one workflow. `guarded` limits
-automatic work to deterministic playbooks or already-proven-safe repairs; `max` also permits bounded
-isolated code experiments. A dirty auto_agents checkout no longer disables repair: the approved
-candidate runs from an isolated worktree and integration is deferred. `--strict-self-repair` now
-fails only when no isolated repair or verification environment can be created.
 
 Implementation resume is task-aware rather than fully transactional:
 
@@ -1995,7 +1866,7 @@ scoped to collab's final attestation; it is not inherited by routed `fix` childr
 
 `collab --auto-approve` is a workflow-wide policy: routed `fix` and `run` children inherit it, as
 does a `run` reached through `collab -> fix -> run`. The versioned authorization policy is recorded
-in durable session, handoff, run, and self-repair state so workflow resume does not silently
+in durable session, handoff and run state so workflow resume does not silently
 downgrade it. Collab asks the user only for missing goal intent, credentials, rights attestations,
 unbudgeted external costs, destructive changes, irreversible product decisions, or an external
 observation only the user can perform. Repository selection, implementation scope, safe migration,
@@ -2009,12 +1880,10 @@ content-correction or background-job policies. Explicit user limits on product c
 still apply. Agent-generated route constraints remain derived context and cannot create user
 restrictions; a configured retry ceiling must not be reported as retries already consumed.
 
-Controlled `blocked` and `failed` results from session commands and workflow resume enter the
-same root-cause investigation as exceptions. The diagnostic context binds the current session or
-run, including acceptance evidence and the original goal; unrelated saved runs remain outside
-that investigation. Only an approved engine-owned diagnosis dispatches self-repair. Other owners
-and unavailable diagnoses preserve the failure, with a `terminal-triage.json` record beside the
-session state (or in the run's outputs). Waiting and paused states do not start this investigation.
+Controlled business blockers remain under the business workflow's recovery policy.
+The external watcher repairs reproducible engine exceptions and deterministic
+cycles without verified progress. Waiting for a user, unavailable prerequisites,
+and heartbeat loss alone do not authorize code repair.
 
 Before the first implementation route, collab records whether the requested outcome is real or
 simulated. An explicit goal is classified without another prompt; an ambiguous goal receives one
@@ -2022,14 +1891,10 @@ plain-language, project-specific choice generated from the current project rathe
 cross-project template. The choice is durable across all child workflows. Real outcomes may use
 fakes for internal tests but not as final evidence; simulated outcomes must disclose their nature.
 
-When an active run is blocked by an `auto_agents` defect, the controller resolves that engine-owned
-work before creating a new run handoff. Known legacy blockers are projected to versioned built-in
-postcondition claims and rechecked against the installed engine. A verified equivalent repair may
-resume even when its historical repair commit is not an ancestor of the installed HEAD; unknown or
-changed evidence stays blocked. If code repair is still required, the existing isolated
-auto_agents self-repair runner owns the repair, verification, local commit, runtime handoff, and
-resume. A run handoff is created only after the prior run is safely complete, so failed preflight
-does not leave a resumable-looking `child=null` handoff.
+An engine defect stops business execution and retains the original session,
+goal, authorization and call receipts. The optional watcher verifies and installs
+an accepted revision before starting a fresh process with the original arguments.
+It does not create an internal engine-repair handoff.
 
 Automatic returns never reopen session selection or ask for the goal again. A self-repair restart
 resumes the exact durable root session, while `fix` and `run` children return through their recorded
@@ -2079,12 +1944,11 @@ processes. Handoffs and their append-only transition journal live under
 `.auto-agents/state/handoffs/` and `.auto-agents/state/workflows/`. A routed run receives an immutable,
 Git-tracked input at `specs/iterations/<timestamp>-<handoff-id>-<slug>.md`; a fix keeps its machine
 issue brief and readable rendering beside its session state as `issue.json` and `issue.md`.
-The JSON transition journal remains authoritative and hash-chained; a disposable SQLite index speeds
-repeated reads and is rebuilt after any mismatch. Repeated checkpoint file content is stored once in
+The project SQLite database owns workflow records and hash-chained transition events;
+JSON journals are display projections. Repeated checkpoint file content is stored once in
 a content-addressed blob pool and hard-linked into restore points when the filesystem supports it.
 
-If the foreground owner exits unexpectedly, health-watch records and notifies
-`pending_manual_resume` but does not restart the process. Resume the deepest durable checkpoint with:
+If standalone execution stops unexpectedly, resume the deepest durable checkpoint with:
 
 ```bash
 python3 -m auto_agents resume --project /tmp/demo

@@ -10,7 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from .repair_v2.store import Store, digest
+from .proof_support.store import Store, digest
 from .session_verification import SessionOwnershipError, ownership_error
 
 POLICY = 'proof-amendment-v2'
@@ -27,7 +27,7 @@ def required(state, path):
 
 
 def pending(state):
-    from .repair_v2.incidents import latest_failure
+    from .proof_support.incidents import latest_failure
     failure = latest_failure(state.to_dict())
     if not failure or not state.candidate_custody.get('receipt'):
         return False
@@ -53,7 +53,7 @@ def _goal(session, state):
         if workflow.root.kind in {'collab', 'fix', 'provider_resolve'}:
             original = load_session_state(_root(session), workflow.root.native_id)
         elif workflow.root.kind == 'run':
-            from .repair_v2.scope import context
+            from .proof_support.scope import context
             run_context = context(_root(session), {'project': str(_root(session)), 'invocation': {
                 'run_id': workflow.root.native_id, 'workflow_id': state.workflow_id}})
     from .scope_decisions import Decisions
@@ -397,20 +397,6 @@ def ensure(session, state):
                        else '正在独立审核测试修订；保留现有候选。')
         if not saved.get('reply'):
             registration = getattr(session.orch, '_repair_registration', None)
-            if registration:
-                from .repair_v2.chain import RepairChain
-                kind, native = value['owner']['subject'].split(':', 1)
-                payload = {'project': str(_root(session)), 'invocation': {
-                    'session_id' if kind == 'session' else 'run_id': native}}
-                chain = RepairChain(registration['config'], payload, store.root)
-                from .repair_v2.types import RepairBlocked
-                try:
-                    chain.reserve_review(digest(value), saved['model_calls'] + 1)
-                except RepairBlocked as error:
-                    state.status, state.resolution, state.resume_phase = 'paused', error.code, 'executing'
-                    session._print(str(error))
-                    session._save(state)
-                    return 'paused'
             from .proof_review_prompt import render
             evidence = render(store, value)
             store.transition(saved, status='dispatched', model_calls=saved['model_calls'] + 1)
@@ -434,7 +420,7 @@ def ensure(session, state):
             try:
                 result = session.orch._call_with_failover(request)
                 if not result.ok or getattr(result, 'cleanup_incomplete', False):
-                    from .repair_environment_log import sanitize
+                    from .diagnostic_redaction import sanitize
                     raise RuntimeError(sanitize(getattr(result, 'error', '') or result.stderr or '审核服务未完成'))
                 reply = store.artifact('reply', {'text': result.summary or result.stdout})
                 store.transition(saved, reply=reply, status='received')
@@ -464,7 +450,7 @@ def ensure(session, state):
             return 'paused'
         if decision == 'needs_user':
             from .scope_decisions import session_choice
-            from .repair_v2.scope import context
+            from .proof_support.scope import context
             current = context(_root(session), {'project': str(_root(session)),
                 'invocation': {'session_id': state.session_id, 'workflow_id': state.workflow_id}})
             proposal = {'question': verdict.get('question') or verdict['reason'],
@@ -476,7 +462,7 @@ def ensure(session, state):
                 return ensure(session, state)
             return 'paused'
         from dataclasses import asdict
-        from .repair_v2.types import ProofAmendmentReceipt
+        from .proof_support.types import ProofAmendmentReceipt
         receipt = store.artifact('amendment', asdict(ProofAmendmentReceipt(
             POLICY, digest(value), decision, value['changes'], verdict)))
         store.transition(saved, status='approved' if decision == 'approve' else 'rejected', receipt=receipt, error=None)

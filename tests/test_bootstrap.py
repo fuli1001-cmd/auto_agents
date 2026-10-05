@@ -53,6 +53,8 @@ class BootstrapTests(unittest.TestCase):
             auto_gitignore = (auto_dir(project_root) / ".gitignore").read_text(encoding="utf-8")
             self.assertEqual(
                 auto_gitignore,
+                "state/business.sqlite3*\nstate/run.lock*\nstate/run.processes*\n"
+                "state/resume-checkpoints/\nstate/legacy-archive/\n"
                 "operator/\nruntime/\nfailed-verification-logs/\nruns/\n"
                 "state/gate_baseline_cache.json\nstate/gate_baseline_cache.sqlite3\n"
                 "state/gate_baseline_cache.sqlite3-*\nstate/requirements_audit_cache.sqlite3\n"

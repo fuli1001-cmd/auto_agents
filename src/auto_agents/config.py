@@ -41,6 +41,11 @@ node_modules/
 .antigravitycli/
 """
 AUTO_GITIGNORE_ENTRIES = (
+    "state/business.sqlite3*",
+    "state/run.lock*",
+    "state/run.processes*",
+    "state/resume-checkpoints/",
+    "state/legacy-archive/",
     "operator/",
     "runtime/",
     "failed-verification-logs/",
@@ -366,18 +371,7 @@ DEFAULT_CONFIG = {
                 "readme": 900,
             },
         },
-        "health_watch": {
-            "enabled": True,
-            "agent_triage_enabled": True,
-            "poll_seconds": 30,
-            "heartbeat_timeout_seconds": 120,
-            "goal_stall_lease_multiplier": 2.0,
-            "oscillation_repeat_limit": 3,
-            "recovery_churn_limit": 3,
-            "max_interventions_per_root": 3,
-            "quiesce_timeout_seconds": 600,
-            "boundary_replay_timeout_seconds": 1200,
-        },
+        "supervision": {"mode":"auto","no_progress_limit":2,"loop_repeat_limit":3,"heartbeat_timeout_seconds":120},
         "session_limits": {
             "hard_ceiling": {
                 "fix": 15,
@@ -393,18 +387,6 @@ DEFAULT_CONFIG = {
             "timeout_cooldown_seconds": 1800,
             "quota_cooldown_seconds": 3600,
             "max_cooldown_seconds": 14400,
-        },
-        "self_repair_diagnosis": {
-            "mode": "all_terminal",
-            "investigator_timeout_seconds": 900,
-            "reviewer_timeout_seconds": 600,
-            "arbiter_timeout_seconds": 600,
-            "command_timeout_seconds": 300,
-            "max_dynamic_commands": 12,
-            "confidence_threshold": 0.85,
-            "arbiter_confidence_threshold": 0.90,
-            "max_repair_cycles": 2,
-            "network_enabled": False,
         },
         "autonomy": {
             "mode": "max",
@@ -644,18 +626,18 @@ def supported_provider_kinds() -> Tuple[str, ...]:
 
 def bootstrap_project(project_root: Path, name: str, doc_language: str = "en") -> Path:
     root = project_root.resolve()
-    
+
     if auto_dir(root).is_dir():
         print(f"Project already initialized at {root}", file=import_sys().stderr)
         return root
-        
+
     has_existing_content = False
     if root.exists():
         for child in root.iterdir():
             if child.name not in (".git", "spec.md", AUTO_DIR) and not child.name.startswith("."):
                 has_existing_content = True
                 break
-                
+
     root.mkdir(parents=True, exist_ok=True)
 
     config = dict(DEFAULT_CONFIG)
@@ -674,13 +656,13 @@ def bootstrap_project(project_root: Path, name: str, doc_language: str = "en") -
     write_json(requirements_trace_path(root), REQUIREMENTS_TRACE_TEMPLATE)
     write_json(provider_references_lock_path(root), PROVIDER_REFERENCES_LOCK_TEMPLATE)
     write_json(task_plan_path(root), TASK_PLAN_TEMPLATE)
-    
+
     run_state = dict(RUN_STATE_TEMPLATE)
     if has_existing_content:
         run_state["status"] = "completed"
         run_state["current_stage"] = "readme"
     write_json(run_state_path(root), run_state)
-    
+
     write_if_missing(root / ".gitignore", PROJECT_GITIGNORE)
     write_if_missing(root / "README.md", f"# {name}\n")
     return root
@@ -799,13 +781,13 @@ def load_run_state(project_root: Path) -> RunState:
     data = read_json(run_state_path(project_root), default=None)
     if data is None or not data.get("run_id"):
         return create_run(project_root)
-    from .recovery.authority import bind_model
-    return bind_model(RunState.from_dict(data), data)
+    from .business_state import bind_model
+    return bind_model(RunState.from_dict(data), data, run_state_path(project_root))
 
 
 def save_run_state(project_root: Path, state: RunState) -> None:
     ensure_auto_gitignore(project_root)
-    from .recovery.authority import save_model
+    from .business_state import save_model
     if not save_model(run_state_path(project_root), state):
         write_json(run_state_path(project_root), state.to_dict())
     from .reporting import observe_saved_run
@@ -920,15 +902,15 @@ def load_session_state(project_root: Path, session_id: str) -> SessionState:
         raise FileNotFoundError(
             f"Session not found: {session_state_path(project_root, session_id)}"
         )
-    from .recovery.authority import bind_model
-    return bind_model(SessionState.from_dict(data), data)
+    from .business_state import bind_model
+    return bind_model(SessionState.from_dict(data), data, session_state_path(project_root, session_id))
 
 
 def save_session_state(project_root: Path, state: SessionState) -> None:
     ensure_auto_gitignore(project_root)
     path = session_state_path(project_root, state.session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    from .recovery.authority import save_model
+    from .business_state import save_model
     if not save_model(path, state): write_json(path, state.to_dict())
 
 

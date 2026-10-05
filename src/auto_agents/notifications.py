@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 def send_wechat_markdown(content: str, webhook_url: Optional[str] = None) -> bool:
     """Send a markdown notification to an Enterprise WeChat group robot."""
+    if os.environ.get('AUTO_AGENTS_OFFLINE_RESUME')=='1':
+        return False
     url = (webhook_url or os.environ.get(WECHAT_WEBHOOK_ENV, "")).strip()
     if not url:
         return False

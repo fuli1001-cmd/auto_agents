@@ -173,6 +173,10 @@ def _replace_json_batch(payloads: Mapping[Path, object]) -> None:
 
         for path, staged_path in staged.items():
             os.replace(staged_path, path)
+        from .business_state import record_location, write_projection
+        for path, payload in payloads.items():
+            if record_location(path):
+                write_projection(path, payload)
     except Exception as error:
         recovery_errors: List[str] = []
         for path in reversed(list(payloads)):

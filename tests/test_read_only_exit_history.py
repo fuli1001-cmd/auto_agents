@@ -12,7 +12,7 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.session import Session
 from auto_agents.session_verification import preimplementation_exit, preimplementation_failure
 from auto_agents.workflow_runtime import WorkflowCoordinator
-from test_engine_child_recovery import ObservationBoundary, parent_workflow
+from workflow_support import ObservationBoundary, parent_workflow
 from test_session_verification_ownership import project, git, _retain_contract, _prepare_binding_child_resume
 
 

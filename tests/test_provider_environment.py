@@ -11,8 +11,7 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.prompting.core import PromptBlock, PromptSpec, prepare_request
 from auto_agents.prompting.runtime import resolve_runtime
 from auto_agents.provider_environment import effective_environment
-from auto_agents.repair_v2.providers import AgentSandbox
-from auto_agents.repair_v2.types import RepairBlocked
+from auto_agents.proof_support.types import RepairBlocked
 from auto_agents.validation import validate_project_config_payload
 
 
@@ -126,45 +125,3 @@ def test_cli_selects_configured_account_alias_and_rejects_unknown_alias(tmp_path
         assert "Configured providers" in str(error)
     else:
         raise AssertionError("an unknown provider alias was silently created")
-
-
-def test_repair_sandbox_copies_selected_account_and_rejects_account_switch(tmp_path):
-    first, second = tmp_path / "account-a", tmp_path / "account-b"
-    for home, account in ((first, "first"), (second, "second")):
-        home.mkdir()
-        (home / "auth.json").write_text(json.dumps({"account": account}))
-        (home / "config.toml").write_text(f'model = "{account}"\n')
-        (home / "deep.config.toml").write_text(f'model = "{account}-deep"\n')
-    root = tmp_path / "repair-state"
-    sandbox = AgentSandbox(root, "image", kind="codex", provider_name="codex-a",
-                           environment={"HOME": str(tmp_path), "CODEX_HOME": str(first)},
-                           binding="account-a")
-    with patch("auto_agents.repair_v2.storage.require_space"):
-        private = sandbox.home("implement")
-    assert json.loads((private / ".codex/auth.json").read_text())["account"] == "first"
-    assert "first-deep" in (private / ".codex/deep.config.toml").read_text()
-    switched = AgentSandbox(root, "image", kind="codex", provider_name="codex-b",
-                            environment={"HOME": str(tmp_path), "CODEX_HOME": str(second)},
-                            binding="account-b")
-    try:
-        switched.home("implement")
-    except RepairBlocked as error:
-        assert error.code == "provider_configuration"
-    else:
-        raise AssertionError("repair sandbox reused another account")
-
-
-def test_repair_container_remaps_native_home_and_respects_unset_variables(tmp_path):
-    root = tmp_path / "candidate"
-    root.mkdir()
-    sandbox = AgentSandbox(tmp_path / "repair-state", "image", kind="codex",
-                           environment={"HOME": "/host/home", "CODEX_HOME": "/host/account",
-                                        "OPENAI_API_KEY": "selected", "ANTHROPIC_API_KEY": "other"})
-    with patch.object(sandbox, "home", return_value=tmp_path / "private"), \
-         patch("auto_agents.repair_v2.docker.run", return_value=(0, "")):
-        with sandbox.command("plan", root, ["/usr/bin/codex"]) as command:
-            variables = [command[index + 1] for index, item in enumerate(command) if item == "-e"]
-    assert variables.count("CODEX_HOME=/agent-home/.codex") == 1
-    assert "OPENAI_API_KEY=selected" in variables
-    assert not any(value.startswith("ANTHROPIC_API_KEY=") for value in variables)
-    assert not any("/host/account" in value for value in variables)

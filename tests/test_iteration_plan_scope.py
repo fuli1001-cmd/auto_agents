@@ -749,103 +749,10 @@ class IterationPlanScopeTests(unittest.TestCase):
             self.assertEqual(provider_references_lock_path(root).read_bytes(), lock_before)
             self.assertEqual(load_task_plan(root)["tasks"][0]["requirement_proofs"], plan["tasks"][0]["requirement_proofs"])
 
-    def test_controller_collects_workflow_entry_and_supplies_it_to_review(self):
-        from auto_agents.repair_v2.boundary_driver import observe_run_continuation
-        from auto_agents.repair_v2.review_evidence import recovery_evidence
 
-        with continuation_probe_project() as (root, orch, original, plan, request, runtime, frozen):
-            result = observe_run_continuation(orch, original, plan, request, runtime, frozen)
-            self.assertTrue(result['ok'])
-            self.assertEqual(result['current_stage'], 'implement')
-            receipt = result['recovery_observation']
-            self.assertEqual(receipt['run_id'], original.run_id)
-            self.assertEqual(receipt['workflow_id'], original.resume_context['workflow_id'])
-            self.assertEqual(receipt['accepted_task_ids'], ['task-current'])
-            self.assertEqual(receipt['oracle_proof_count'], 2)
-            self.assertEqual(receipt['spec_sha256'], frozen['spec_sha256'])
-            self.assertEqual(receipt['requirements_trace_sha256'], frozen['requirements_trace_sha256'])
-            self.assertTrue(receipt['implementation_entry']['event_id'])
-            report = {'ok': True, 'snapshot': 'candidate-source', 'runtime': 'pinned-verifier',
-                      'target': 'frozen-scene', 'observed': result}
-            controller = SimpleNamespace(
-                state={'boundary_preflight': 'receipt.json', 'verification_runtime': 'pinned-verifier'},
-                store=SimpleNamespace(read=lambda ref: report),
-            )
-            evidence = recovery_evidence(controller, 'candidate-source')
-            self.assertEqual(evidence['cases'][0]['run_id'], original.run_id)
-            self.assertEqual(evidence['cases'][0]['workflow_id'], receipt['workflow_id'])
-            self.assertEqual(evidence['cases'][0]['current_stage'], 'implement')
-            projected = evidence['cases'][0]['recovery_observation']
-            for key, value in receipt.items():
-                self.assertEqual(projected[key], value, key)
-            self.assertIsNone(recovery_evidence(controller, 'other-candidate'))
 
-    def test_controller_records_actual_research_prerequisite_without_claiming_implementation(self):
-        from auto_agents.repair_v2.boundary_driver import observe_run_continuation
-        with continuation_probe_project(research_required=True) as (root, orch, original, plan, request, runtime, frozen):
-            lock_before = provider_references_lock_path(root).read_bytes()
-            result = observe_run_continuation(orch, original, plan, request, runtime, frozen)
-            receipt = result['recovery_observation']
-            self.assertTrue(result['ok'])
-            self.assertEqual(receipt['boundary_kind'], 'provider_research')
-            self.assertEqual(receipt['continuation_status'], 'prerequisite_required')
-            self.assertFalse(receipt['implementation_entered'])
-            self.assertIsNone(receipt['implementation_entry'])
-            self.assertEqual(receipt['continuation_entry']['type'], 'provider_research.required')
-            self.assertEqual(receipt['prerequisites'][0]['status'], 'needs_refresh')
-            self.assertEqual(receipt['accepted_task_ids'], ['task-current'])
-            self.assertEqual(provider_references_lock_path(root).read_bytes(), lock_before)
-            self.assertEqual(load_run_state(root).agent_attempts, original.agent_attempts)
-            self.assertNotIn('provider_research', load_run_state(root).stage_summaries)
 
-    def test_controller_rejects_fabricated_prerequisite_event(self):
-        from auto_agents.repair_v2.boundary_driver import observe_run_continuation
-        with continuation_probe_project(research_required=True) as (root, orch, original, plan, request, runtime, frozen):
-            write_event = orch.reporter.event
-            def tamper(kind, data, **options):
-                if kind == 'provider_research.required':
-                    data = {**data, 'prerequisites': [{'status': 'invented'}]}
-                return write_event(kind, data, **options)
-            with patch.object(orch.reporter, 'event', side_effect=tamper):
-                with self.assertRaisesRegex(RuntimeError, 'identity or preservation'):
-                    observe_run_continuation(orch, original, plan, request, runtime, frozen)
 
-    def test_controller_rejects_old_entry_when_workflow_stops_before_implementation(self):
-        from auto_agents.repair_v2.boundary_driver import observe_run_continuation
-
-        with continuation_probe_project() as (root, orch, original, plan, request, runtime, frozen):
-            first = observe_run_continuation(orch, original, plan, request, runtime, frozen)
-            self.assertTrue(first['ok'])
-            state = load_run_state(root)
-            state.pending_approval = 'implementation-confirmation'
-            save_run_state(root, state)
-            with self.assertRaisesRegex(RuntimeError, 'fresh implementation entry'):
-                observe_run_continuation(orch, original, plan, request, runtime, frozen)
-            self.assertEqual(load_run_state(root).pending_approval, 'implementation-confirmation')
-
-    def test_controller_rejects_foreign_identity_or_changed_retained_inputs(self):
-        from auto_agents.repair_v2.boundary_driver import observe_run_continuation
-
-        for mismatch in ('run', 'workflow', 'runtime', 'spec', 'trace', 'proof'):
-            with self.subTest(mismatch=mismatch), continuation_probe_project() as (root, orch, original, plan, request, runtime, frozen):
-                if mismatch == 'run':
-                    request['invocation']['run_id'] = 'different-run'
-                elif mismatch == 'workflow':
-                    request['invocation']['workflow_id'] = 'different-workflow'
-                elif mismatch == 'runtime':
-                    runtime['commit'] = 'different-engine'
-                elif mismatch == 'spec':
-                    Path(original.resume_context['spec_file']).write_text('# Different scope\n')
-                elif mismatch == 'trace':
-                    changed = json.loads(requirements_trace_path(root).read_text())
-                    changed['requirements'][1]['notes'] = 'changed historical backlog'
-                    write_json(requirements_trace_path(root), changed)
-                else:
-                    # The expected contract is sealed before reconciliation;
-                    # even a correctly identified entry cannot waive its loss.
-                    plan['tasks'][0]['requirement_proofs'].pop()
-                with self.assertRaises(RuntimeError):
-                    observe_run_continuation(orch, original, plan, request, runtime, frozen)
 
 
 if __name__ == "__main__":

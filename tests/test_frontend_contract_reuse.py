@@ -128,15 +128,11 @@ def spurious_lock(scene):
     return current
 
 
-@pytest.mark.parametrize('managed', [False, True])
-def test_interrupted_spurious_reapproval_restores_actual_historical_approval(scene, monkeypatch, managed):
+def test_interrupted_spurious_reapproval_restores_actual_historical_approval(scene, monkeypatch):
     root, orch, state, original, before, trace = scene
     spurious_lock(scene)
     write_text(root / '.auto-agents/docs/frontend_prototype_variants/interrupted-draft/home.html', 'Keep this draft')
-    if managed:
-        from test_recovery_native import activate
-        activate(root, root.parent / 'control', monkeypatch)
-        state = load_run_state(root)
+    state = load_run_state(root)
     assert recover(root, state)
     assert frontend_design_lock_path(root).read_bytes() == before
     assert state.status == 'failed'  # Status changes require successful preflight.

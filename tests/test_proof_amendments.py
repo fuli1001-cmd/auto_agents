@@ -8,7 +8,7 @@ from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.proof_amendments import admissible
 from auto_agents.session import Session
-from test_engine_child_recovery import configure_local_writer, REAL_PROVIDER_CALL
+from workflow_support import configure_local_writer, REAL_PROVIDER_CALL
 from test_session_verification_ownership import project
 
 
@@ -19,7 +19,7 @@ BEFORE = 'import unittest\nclass Tests(unittest.TestCase):\n    def test_value(s
 def retained_review(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from auto_agents import proof_amendments as review
-    from auto_agents.repair_v2.store import digest
+    from auto_agents.proof_support.store import digest
     verdict = json.loads((Path(__file__).parent / 'fixtures/proof_review_related_config.json').read_text())
     value = {'owner': {'subject': 'session:original'}, 'candidate': 'sealed-candidate',
              'changes': {'tests/test_provider_capability_snapshot.py': {}},
@@ -204,7 +204,7 @@ with Path('tests/test_owned.py').open('a') as f:
         return REAL_PROVIDER_CALL(self, request)
     monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
     if interrupt:
-        from auto_agents.repair_v2.store import Store
+        from auto_agents.proof_support.store import Store
         transition = Store.transition
         interrupted = []
         def crash(store, state, **updates):
@@ -301,49 +301,3 @@ def test_user_choice_survives_restart_without_reimplementing_candidate(tmp_path,
     assert result.candidate_custody['receipt']['fingerprint'] == receipt and result.current_attempt == 1
     assert calls == ['fix', 'proof_review', 'proof_review']
     assert any('这个测试应该验证返回值为 1' in p for p in prompts)
-
-
-def test_later_engine_failure_recovers_at_verification_without_another_writer(tmp_path, monkeypatch):
-    from test_engine_child_recovery import parent_workflow, ObservationBoundary
-    from test_multilayer_engine_recovery import replay, ENGINE
-    root, child = project(tmp_path)
-    configure_local_writer(root, child, "Path('value.py').write_text('VALUE = 1\\n')")
-    workflows, workflow, original = parent_workflow(root, child)
-    calls = []
-    def provider(self, request):
-        calls.append(request.purpose)
-        assert request.purpose == 'fix'
-        return REAL_PROVIDER_CALL(self, request)
-    monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
-    phase = Session._phase_collab_loop
-    def observe(self, state):
-        if load_session_state(root, child.session_id).status == 'completed':
-            raise ObservationBoundary()
-        return phase(self, state)
-    monkeypatch.setattr(Session, '_phase_collab_loop', observe)
-    with pytest.raises(ObservationBoundary):
-        Session(Orchestrator(root), mode='collab', auto_approve=True).resume('parent')
-    child = load_session_state(root, child.session_id)
-    receipt = child.candidate_custody['receipt']['fingerprint']
-    assert child.status == 'completed' and calls == ['fix']
-    # The next engine failure has the same child and handoff but occurs after
-    # the earlier implementation/verification/delivery actually completed.
-    child.status, child.resolution = 'failed', 'verification_execution_binding'
-    child.execution_log.append({'action': 'verify', 'failure_kind': child.resolution,
-                               'result': 'later engine verification return failed', 'retry_fix': False})
-    save_session_state(root, child)
-    payload = {'child_session_id': child.session_id, 'issue_seed': {'target_repository': str(ENGINE),
-               'failed_handoff_id': original.handoff_id, 'original_handoff_id': original.handoff_id}}
-    workflow = workflows.load(workflow.workflow_id)
-    handoff = workflows.prepare_handoff(workflow, parent=original.parent, target='fix', goal='Repair verification return',
-                                       reason='new execution failure', payload=payload)
-    parent = load_session_state(root, 'parent')
-    parent.active_handoff_id, parent.status, parent.return_phase = handoff.handoff_id, 'waiting_child', ''
-    save_session_state(root, parent)
-    result = replay(root, payload, tmp_path)
-    assert result['ok'], result
-    observed = result['recovery_observation']
-    assert observed['boundary_kind'] == 'verification'
-    assert observed['candidate_fingerprint'] == receipt
-    assert observed['budget_reserved'] == observed.get('provider_boundary_calls', 0) == 0
-    assert observed['verification_identity']

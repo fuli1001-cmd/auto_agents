@@ -444,7 +444,7 @@ def test_auto_result_cache_reuses_when_only_unobserved_source_changes(
             idle_timeout_seconds=60,
         )
 
-    assert first.ok and first.input_trace_complete
+    assert first.ok and first.input_trace_complete, repr(first)
     assert second.ok and second.cached
     assert second.backend == "result-cache-observed-inputs"
 

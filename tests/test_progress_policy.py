@@ -53,8 +53,6 @@ def test_expired_budget_does_not_launch_provider_and_preserves_reason(tmp_path):
     launch.assert_not_called()
     assert result.termination.reason == "execution_budget_exhausted"
     assert json.loads((tmp_path / "attempt.json").read_text())["reason"] == "execution_budget_exhausted"
-    from auto_agents.self_repair import classify_auto_agents_error
-    assert classify_auto_agents_error(result.stderr).category == "execution_time_budget"
 
 
 def test_attempt_preparation_preserves_budget_and_health_across_continuation(tmp_path):

@@ -24,7 +24,6 @@ from auto_agents.gates import (
 from auto_agents.git_ops import head_ref, worktree_fingerprint
 from auto_agents.models import CommandResult, GateResult, TaskSpec, VerificationStep
 from auto_agents.orchestrator import Orchestrator
-from auto_agents.self_repair import self_repair_error_fingerprint
 
 
 CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND = (
@@ -266,6 +265,7 @@ class GateCurrentSelectorRoutingTests(unittest.TestCase):
             case["checkpoint"],
         )
 
+
     @staticmethod
     def _diagnosed_selector_blocker(case: dict) -> dict:
         incident = case["incident"]
@@ -276,10 +276,7 @@ class GateCurrentSelectorRoutingTests(unittest.TestCase):
         return {
             "owner": "auto_agents",
             "category": "diagnosed_engine_failure",
-            "fingerprint": self_repair_error_fingerprint(
-                incident.diagnosis["reason"],
-                "provider_judged_auto_agents",
-            ),
+            "fingerprint": Orchestrator._persisted_incident_self_repair_fingerprint(incident),
             "status": "blocked",
             "reason": reason,
             "incident_id": "",
@@ -297,6 +294,7 @@ class GateCurrentSelectorRoutingTests(unittest.TestCase):
                 },
             },
         }
+
 
     def _check_current_and_baseline_missing_routes_target_recovery(
         self,
@@ -1692,23 +1690,7 @@ class GateCurrentSelectorRoutingTests(unittest.TestCase):
             state.active_blocker = blocker
             save_run_state(root, state)
 
-            with (
-                patch.object(
-                    orchestrator,
-                    "_installed_engine_revision",
-                    return_value="engine-before-generic-self-repair-resume",
-                ),
-                patch.object(
-                    orchestrator,
-                    "_verify_installed_generic_self_repair",
-                    side_effect=AssertionError(
-                        "selector evidence must be handled before generic resume"
-                    ),
-                ),
-            ):
-                changed = orchestrator._prepare_installed_generic_self_repair_resume(
-                    state
-                )
+            changed = orchestrator._resume_blocked_run(state)
 
             self.assertTrue(changed)
             persisted = ExecutionIncidentStore(root, state.run_id).load(

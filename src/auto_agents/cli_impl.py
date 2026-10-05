@@ -41,11 +41,13 @@ from .notifications import (
     notify_run_finished,
     notify_run_started,
     notify_run_waiting,
-    notify_self_repair_finished,
+
     notify_session_finished,
     notify_session_started,
 )
 from .orchestrator import Orchestrator
+from .engine_fault import EngineFault, engine_root as auto_agents_repo_root
+from .supervision_api import BusinessTelemetry as WorkflowHealthRuntime
 from .models import PersistenceTargetConfig
 from .operator_inputs import OperatorInputStore, UserInputRequest, prompt_for_request
 from .persistence_rebind import rebind_legacy_persistence_decision
@@ -59,17 +61,6 @@ from .prototype_variants import (
 )
 from .foreground_activity import ForegroundActivity
 from .git_ops import add_worktree, changed_paths, head_ref, remove_worktree
-from .health_watch import (
-    HealthSelfRepairRequired,
-    advance_run_health_control,
-    build_progress_vector,
-)
-from .health_control import health_watch_status, request_health_state
-from .health_watchdog import (
-    mark_watchdog_stop_intent,
-    run_health_sidecar,
-)
-from .workflow_health import WorkflowHealthRuntime
 from .process_supervision import (
     ACTIVE_PROCESSES,
     RunInterruptedError,
@@ -88,25 +79,6 @@ from .release_attestation import (
     enqueue_release_verification,
 )
 from .release_worker import ensure_release_worker, run_release_worker
-from .self_repair import (
-    SELF_REPAIR_DISABLED_ENV,
-    AutoAgentsSelfRepairRunner,
-    SelfRepairDecision,
-    SelfRepairResult,
-    SelfRepairTriageResult,
-    adjudicate_auto_agents_error,
-    append_self_repair_history,
-    auto_agents_repo_root,
-    classify_auto_agents_error,
-    self_repair_verification_command,
-    self_repair_verify_commands,
-)
-from .repair_cases import RepairCase, RepairCaseStore
-from .repair_checkpoint import (
-    create_repair_checkpoint,
-    restore_repair_control_checkpoint,
-)
-from .self_repair_playbooks import SelfRepairPlaybookRegistry
 from .validation import validate_persistence_config_payload, validation_report
 from .worker_cluster import (
     WORKER_API_PORT,
@@ -212,72 +184,10 @@ def _interactive_variant_id(
     )
 
 
-SELF_REPAIR_STRICT_ENV = "AUTO_AGENTS_SELF_REPAIR_STRICT"
-
-
 def _truthy_environment_flag(values: dict[str, str], name: str) -> bool:
     return str(values.get(name, "")).strip().lower() in {"1", "true", "yes"}
 
 
-def _preflight_automatic_self_repair(args, *, env: Optional[dict[str, str]] = None) -> Optional[int]:
-    """Warn early when a run cannot use the automatic self-repair path."""
-    if getattr(args, "command", "") != "run":
-        return None
-
-    values = os.environ if env is None else env
-    if _truthy_environment_flag(values, SELF_REPAIR_DISABLED_ENV):
-        return None
-    autonomy_mode = str(getattr(args, "autonomy", None) or "").strip()
-    allow_isolated_dirty = True
-    try:
-        project_config = load_project_config(
-            Path(getattr(args, "project", "")).expanduser().resolve()
-        )
-        autonomy_mode = autonomy_mode or project_config.execution.autonomy.mode
-        allow_isolated_dirty = bool(
-            project_config.execution.autonomy.allow_isolated_dirty_checkout
-        )
-    except Exception:
-        autonomy_mode = autonomy_mode or "max"
-    if autonomy_mode == "off":
-        return None
-
-    repo_root = auto_agents_repo_root()
-    try:
-        dirty = changed_paths(repo_root)
-    except RuntimeError as error:
-        detail = f"could not inspect {repo_root}: {error}"
-    else:
-        if not dirty:
-            return None
-        if allow_isolated_dirty:
-            return None
-        preview = ", ".join(dirty[:8])
-        if len(dirty) > 8:
-            preview += f", ... ({len(dirty)} paths total)"
-        detail = f"working tree is not clean; changed paths: {preview}"
-
-    message = (
-        "automatic auto_agents self-repair is unavailable because "
-        f"{detail}. Normal run can continue, but an auto_agents-owned failure "
-        "cannot be repaired automatically until this repository is clean."
-    )
-    strict = bool(getattr(args, "strict_self_repair", False)) or _truthy_environment_flag(
-        values,
-        SELF_REPAIR_STRICT_ENV,
-    )
-    if strict:
-        print(
-            json.dumps(
-                {"ok": False, "error": f"self-repair preflight failed: {message}"},
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
-        return 2
-
-    print(f"WARNING: {message}", file=sys.stderr)
-    return None
 
 
 def _configure_persistence_target(args: argparse.Namespace) -> dict:
@@ -986,134 +896,8 @@ def _auto_resolve_provider_blocker(
     return 0
 
 
-def _run_command_for_self_repair_resume(
-    args,
-    *,
-    repo_root: Optional[Path] = None,
-) -> list[str]:
-    runtime_root = (repo_root or auto_agents_repo_root()).resolve()
-    source_command = str(getattr(args, "command", "run") or "run")
-    if source_command == "answer":
-        try:
-            answered_state = load_run_state(Path(str(args.project)))
-            answered_context = dict(answered_state.resume_context)
-        except (OSError, RuntimeError, FileNotFoundError, ValueError):
-            answered_context = {}
-        workflow_id = str(answered_context.get("workflow_id", "")).strip()
-        parent_handoff_id = str(
-            answered_context.get("parent_handoff_id", "")
-        ).strip()
-        if workflow_id and parent_handoff_id:
-            command = [
-                sys.executable,
-                str(runtime_root / "auto_agents.py"),
-                "resume",
-                "--project",
-                str(args.project),
-                "--workflow",
-                workflow_id,
-            ]
-            if bool(getattr(args, "print_agent_output", False)):
-                command.append("--print-agent-output")
-            if getattr(args, "log_mode", None):
-                command.extend(["--log-mode", args.log_mode])
-            return command
-    resume_command = "run" if source_command == "answer" else source_command
-    command = [
-        sys.executable,
-        str(runtime_root / "auto_agents.py"),
-        resume_command,
-        "--project",
-        str(args.project),
-    ]
-    if getattr(args, "log_mode", None):
-        command.extend(["--log-mode", args.log_mode])
-    if source_command == "resume" and getattr(args, "workflow", None):
-        command.extend(["--workflow", args.workflow])
-    if getattr(args, "command", "run") in {"fix", "collab", "provider-resolve"}:
-        session_id = _session_id_for_self_repair_resume(args)
-        if session_id:
-            command.extend(["--session", session_id])
-        if getattr(args, "provider", None):
-            command.extend(["--provider", str(args.provider)])
-        if bool(getattr(args, "print_agent_output", False)):
-            command.append("--print-agent-output")
-        if bool(getattr(args, "auto_approve", False)):
-            command.append("--auto-approve")
-        if bool(getattr(args, "full_verify", False)):
-            command.append("--full-verify")
-        if bool(getattr(args, "no_health_watch", False)):
-            command.append("--no-health-watch")
-        if getattr(args, "autonomy", None):
-            command.extend(["--autonomy", str(args.autonomy)])
-        return command
-    if getattr(args, "spec_file", None):
-        command.extend(["--spec-file", str(args.spec_file)])
-    if bool(getattr(args, "auto_approve", False)):
-        command.append("--auto-approve")
-    if bool(getattr(args, "allow_dirty_tree", False)):
-        command.append("--allow-dirty-tree")
-    if getattr(args, "max_tasks", None) is not None:
-        command.extend(["--max-tasks", str(args.max_tasks)])
-    if bool(getattr(args, "skip_validate", False)):
-        command.append("--skip-validate")
-    if bool(getattr(args, "print_agent_output", False)):
-        command.append("--print-agent-output")
-    if bool(getattr(args, "full_verify", False)):
-        command.append("--full-verify")
-    if getattr(args, "provider", None):
-        command.extend(["--provider", str(args.provider)])
-    if getattr(args, "doc_language", None):
-        command.extend(["--doc-language", str(args.doc_language)])
-    if bool(getattr(args, "no_repo_map", False)):
-        command.append("--no-repo-map")
-    if bool(getattr(args, "no_health_watch", False)):
-        command.append("--no-health-watch")
-    if bool(getattr(args, "strict_self_repair", False)):
-        command.append("--strict-self-repair")
-    if getattr(args, "autonomy", None):
-        command.extend(["--autonomy", str(args.autonomy)])
-    if getattr(args, "interaction_mode", None):
-        command.extend(["--interaction-mode", str(args.interaction_mode)])
-    if getattr(args, "secret_echo", None):
-        command.extend(["--secret-echo", str(args.secret_echo)])
-    return command
 
 
-def _session_id_for_self_repair_resume(args) -> str:
-    """Resolve the exact durable root session for an automatic CLI restart."""
-
-    explicit = str(getattr(args, "session", "") or "").strip()
-    if explicit:
-        return explicit
-    command = str(getattr(args, "command", "") or "").strip()
-    if command not in {"fix", "collab", "provider-resolve"}:
-        return ""
-    raw_project = str(getattr(args, "project", "") or "").strip()
-    if not raw_project:
-        return ""
-    project_root = Path(raw_project).expanduser()
-    from .config import load_session_state
-    from .workflow_chain import WorkflowStore
-
-    try:
-        snapshot = WorkflowStore(project_root).active()
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
-        return ""
-    if snapshot is None:
-        return ""
-    if snapshot.status in {"completed", "suspended"}:
-        return ""
-    expected_mode = _session_mode_for_command(command)
-    if snapshot.root.kind != expected_mode:
-        return ""
-    try:
-        state = load_session_state(project_root, snapshot.root.native_id)
-    except (OSError, RuntimeError, FileNotFoundError, ValueError, json.JSONDecodeError):
-        return ""
-    if state.mode != expected_mode or state.status == "completed":
-        return ""
-    return state.session_id
 
 
 def _prepare_explicit_session(project_root: Path, session_id: str, mode: str):
@@ -1167,994 +951,45 @@ def _reconcile_session_interruption(coordinator, payload, requested_state) -> No
     coordinator.reconcile_interruption(payload)
 
 
-def _run_self_repair_resume_process(
-    command: list[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    pass_fd: int,
-) -> int:
-    """Run the repaired CLI under the same bounded process supervision."""
-    reporter = find_reporter()
-    if reporter is not None:
-        reporter.handoff()
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(cwd),
-            env=env,
-            pass_fds=(pass_fd,),
-            text=True,
-            start_new_session=True,
-        )
-    except BaseException:
-        if reporter is not None:
-            reporter.cancel_handoff()
-        raise
-    record = ACTIVE_PROCESSES.register(process, kind="self-repair-resume")
-    cleanup_incomplete = False
-    try:
-        while process.poll() is None:
-            time.sleep(0.1)
-        return int(process.returncode or 0)
-    except BaseException:
-        cleanup_incomplete = terminate_process_group(
-            process, pgid=record.pgid
-        ).cleanup_incomplete
-        raise
-    finally:
-        ACTIVE_PROCESSES.unregister(
-            process.pid,
-            preserve_if_alive=(cleanup_incomplete or process_group_exists(record.pgid)),
-        )
 
 
-def _finalize_health_live_boundary(
-    project_root: Path,
-    repair_case: RepairCase,
-    *,
-    exit_code: int,
-) -> bool:
-    after = _try_load_run_state(project_root)
-    before_atoms = {
-        str(item) for item in repair_case.progress_before.get("durable_atoms", [])
-    }
-    after_progress = build_progress_vector(after) if after is not None else None
-    crossed = bool(
-        exit_code == 0
-        and after_progress is not None
-        and (
-            set(after_progress.durable_atoms) - before_atoms
-            or len(after_progress.unresolved_roots)
-            < len(repair_case.progress_before.get("unresolved_roots", []))
-        )
-    )
-    if after is not None:
-        stored = RepairCaseStore(project_root, after.run_id).load(repair_case.case_id)
-        if stored is not None:
-            stored.status = "resolved" if crossed else "live_boundary_failed"
-            stored.history.append(
-                {
-                    "event": "live_boundary",
-                    "crossed": crossed,
-                    "exit_code": exit_code,
-                }
-            )
-            RepairCaseStore(project_root, after.run_id).save(stored)
-        if crossed:
-            after.active_repair_case_id = ""
-            after.repair_phase = ""
-            after.repair_checkpoint_ref = ""
-            advance_run_health_control(
-                after,
-                kind="health_self_repair_resumed",
-                intervention_active=False,
-                resume=True,
-            )
-            save_run_state(project_root, after)
-    return crossed
 
 
-def _restore_failed_health_boundary(
-    project_root: Path,
-    repair_case: RepairCase,
-    checkpoint: Path,
-) -> None:
-    try:
-        restore_repair_control_checkpoint(project_root, checkpoint)
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
-        state = _try_load_run_state(project_root)
-        if state is None:
-            return
-        stored = RepairCaseStore(project_root, state.run_id).load(repair_case.case_id)
-        if stored is not None:
-            stored.status = "checkpoint_restore_failed"
-            stored.history.append(
-                {
-                    "event": "checkpoint_restore_failed",
-                    "reason": str(error),
-                }
-            )
-            RepairCaseStore(project_root, state.run_id).save(stored)
 
 
-def _auto_repair_auto_agents_and_resume(
-    project_root: Path,
-    orchestrator: Orchestrator,
-    error: object,
-    decision: SelfRepairDecision,
-    args,
-    run_lock: ProjectRunLock,
-    diagnosis=None,
-    repair_case: Optional[RepairCase] = None,
-) -> int:
-    from .recovery.model import KernelError
-    if isinstance(error, KernelError):
-        print(json.dumps({'ok': False, 'failure_kind': error.code, 'error': str(error),
-                          'diagnostic': error.details}, ensure_ascii=False), file=sys.stderr)
-        return 3
-    from .repair_client import enabled as repair_control_enabled, submit_and_wait
-    if repair_control_enabled():
-        try:
-            return submit_and_wait(project_root, orchestrator, error, decision, args,
-                                   run_lock, diagnosis, repair_case)
-        except KernelError as failure:
-            print(json.dumps({'ok':False,'failure_kind':failure.code,'error':str(failure),
-                              'diagnostic':failure.details},ensure_ascii=False),file=sys.stderr)
-            return 3
-    invocation = dict(getattr(orchestrator, "_invocation_context", {}) or {})
-    if invocation.get("session_id") and not invocation.get("run_id"):
-        return _auto_repair_session_and_resume(
-            project_root, orchestrator, error, decision, args, run_lock, diagnosis,
-        )
-    existing_state = load_run_state(project_root)
-    authorization_policy = authorization_policy_for_state(
-        auto_approve=bool(getattr(args, "auto_approve", False)),
-        payload=existing_state.resume_context.get("authorization_policy", {}),
-    )
-    existing_state.resume_context["authorization_policy"] = (
-        authorization_policy.to_dict()
-    )
-    save_run_state(project_root, existing_state)
-    if repair_case is not None:
-        repair_case.authorization_policy = authorization_policy.to_dict()
-        RepairCaseStore(project_root, existing_state.run_id).save(repair_case)
-    health_runtime = getattr(orchestrator, "_workflow_health_runtime", None)
-    if health_runtime is not None:
-        health_runtime.set_phase("self_repair")
-    health_repair = bool(repair_case is not None and repair_case.source == "health_watch")
-    if health_repair:
-        state = load_run_state(project_root)
-        state.active_repair_case_id = repair_case.case_id
-        state.repair_phase = "quiescing"
-        save_run_state(project_root, state)
-        ACTIVE_PROCESSES.terminate_all()
-        deadline = time.monotonic() + max(
-            60,
-            int(orchestrator.config.execution.health_watch.quiesce_timeout_seconds),
-        )
-        while time.monotonic() < deadline:
-            if not any(
-                process_group_exists(record.pgid)
-                for record in ACTIVE_PROCESSES.snapshot()
-            ):
-                break
-            time.sleep(0.1)
-        else:
-            message = "health self-repair could not quiesce all managed process groups"
-            orchestrator.record_self_repair_failure(
-                category=repair_case.kind,
-                reason=message,
-                summary="",
-                verification="",
-            )
-            orchestrator.stop_health_supervision(status="blocked", reason=message)
-            _notify_run_blocked(project_root, message)
-            print(json.dumps({"ok": False, "error": message}, indent=2, ensure_ascii=False))
-            return 3
-        try:
-            checkpoint = create_repair_checkpoint(
-                project_root,
-                state.run_id,
-                repair_case.case_id,
-            )
-        except (OSError, RuntimeError) as checkpoint_error:
-            message = f"health self-repair checkpoint failed: {checkpoint_error}"
-            orchestrator.record_self_repair_failure(
-                category=repair_case.kind,
-                reason=message,
-                summary="",
-                verification="",
-            )
-            orchestrator.stop_health_supervision(status="blocked", reason=message)
-            _notify_run_blocked(project_root, message)
-            print(json.dumps({"ok": False, "error": message}, indent=2, ensure_ascii=False))
-            return 3
-        repair_case.resume_checkpoint_ref = str(checkpoint)
-        repair_case.status = "self_repairing"
-        RepairCaseStore(project_root, state.run_id).save(repair_case)
-        state = load_run_state(project_root)
-        state.repair_phase = "self_repairing"
-        state.repair_checkpoint_ref = str(checkpoint)
-        save_run_state(project_root, state)
-    else:
-        orchestrator.record_run_blocker(
-            owner="auto_agents",
-            category=decision.category or "auto_agents_error",
-            reason=decision.reason or str(error),
-            fingerprint=decision.fingerprint,
-        )
-    if diagnosis is not None:
-        if health_repair:
-            state = load_run_state(project_root)
-            stored_case = RepairCaseStore(
-                project_root, state.run_id
-            ).load(repair_case.case_id)
-            if stored_case is not None:
-                stored_case.history.append(
-                    {
-                        "event": "root_cause_diagnosis",
-                        "diagnosis_id": diagnosis.diagnosis_id,
-                        "evidence_path": diagnosis.evidence_path,
-                        "final": diagnosis.final.to_dict(),
-                    }
-                )
-                RepairCaseStore(project_root, state.run_id).save(stored_case)
-        else:
-            state = load_run_state(project_root)
-            blocker = dict(state.active_blocker)
-            blocker["root_cause_diagnosis"] = {
-                "diagnosis_id": diagnosis.diagnosis_id,
-                "evidence_path": diagnosis.evidence_path,
-                "final": diagnosis.final.to_dict(),
-            }
-            state.active_blocker = blocker
-            save_run_state(project_root, state)
-    print(
-        "Run hit an auto_agents-owned failure. Starting automatic auto_agents self-repair...",
-        file=sys.stderr,
-    )
-    runner = AutoAgentsSelfRepairRunner(
-        orchestrator,
-        target_project_root=project_root,
-        error=error,
-        decision=decision,
-        diagnosis=diagnosis,
-        repair_case=repair_case,
-        print_agent_output=bool(getattr(args, "print_agent_output", False)),
-    )
-    if health_runtime is not None:
-        health_runtime.set_active_operation(
-            "self_repair",
-            decision.category or "auto_agents_self_repair",
-        )
-    try:
-        try:
-            result = runner.run()
-        except Exception as repair_error:
-            detail = (
-                f"{type(repair_error).__name__}: {repair_error}"
-            ).strip()
-            result = SelfRepairResult(
-                ok=False,
-                status="self_repair_exception",
-                category=(
-                    decision.category or "self_repair_exception"
-                ),
-                reason=(
-                    "self-repair runner exited unexpectedly; collab will "
-                    f"persist a blocker and exit: {detail}"
-                ),
-                infrastructure_failure=True,
-            )
-    finally:
-        if health_runtime is not None:
-            health_runtime.set_active_operation()
-    if not result.ok:
-        # No provider, test, or speculative validation process may outlive a
-        # terminal self-repair boundary and keep the foreground collab alive.
-        ACTIVE_PROCESSES.terminate_all()
-        message = f"automatic auto_agents self-repair failed: {result.reason}"
-        orchestrator.record_self_repair_failure(
-            category=result.category or decision.category or "self_repair_failed",
-            reason=message,
-            summary=result.summary,
-            verification=result.verification,
-        )
-        if health_repair:
-            orchestrator.stop_health_supervision(status="blocked", reason=message)
-        _notify_run_blocked(project_root, message)
-        payload = {"ok": False, "error": message}
-        if result.verification.strip():
-            payload["verification"] = result.verification
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
-        return 3
-
-    if result.status == "already_repaired" or not result.candidate_commit:
-        orchestrator.mark_self_repair_applied(
-            result.commit_sha,
-            verification=result.verification,
-        )
-        notice(
-            "repair.resume_pending",
-            "Verified auto_agents code resolves this issue at "
-            f"{result.commit_sha[:12]}. Resuming run without a new repair...",
-        )
-        if health_repair:
-            orchestrator.stop_health_supervision(status="handoff")
-        resume_command = _run_command_for_self_repair_resume(args)
-        inherited_env = run_lock.inherited_environment(
-            append_self_repair_history(decision)
-        )
-        boundary_exit = 0
-        if health_repair:
-            boundary_exit = _run_self_repair_resume_process(
-                [
-                    *resume_command,
-                    "--repair-boundary-only",
-                    repair_case.case_id,
-                ],
-                cwd=auto_agents_repo_root(),
-                env=inherited_env,
-                pass_fd=run_lock.fileno,
-            )
-            if boundary_exit != 0:
-                _restore_failed_health_boundary(
-                    project_root,
-                    repair_case,
-                    checkpoint,
-                )
-        exit_code = (
-            boundary_exit
-            if boundary_exit != 0
-            else _run_self_repair_resume_process(
-                resume_command,
-                cwd=auto_agents_repo_root(),
-                env=inherited_env,
-                pass_fd=run_lock.fileno,
-            )
-        )
-        if health_repair and not _finalize_health_live_boundary(
-            project_root,
-            repair_case,
-            exit_code=exit_code,
-        ):
-            message = "approved self-repair did not cross the live health boundary"
-            orchestrator.record_self_repair_failure(
-                category=result.category,
-                reason=message,
-                summary=result.summary,
-                verification=result.verification,
-            )
-            exit_code = 3
-    else:
-        before = load_run_state(project_root)
-        before_blocker = (
-            dict(before.active_blocker)
-            if isinstance(before.active_blocker, dict)
-            else {}
-        )
-        orchestrator.mark_self_repair_applied(
-            result.candidate_commit,
-            verification=result.verification,
-        )
-        runtime_root = Path(result.runtime_root).resolve()
-        notice(
-            "repair.resume_pending",
-            f"auto_agents approved isolated candidate "
-            f"{result.candidate_commit[:12]}. Resuming from its worktree...",
-        )
-        try:
-            if health_repair:
-                orchestrator.stop_health_supervision(status="handoff")
-            resume_command = _run_command_for_self_repair_resume(
-                args,
-                repo_root=runtime_root,
-            )
-            inherited_env = run_lock.inherited_environment(
-                append_self_repair_history(decision)
-            )
-            boundary_exit = 0
-            if health_repair:
-                boundary_exit = _run_self_repair_resume_process(
-                    [
-                        *resume_command,
-                        "--repair-boundary-only",
-                        repair_case.case_id,
-                    ],
-                    cwd=runtime_root,
-                    env=inherited_env,
-                    pass_fd=run_lock.fileno,
-                )
-                if boundary_exit != 0:
-                    _restore_failed_health_boundary(
-                        project_root,
-                        repair_case,
-                        checkpoint,
-                    )
-            exit_code = (
-                boundary_exit
-                if boundary_exit != 0
-                else _run_self_repair_resume_process(
-                    resume_command,
-                    cwd=runtime_root,
-                    env=inherited_env,
-                    pass_fd=run_lock.fileno,
-                )
-            )
-            after = _try_load_run_state(project_root)
-            after_blocker = (
-                dict(after.active_blocker)
-                if after is not None and isinstance(after.active_blocker, dict)
-                else {}
-            )
-            if health_repair:
-                same_root = not _finalize_health_live_boundary(
-                    project_root,
-                    repair_case,
-                    exit_code=exit_code,
-                )
-            elif getattr(args, "command", "run") == "run":
-                same_root = bool(
-                    after_blocker
-                    and (
-                        str(after_blocker.get("fingerprint", "")).strip()
-                        == str(before_blocker.get("fingerprint", "")).strip()
-                        or str(after_blocker.get("category", "")).strip()
-                        == str(before_blocker.get("category", "")).strip()
-                    )
-                )
-            else:
-                same_root = exit_code != 0
-                if not same_root and after is not None:
-                    after.active_blocker = {}
-                    if after.status == "blocked":
-                        after.status = "pending"
-                    after.last_error = ""
-                    save_run_state(project_root, after)
-            if same_root:
-                message = (
-                    "approved self-repair candidate did not cross the live "
-                    "blocked boundary"
-                )
-                orchestrator.record_self_repair_failure(
-                    category=result.category,
-                    reason=message,
-                    summary=result.summary,
-                    verification=result.verification,
-                )
-                result.status = "live_boundary_failed"
-                result.reason = message
-                exit_code = 3
-            else:
-                if hasattr(runner, "promote_after_live_boundary"):
-                    result = runner.promote_after_live_boundary(result)
-        finally:
-            if hasattr(runner, "cleanup_runtime"):
-                runner.cleanup_runtime(result)
-
-    if health_repair:
-        final_state = _try_load_run_state(project_root)
-        if final_state is not None:
-            if exit_code != 0:
-                mark_watchdog_stop_intent(
-                    project_root,
-                    final_state.run_id,
-                    reason="health self-repair resume failed",
-                )
-
-    _safe_notify(
-        notify_self_repair_finished,
-        project_root,
-        auto_agents_root=runner.repo_root,
-        status=(
-            "completed" if result.status == "already_repaired" else result.status
-        ),
-        reason=str(error),
-        commit_sha=result.commit_sha,
-        summary=result.summary or result.reason,
-        verification=result.verification,
-    )
-    return exit_code
 
 
-def _auto_repair_session_and_resume(project_root, orchestrator, error, decision, args, run_lock, diagnosis) -> int:
-    """Repair a session without mutating an unrelated run's control state."""
-    from .config import load_session_state, save_session_state
-    from .execution_recovery import redact_incident_text
-    from .repair_client import enabled as repair_control_enabled, submit_and_wait
-    if repair_control_enabled():
-        return submit_and_wait(project_root, orchestrator, error, decision, args, run_lock, diagnosis)
-
-    state = load_session_state(project_root, args.session)
-    runner = AutoAgentsSelfRepairRunner(
-        orchestrator, target_project_root=project_root, error=error,
-        decision=decision, diagnosis=diagnosis,
-        print_agent_output=bool(getattr(args, "print_agent_output", False)),
-    )
-    health_runtime = getattr(orchestrator, "_workflow_health_runtime", None)
-    if health_runtime is not None:
-        health_runtime.set_phase("self_repair")
-        health_runtime.set_active_operation("self_repair", decision.category or "session self-repair")
-    try:
-        result = runner.run()
-    finally:
-        if health_runtime is not None:
-            health_runtime.set_active_operation()
-    if not result.ok or (not result.candidate_commit and result.status != "already_repaired"):
-        ACTIVE_PROCESSES.terminate_all()
-        state.status = "failed"
-        state.resolution = redact_incident_text(result.reason)
-        state.execution_log.append({
-            "action": "engine_self_repair", "result": result.status,
-            "experiment_id": result.experiment_id, "reason": state.resolution,
-        })
-        save_session_state(project_root, state)
-        print(json.dumps({"ok": False, "session_id": args.session, "error": state.resolution,
-                          "experiment_id": result.experiment_id}, ensure_ascii=False))
-        return 3
-    runtime_root = Path(result.runtime_root) if result.runtime_root else auto_agents_repo_root()
-    command = _run_command_for_self_repair_resume(args, repo_root=runtime_root)
-    if health_runtime is not None:
-        health_runtime.set_phase("handoff")
-    try:
-        exit_code = _run_self_repair_resume_process(
-            command, cwd=runtime_root,
-            env=run_lock.inherited_environment(append_self_repair_history(decision)),
-            pass_fd=run_lock.fileno,
-        )
-        if exit_code == 0 and result.candidate_commit:
-            runner.promote_after_live_boundary(result)
-        return exit_code
-    finally:
-        runner.cleanup_runtime(result)
 
 
-def _try_deterministic_self_repair_playbook(
-    project_root: Path,
-    orchestrator: Orchestrator,
-    args,
-    run_lock: ProjectRunLock,
-) -> Optional[int]:
-    autonomy_mode = str(
-        getattr(args, "autonomy", None)
-        or orchestrator.config.execution.autonomy.mode
-    ).strip()
-    if autonomy_mode == "off":
-        return None
-    state = load_run_state(project_root)
-    result = SelfRepairPlaybookRegistry().attempt(orchestrator, state)
-    if result is None:
-        return None
-    try:
-        write_json(
-            run_path(project_root, state.run_id)
-            / "outputs"
-            / "deterministic-self-repair.json",
-            result.to_dict(),
-        )
-    except OSError:
-        pass
-    if not result.ok or not result.changed:
-        return None
-    save_run_state(project_root, state)
-    notice(
-        "repair.resume_pending",
-        f"Deterministic self-repair playbook {result.name} succeeded. Resuming run...",
-    )
-    return _run_self_repair_resume_process(
-        _run_command_for_self_repair_resume(args),
-        cwd=auto_agents_repo_root(),
-        env=run_lock.inherited_environment(os.environ),
-        pass_fd=run_lock.fileno,
-    )
 
 
-def _pending_candidate_verifies_on_head(
-    repo_root: Path,
-    candidate: str,
-    *,
-    project_root: Optional[Path] = None,
-) -> bool:
-    with tempfile.TemporaryDirectory(
-        prefix="auto-agents-pending-promotion-"
-    ) as tmp:
-        verification_root = Path(tmp) / "verification"
-        created = False
-        try:
-            add_worktree(repo_root, verification_root, ref="HEAD")
-            created = True
-            applied = subprocess.run(
-                ["git", "cherry-pick", candidate],
-                cwd=str(verification_root),
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-            )
-            if applied.returncode != 0:
-                return False
-            for command in self_repair_verify_commands():
-                verification_python = (
-                    project_root / ".conda" / "bin" / "python"
-                    if project_root is not None
-                    and (project_root / ".conda" / "bin" / "python").is_file()
-                    else Path(sys.executable)
-                )
-                rendered = self_repair_verification_command(
-                    command,
-                    verification_root,
-                    repository_aliases={repo_root.name},
-                    python_executable=str(verification_python),
-                )
-                verified = subprocess.run(
-                    rendered,
-                    cwd=str(verification_root),
-                    shell=True,
-                    text=True,
-                    encoding="utf-8",
-                    capture_output=True,
-                    timeout=900,
-                )
-                if verified.returncode != 0:
-                    return False
-            return True
-        finally:
-            if created:
-                try:
-                    remove_worktree(repo_root, verification_root, force=True)
-                except RuntimeError:
-                    pass
 
 
-def _promote_pending_self_repairs(project_root: Path) -> None:
-    try:
-        state = load_run_state(project_root)
-    except Exception:
-        return
-    if not state.pending_self_repair_promotions:
-        return
-    repo_root = auto_agents_repo_root()
-    if changed_paths(repo_root):
-        return
-    current_head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(repo_root),
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-    ).stdout.strip()
-    remaining = []
-    changed = False
-    for item in state.pending_self_repair_promotions:
-        candidate = str(item.get("candidate_commit", "")).strip()
-        base = str(item.get("base_commit", "")).strip()
-        if not candidate or not base:
-            continue
-        contained = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", candidate, "HEAD"],
-            cwd=str(repo_root),
-            capture_output=True,
-        )
-        if contained.returncode == 0:
-            if str(item.get("publish_status", "")) == "publish_pending":
-                published = subprocess.run(
-                    ["git", "push"],
-                    cwd=str(repo_root),
-                    text=True,
-                    encoding="utf-8",
-                    capture_output=True,
-                )
-                if published.returncode != 0:
-                    remaining.append(dict(item))
-                    continue
-            changed = True
-            continue
-        if current_head != base and not _pending_candidate_verifies_on_head(
-            repo_root,
-            candidate,
-            project_root=project_root,
-        ):
-            item = {**dict(item), "promotion_status": "pending_head_conflict"}
-            remaining.append(item)
-            continue
-        promoted = subprocess.run(
-            ["git", "cherry-pick", candidate],
-            cwd=str(repo_root),
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-        )
-        if promoted.returncode != 0:
-            subprocess.run(
-                ["git", "cherry-pick", "--abort"],
-                cwd=str(repo_root),
-                capture_output=True,
-            )
-            item = {**dict(item), "promotion_status": "pending_conflict"}
-            remaining.append(item)
-            continue
-        current_head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo_root),
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-        ).stdout.strip()
-        changed = True
-    if changed or len(remaining) != len(state.pending_self_repair_promotions):
-        state.pending_self_repair_promotions = remaining
-        save_run_state(project_root, state)
 
 
-def _block_terminal_run_error(
-    project_root: Path,
-    orchestrator: Optional[Orchestrator],
-    error: object,
-    triage: SelfRepairTriageResult,
-) -> None:
-    judgment = triage.judgment
-    owner = judgment.owner if judgment is not None else "unknown"
-    category = (
-        triage.decision.category
-        or (judgment.category if judgment is not None else "")
-        or type(error).__name__.lower()
-    )
-    reason = str(error).strip() or triage.decision.reason or triage.reason
-    if orchestrator is not None and hasattr(orchestrator, "record_run_blocker"):
-        orchestrator.record_run_blocker(
-            owner=owner,
-            category=category,
-            reason=reason,
-            fingerprint=triage.decision.fingerprint,
-        )
-        return
-    try:
-        state = load_run_state(project_root)
-        state.status = "blocked"
-        state.last_error = reason
-        state.active_blocker = {
-            "owner": owner,
-            "category": category,
-            "reason": reason,
-            "fingerprint": triage.decision.fingerprint,
-            "occurrence_count": 1,
-            "resume_attempts": 0,
-            "status": "blocked",
-        }
-        save_run_state(project_root, state)
-    except Exception:
-        pass
 
 
-def _triage_terminal_run_error(
-    project_root: Path,
-    orchestrator: Optional[Orchestrator],
-    error: object,
-) -> SelfRepairTriageResult:
-    from .repair_client import triage_engine_request
-    request = triage_engine_request(orchestrator, project_root, error)
-    if request is not None:
-        notice("repair.request_accepted" if request.decision.eligible else "repair.request_rejected",
-               request.reason)
-        return request
-    state = _try_load_run_state(project_root)
-    invocation = dict(getattr(orchestrator, "_invocation_context", {}) or {})
-    if invocation.get("session_id"):
-        # Only a durable child run of this workflow may supply run evidence.
-        workflow_id = str(invocation.get("workflow_id", ""))
-        from .io_utils import read_json
-        workflow = read_json(project_root / ".auto-agents/state/workflows" / workflow_id / "workflow.json", default={})
-        frame = workflow.get("active_frame", {})
-        bound = bool(state is not None and workflow_id
-                     and state.resume_context.get("workflow_id") == workflow_id
-                     and frame == {"kind": "run", "native_id": state.run_id})
-        invocation["run_id"] = state.run_id if bound else ""
-        orchestrator._invocation_context = invocation
-        if not bound:
-            state = None
-    if orchestrator is None:
-        fallback = classify_auto_agents_error(error, state=state)
-        return SelfRepairTriageResult(
-            decision=SelfRepairDecision(
-                False,
-                category=(
-                    fallback.category
-                    or "root_cause_diagnosis_unavailable"
-                ),
-                reason=(
-                    "root-cause diagnosis is unavailable before orchestrator "
-                    "initialization; automatic repair fails closed"
-                ),
-                fingerprint=fallback.fingerprint,
-                repeat_count=fallback.repeat_count,
-            ),
-            source="root_cause_failed",
-            reason="orchestrator initialization did not complete",
-            provider_error="orchestrator initialization did not complete",
-        )
-    traceback_text = traceback.format_exc()
-    if traceback_text.strip() == "NoneType: None":
-        traceback_text = ""
-    from .repair_client import cached_contract
-    prior = cached_contract(orchestrator, project_root, error)
-    if prior:
-        from .root_cause import RootCauseDiagnosis
-        try:
-            diagnosis = RootCauseDiagnosis.from_dict(prior["diagnosis"])
-            return SelfRepairTriageResult(decision=SelfRepairDecision(**prior["decision"]),
-                source=prior.get('source', 'shared_repair_contract'), reason="reusing an approved repair contract; frozen behavior and boundary must be revalidated",
-                root_cause=diagnosis)
-        except (ValueError, TypeError, KeyError):
-            pass  # An obsolete cached schema cannot replace fresh diagnosis.
-    result = adjudicate_auto_agents_error(
-        orchestrator,
-        target_project_root=project_root,
-        error=error,
-        state=state,
-        traceback_text=traceback_text,
-    )
-    if state is not None and state.run_id.strip():
-        try:
-            write_json(
-                run_path(project_root, state.run_id) / "outputs" / "self-repair-triage.json",
-                result.to_dict(),
-            )
-        except Exception:
-            pass
-    judgment = result.judgment
-    detail = (
-        f" owner={judgment.owner} confidence={judgment.confidence:.2f}"
-        if judgment is not None
-        else ""
-    )
-    notice(
-        "diagnosis.unavailable" if result.provider_error else
-        "repair.eligible" if result.decision.eligible else "repair.not_eligible",
-        f"Self-repair triage source={result.source} eligible={result.decision.eligible}"
-        f" category={result.decision.category or '-'}{detail}: {result.reason}"
-        + (f"; provider error: {result.provider_error}" if result.provider_error else ""),
-    )
-    return result
 
 
-def _record_blocked_self_repair_triage(
-    project_root: Path,
-    triage: SelfRepairTriageResult,
-) -> None:
-    """Attach the final meta-triage decision without replacing the blocker."""
-    try:
-        state = load_run_state(project_root)
-        blocker = (
-            dict(state.active_blocker)
-            if isinstance(state.active_blocker, dict)
-            else {}
-        )
-        blocker["self_repair_triage"] = triage.to_dict()
-        state.active_blocker = blocker
-        save_run_state(project_root, state)
-    except Exception:
-        pass
 
 
-def _triage_controlled_workflow_result(project_root, orchestrator, state, args,
-                                      run_lock, foreground, health_runtime=None):
-    """Use the same ownership investigation for returned failures and exceptions."""
-    from copy import copy
-    from .controlled_failure import capture, record
-    failure = capture(state)
-    if failure is None:
-        return None
-    evidence = failure.evidence
-    invocation = dict(getattr(orchestrator, '_invocation_context', {}) or {})
-    invocation.update(command=evidence['mode'], workflow_id=evidence['workflow_id'],
-                      controlled_failure=evidence)
-    resume_args = copy(args)
-    if evidence['kind'] == 'session':
-        invocation.update(session_id=state.session_id, run_id='',
-                          auto_approve=bool(state.auto_approve or getattr(args, 'auto_approve', False)))
-        # A new session or a directly resumed child must retain the exact
-        # returned workflow root when repair restarts this command.
-        resume_args.command = 'provider-resolve' if state.mode == 'provider_resolve' else state.mode
-        resume_args.session = state.session_id
-        resume_args.auto_approve = invocation['auto_approve']
-        resume_args.full_verify = bool(state.full_verify or getattr(args, 'full_verify', False))
-    else:
-        invocation.update(session_id='', run_id=state.run_id)
-    orchestrator._invocation_context = invocation
-    from .recovery.rejections import quota_blocker
-    quota = quota_blocker(project_root, failure)
-    if quota:
-        from .self_repair import SelfRepairJudgment
-        triage = SelfRepairTriageResult(
-            SelfRepairDecision(False, category='provider_quota', reason=quota['reason'],
-                fingerprint=failure.fingerprint, requires_candidate_proof=False),
-            source='provider_receipt', reason=quota['reason'],
-            judgment=SelfRepairJudgment('NO_SELF_REPAIR', 'external_provider', False, False,
-                1.0, 'provider_quota', quota['reason'], [quota['result_ref']]))
-        path, _ = record(project_root, failure, triage)
-        reporter = getattr(orchestrator, 'reporter', None)
-        if reporter is not None:
-            reporter.text(('模型服务用量已耗尽，本次调用在执行前被拒绝。额度恢复后可继续同一 session。'
-                           if reporter.language == 'zh' else
-                           'Provider quota is exhausted; execution did not start. Resume this session after quota is available.'))
-            reporter.text(quota['reason'])
-            reporter.register(path, {'kind': 'terminal_triage'})
-        return None
-    if health_runtime is not None:
-        health_runtime.set_phase('triage')
-    try:
-        from .recovery.model_progress import stopped_search
-        stop = stopped_search(project_root, failure)
-        if stop is not None:
-            from .controlled_failure import ControlledWorkflowFailure
-            failure = ControlledWorkflowFailure({**evidence, 'kernel_stop': stop})
-            reason = (('Search stopped after failed candidate verification; correct the retained candidate '
-                       'and reverify before further model work. ' + stop['last_rejection']['reason'])
-                      if stop.get('last_rejection') else
-                      'Recovery stopped without new evidence. ' + stop.get('reason', evidence['reason']))
-            triage = SelfRepairTriageResult(
-                SelfRepairDecision(False, reason=reason, category='no_progress', fingerprint=failure.fingerprint),
-                source='kernel_budget', reason=reason)
-        else:
-            triage = _triage_terminal_run_error(project_root, orchestrator, failure)
-    except (OSError, RuntimeError, ValueError) as error:
-        record(project_root, failure, error=str(error))
-        notice('diagnosis.unavailable', 'Controlled workflow diagnosis is unavailable; the original failure is retained.')
-        return None
-    path, owner = record(project_root, failure, triage)
-    reporter = getattr(orchestrator, 'reporter', None)
-    if stop is not None:
-        from .diagnostic_output import clean_payload
-        candidate_failed = bool(stop.get('last_rejection'))
-        reason = clean_payload(stop.get('last_rejection', {}).get('reason') or
-                               stop.get('reason') or failure.evidence['reason'])
-        if reporter is not None and reporter.language == 'zh':
-            reporter.text((f'候选验证仍未通过，已停止自动重试：{reason}' if candidate_failed else
-                           f'当前恢复步骤缺少新的执行依据，已停止自动重试：{reason}'))
-            reporter.text((f'请修正保留候选后重新验证；诊断记录：{path}' if candidate_failed else
-                           f'请检查当前路由或恢复阻断；诊断记录：{path}'))
-        else:
-            message = (f'Candidate verification remains blocked: {reason}\nCorrect the retained candidate and reverify. Diagnostic record: {path}'
-                       if candidate_failed else
-                       f'Recovery stopped without new evidence: {reason}\nInspect the current routing or recovery blocker. Diagnostic record: {path}')
-            reporter.text(message) if reporter is not None else print(message)
-        if reporter is not None:
-            reporter.register(path, {'kind': 'terminal_triage'})
-        return None
-    if reporter is not None:
-        reporter.register(path, {'kind': 'terminal_triage'})
-        labels = {'auto_agents': 'auto_agents 引擎', 'target_project': '目标项目',
-                  'execution_environment': '运行环境', 'external_provider': '外部服务',
-                  'user_input': '用户输入', 'unknown': '尚未确定'}
-        reporter.text(('问题归属：' + labels.get(owner, owner)) if reporter.language == 'zh' else
-                      'Failure owner: ' + owner)
-        if triage is not None and triage.provider_error:
-            from .diagnostic_output import clean_payload
-            detail = clean_payload(str(triage.provider_error))
-            reporter.text(('诊断未完成：' if reporter.language == 'zh' else
-                           'Diagnosis did not complete: ') + detail)
-            reporter.text(('诊断记录：' if reporter.language == 'zh' else
-                           'Diagnosis record: ') + str(path))
-    if triage is not None and triage.decision.eligible:
-        foreground.release()
-        return _auto_repair_auto_agents_and_resume(
-            project_root, orchestrator, failure, triage.decision, resume_args, run_lock,
-            diagnosis=triage.root_cause)
+def _triage_controlled_workflow_result(project_root, orchestrator, state, args, *unused):
+    resolution = str(getattr(state, 'resolution', '') or '')
+    if resolution.startswith(('engine_', 'verification_ownership', 'execution_binding_mismatch')):
+        diagnostic=next((item for item in reversed(getattr(state,'execution_log',[]))
+                         if item.get('action')=='execution_preflight_blocked'),{})
+        reason=str(diagnostic.get('result') or getattr(state,'summary','') or resolution)
+        if resolution in {'verification_ownership','execution_binding_mismatch'}:
+            from .business_state import BusinessStateError
+            raise BusinessStateError('verification_ownership',reason,diagnostic=diagnostic)
+        from .engine_fault import EngineFault
+        raise EngineFault(reason,step_id=resolution,evidence=diagnostic)
     return None
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    repair_parser = subparsers.add_parser("repair", help="Inspect and control durable engine repairs")
-    repair_parser.add_argument("repair_action", choices=("status", "resume", "reverify", "cancel", "abandon", "retry-publish", "migrate", "upgrade"))
-    repair_parser.add_argument("--job", default="")
-    repair_parser.add_argument("--project", default="")
-    repair_parser.add_argument("--check", action="store_true")
-    repair_parser.add_argument("--runtime", default="")
-    repair_parser.add_argument("--transaction", default="", help="Exact stopped V2 transaction to abandon.")
-    repair_parser.add_argument("--reason", default="", help="Reason for explicitly abandoning a V2 transaction.")
-    repair_parser.add_argument("--json", action="store_true")
     prompt_eval_parser = subparsers.add_parser(
         "prompt-eval", help="Capture prompt baselines or explicitly evaluate configured providers"
     )
@@ -2192,14 +1027,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow implementation to start even when the project git tree already has local changes.",
     )
     run_parser.add_argument(
-        "--no-health-watch",
+        "--no-supervisor",
         action="store_true",
-        help="Disable run-health supervision and its sidecar for this invocation.",
-    )
-    run_parser.add_argument(
-        "--repair-boundary-only",
-        default="",
-        help=argparse.SUPPRESS,
+        help="Run directly without the optional maintenance supervisor.",
     )
     run_parser.add_argument(
         "--max-tasks",
@@ -2240,14 +1070,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--full-verify",
         action="store_true",
         help="Bypass incremental gate certificates and execute every final shard.",
-    )
-    run_parser.add_argument(
-        "--strict-self-repair",
-        action="store_true",
-        help=(
-            "Fail before starting only when no isolated self-repair or "
-            "verification environment can be created."
-        ),
     )
     run_parser.add_argument(
         "--autonomy",
@@ -2436,7 +1258,6 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--test", action="append", default=[], help="Repository-local test target; repeat for multiple targets.")
     verify_parser.add_argument("--engine", action="store_true", help="Use the engine verification profile and interpreter.")
     verify_parser.add_argument("--explain", action="store_true", help="Explain selection without executing or changing project state.")
-    verify_parser.add_argument("--verification-context", default="", help=argparse.SUPPRESS)
 
     release_worker_parser = subparsers.add_parser(
         "release-worker",
@@ -2511,7 +1332,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override autonomous repair mode for this session.",
     )
     fix_parser.add_argument(
-        "--no-health-watch",
+        "--no-supervisor",
         action="store_true",
         help="Disable proactive health supervision for this invocation.",
     )
@@ -2557,22 +1378,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override autonomous repair mode for this session.",
     )
     collab_parser.add_argument(
-        "--no-health-watch",
+        "--no-supervisor",
         action="store_true",
         help="Disable proactive health supervision for this invocation.",
     )
 
-    health_watch_parser = subparsers.add_parser(
-        "health-watch",
-        help="Dynamically control health supervision for the active workflow.",
-    )
-    health_watch_subparsers = health_watch_parser.add_subparsers(
-        dest="health_watch_command",
-        required=True,
-    )
-    for health_command in ("start", "stop", "status"):
-        health_command_parser = health_watch_subparsers.add_parser(health_command)
-        health_command_parser.add_argument("--project", required=True)
 
     persistence_parser = subparsers.add_parser(
         "persistence-configure",
@@ -2684,7 +1494,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Force the resumed root session's final attestation.",
     )
     resume_parser.add_argument(
-        "--no-health-watch",
+        "--no-supervisor",
         action="store_true",
         help="Disable proactive health supervision for this invocation.",
     )
@@ -2755,8 +1565,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workers_cleanup.add_argument("--max-age-seconds", type=float, default=86400.0)
 
-    watchdog_parser = subparsers.add_parser("_health-sidecar", help=argparse.SUPPRESS)
-    watchdog_parser.add_argument("--project", required=True)
 
     worker_parser = subparsers.add_parser(
         "worker",
@@ -2867,37 +1675,6 @@ def _dispatch(args) -> int:
             payload = {"ok": False, "error": str(error)}
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if payload.get("ok") else 1
-    if args.command == "repair":
-        from .repair_control import configure, ensure_supervisor, rpc
-        try:
-            from .recovery.cli import maintenance
-            from .recovery.authority import installation_root
-            if args.repair_action in {'migrate','upgrade'} or installation_root() is not None:
-                managed = maintenance(args)
-                if managed is not None:
-                    print(json.dumps(managed, ensure_ascii=False, indent=2))
-                    return 0 if managed.get('ok') else 3
-            config = configure(auto_agents_repo_root())
-            if args.repair_action == 'abandon':
-                from .repair_v2.retirement import abandon
-                payload = abandon(config['root'], args.transaction, args.reason)
-                print(json.dumps(payload, ensure_ascii=False, indent=2))
-                return 0
-            ensure_supervisor(config)
-            request = {"op": args.repair_action}
-            if args.repair_action == "resume":
-                request["environment"] = dict(os.environ)
-            if args.job:
-                request["job"] = args.job
-            if args.project:
-                request["project"] = str(Path(args.project).resolve())
-            if args.repair_action in {"resume", "retry-publish"} and not args.job:
-                raise ValueError("--job is required")
-            print(json.dumps(rpc(config, request), ensure_ascii=False, indent=2))
-            return 0
-        except (OSError, RuntimeError, ValueError) as error:
-            print(json.dumps({"ok": False, "error": str(error)}))
-            return 3
     if args.command == "prompt-eval":
         from .prompting.evaluate import main as evaluate_prompts
         _load_cli_dotenv()
@@ -2908,27 +1685,6 @@ def _dispatch(args) -> int:
             return 1
         return 0
     _load_cli_dotenv()
-
-    if args.command == "_health-sidecar":
-        return run_health_sidecar(Path(args.project))
-
-    if args.command == "health-watch":
-        try:
-            if args.health_watch_command == "status":
-                payload = health_watch_status(Path(args.project))
-            else:
-                payload = request_health_state(
-                    Path(args.project),
-                    enabled=args.health_watch_command == "start",
-                )
-        except (OSError, RuntimeError, ValueError) as error:
-            payload = {"ok": False, "error": str(error)}
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
-        return 0 if bool(payload.get("ok")) else 1
-
-    self_repair_preflight_exit = _preflight_automatic_self_repair(args)
-    if self_repair_preflight_exit is not None:
-        return self_repair_preflight_exit
 
     if args.command == "persistence-configure":
         try:
@@ -3132,7 +1888,7 @@ def _dispatch(args) -> int:
                 orchestrator = Orchestrator(
                     project_root, agent_output_stream=sys.stderr
                 )
-                _promote_pending_self_repairs(project_root)
+                pass
                 request = _active_input_request(project_root, args.request_id)
                 value = _input_value_from_args(args, request, orchestrator)
                 payload = orchestrator.answer_input_request(
@@ -3169,26 +1925,6 @@ def _dispatch(args) -> int:
                         if parent_result is not None:
                             payload["resumed_workflow"] = parent_result.to_dict()
         except (OSError, RuntimeError, ValueError, RunAlreadyActiveError) as error:
-            triage = (
-                _triage_terminal_run_error(project_root, orchestrator, error)
-                if "orchestrator" in locals()
-                else None
-            )
-            if triage is not None and triage.decision.eligible:
-                repair_lock = ProjectRunLock(project_root)
-                try:
-                    repair_lock.acquire()
-                    return _auto_repair_auto_agents_and_resume(
-                        project_root,
-                        orchestrator,
-                        error,
-                        triage.decision,
-                        args,
-                        repair_lock,
-                        diagnosis=triage.root_cause,
-                    )
-                finally:
-                    repair_lock.release()
             payload = {"ok": False, "error": str(error)}
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if bool(payload.get("ok")) else 1
@@ -3314,9 +2050,8 @@ def _dispatch(args) -> int:
         try:
             spec_file = _apply_saved_run_context(args, project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
-            orchestrator._run_token = run_lock.health_lease_token
-            from .repair_client import register as register_repair_control
-            register_repair_control(run_lock, args, orchestrator)
+            orchestrator._run_token = run_lock.run_token
+            pass
             from .workflow_chain import WorkflowRef, WorkflowStore
 
             workflow_store = WorkflowStore(project_root)
@@ -3347,20 +2082,19 @@ def _dispatch(args) -> int:
                 run_lock.bind_subject("run", initial_run_state.run_id)
             health_config = getattr(
                 getattr(getattr(orchestrator, "config", None), "execution", None),
-                "health_watch",
+                "supervision",
                 None,
             )
             if health_config is not None:
-                if bool(getattr(args, "no_health_watch", False)):
+                if bool(getattr(args, "no_supervisor", False)):
                     health_config.enabled = False
                 health_runtime = WorkflowHealthRuntime(
                     project_root,
                     workflow_kind="run",
-                    run_token=run_lock.health_lease_token,
+                    run_token=run_lock.run_token,
                     enabled=bool(health_config.enabled),
                     auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
                     orchestrator=orchestrator,
-                    fresh_health_boundary=run_lock.health_boundary_rebased,
                 )
                 orchestrator._workflow_health_runtime = health_runtime
                 health_runtime.start(
@@ -3383,12 +2117,8 @@ def _dispatch(args) -> int:
                 getattr(args, "repair_boundary_only", "") or ""
             ).strip()
             if boundary_case_id:
-                receipt = orchestrator.verify_health_repair_boundary(
-                    boundary_case_id
-                )
-                print(json.dumps({"ok": True, "receipt": receipt}, indent=2, ensure_ascii=False))
-                return 0
-            _promote_pending_self_repairs(project_root)
+                raise ValueError('Legacy repair boundary retired; use resume-check')
+            pass
             if health_runtime is not None and hasattr(orchestrator, "_start_health_supervision"):
                 def _bind_run_workflow_subject(watched_state):
                     run_lock.bind_subject("run", watched_state.run_id)
@@ -3458,51 +2188,10 @@ def _dispatch(args) -> int:
                 if isinstance(state_payload.get("active_blocker", {}), dict)
                 else {}
             )
-            if state_status in {"blocked", "failed"}:
-                if health_runtime is not None:
-                    health_runtime.set_phase("triage")
-                playbook_exit = _try_deterministic_self_repair_playbook(
-                    project_root,
-                    orchestrator,
-                    args,
-                    run_lock,
-                )
-                if playbook_exit is not None:
-                    return playbook_exit
-                blocked_error = RuntimeError(
-                    str(
-                        blocker.get("reason", "")
-                        or state_payload.get("last_error", "")
-                        or f"run {state_status} without a reason"
-                    )
-                )
-                triage = _triage_terminal_run_error(
-                    project_root,
-                    orchestrator,
-                    blocked_error,
-                )
-                if triage.decision.eligible:
-                    return _auto_repair_auto_agents_and_resume(
-                        project_root,
-                        orchestrator,
-                        blocked_error,
-                        triage.decision,
-                        args,
-                        run_lock,
-                        diagnosis=triage.root_cause,
-                    )
-                _record_blocked_self_repair_triage(project_root, triage)
-                updated_state = _try_load_run_state(project_root)
-                print(
-                    _render_run_summary(
-                        project_root,
-                        (
-                            updated_state.to_dict()
-                            if updated_state is not None
-                            else state_payload
-                        ),
-                    )
-                )
+            if state_status in {'blocked', 'failed'}:
+                if blocker.get('owner') == 'auto_agents':
+                    raise EngineFault(blocker.get('reason') or state_payload.get('last_error', 'Engine failed'), step_id=blocker.get('category', 'engine'))
+                print(_render_run_summary(project_root, state_payload))
                 return 3
             if (
                 state_status == "completed"
@@ -3533,29 +2222,6 @@ def _dispatch(args) -> int:
                     )
             print(_render_run_summary(project_root, state_payload))
             return 0
-        except HealthSelfRepairRequired as error:
-            if health_runtime is not None:
-                health_runtime.set_phase("self_repair")
-            triage = error.triage
-            try:
-                return _auto_repair_auto_agents_and_resume(
-                    project_root,
-                    orchestrator,
-                    error,
-                    triage.decision,
-                    args,
-                    run_lock,
-                    diagnosis=triage.root_cause,
-                    repair_case=error.repair_case,
-                )
-            except RunInterruptedError as interrupted:
-                if workflow_store is not None and workflow_snapshot is not None:
-                    workflow_store.mark_recovery_required(
-                        workflow_snapshot,
-                        reason=str(interrupted),
-                        details={"head": head_ref(project_root)},
-                    )
-                return _handle_run_interrupted(project_root, interrupted)
         except RunInterruptedError as error:
             if workflow_store is not None and workflow_snapshot is not None:
                 workflow_store.mark_recovery_required(
@@ -3578,50 +2244,12 @@ def _dispatch(args) -> int:
             print(json.dumps({"ok": False, "error": reason}, indent=2, ensure_ascii=False))
             return 130
         except Exception as error:
-            project_root = Path(args.project)
-            if health_runtime is not None:
-                health_runtime.set_phase("triage")
-            try:
-                triage = _triage_terminal_run_error(project_root, orchestrator, error)
-                decision = triage.decision
-                if orchestrator is not None and decision.eligible:
-                    return _auto_repair_auto_agents_and_resume(
-                        project_root,
-                        orchestrator,
-                        error,
-                        decision,
-                        args,
-                        run_lock,
-                        diagnosis=triage.root_cause,
-                    )
-                if (
-                    orchestrator is not None
-                    and hasattr(orchestrator, "is_provider_research_blocked_error")
-                    and orchestrator.is_provider_research_blocked_error(str(error))
-                ):
-                    return _auto_resolve_provider_blocker(
-                        project_root,
-                        orchestrator,
-                        print_agent_output=bool(args.print_agent_output),
-                    )
-                _block_terminal_run_error(project_root, orchestrator, error, triage)
-                _notify_run_blocked(project_root, error)
-                print(
-                    json.dumps(
-                        {"ok": False, "error": str(error)},
-                        indent=2,
-                        ensure_ascii=False,
-                    )
-                )
-                return 3
-            except RunInterruptedError as interrupted:
-                if workflow_store is not None and workflow_snapshot is not None:
-                    workflow_store.mark_recovery_required(
-                        workflow_snapshot,
-                        reason=str(interrupted),
-                        details={"head": head_ref(project_root)},
-                    )
-                return _handle_run_interrupted(project_root, interrupted)
+            if (orchestrator is not None and
+                    orchestrator.is_provider_research_blocked_error(str(error))):
+                return _auto_resolve_provider_blocker(project_root, orchestrator,
+                    print_agent_output=bool(args.print_agent_output))
+            _notify_run_blocked(project_root, str(error))
+            raise
         finally:
             if health_runtime is not None:
                 health_runtime.close(reason="foreground run command exited")
@@ -3634,13 +2262,9 @@ def _dispatch(args) -> int:
             parser.error("--grace-seconds must be >= 0")
         try:
             stopped_state = load_run_state(project_root)
-            mark_watchdog_stop_intent(
-                project_root,
-                stopped_state.run_id,
-                reason="run stopped by user",
-            )
-        except Exception:
             pass
+        except Exception:
+            raise
         payload, exit_code = stop_project_run(
             project_root,
             grace_seconds=float(args.grace_seconds),
@@ -3666,7 +2290,7 @@ def _dispatch(args) -> int:
             default={},
         )
         payload["health"] = health if isinstance(health, dict) else {}
-        payload["health_watch"] = health_watch_status(project_root)
+        payload["health_watch"] = {'enabled': False, 'owner': 'external'}
         payload["runtime"] = runtime_status(project_root)
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
@@ -3707,7 +2331,7 @@ def _dispatch(args) -> int:
 
     if args.command == "verify":
         try:
-            if args.engine or args.verification_context:
+            if args.engine or getattr(args, "verification_context", ""):
                 from .managed_verification import request_from_cli
                 result = request_from_cli(args)
                 print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -3848,9 +2472,8 @@ def _dispatch(args) -> int:
             foreground.acquire()
             workflow_lock.acquire()
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
-            orchestrator._run_token = workflow_lock.health_lease_token
-            from .repair_client import register as register_repair_control
-            register_repair_control(workflow_lock, args, orchestrator)
+            orchestrator._run_token = workflow_lock.run_token
+            pass
             store = WorkflowStore(project_root)
             selected = (
                 store.load(str(args.workflow))
@@ -3862,17 +2485,16 @@ def _dispatch(args) -> int:
                     "command": selected.root.kind, "workflow_id": selected.workflow_id,
                     "session_id": selected.root.native_id if selected.root.kind in {"fix", "collab"} else "",
                 }
-                health_config = orchestrator.config.execution.health_watch
-                if bool(args.no_health_watch):
+                health_config = orchestrator.config.execution.supervision
+                if bool(getattr(args, "no_supervisor", False)):
                     health_config.enabled = False
                 health_runtime = WorkflowHealthRuntime(
                     project_root,
                     workflow_kind=selected.root.kind,
-                    run_token=workflow_lock.health_lease_token,
+                    run_token=workflow_lock.run_token,
                     enabled=bool(health_config.enabled),
                     auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
                     orchestrator=orchestrator,
-                    fresh_health_boundary=workflow_lock.health_boundary_rebased,
                 )
                 health_runtime.start(selected.workflow_id)
             coordinator = WorkflowCoordinator(
@@ -3904,16 +2526,8 @@ def _dispatch(args) -> int:
         except RunAlreadyActiveError as error:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 2
-        except (OSError, RuntimeError, FileNotFoundError, ValueError) as error:
-            from .repair_client import EngineRepairRequired
-            if isinstance(error, EngineRepairRequired) and "orchestrator" in locals():
-                triage = _triage_terminal_run_error(project_root, orchestrator, error)
-                if triage.decision.eligible:
-                    foreground.release()
-                    return _auto_repair_auto_agents_and_resume(
-                        project_root, orchestrator, error, triage.decision, args, workflow_lock)
-            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
-            return 1
+        except (OSError, RuntimeError, FileNotFoundError, ValueError):
+            raise
         finally:
             if health_runtime is not None:
                 health_runtime.close(reason="workflow resume command exited")
@@ -4048,31 +2662,29 @@ def _dispatch(args) -> int:
                 "provider": getattr(args, "provider", "") or "",
                 "auto_approve": bool(getattr(args, "auto_approve", False)),
             }
-            orchestrator._run_token = workflow_lock.health_lease_token
-            from .repair_client import register as register_repair_control
-            register_repair_control(workflow_lock, args, orchestrator)
+            orchestrator._run_token = workflow_lock.run_token
+            pass
             health_config = getattr(
                 getattr(getattr(orchestrator, "config", None), "execution", None),
-                "health_watch",
+                "supervision",
                 None,
             )
             if health_config is not None:
-                if bool(getattr(args, "no_health_watch", False)):
+                if bool(getattr(args, "no_supervisor", False)):
                     health_config.enabled = False
                 health_runtime = WorkflowHealthRuntime(
                     project_root,
                     workflow_kind=(
                         args.command if args.command in {"fix", "collab"} else "fix"
                     ),
-                    run_token=workflow_lock.health_lease_token,
+                    run_token=workflow_lock.run_token,
                     enabled=bool(health_config.enabled),
                     auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
                     orchestrator=orchestrator,
-                    fresh_health_boundary=workflow_lock.health_boundary_rebased,
                 )
                 orchestrator._workflow_health_runtime = health_runtime
                 health_runtime.start()
-            _promote_pending_self_repairs(project_root)
+            pass
             orchestrator._ensure_agent_instructions_synced()
             if getattr(args, "provider", None):
                 orchestrator._set_active_provider(args.provider)
@@ -4140,54 +2752,9 @@ def _dispatch(args) -> int:
                 return 3
             return 1 if state.status == "failed" else 3
         except (RuntimeError, FileNotFoundError, ValueError) as error:
-            project_root = Path(args.project)
-            from .session_recovery import SessionRecoveryError
-            if isinstance(error, SessionRecoveryError):
-                print(json.dumps({"ok": False, "error": str(error), "command": args.command,
-                                  "session_id": args.session, "category": "session_recovery_unavailable"},
-                                 ensure_ascii=False), file=sys.stderr)
-                return 3
-            if health_runtime is not None:
-                health_runtime.set_phase("triage")
-            triage = (
-                _triage_terminal_run_error(project_root, orchestrator, error)
-                if "orchestrator" in locals()
-                else None
-            )
-            if triage is not None and triage.decision.eligible:
-                foreground.release()
-                # A self-repair runtime may itself have inherited this descriptor
-                # from its waiting parent. Closing our copy does not release the
-                # parent's flock, so reacquiring through a new descriptor deadlocks
-                # against the same logical run. Preserve and hand off the existing
-                # lock ownership instead.
-                return _auto_repair_auto_agents_and_resume(
-                    project_root,
-                    orchestrator,
-                    error,
-                    triage.decision,
-                    args,
-                    workflow_lock,
-                    diagnosis=triage.root_cause,
-                )
-            _safe_notify(
-                notify_session_finished,
-                project_root,
-                {
-                    "status": "failed",
-                    "mode": _session_mode_for_command(args.command),
-                },
-                command=args.command,
-                status="failed",
-                error=str(error),
-            )
-            if 'orchestrator' in locals() and orchestrator.reporter.presenter.mode != 'debug':
-                orchestrator.reporter.exception(error)
-                orchestrator.reporter.emit('status', status=(
-                    '执行失败' if orchestrator.reporter.language == 'zh' else 'Failed'))
-                return 1
-            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
-            return 1
+            _safe_notify(notify_session_finished, project_root, command=args.command,
+                         status='failed', error=str(error))
+            raise
         finally:
             if health_runtime is not None:
                 health_runtime.close(reason="foreground session command exited")

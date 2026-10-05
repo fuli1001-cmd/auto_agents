@@ -2,7 +2,7 @@
 import difflib
 import json
 
-from .repair_v2.store import digest
+from .proof_support.store import digest
 
 
 def render(store, value):

@@ -15,11 +15,12 @@ import sqlite3
 import time
 
 from .artifact_store import _identity, _parents
-from .repair_control import atomic_json
+from .local_io import atomic_json
 
 
 def _persist(path, value):
-    atomic_json(path, value)
+    from .io_utils import write_json
+    write_json(path, value)
     descriptor = os.open(Path(path).parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)
@@ -31,7 +32,8 @@ def _read(path):
     path = Path(path)
     if path.is_symlink() or path.stat().st_size > 32 * 1024 * 1024:
         raise ValueError('unknown_reference: unsafe or oversized state: ' + str(path))
-    value = json.loads(path.read_text())
+    from .io_utils import read_json
+    value = read_json(path)
     if not isinstance(value, dict):
         raise ValueError('unknown_reference: invalid state: ' + str(path))
     return value

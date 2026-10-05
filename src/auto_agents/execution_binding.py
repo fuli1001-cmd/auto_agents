@@ -580,7 +580,7 @@ def validate_verification_binding(command: str, project_root: Path) -> None:
 
 def engine_verification_command(command: str, root: Path, python: str, source_root: Path) -> str:
     """Bind copied engine checks to the candidate and its explicit interpreter."""
-    from .self_repair import self_repair_verification_command
+    from .verification_commands import self_repair_verification_command
     root, source_root = root.resolve(), source_root.resolve()
     def compile_branch(raw):
         original = shlex.split(raw)

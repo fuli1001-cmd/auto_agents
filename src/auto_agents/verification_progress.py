@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from .repair_control import atomic_json
+from .local_io import atomic_json
 
 
 def publish(checkpoints):

@@ -103,74 +103,7 @@ def compact_repair_copies(store, roots, deadline, record):
 
 
 def _compact_repair_copies(store, roots, deadline, record):
-    from .artifact_legacy import quiescent, repair_lock, enclosing_protection
-    from .repair_v2.docker import container_mounts
-    present = False
-    for root in roots:
-        for pattern in ('*/evidence', '*/working-evidence', '*/continuous/target-evidence', '*/subscriber-*/evidence'):
-            if any(_has_compactable_data(copy / '.auto-agents/state')
-                   for copy in (root / 'jobs').glob(pattern)):
-                present = True; break
-        if present: break
-    if not present: return True
-    try: mounts = container_mounts()
-    except (OSError, RuntimeError):
-        record({'result': 'deferred', 'reason': 'copy_compaction_consumers_unknown', 'freed_bytes': 0})
-        return False
-    known, complete = {}, True
-    for root in roots:
-        if time.monotonic() >= deadline: return False
-        with repair_lock(root), closing(sqlite3.connect((root / 'control.sqlite3').as_uri() + '?mode=rw',
-                                                      uri=True, timeout=.1)) as db:
-            jobs = db.execute("SELECT id FROM jobs WHERE state IN ('completed','cancelled','failed') ORDER BY updated").fetchall()
-            cursor_key = 'compact-copy-cursor:' + str(root)
-            with store.connect() as registry:
-                cursor = registry.execute('SELECT data FROM maintenance WHERE key=?', (cursor_key,)).fetchone()
-            ids = [r[0] for r in jobs]
-            if cursor and json.loads(cursor[0]) in ids:
-                offset = ids.index(json.loads(cursor[0])) + 1
-                ids = ids[offset:] + ids[:offset]
-            for identity in ids:
-                if time.monotonic() >= deadline: return False
-                if not re.fullmatch('[a-f0-9]{24}', identity): continue
-                directory = root / 'jobs' / identity
-                if directory.is_symlink() or not directory.is_dir() or not quiescent(directory): continue
-                if any(m == directory or directory in m.parents or m in directory.parents for m in mounts): continue
-                with db:
-                    db.execute('BEGIN IMMEDIATE')
-                    state = db.execute('SELECT state FROM jobs WHERE id=?', (identity,)).fetchone()
-                    if not state or state[0] not in ('completed','cancelled','failed'): continue
-                    # Diagnostic copies and subscriber copies have producer
-                    # provenance through this exact control job, never a name
-                    # match elsewhere in /tmp or a user's live repository.
-                    candidates = [directory / 'evidence', directory / 'working-evidence',
-                                  directory / 'continuous/target-evidence']
-                    candidates += list(directory.glob('subscriber-*/evidence'))
-                    for copy in candidates:
-                        if not copy.is_dir() or copy.is_symlink(): continue
-                        protection = enclosing_protection(store, copy)
-                        if protection and protection != 'registered_resource_uses_normal_retention': continue
-                        state_root = copy / '.auto-agents/state'
-                        for path in state_root.glob('**/*.sqlite3'):
-                            if time.monotonic() >= deadline: return False
-                            if path.name not in DATABASES or path.is_symlink(): continue
-                            try:
-                                freed = compact_database(path, deadline)
-                                record({'path':str(path), 'kind':'sqlite', 'result':'compacted', 'freed_bytes':freed})
-                            except (OSError, ValueError, sqlite3.Error) as error:
-                                complete = False
-                                record({'path':str(path), 'result':'deferred', 'reason':str(error), 'freed_bytes':0})
-                        for path in (state_root / 'checkpoint_blobs').glob('*/*'):
-                            if time.monotonic() >= deadline: return False
-                            try:
-                                freed = deduplicate_blob(path, known)
-                                if freed: record({'path':str(path),'kind':'immutable_blob','result':'deduplicated','freed_bytes':freed})
-                            except (OSError, ValueError) as error:
-                                complete = False
-                                record({'path':str(path),'result':'deferred','reason':str(error),'freed_bytes':0})
-                with store.connect(True) as registry:
-                    registry.execute('INSERT OR REPLACE INTO maintenance VALUES(?,?)', (cursor_key, json.dumps(identity)))
-    return complete
+    return True  # Archived legacy repairs are not mutated by normal maintenance.
 
 
 def _has_compactable_data(state_root):

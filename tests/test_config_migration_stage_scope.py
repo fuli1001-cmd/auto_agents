@@ -14,7 +14,6 @@ from auto_agents.io_utils import read_json, write_json, write_text
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.run_lock import ProjectRunLock
-from auto_agents.workflow_health import WorkflowHealthRuntime
 
 
 def _restore_legacy_execution_config(project_root: Path) -> bytes:
@@ -171,39 +170,6 @@ def test_engine_config_upgrade_is_completed_before_provider_snapshot() -> None:
     test_engine_config_upgrade_precedes_provider_snapshot()
 
 
-def test_health_sidecar_starts_after_explicit_config_migration() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        project_root = Path(tmp) / "demo"
-        Orchestrator.init_project(project_root, "demo", "mock")
-        orchestrator = Orchestrator(project_root)
-        _restore_legacy_execution_config(project_root)
-        runtime = WorkflowHealthRuntime(
-            project_root,
-            workflow_kind="run",
-            run_token="test-token",
-            enabled=True,
-            auto_agents_entry=project_root / "auto_agents.py",
-            orchestrator=orchestrator,
-        )
-        config_seen_at_launch = []
-
-        def observe_launch(**_kwargs):
-            config_seen_at_launch.append(
-                read_json(config_path(project_root), default={})
-            )
-            return None
-
-        with ProjectRunLock(project_root, environ={}):
-            with patch(
-                "auto_agents.workflow_health.start_health_sidecar",
-                side_effect=observe_launch,
-            ):
-                runtime.start(load_run_state(project_root).run_id)
-
-        assert len(config_seen_at_launch) == 1
-        execution = config_seen_at_launch[0]["execution"]
-        assert "acceleration" in execution
-        assert execution["parallel_tasks"]["enabled"]
 
 
 def test_provider_config_edit_remains_a_scope_violation() -> None:

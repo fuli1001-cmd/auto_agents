@@ -73,13 +73,8 @@ def test_spec_preserves_all_continuation_inputs_and_distinguishes_child_scope(sc
     assert scoped.split('## Requested Capability\n\n')[1].split('\n\n')[0] == explicit['goal']
 
 
-@pytest.mark.parametrize('managed', [False, True])
-def test_legacy_context_restoration_keeps_identity_history_and_counters(scene, monkeypatch, managed):
+def test_legacy_context_restoration_keeps_identity_history_and_counters(scene, monkeypatch):
     root, state, handoff, seed, history = scene
-    if managed:
-        from test_recovery_native import activate
-        activate(root, root.parent / 'control', monkeypatch)
-        state = load_run_state(root)
     original_path = Path(state.resume_context['spec_file'])
     original = original_path.read_bytes()
     handoff_before = WorkflowStore(root).load_handoff(handoff.handoff_id).to_dict()

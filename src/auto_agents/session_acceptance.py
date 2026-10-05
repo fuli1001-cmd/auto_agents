@@ -11,7 +11,7 @@ import shutil
 
 from .git_ops import head_ref
 from .prompting.core import ContextBlock, compose_prompt
-from .repair_v2.store import digest
+from .proof_support.store import digest
 from .session_operation_policy import operation_policy_lines
 from .recovery.model import KernelError
 
@@ -59,7 +59,7 @@ def begin_recovery(session, state, *, automatic=False):
         return False
     saved = state.acceptance_execution
     if saved.get('result', {}).get('status') == 'blocked':
-        from .recovery.native import acceptance
+        from .business_calls import acceptance
         from .session_candidate import execution_checkout
         from contextlib import nullcontext
         try:
@@ -315,7 +315,7 @@ def drive(session, state):
         state.status, state.resolution = 'blocked', 'acceptance_evidence_invalid'
         state.conversation.append({'role': 'orchestrator', 'content': 'Acceptance blocked: ' + str(error)})
     session._save(state)
-    from .recovery.native import acceptance
+    from .business_calls import acceptance
     acceptance(session, state)
     return state
 

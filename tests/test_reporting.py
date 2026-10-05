@@ -13,7 +13,6 @@ import pytest
 from auto_agents.adapters.base import run_subprocess_with_optional_streaming
 from auto_agents.cli import build_parser
 from auto_agents.diagnostic_output import diagnostic_attachments, copy_diagnostic_attachments
-from auto_agents.health_watch import build_progress_vector, _activity_payload
 from auto_agents.logging_utils import build_run_logger, attach_run_file_logger, read_diagnostic_log
 from auto_agents.models import AgentRequest, RunState, TaskSpec
 from auto_agents.process_supervision import run_supervised_shell_command
@@ -138,21 +137,6 @@ def test_parent_view_is_restored_after_nested_session(report):
     assert any(item.get("kind") == "index" for item in reporter._artifacts.values())
 
 
-def test_user_heartbeat_does_not_change_health_inputs(report):
-    reporter, stream = report
-    state = RunState("example", tasks=[task()])
-    logger = build_run_logger(stream, reporter)
-    log_path = attach_run_file_logger(logger, reporter.root / "run.log")
-    logger.info("real diagnostic event")
-    before_stat = log_path.stat()
-    before_vector = build_progress_vector(state)
-    before_activity = _activity_payload(reporter.project_root, state)
-    reporter.emit("heartbeat", stage="实现", elapsed="00:10:00")
-    after_activity = _activity_payload(reporter.project_root, state)
-    assert log_path.stat().st_mtime_ns == before_stat.st_mtime_ns
-    assert log_path.stat().st_size == before_stat.st_size
-    assert build_progress_vector(state) == before_vector
-    assert before_activity == after_activity
 
 
 def test_capture_redacts_split_secrets_and_is_available_in_private_snapshot(report, tmp_path):
@@ -359,18 +343,6 @@ def test_controls_are_removed_from_logs_without_mutating_diagnostic_records(repo
     assert "technical diagnostic" in read_diagnostic_log(reporter.root / "run.log")
 
 
-def test_certificate_uses_output_content_and_not_capture_paths(tmp_path):
-    from auto_agents.root_cause import RootCauseCoordinator
-    coordinator = RootCauseCoordinator.__new__(RootCauseCoordinator)
-    coordinator.auto_agents_root = tmp_path / "engine"
-    coordinator.target_root = tmp_path / "project"
-    coordinator.diagnostic_auto_root = tmp_path / "engine-snapshot"
-    coordinator.diagnostic_target_root = tmp_path / "project-snapshot"
-    first = {"diagnostic_attachments": [{"path": "/tmp/first/stdout.txt", "kind": "stdout", "sha256": "a" * 64}]}
-    second = {"diagnostic_attachments": [{"path": "/tmp/second/stdout.txt", "kind": "stdout", "sha256": "a" * 64}]}
-    assert coordinator._canonical_certificate_evidence(first) == coordinator._canonical_certificate_evidence(second)
-    second["diagnostic_attachments"][0]["sha256"] = "b" * 64
-    assert coordinator._canonical_certificate_evidence(first) != coordinator._canonical_certificate_evidence(second)
 
 
 def test_visible_shell_output_without_final_newline_is_flushed(tmp_path):
@@ -559,36 +531,8 @@ def test_repair_handoff_parent_does_not_overwrite_resumed_diagnostic_index(repor
     assert parent.presenter.external_owner
 
 
-def test_repair_launcher_hands_off_display_and_preserves_process_contract(report, monkeypatch):
-    import auto_agents.cli as cli
-    from unittest.mock import Mock
-    reporter, stream = report
-    process = SimpleNamespace(pid=12345, returncode=0, poll=lambda: 0)
-    popen = Mock(return_value=process)
-    registry = Mock()
-    registry.register.return_value = SimpleNamespace(pgid=12345)
-    monkeypatch.setattr(cli, "find_reporter", lambda: reporter)
-    monkeypatch.setattr(cli.subprocess, "Popen", popen)
-    monkeypatch.setattr(cli, "ACTIVE_PROCESSES", registry)
-    monkeypatch.setattr(cli, "process_group_exists", lambda group: False)
-    code = cli._run_self_repair_resume_process(["repaired-cli"], cwd=reporter.project_root, env={}, pass_fd=7)
-    assert code == 0 and reporter._handed_off
-    assert reporter.presenter.external_owner
-    assert popen.call_args.kwargs["pass_fds"] == (7,)
-    assert popen.call_args.kwargs["start_new_session"] is True
-    registry.unregister.assert_called_once_with(12345, preserve_if_alive=False)
 
 
-def test_failed_repair_launch_returns_display_ownership(report, monkeypatch):
-    import auto_agents.cli as cli
-    reporter, stream = report
-    monkeypatch.setattr(cli, "find_reporter", lambda: reporter)
-    def failed(*args, **kwargs):
-        raise OSError("could not launch")
-    monkeypatch.setattr(cli.subprocess, "Popen", failed)
-    with pytest.raises(OSError, match="could not launch"):
-        cli._run_self_repair_resume_process(["repaired-cli"], cwd=reporter.project_root, env={}, pass_fd=7)
-    assert not reporter._handed_off and not reporter.presenter.external_owner
 
 
 def test_closed_reporter_cannot_recreate_a_removed_artifact_directory(report):
@@ -741,31 +685,6 @@ def test_fix_preflight_blocker_explains_whether_project_repair_started(tmp_path,
         reporter.close()
 
 
-def test_engine_repair_describes_the_issue_once_then_only_reports_progress(report):
-    from auto_agents.repair_client import EngineRepairRequired
-
-    reporter, stream = report
-    detail = '修复流程因缺少任务记录而无法开始'
-    route = {'issue_seed': {'summary': 'focused_fix /private/file.py hf-123456abcdef', 'user_summary': detail}}
-    reporter.exception(EngineRepairRequired(route))
-    reporter.emit('repair.request_accepted')
-    job = {'id': 'private-job', 'generation': 1, 'state': 'repairing',
-           'payload': {'invocation': {'engine_route': route}}}
-    before = json.dumps(job, sort_keys=True)
-    for index, phase in enumerate(('plan', 'implement', 'validate')):
-        observed = {**job, 'display': {'phase': phase, 'sequence': index + 1}}
-        reporter.repair_update(observed, {'state': 'waiting'})
-        reporter.repair_update(observed, {'state': 'waiting'})
-    reporter.repair_update({**job, 'state': 'blocked',
-        'result': {'error': 'ValueError: engine request has no explicit acceptance obligations'}}, {'state': 'blocked'})
-    value = stream.getvalue()
-    assert value.count(detail) == 1
-    assert '[自修复] 问题：' + detail in value
-    for label in ('准备开始', '制定修复方案', '修复中', '验证'):
-        assert value.count('[自修复] ' + label) == 1
-    assert '缺少明确的修复完成标准' in value
-    assert 'private-job' not in value and 'focused_fix' not in value and '/private/' not in value
-    assert json.dumps(job, sort_keys=True) == before
 
 
 def test_user_summary_survives_fix_routing_and_issue_materialization(tmp_path):
@@ -868,16 +787,6 @@ def test_new_problem_description_is_generic_and_unknown_causes_are_not_invented(
                     'necessity': {'consequence': '报表无法下载。'}}) == '报表无法下载。'
 
 
-def test_diagnosis_user_description_roundtrips_without_changing_the_verdict():
-    from auto_agents.root_cause import RootCauseReport
-    from test_root_cause import _report
-    raw = _report(role='investigator', verdict='ROOT_CAUSE')
-    original = RootCauseReport.from_dict(raw, role='investigator').to_dict()
-    assert 'user_summary' not in original
-    description = '恢复任务时没有还原之前的修改，导致重试失败。'
-    changed = RootCauseReport.from_dict({**raw, 'user_summary': description}, role='investigator').to_dict()
-    assert changed.pop('user_summary') == description
-    assert changed == original
 
 
 def test_repair_issue_is_announced_again_on_a_new_console_but_not_on_heartbeat(tmp_path, monkeypatch):

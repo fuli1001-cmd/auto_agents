@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from auto_agents import artifact_temp as tempfile
-from auto_agents.repair_control import atomic_json
+from auto_agents.local_io import atomic_json
 from auto_agents.managed_verification import execute_engine, selected_tests
 
 

@@ -630,13 +630,6 @@ def test_pending_review_cannot_bypass_changed_inputs_or_uncovered_facts(tmp_path
     assert recovered is None or review.validate(lock, trace, recovered)
 
 
-def test_provider_recovery_replay_requires_admission_not_only_flag_clearance():
-    from test_iteration_plan_scope import continuation_probe_project
-    from auto_agents.repair_v2.boundary_driver import observe_run_continuation
-    with continuation_probe_project() as (_, orch, original, plan, request, runtime, frozen):
-        original.active_blocker['category'] = 'provider_reference_freshness_validity_conflation'
-        with pytest.raises(RuntimeError, match='fresh provider-review admission'):
-            observe_run_continuation(orch, original, plan, request, runtime, frozen)
 
 
 def test_applied_provider_repair_only_routes_to_reassessment(tmp_path, monkeypatch):

@@ -620,7 +620,7 @@ class WorkerSlotLease:
         self._handle_slots: dict[int, int] = {}
 
     def __enter__(self) -> "WorkerSlotLease":
-        from .repair_control import start_ticks
+        from .process_supervision import process_start_ticks as start_ticks
         directory = self.root / "slots" / self.worker_id / "queue"
         directory.mkdir(parents=True, exist_ok=True)
         ticket = directory / (self.lease_id + ".json")
@@ -636,7 +636,7 @@ class WorkerSlotLease:
 
     def _queue_turn(self, slot_root):
         """Called with the allocation lock; ready work bypasses blocked work."""
-        from .repair_control import alive
+        from .local_io import process_alive as alive
         now = time.time()
         state = _read_json(slot_root / "scheduler.json")
         served = state.get("served", {})

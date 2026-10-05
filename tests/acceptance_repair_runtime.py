@@ -148,7 +148,7 @@ def test_real_launcher_registers_and_reaches_one_native_provider_boundary(runtim
     from auto_agents.repair_v2.types import Acceptance, AgentReply, RepairRequest
     from auto_agents.run_lock import ProjectRunLock
     from execution_marker import ExecutionMarker
-    from test_engine_child_recovery import configure_local_writer, parent_workflow
+    from workflow_support import configure_local_writer, parent_workflow
     from test_repair_control import configuration, registration
     from test_session_verification_ownership import project
 

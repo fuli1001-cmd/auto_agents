@@ -76,7 +76,7 @@ from .persistence import (
     persistence_change_strategy,
 )
 from .performance_trace import PerformanceTrace
-from .recovery.authority import entry as kernel_entry
+from .business_state import entry as kernel_entry
 from .verification_sandbox import ConfinementPreflightError
 from .session_verification import (
     SessionOwnershipError, bind_session, collection_command, diagnostic_owners,
@@ -640,7 +640,7 @@ class Session:
             state.resolution = "interrupted_by_user"
             self._save(state)
         except RuntimeError as exc:
-            from .repair_client import EngineRepairRequired
+            from .engine_fault import EngineFault as EngineRepairRequired
             if isinstance(exc, EngineRepairRequired):
                 # This is a handoff to the independent repair controller.
                 # Reclassifying it as failure would mutate the just-admitted
@@ -2075,75 +2075,19 @@ class Session:
                 payload = {'resume_handoff_id': child.parent_handoff_id}
                 binding_error = ''
                 proof_resume = True
-        from .repair_v2.scope import ScopeGuard, context as scope_context
-        from .repair_v2.types import RepairBlocked
         # Product execution may be inside private custody. Repair admission
         # belongs to the durable workflow and its controller-owned evidence.
         control_root = Path(getattr(self, '_custody_control_root', self.project_root))
         necessity = payload.get('necessity') or (payload.get('issue_seed') or payload.get('spec_seed') or {}).get('necessity')
-        if isinstance(necessity, dict) and necessity.get('decision') == 'skip':
-            state.status = 'executing'
+        if binding_error:
+            from .engine_fault import request_engine_repair
+            request_engine_repair(self.orch, payload)
+            state.status = 'blocked'
+            state.resolution = 'execution_binding_mismatch'
+            state.execution_log.append({'action': 'execution_binding', 'result': binding_error,
+                                        'retry_fix': False})
             self._save(state)
             return state
-        if isinstance(necessity, dict) and necessity.get('decision') == 'needs_user':
-            from .scope_decisions import session_choice
-            invocation = {'session_id': state.session_id, 'workflow_id': state.workflow_id, 'engine_route': payload}
-            incoming = {'project': str(control_root), 'invocation': invocation}
-            context = scope_context(control_root, incoming)
-            choice = session_choice(self, state, context, necessity,
-                                    {'kind': 'route', 'target': target, 'reason': reason, 'payload': payload})
-            if choice != 'approve':
-                return state
-            # The exact proposed product/resume route now has explicit user
-            # authority. It still passes the ordinary ownership/routing checks.
-            if binding_error:
-                state.conversation.append({'role': 'orchestrator', 'content':
-                    'The user approved only the displayed goal change. Re-evaluate the original goal and '
-                    'route product work through its existing workflow; do not expand engine maintenance.'})
-                self._save(state)
-                return state
-        if binding_error:
-            from .repair_client import engine_route
-            self.orch._repair_scope_receipt = None
-            if isinstance(necessity, dict):
-                from .self_repair import auto_agents_repo_root
-                incoming = {'project': str(control_root), 'invocation': {
-                    'session_id': state.session_id, 'workflow_id': state.workflow_id, 'engine_route': payload}}
-                try:
-                    guard = ScopeGuard(control_root / '.auto-agents/state/repair-scope' / state.session_id,
-                                       incoming, control_root, auto_agents_repo_root())
-                    reference = guard.admit(necessity)
-                    self.orch._repair_scope_receipt = guard.store.read(reference)
-                except RepairBlocked as error:
-                    state.conversation.append({'role': 'orchestrator', 'content': str(error)})
-                    state.status = 'executing'
-                    self._save(state)
-                    return state
-            if engine_route(self.orch, payload):
-                if self._coordinator is not None and state.workflow_id:
-                    snapshot = self._coordinator.store.load(state.workflow_id)
-                    child_id = self._coordinator._engine_child_id(payload, snapshot)
-                    if child_id:
-                        # Consume the verified return through the actual child
-                        # recovery path. Returning to parent diagnosis here used
-                        # to produce another resume wrapper around a stale error.
-                        # Keep the exact approved payload/digest, without adding
-                        # new product authorization or reseeding the child.
-                        handoff = self._coordinator.store.prepare_handoff(
-                            snapshot, parent=WorkflowRef(state.mode, state.session_id),
-                            target='fix', goal=state.goal, reason='Resume the verified engine repair child',
-                            payload=payload)
-                        state.active_handoff_id = handoff.handoff_id
-                        state.status, state.resolution, state.return_phase = 'waiting_child', '', ''
-                        self._save(state)
-                        return state
-                state.status = "executing"
-                state.resolution = ""
-                state.conversation.append({"role": "orchestrator", "content":
-                    "The engine-owned repair passed verification and was installed. Continue the original goal; this engine route has been consumed."})
-                self._save(state)
-                return state
-            return self._block_execution_binding(state, binding_error)
 
         if not state.workflow_id:
             store = WorkflowStore(self.project_root)
@@ -2323,9 +2267,6 @@ class Session:
             prior_receipt = deepcopy(state.candidate_custody.get("receipt"))
             prior_candidate_paths = dict(state.candidate_paths)
             try:
-                if not self._ack_engine_recovery(state, 'implementation'):
-                    restore_guard.cleanup()
-                    return state
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
             except SessionOwnershipError as error:
                 restore_guard.cleanup()
@@ -2545,25 +2486,6 @@ class Session:
         self._print("Fix session stopped (no further progress). Session marked as failed.")
         return state
 
-    def _ack_engine_recovery(self, state, stage, *, verification_identity=''):
-        recovery = getattr(self, '_engine_recovery_context', None)
-        if not recovery or not os.environ.get('AUTO_AGENTS_REPAIR_SUBSCRIBER'):
-            return True
-        from .repair_client import boundary_event
-        if boundary_event('engine_child', **recovery, recovery_stage=stage,
-                binding_fingerprint=state.verification_binding.get('binding_fingerprint'),
-                candidate_fingerprint=state.candidate_custody.get('receipt', {}).get('fingerprint', ''),
-                verification_identity=verification_identity):
-            self._engine_recovery_context = None
-            return True
-        state.status, state.resolution, state.resume_phase = 'paused', 'engine_recovery_unacknowledged', 'executing'
-        message = '恢复控制器尚未确认接管，已暂停原任务，不继续调用模型。'
-        state.execution_log.append({'action': state.resolution, 'attempt': state.current_attempt,
-                                    'result': message, 'timestamp': self._now()})
-        self._save(state)
-        self._print(message)
-        return False
-
     def _complete_verified_fix(self, state, verify, reply, *, identity=None):
         candidate_scope = str(verify.get('scope', 'final'))
         if state.candidate_custody.get('receipt'):
@@ -2579,9 +2501,7 @@ class Session:
                     raise ownership_error(state, 'verification inputs changed before completion',
                                           execution_identity=verify.get('execution_identity'),
                                           current_identity=current_identity)
-        if candidate_scope == 'final' and not self._ack_engine_recovery(state, 'verification', verification_identity=identity or ''):
-            return state
-        from .recovery.native import review_candidate
+        from .business_calls import review_candidate
         review = review_candidate(self, state, verify)
         if not review.get('ok'):
             self._receipt_retry_feedback = str(review.get('reason', 'Independent candidate review rejected the change'))
@@ -2603,8 +2523,6 @@ class Session:
                 self._save(state)
                 return self._phase_fix_execute_owned(state)
             require_release_verification(self, state)
-            if not self._ack_engine_recovery(state, 'verification', verification_identity=identity or ''):
-                return state
         self._print("Verification passed!")
         self._run_session_persistence_action(state)
         state.status, state.resolution = 'completed', 'fixed'
@@ -4340,7 +4258,7 @@ class Session:
             return plan, commands
 
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
-        from .recovery.native import verification
+        from .business_calls import verification
         return verification(self, scope, lambda: self._run_verify_owned(scope))
 
     def _candidate_verify_scope(self):
@@ -4775,7 +4693,7 @@ class Session:
             return diagnostic_gate
 
         def priority_check():
-            from .recovery.policy import retained_failure_commands
+            from .business_calls import retained_failure_commands
             priority = retained_failure_commands(self, state, commands)
             if not priority: return None
             with self._session_gate_executor_context(
@@ -5440,6 +5358,8 @@ class Session:
             path
             for path in delta
             if not path.startswith(session_prefix)
+            and not path.startswith((".auto-agents/state/business.sqlite3", ".auto-agents/state/run.lock",
+                                     ".auto-agents/state/run.processes", ".auto-agents/state/resume-checkpoints/"))
             and not (checkpoint_prefix and path.startswith(checkpoint_prefix))
             and not path.startswith(".auto-agents/state/checkpoint_blobs/")
             and path
@@ -5577,7 +5497,7 @@ class Session:
 
     def _should_stop(self, state: SessionState, reason: str) -> Optional[str]:
         """Return a stop-reason string if the session should stop, else None."""
-        from .recovery.policy import session_stop
+        from .business_calls import session_stop
         recovery_stop = session_stop(self, state)
         if recovery_stop is not None:
             if state.consecutive_agent_errors >= SESSION_AGENT_ERROR_THRESHOLD:
@@ -5794,7 +5714,7 @@ class Session:
         return self._normalize_commit_subject(state.goal.replace("\n", " ")) or "verified update"
 
     def _git_commit(self, state: SessionState, prefix: str, reply: str = "") -> bool:
-        from .recovery.native import delivery
+        from .business_calls import delivery
         return delivery(self, state, lambda: self._git_commit_owned(state, prefix, reply))
 
     def _git_commit_owned(self, state: SessionState, prefix: str, reply: str = "") -> bool:

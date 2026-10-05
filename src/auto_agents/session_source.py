@@ -3,7 +3,7 @@ from pathlib import Path
 
 from .config import load_session_state
 from .io_utils import read_json
-from .repair_control import atomic_json
+from .local_io import atomic_json
 
 
 def register_checkout(root, state, checkout):

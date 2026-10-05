@@ -83,15 +83,6 @@ def test_unrelated_workflow_and_wrong_mode_never_supply_recovery(tmp_path):
         plan_session_recovery(tmp_path, "session-1", "fix")
 
 
-def test_cli_resume_command_retains_collab_identity_and_options(tmp_path):
-    from argparse import Namespace
-    from auto_agents.cli import _run_command_for_self_repair_resume
-    args = Namespace(command="collab", project=str(tmp_path), session="session-1", provider="codex", auto_approve=True)
-    command = _run_command_for_self_repair_resume(args)
-    assert command[2] == "collab"
-    assert command[command.index("--session") + 1] == "session-1"
-    assert command[command.index("--provider") + 1] == "codex"
-    assert "--auto-approve" in command
 
 
 def test_cli_missing_session_does_not_initialize_or_triage_ambient_run(tmp_path):
@@ -102,29 +93,13 @@ def test_cli_missing_session_does_not_initialize_or_triage_ambient_run(tmp_path)
     path = tmp_path / ".auto-agents/state/run_state.json"
     raw = json.dumps(RunState("unrelated", status="blocked", active_blocker={"owner": "auto_agents", "category": "old_failure"}).to_dict())
     path.write_text(raw)
-    with patch("auto_agents.cli.Orchestrator") as orchestrator, patch("auto_agents.cli._triage_terminal_run_error") as triage:
+    with patch("auto_agents.cli.Orchestrator") as orchestrator:
         code = main(["collab", "--project", str(tmp_path), "--session", "nonexistent", "--auto-approve"])
     assert code == 3
     orchestrator.assert_not_called()
-    triage.assert_not_called()
     assert path.read_text() == raw
 
 
-def test_session_triage_ignores_run_outside_its_handoff_chain(tmp_path):
-    from types import SimpleNamespace
-    from unittest.mock import patch
-    from auto_agents.cli import _triage_terminal_run_error
-    from auto_agents.models import RunState
-    from auto_agents.self_repair import SelfRepairDecision, SelfRepairTriageResult
-    session, _ = _fixture(tmp_path)
-    path = tmp_path / ".auto-agents/state/run_state.json"
-    path.write_text(json.dumps(RunState("other-run", status="blocked").to_dict()))
-    orchestrator = SimpleNamespace(_invocation_context={"session_id": "session-1", "command": "collab", "workflow_id": "wf-1"})
-    result = SelfRepairTriageResult(SelfRepairDecision(False), source="test", reason="test")
-    with patch("auto_agents.cli.adjudicate_auto_agents_error", return_value=result) as diagnose:
-        _triage_terminal_run_error(tmp_path, orchestrator, RuntimeError("session failure"))
-    assert diagnose.call_args.kwargs["state"] is None
-    assert orchestrator._invocation_context["run_id"] == ""
 
 
 def test_recovery_can_use_committed_history_without_checkpoint_blobs(tmp_path):

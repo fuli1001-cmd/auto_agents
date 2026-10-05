@@ -1,7 +1,7 @@
 import json
 
 from auto_agents.proof_review_prompt import render
-from auto_agents.repair_v2.store import Store, digest
+from auto_agents.proof_support.store import Store, digest
 
 
 def test_oversized_review_preserves_complete_code_and_bounds_inline_diff(tmp_path):

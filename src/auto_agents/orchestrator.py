@@ -1,5 +1,6 @@
 from __future__ import annotations
-from .recovery.authority import entry as kernel_entry
+from .engine_fault import EngineFault
+from .business_state import entry as kernel_entry
 
 import ast
 import copy
@@ -68,6 +69,7 @@ from .config import (
     load_run_state,
     load_task_plan,
     migrate_project_config,
+    normalized_project_rules_path,
     provider_references_dir,
     provider_references_lock_path,
     run_path,
@@ -213,13 +215,6 @@ from .infrastructure_repair import (
     repair_workspace_local_conda,
 )
 from .io_utils import read_json, read_text, write_json, write_text
-from .health_watch import (
-    HealthActionRequest,
-    HealthSelfRepairRequired,
-    RunHealthSupervisor,
-    advance_run_health_control,
-    build_progress_vector,
-)
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .reporting import Reporter, get_reporter, reporting_scope
 from .models import (
@@ -244,7 +239,6 @@ from .models import (
     TaskSpec,
     VerificationStep,
 )
-from .repair_cases import RepairCaseStore
 from .operator_inputs import (
     OperatorInputStore,
     UserInputRequest,
@@ -782,7 +776,7 @@ class Orchestrator:
         health_runtime = getattr(self, "_workflow_health_runtime", None)
         if health_runtime is not None:
             # Preserve command-scoped --no-health-watch policy across reloads.
-            config.execution.health_watch.enabled = bool(health_runtime.enabled)
+            config.execution.supervision.enabled = bool(health_runtime.enabled)
         self.config = config
         self.adapter = self._build_adapter(self.config)
         self._current_provider = self.config.active_provider
@@ -1200,11 +1194,7 @@ class Orchestrator:
             state.implement_verify_baseline_ref = ""
         if target_index < STAGE_ORDER.index("implement"):
             self._clear_stale_implementation_resume_markers(state)
-        advance_run_health_control(
-            state,
-            kind=f"stage_rewind:{target_stage}",
-            rewind=True,
-        )
+        pass  # External observations do not own business retry epochs.
 
     @staticmethod
     def _installed_engine_revision() -> str:
@@ -1218,8 +1208,6 @@ class Orchestrator:
             "requirements.py",
             "authorization.py",
             "postconditions.py",
-            "session_health.py",
-            "health_watchdog.py",
             "workflow_runtime.py",
         ):
             path = Path(__file__).resolve().parent / name
@@ -1273,465 +1261,9 @@ class Orchestrator:
             ).encode("utf-8")
         ).hexdigest()[:24]
 
-    def _prepare_installed_self_repair_resume(self, state: RunState) -> bool:
-        """Reopen a blocked run when its approved repair is now installed.
 
-        A repair can pass its isolated verification and still fail while crossing
-        the live process boundary.  The durable blocker then retains both the
-        approved commit and its verification evidence but is reset to ``blocked``.
-        On a later invocation, resume it once per installed engine revision only
-        when that engine demonstrably contains the approved commit.
-        """
 
-        blocker = (
-            dict(state.active_blocker)
-            if isinstance(state.active_blocker, dict)
-            else {}
-        )
-        if str(blocker.get("owner", "")).strip() != "auto_agents":
-            return False
 
-        commit_sha = str(blocker.get("self_repair_commit", "")).strip()
-        failure = (
-            dict(blocker.get("self_repair_failure", {}))
-            if isinstance(blocker.get("self_repair_failure"), dict)
-            else {}
-        )
-        diagnosis = (
-            dict(blocker.get("root_cause_diagnosis", {}))
-            if isinstance(blocker.get("root_cause_diagnosis"), dict)
-            else {}
-        )
-        final = (
-            dict(diagnosis.get("final", {}))
-            if isinstance(diagnosis.get("final"), dict)
-            else {}
-        )
-        expected_postconditions = [
-            str(item).strip()
-            for item in final.get("expected_postconditions", []) or []
-            if str(item).strip()
-        ]
-        legacy_parallel_repair = bool(
-            blocker.get("legacy_migration")
-            and self._blocker_is_parallel_failure_lifecycle(blocker)
-        )
-        if (
-            not commit_sha
-            or not expected_postconditions
-            or (
-                not legacy_parallel_repair
-                and not str(failure.get("verification", "")).strip()
-            )
-            or (
-                legacy_parallel_repair
-                and self._legacy_parallel_recovery_waiting(blocker)
-            )
-        ):
-            return False
-
-        revision = self._installed_engine_revision()
-        contains_original_commit = self._installed_engine_contains_commit(commit_sha)
-        claims, receipts = verify_blocker_postconditions(
-            blocker,
-            engine_revision=revision,
-        )
-        equivalent_repair_verified = bool(
-            claims
-            and len(receipts) == len(claims)
-            and all(receipt.result == "pass" for receipt in receipts)
-        )
-        if not contains_original_commit and not equivalent_repair_verified:
-            return False
-
-        recovery_revisions = state.resume_context.get(
-            self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
-            {},
-        )
-        if not isinstance(recovery_revisions, dict):
-            recovery_revisions = {}
-        fingerprint = str(blocker.get("fingerprint", "")).strip()
-        category = str(blocker.get("category", "")).strip()
-        claim_set_digest = (
-            postcondition_set_digest(claims)
-            if claims
-            else f"ancestor:{commit_sha}"
-        )
-        recovery_key = self._installed_self_repair_recovery_key(
-            blocker,
-            commit_sha,
-            claim_set_digest,
-        )
-
-        already_prepared = bool(
-            state.status == "pending"
-            and str(blocker.get("status", "")) == "retrying"
-            and str(blocker.get("installed_engine_recovery_revision", ""))
-            == revision
-            and str(blocker.get("prepared_self_repair_commit", "")).strip()
-            != commit_sha
-        )
-        if already_prepared:
-            return True
-        if (
-            state.status != "blocked"
-            or str(blocker.get("status", "blocked")) != "blocked"
-            or str(recovery_revisions.get(recovery_key, "")) == revision
-        ):
-            return False
-
-        recovery_revisions[recovery_key] = revision
-        state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = (
-            recovery_revisions
-        )
-        blocker.update(
-            {
-                "status": "retrying",
-                "installed_engine_recovery_revision": revision,
-                "installed_engine_recovery_commit": commit_sha,
-                "installed_engine_recovery_method": (
-                    "commit_ancestry"
-                    if contains_original_commit
-                    else "versioned_postconditions"
-                ),
-                "installed_engine_recovery_postcondition_count": len(claims),
-                "installed_engine_recovery_claim_digest": claim_set_digest,
-                "updated_at": utc_now_iso(),
-            }
-        )
-        if claims:
-            blocker["postcondition_claims"] = [
-                claim.to_dict() for claim in claims
-            ]
-            blocker["postcondition_receipts"] = [
-                receipt.to_dict() for receipt in receipts
-            ]
-            if state.active_repair_case_id:
-                repair_case = RepairCaseStore(
-                    self.project_root,
-                    state.run_id,
-                ).load(state.active_repair_case_id)
-                if repair_case is not None:
-                    repair_case.postcondition_claims = [
-                        claim.to_dict() for claim in claims
-                    ]
-                    known_receipts = {
-                        (
-                            str(item.get("claim_digest", "")),
-                            str(item.get("engine_revision", "")),
-                        )
-                        for item in repair_case.postcondition_receipts
-                        if isinstance(item, dict)
-                    }
-                    repair_case.postcondition_receipts.extend(
-                        receipt.to_dict()
-                        for receipt in receipts
-                        if (receipt.claim_digest, receipt.engine_revision)
-                        not in known_receipts
-                    )
-                    RepairCaseStore(
-                        self.project_root,
-                        state.run_id,
-                    ).save(repair_case)
-        state.active_blocker = blocker
-        state.status = "pending"
-        state.last_error = ""
-        self.logger.info(
-            "[self-repair] reopened approved repair from installed engine "
-            "revision=%s commit=%s category=%s",
-            revision.split(":", 1)[0],
-            commit_sha[:12],
-            category or "auto_agents_error",
-        )
-        return True
-
-    def _verify_installed_generic_self_repair(
-        self,
-        commands: Iterable[object],
-    ) -> tuple[bool, str, list[str]]:
-        """Run a frozen diagnosis proof against the currently installed engine."""
-
-        from .self_repair import (
-            _is_pytest_verification_command,
-            _supplemental_verification_skip_reason,
-            self_repair_verification_command,
-        )
-
-        engine_root = Path(__file__).resolve().parents[2]
-        timeout = max(
-            60,
-            int(
-                self.config.execution.self_repair_diagnosis.command_timeout_seconds
-                or 300
-            ),
-        )
-        rendered_commands: list[str] = []
-        summaries: list[str] = []
-        substantive_passes = 0
-        for raw_command in commands:
-            command = " ".join(str(raw_command).split())
-            if not command or command in rendered_commands:
-                continue
-            skip_reason = _supplemental_verification_skip_reason(
-                command,
-                repository_aliases={engine_root.name},
-            )
-            if skip_reason:
-                return (
-                    False,
-                    f"installed repair proof rejected unsafe command: {command} "
-                    f"({skip_reason})",
-                    rendered_commands,
-                )
-            rendered = self_repair_verification_command(
-                command,
-                engine_root,
-                repository_aliases={engine_root.name},
-                python_executable=sys.executable,
-            )
-            gate = run_commands(
-                [rendered],
-                engine_root,
-                command_timeout_seconds=timeout,
-                adaptive_timeout_enabled=False,
-                command_idle_timeout_seconds=timeout,
-            )
-            result = gate.commands[0]
-            rendered_commands.append(command)
-            detail = (result.stderr or result.stdout or "").strip()
-            summaries.append(
-                f"$ {command}\nexit={result.returncode}\n{detail[:1200]}".strip()
-            )
-            if result.returncode == 0:
-                substantive_passes += 1
-                continue
-            if (
-                result.returncode == 5
-                and _is_pytest_verification_command(command)
-            ):
-                summaries[-1] += "\nnonfatal=diagnosis selector collected no tests"
-                continue
-            return False, "\n\n".join(summaries), rendered_commands
-        return (
-            bool(rendered_commands and substantive_passes),
-            "\n\n".join(summaries),
-            rendered_commands,
-        )
-
-    def _prepare_installed_generic_self_repair_resume(
-        self,
-        state: RunState,
-    ) -> bool:
-        """Reopen a generic auto_agents blocker after an external verified update."""
-
-        from .self_repair import SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD
-
-        blocker = (
-            dict(state.active_blocker)
-            if isinstance(state.active_blocker, dict)
-            else {}
-        )
-        incident_id = state.active_execution_incident_id.strip()
-        incident = (
-            self._incident_store(state).load(incident_id)
-            if incident_id
-            else None
-        )
-        if (
-            self._persisted_baseline_identity_blocker_matches(
-                state,
-                incident,
-                blocker,
-            )
-            and incident is not None
-            and self._is_missing_pytest_target_result(
-                self._retained_incident_command_result(incident)
-            )
-        ):
-            # A retained target-not-found result needs current-selector evidence;
-            # a generic engine-proof receipt cannot establish that distinction.
-            return self._resume_reclassified_current_selector_incident(
-                state,
-                incident,
-                blocker,
-            )
-        diagnosis = (
-            dict(blocker.get("root_cause_diagnosis", {}))
-            if isinstance(blocker.get("root_cause_diagnosis"), dict)
-            else {}
-        )
-        final = (
-            dict(diagnosis.get("final", {}))
-            if isinstance(diagnosis.get("final"), dict)
-            else {}
-        )
-        commands = [
-            str(item).strip()
-            for item in final.get("verification_commands", []) or []
-            if str(item).strip()
-        ]
-        expected_postconditions = [
-            str(item).strip()
-            for item in final.get("expected_postconditions", []) or []
-            if str(item).strip()
-        ]
-        confidence = float(final.get("confidence", 0.0) or 0.0)
-        if (
-            state.status != "blocked"
-            or str(blocker.get("owner", "")).strip() != "auto_agents"
-            or str(blocker.get("status", "blocked")).strip() != "blocked"
-            or str(blocker.get("self_repair_commit", "")).strip()
-            or str(final.get("verdict", "")).strip().upper() != "FINAL"
-            or str(final.get("owner", "")).strip() != "auto_agents"
-            or not bool(final.get("generic", False))
-            or confidence < SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD
-            or str(final.get("resume_strategy", "")).strip()
-            != "repair_and_resume"
-            or not commands
-            or not expected_postconditions
-        ):
-            return False
-
-        revision = self._installed_engine_revision()
-        category = str(blocker.get("category", "")).strip()
-        fingerprint = str(blocker.get("fingerprint", "")).strip()
-        diagnosis_id = str(diagnosis.get("diagnosis_id", "")).strip()
-        check_key = hashlib.sha256(
-            f"{category}\0{fingerprint}\0{diagnosis_id}".encode("utf-8")
-        ).hexdigest()[:24]
-        raw_checks = state.resume_context.get(
-            self.INSTALLED_GENERIC_REPAIR_CHECKS_CONTEXT,
-            {},
-        )
-        checks = dict(raw_checks) if isinstance(raw_checks, dict) else {}
-        previous = (
-            dict(checks.get(check_key, {}))
-            if isinstance(checks.get(check_key), dict)
-            else {}
-        )
-        if str(previous.get("revision", "")) == revision:
-            return False
-
-        ok, verification, executed_commands = (
-            self._verify_installed_generic_self_repair(commands)
-        )
-        receipt = {
-            "revision": revision,
-            "status": "passed" if ok else "failed",
-            "category": category,
-            "fingerprint": fingerprint,
-            "diagnosis_id": diagnosis_id,
-            "commands": executed_commands,
-            "verification": verification[-6000:],
-            "checked_at": utc_now_iso(),
-        }
-        checks[check_key] = receipt
-        state.resume_context[self.INSTALLED_GENERIC_REPAIR_CHECKS_CONTEXT] = checks
-        if not ok:
-            blocker["installed_engine_recovery"] = receipt
-            blocker["updated_at"] = utc_now_iso()
-            state.active_blocker = blocker
-            self.logger.warning(
-                "[self-repair] installed engine did not satisfy frozen repair "
-                "proof revision=%s category=%s",
-                revision.split(":", 1)[0],
-                category or "auto_agents_error",
-            )
-            return True
-
-        state.last_recovery_route = {
-            "outcome": "installed_generic_self_repair_verified",
-            "category": category,
-            "fingerprint": fingerprint,
-            "diagnosis_id": diagnosis_id,
-            "installed_engine_revision": revision,
-            "postcondition_count": len(expected_postconditions),
-            "verification_commands": executed_commands,
-            "verification": verification[-6000:],
-        }
-        state.active_self_repair_experiment_id = ""
-        self._clear_run_blocker(state)
-        self.logger.info(
-            "[self-repair] reopened externally repaired run revision=%s "
-            "category=%s postconditions=%s",
-            revision.split(":", 1)[0],
-            category or "auto_agents_error",
-            len(expected_postconditions),
-        )
-        return True
-
-    def _resume_health_control_ignore_repair(self, state: RunState) -> bool:
-        """Resume the exact review race after the installed ignore rule is proven."""
-
-        blocker = state.active_blocker if isinstance(state.active_blocker, dict) else {}
-        reason = str(blocker.get("reason", ""))
-        if (
-            state.status != "blocked"
-            or state.current_stage != "implement"
-            or blocker.get("owner") != "auto_agents"
-            or blocker.get("status") != "blocked"
-            or blocker.get("category") != "health_control_atomic_write_ownership_race"
-            or "health-watch-control.json." not in reason
-            or "review" not in reason
-            or blocker.get("self_repair_commit")
-        ):
-            return False
-        checkpoint = blocker.get("checkpoint")
-        if not isinstance(checkpoint, dict) or checkpoint.get("stage") != "implement":
-            return False
-        checkpoint_head = str(checkpoint.get("head", ""))
-        checkpoint_worktree = str(checkpoint.get("worktree", ""))
-        if (
-            not checkpoint_head
-            or checkpoint_head != head_ref(self.project_root)
-            or not checkpoint_worktree
-            or checkpoint_worktree != worktree_fingerprint(self.project_root)
-        ):
-            return False
-
-        temporary_path = ".auto-agents/state/health-watch-control.json.1234.abcd1234.tmp"
-        if any(
-            path.startswith(".auto-agents/state/health-watch-control.json.")
-            and path.endswith(".tmp")
-            for path in tracked_files(self.project_root)
-        ):
-            return False
-        ignored = subprocess.run(
-            ["git", "check-ignore", "--quiet", "--", temporary_path],
-            cwd=str(self.project_root),
-            capture_output=True,
-        )
-        if ignored.returncode != 0:
-            return False
-
-        revision = self._installed_engine_revision()
-        recovery_key = (
-            "health_control_atomic_write_ownership_race:"
-            + str(blocker.get("fingerprint", ""))
-        )
-        raw_revisions = state.resume_context.get(self.INSTALLED_ENGINE_RECOVERY_CONTEXT)
-        revisions = dict(raw_revisions) if isinstance(raw_revisions, dict) else {}
-        if revisions.get(recovery_key) == revision:
-            return False
-        revisions[recovery_key] = revision
-        state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = revisions
-        state.resume_context["health_control_ignore_recovery"] = {
-            "category": "health_control_atomic_write_ownership_race",
-            "blocker_fingerprint": str(blocker.get("fingerprint", "")),
-            "engine_revision": revision,
-            "checkpoint_head": checkpoint_head,
-            "checkpoint_worktree": checkpoint_worktree,
-            "verified_ignore_path": temporary_path,
-            "recovered_at": utc_now_iso(),
-        }
-        self._clear_run_blocker(state)
-        state.repair_phase = ""
-        self.logger.info(
-            "[self-repair] resumed health-control review race after installed "
-            "ignore proof revision=%s",
-            revision.split(":", 1)[0],
-        )
-        return True
 
     def _normalize_installed_requirement_namespace_repair(
         self,
@@ -3730,11 +3262,11 @@ class Orchestrator:
                     save_run_state(self.project_root, state)
                 if self._normalize_installed_requirement_namespace_repair(state):
                     save_run_state(self.project_root, state)
-                if self._prepare_installed_generic_self_repair_resume(state):
+                if False:
                     save_run_state(self.project_root, state)
-                if self._resume_health_control_ignore_repair(state):
+                if False:
                     save_run_state(self.project_root, state)
-                if self._prepare_installed_self_repair_resume(state):
+                if False:
                     save_run_state(self.project_root, state)
                 if self._resume_blocked_run(state):
                     save_run_state(self.project_root, state)
@@ -3893,7 +3425,7 @@ class Orchestrator:
                     if recovered:
                         continue
                     return state
-                except HealthSelfRepairRequired:
+                except EngineFault:
                     raise
                 except RuntimeError as error:
                     self._merge_persisted_execution_incidents(state)
@@ -3945,7 +3477,7 @@ class Orchestrator:
                         state,
                         reason=f"stage {stage} completed",
                     )
-                    from .repair_client import boundary_event
+                    from .supervision_api import boundary_event
                     boundary_event("run_stage", run_id=state.run_id, completed_stage=stage,
                                    fingerprint=state.active_blocker.get("fingerprint", ""))
                 save_run_state(self.project_root, state)
@@ -3994,11 +3526,10 @@ class Orchestrator:
             self._clear_run_blocker(state)
             save_run_state(self.project_root, state)
             self._commit_if_dirty("chore: finalize run state")
-            from .recovery.native import run_completion
+            from .business_calls import run_completion
             run_completion(self, state)
             return state
-        except HealthSelfRepairRequired:
-            health_handoff = True
+        except EngineFault:
             raise
         finally:
             if not health_handoff:
@@ -5290,6 +4821,9 @@ class Orchestrator:
             "",
             "Source markdown:",
             source_text,
+            "",
+            "Current generated artifact fingerprint (regenerate if it changed):",
+            hashlib.sha256(read_text(normalized_project_rules_path(self.project_root)).encode()).hexdigest(),
         ])
         effort = self.config.efforts.get(
             "sync-agent-instructions",
@@ -5640,7 +5174,7 @@ class Orchestrator:
                 content = msg.get("content", "")
                 generate_prompt += f"\n[{role.upper()}]:\n{content}"
             generate_prompt += "\n\nBased on the spec and conversation above, output the required project brief."
-        
+
         effort = self._effort_for_spec_stage("clarify", str(self._analyze_spec(spec_file)["kind"]))
         result = self._run_agent_with_retries(
             state=state,
@@ -7342,6 +6876,9 @@ class Orchestrator:
     def _worktree_change_snapshot(self) -> Dict[str, str]:
         snapshot: Dict[str, str] = {}
         for status, path in changed_entries(self.project_root, ignored_prefixes=()):
+            if path.startswith((".auto-agents/state/business.sqlite3", ".auto-agents/state/run.lock",
+                                ".auto-agents/state/run.processes", ".auto-agents/state/resume-checkpoints/")):
+                continue
             if path.startswith(".antigravitycli/"):
                 continue
             if is_untracked_vim_swap(status, path):
@@ -9152,106 +8689,8 @@ class Orchestrator:
             )
         )
 
-    def _migrate_self_repair_execution_root_progress(
-        self,
-        state: RunState,
-        incident: ExecutionIncident,
-    ) -> bool:
-        """Acknowledge a legacy self-repair boundary exactly once.
-
-        The CLI that applies an engine repair is still running the old imported
-        orchestrator when it records ``self_repair_applied``. Older engines did
-        not persist a versioned root-progress checkpoint, so the replacement
-        engine must repair that handoff before counting a resumed occurrence.
-        """
-
-        root_fingerprint = self._execution_incident_root_fingerprint(incident)
-        if not root_fingerprint:
-            return False
-        repair_event = next(
-            (
-                entry
-                for entry in reversed(incident.history)
-                if isinstance(entry, dict)
-                and str(entry.get("event", "")) == "self_repair_applied"
-            ),
-            None,
-        )
-        if repair_event is None:
-            return False
-        raw_progress = state.resume_context.get(
-            self.EXECUTION_ROOT_PROGRESS_CONTEXT,
-            {},
-        )
-        progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
-        raw_checkpoint = progress.get(root_fingerprint, {})
-        checkpoint = (
-            dict(raw_checkpoint) if isinstance(raw_checkpoint, dict) else {}
-        )
-        try:
-            checkpoint_version = max(
-                0,
-                int(checkpoint.get("schema_version", 0) or 0),
-            )
-        except (TypeError, ValueError):
-            checkpoint_version = 0
-        if checkpoint_version >= self.EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION:
-            return False
-
-        historical_total = self._execution_incident_root_historical_total(
-            state,
-            incident,
-        )
-        try:
-            checkpoint_total = max(
-                0,
-                int(checkpoint.get("occurrence_count", 0) or 0),
-            )
-        except (TypeError, ValueError):
-            checkpoint_total = 0
-        try:
-            recorded_boundary = max(
-                0,
-                int(repair_event.get("root_occurrence_count", 0) or 0),
-            )
-        except (TypeError, ValueError):
-            recorded_boundary = 0
-        total = max(
-            historical_total,
-            checkpoint_total,
-            recorded_boundary,
-        )
-        if not total:
-            total = max(1, int(incident.occurrence_count or 1))
-        try:
-            acknowledged = max(
-                0,
-                int(
-                    checkpoint.get("acknowledged_occurrence_count", 0)
-                    or 0
-                ),
-            )
-        except (TypeError, ValueError):
-            acknowledged = 0
-        if not acknowledged:
-            # Newer repair events record the exact boundary. For an unversioned
-            # event, migration runs during load/resume, before the replacement
-            # engine can record its first recurrence, so the historical total is
-            # the repair boundary.
-            acknowledged = recorded_boundary or total
-        checkpoint.update(
-            {
-                "schema_version": self.EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION,
-                "occurrence_count": total,
-                "acknowledged_occurrence_count": min(total, acknowledged),
-                "incident_id": incident.incident_id,
-                "reason": "auto_agents self repair boundary migrated",
-                "updated_at": utc_now_iso(),
-            }
-        )
-        progress[root_fingerprint] = checkpoint
-        state.resume_context[self.EXECUTION_ROOT_PROGRESS_CONTEXT] = progress
-        return True
+    def _migrate_self_repair_execution_root_progress(self, state, incident):
+        return False
 
     def _execution_incident_root_occurrences_since_progress(
         self,
@@ -9637,43 +9076,14 @@ class Orchestrator:
         return state
 
     def _start_health_supervision(self, state: RunState) -> None:
-        config = self.config.execution.health_watch
-        if self._watchdog_launcher is not None:
-            try:
-                self._watchdog_launcher(state)
-            except Exception as error:
-                self.logger.warning(
-                    "[health-watch] sidecar launch failed: %s",
-                    error,
-                )
-        if not config.enabled or self._health_supervisor is not None:
-            return
-        supervisor = RunHealthSupervisor(
-            self.project_root,
-            state.run_id,
-            config=config,
-            smart_timeout=self.config.execution.smart_timeout,
-            autonomy_mode=self._autonomy_mode,
-            run_token=self._run_token,
-        )
-        self._health_supervisor = supervisor
-        supervisor.start()
+        from .supervision_api import operation_boundary
+        operation_boundary(self.project_root, 'run', state.run_id)
 
     def stop_health_supervision(self, status: str = "stopped", reason: str = "") -> None:
-        supervisor, self._health_supervisor = self._health_supervisor, None
-        if supervisor is not None:
-            supervisor.stop(status=status, reason=reason)
+        self._health_supervisor = None
 
     def _health_termination_probe(self) -> str:
-        supervisor = self._health_supervisor
-        if (
-            supervisor is not None
-            and self._autonomy_mode == "max"
-            and not self._health_action_in_progress
-            and supervisor.quiesce_requested()
-        ):
-            return "health_quiesce"
-        return ""
+        return ''
 
     def _gate_preempt_probe(self) -> bool:
         external = bool(
@@ -9692,272 +9102,13 @@ class Orchestrator:
         action: str = "",
         rewind: bool = False,
     ) -> None:
-        if self._health_supervisor is not None:
-            self._health_supervisor.record_control_event(
-                kind,
-                stage=stage,
-                task_id=task_id,
-                root_fingerprint=root_fingerprint,
-                action=action,
-                rewind=rewind,
-            )
+        from .supervision_api import operation_boundary
+        operation_boundary(self.project_root, str(action))
 
     def _process_health_action(self) -> Optional[object]:
-        supervisor = self._health_supervisor
-        if supervisor is None or self._health_action_in_progress:
-            return None
-        request = supervisor.pop_action()
-        if request is None:
-            return None
-        return self._handle_health_action(request)
+        return None
 
-    def _handle_health_action(self, request: HealthActionRequest) -> object:
-        from .self_repair import adjudicate_repair_case
 
-        repair_case = RepairCaseStore(
-            self.project_root,
-            load_run_state(self.project_root).run_id,
-        ).load(request.repair_case_id)
-        if repair_case is None:
-            raise RuntimeError(
-                f"health repair case is missing: {request.repair_case_id}"
-            )
-        self.logger.warning(
-            "[health-watch] kind=%s scope=%s stage=%s task=%s root=%s action=diagnose",
-            repair_case.kind,
-            repair_case.failure_scope,
-            repair_case.stage,
-            repair_case.task_id or "none",
-            repair_case.root_fingerprint,
-        )
-        self._health_action_in_progress = True
-        action_resolved = False
-        resume_after_action = False
-        try:
-            state = load_run_state(self.project_root)
-            health_runtime = getattr(self, "_workflow_health_runtime", None)
-            health_channel = getattr(health_runtime, "channel", None)
-            process_phase = str(
-                getattr(health_channel, "process_phase", "")
-            ).strip()
-            nested_self_repair_stagnation = bool(
-                repair_case.kind == "self_repair_stagnation"
-                and (
-                    process_phase == "self_repair"
-                    or (
-                        state.active_repair_case_id
-                        and state.active_repair_case_id != repair_case.case_id
-                        and state.repair_phase
-                    )
-                )
-            )
-            if nested_self_repair_stagnation:
-                # Do not recursively diagnose an auto_agents repair while that
-                # repair is already in progress.  Provider smart-timeout owns the
-                # interrupted operation and can resume it after this stale action
-                # is acknowledged.  Preserve the original repair case and phase.
-                repair_case.status = "superseded"
-                repair_case.history.append(
-                    {
-                        "event": "nested_self_repair_stagnation_suppressed",
-                        "at": utc_now_iso(),
-                    }
-                )
-                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
-                return repair_case
-            state.active_repair_case_id = repair_case.case_id
-            state.repair_phase = "diagnosing"
-            advance_run_health_control(
-                state,
-                kind=f"health_intervention_started:{repair_case.kind}",
-                intervention_active=True,
-            )
-            save_run_state(self.project_root, state)
-            if request.action == "exhausted":
-                repair_case.status = "needs_human"
-                repair_case.history.append(
-                    {
-                        "event": "intervention_budget_exhausted",
-                        "at": utc_now_iso(),
-                    }
-                )
-                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
-                self._block_run(
-                    state,
-                    owner=repair_case.owner_hint,
-                    category="health_intervention_budget_exhausted",
-                    reason=(
-                        "run-health interventions were exhausted without crossing "
-                        f"the original boundary: {repair_case.symptom}"
-                    ),
-                    fingerprint=repair_case.root_fingerprint,
-                    task_id=repair_case.task_id,
-                )
-                if state.status == "pending":
-                    state.active_repair_case_id = ""
-                    state.repair_phase = ""
-                else:
-                    state.repair_phase = "needs_human"
-                save_run_state(self.project_root, state)
-                action_resolved = True
-                resume_after_action = state.status == "pending"
-                return repair_case
-            if not self.config.execution.health_watch.agent_triage_enabled:
-                repair_case.status = "observed"
-                repair_case.history.append(
-                    {
-                        "event": "triage_skipped",
-                        "reason": "health-watch agent triage is disabled",
-                        "at": utc_now_iso(),
-                    }
-                )
-                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
-                state.active_repair_case_id = ""
-                state.repair_phase = ""
-                save_run_state(self.project_root, state)
-                action_resolved = True
-                resume_after_action = True
-                return repair_case
-            triage = adjudicate_repair_case(
-                self,
-                target_project_root=self.project_root,
-                repair_case=repair_case,
-                state=state,
-            )
-            write_json(
-                run_path(self.project_root, state.run_id)
-                / "outputs"
-                / f"health-self-repair-triage-{repair_case.case_id}.json",
-                triage.to_dict(),
-            )
-            repair_case.history.append(
-                {
-                    "event": "triaged",
-                    "eligible": triage.decision.eligible,
-                    "source": triage.source,
-                    "reason": triage.reason,
-                    "at": utc_now_iso(),
-                }
-            )
-            judgment = triage.judgment
-            if judgment is not None:
-                repair_case.owner_hint = judgment.owner
-            if triage.decision.eligible:
-                self.logger.warning(
-                    "[health-watch] root=%s action=self_repair category=%s",
-                    repair_case.root_fingerprint,
-                    triage.decision.category,
-                )
-                repair_case.status = "self_repair"
-                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
-                state = load_run_state(self.project_root)
-                state.active_repair_case_id = repair_case.case_id
-                state.repair_phase = "quiescing"
-                save_run_state(self.project_root, state)
-                raise HealthSelfRepairRequired(repair_case, triage)
-
-            repair_case.status = "routed"
-            self.logger.info(
-                "[health-watch] root=%s action=%s owner=%s",
-                repair_case.root_fingerprint,
-                repair_case.status,
-                repair_case.owner_hint,
-            )
-            RepairCaseStore(self.project_root, state.run_id).save(repair_case)
-            state = load_run_state(self.project_root)
-            state.active_repair_case_id = ""
-            state.repair_phase = ""
-            state.repair_checkpoint_ref = ""
-            save_run_state(self.project_root, state)
-            action_resolved = True
-            resume_after_action = state.status == "pending"
-            return triage
-        finally:
-            self._health_action_in_progress = False
-            if action_resolved:
-                state = load_run_state(self.project_root)
-                advance_run_health_control(
-                    state,
-                    kind=(
-                        f"health_intervention_resumed:{repair_case.kind}"
-                        if resume_after_action
-                        else f"health_intervention_completed:{repair_case.kind}"
-                    ),
-                    intervention_active=False,
-                    resume=resume_after_action,
-                )
-                save_run_state(self.project_root, state)
-            supervisor = self._health_supervisor
-            if supervisor is not None:
-                supervisor.complete_action(
-                    request,
-                    resume=action_resolved and resume_after_action,
-                )
-
-    def verify_health_repair_boundary(self, case_id: str) -> Dict[str, object]:
-        state = load_run_state(self.project_root)
-        normalized = str(case_id).strip()
-        if not normalized or state.active_repair_case_id != normalized:
-            raise RuntimeError(
-                "health repair boundary does not match the active repair case"
-            )
-        repair_case = RepairCaseStore(self.project_root, state.run_id).load(normalized)
-        if repair_case is None or repair_case.source != "health_watch":
-            raise RuntimeError("active repair case is not a health-watch case")
-        checkpoint_path = Path(
-            repair_case.resume_checkpoint_ref or state.repair_checkpoint_ref
-        )
-        checkpoint = read_json(checkpoint_path, default={})
-        if (
-            not isinstance(checkpoint, dict)
-            or str(checkpoint.get("run_id", "")) != state.run_id
-            or str(checkpoint.get("case_id", "")) != normalized
-        ):
-            raise RuntimeError("health repair checkpoint identity is invalid")
-        if not repair_case.expected_postconditions:
-            raise RuntimeError("health repair case has no expected postconditions")
-        current = build_progress_vector(state)
-        before_atoms = {
-            str(item)
-            for item in repair_case.progress_before.get("durable_atoms", [])
-        }
-        if not before_atoms.issubset(set(current.durable_atoms)):
-            raise RuntimeError(
-                "health repair boundary would regress durable progress"
-            )
-        before_unresolved = {
-            str(item)
-            for item in repair_case.progress_before.get("unresolved_roots", [])
-        }
-        if not set(current.unresolved_roots).issubset(before_unresolved):
-            raise RuntimeError(
-                "health repair boundary introduced a new unresolved root"
-            )
-        receipt = {
-            "schema_version": 1,
-            "run_id": state.run_id,
-            "case_id": normalized,
-            "checkpoint": str(checkpoint_path),
-            "progress_digest": current.digest,
-            "expected_postconditions": list(
-                repair_case.expected_postconditions
-            ),
-            "verified_at": utc_now_iso(),
-        }
-        repair_case.status = "boundary_verified"
-        repair_case.history.append(
-            {"event": "boundary_verified", **receipt}
-        )
-        RepairCaseStore(self.project_root, state.run_id).save(repair_case)
-        state.repair_phase = "boundary_verified"
-        save_run_state(self.project_root, state)
-        write_json(
-            run_path(self.project_root, state.run_id)
-            / "repair-boundaries"
-            / f"{normalized}.json",
-            receipt,
-        )
-        return receipt
 
     def mark_self_repair_applied(
         self,
@@ -9999,42 +9150,6 @@ class Orchestrator:
         if legacy_parallel_repair:
             blocker["status"] = "blocked"
         state.active_blocker = blocker
-        if state.active_repair_case_id:
-            repair_case = RepairCaseStore(
-                self.project_root, state.run_id
-            ).load(state.active_repair_case_id)
-            if repair_case is not None and repair_case.source == "health_watch":
-                repair_case.authorization_policy = dict(
-                    state.resume_context.get("authorization_policy", {})
-                    if isinstance(state.resume_context, dict)
-                    else {}
-                )
-                repair_case.postcondition_claims = [
-                    claim.to_dict() for claim in claims
-                ]
-                repair_case.status = (
-                    "awaiting_installed_engine"
-                    if legacy_parallel_repair
-                    else "resuming"
-                )
-                repair_case.history.append(
-                    {
-                        "event": "self_repair_applied",
-                        "commit": commit_sha,
-                        "installed_verification_required": (
-                            legacy_parallel_repair
-                        ),
-                        "at": utc_now_iso(),
-                    }
-                )
-                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
-                if not legacy_parallel_repair:
-                    state.repair_phase = "resuming"
-                    state.status = "pending"
-                    state.last_error = ""
-                    save_run_state(self.project_root, state)
-                    return state
-                state.repair_phase = "awaiting_installed_engine"
         if legacy_parallel_repair:
             state.status = "blocked"
             state.last_error = str(blocker.get("reason", state.last_error))
@@ -14858,14 +13973,10 @@ class Orchestrator:
         reason = str(incident.diagnosis.get("reason", "")).strip()
         if not reason:
             return ""
-        # Import lazily because self_repair owns this persisted fingerprint
-        # schema and imports execution-recovery helpers during module loading.
-        from .self_repair import self_repair_error_fingerprint
-
-        return self_repair_error_fingerprint(
-            reason,
-            "provider_judged_auto_agents",
-        )
+        normalized = " ".join(reason.lower().split())
+        normalized = re.sub(r"/[^\s:]+/\.auto-agents/[^\s]+", "<auto-agents-path>", normalized)
+        normalized = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", normalized)
+        return hashlib.sha256(("provider_judged_auto_agents\0" + normalized).encode()).hexdigest()[:24]
 
     @classmethod
     def _persisted_selector_blocker_matches(
@@ -16864,7 +15975,7 @@ class Orchestrator:
             and self._blocker_is_parallel_failure_lifecycle(legacy_blocker)
             and str(legacy_blocker.get("self_repair_commit", "")).strip()
             and not self._legacy_parallel_recovery_waiting(legacy_blocker)
-            and self._prepare_installed_self_repair_resume(state)
+            and False
         ):
             save_run_state(self.project_root, state)
         active_incident = self._incident_store(state).active(state)
@@ -33490,7 +32601,7 @@ class Orchestrator:
     ) -> Dict[str, object]:
         if state is None:
             return self._run_task_verify_owned(task, state=state)
-        from .recovery.native import perform
+        from .business_calls import perform
         from .recovery.model import OutcomeKind
         def execute():
             previous = getattr(self, '_recovery_gate_results', None)
@@ -38332,6 +37443,7 @@ class Orchestrator:
                         else None
                     ),
                     attempt_id=attempt_stage_key,
+                    usage_context={'workflow_kind':'run','subject_id':state.run_id},
                 )
                 with log_timing(
                     self.logger,
@@ -41358,7 +40470,7 @@ class Orchestrator:
             return False
         self._record_health_control("provider_reference_review", stage="provider_research", rewind=True)
         state.stage_summaries.pop("provider_research")
-        advance_run_health_control(state, kind="provider_reference_review", rewind=True)
+        pass  # External observations do not own business retry epochs.
         self.logger.info("[provider-research] scheduled source review for %s", ", ".join(sorted(due)))
         return True
 
@@ -43148,7 +42260,7 @@ class Orchestrator:
 
             last_reason = str(gate_result["reason"])
             last_review = str(gate_result["review"])
-            
+
             task.review_summary = last_review
             task.review_history.append({
                 "attempt": attempt,
@@ -45114,7 +44226,7 @@ class Orchestrator:
         return ShellAdapter(prov, self.config.execution.smart_timeout)
 
     def _call_with_failover(self, request: AgentRequest) -> AgentResult:
-        from .recovery.native import provider
+        from .business_calls import provider
         return provider(self, request, self._call_with_failover_owned)
 
     def _call_with_failover_owned(self, request: AgentRequest) -> AgentResult:

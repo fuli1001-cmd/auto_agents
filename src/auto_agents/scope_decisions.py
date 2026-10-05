@@ -4,7 +4,7 @@ import fcntl
 import json
 from pathlib import Path
 
-from .repair_v2.store import atomic_json, digest
+from .proof_support.store import atomic_json, digest
 
 
 class Decisions:
@@ -63,7 +63,7 @@ class Decisions:
                 if request['answer'] != answer or request['user_text'] != user_text:
                     raise ValueError('这项决定已经保存，不能用过期回答覆盖。')
                 return request
-            from .repair_v2.scope import context as goal_context
+            from .proof_support.scope import context as goal_context
             owner = request['context']['owner']
             kind, native = owner['subject'].split(':', 1)
             project = self.root.parents[2]
@@ -134,32 +134,7 @@ def session_choice(session, state, context, proposal, continuation):
     state.status = 'waiting_user'
     state.resolution = 'scope_decision:' + request['id']
     session._save(state)
-    registration = getattr(session.orch, '_repair_registration', None)
-    import os
-    if registration and os.environ.get('AUTO_AGENTS_REPAIR_SUBSCRIBER'):
-        from .repair_control import rpc
-        rpc(registration['config'], {'op': 'request-decision', 'subscriber': registration['subscriber'],
-                                    'decision': request['id']})
-        # The resumed process has no terminal. Wait for the foreground relay,
-        # which owns the explicit user response; do not create another agent.
-        import time
-        while request['status'] == 'pending':
-            try:
-                status = rpc(registration['config'], {'op': 'decision-status', 'subscriber': registration['subscriber'],
-                                                      'decision': request['id']})
-            except OSError:
-                # A foreground relay reconnects the supervisor after restart.
-                # This is an idle user wait, not another model/repair attempt.
-                time.sleep(0.5)
-                continue
-            if status.get('detached'):
-                return None
-            request = decisions.read(request['id'])
-            if request['status'] == 'pending':
-                time.sleep(0.5)
-        choice = (request['answer'], request.get('user_text', ''))
-    else:
-        choice = choose(session.orch, request)
+    choice = choose(session.orch, request)
     if choice is None:
         return None
     request = decisions.answer(request['id'], request['version'], choice[0], user_text=choice[1],
@@ -239,7 +214,7 @@ def resume_original(orchestrator, project, identity, args, lock, *, owner=None):
     fd = os.dup(lock.fileno)
     environment = {'AUTO_AGENTS_RUN_LOCK_FD': str(fd),
                    'AUTO_AGENTS_RUN_LOCK_KEY': hashlib.sha256(str(Path(project).resolve()).encode()).hexdigest(),
-                   'AUTO_AGENTS_RUN_TOKEN': lock.run_token, 'AUTO_AGENTS_SELF_REPAIR_HEALTH_REBASE': '1'}
+                   'AUTO_AGENTS_RUN_TOKEN': lock.run_token}
     previous = {key: os.environ.get(key) for key in environment}
     try:
         os.environ.update(environment)

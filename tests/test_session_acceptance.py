@@ -161,23 +161,11 @@ def test_acceptance_user_question_survives_interruption_without_model_retry(tmp_
     assert calls == ['acceptance_execute', 'acceptance_review']
 
 
-def test_cli_failure_details_stay_in_diagnostics(tmp_path, monkeypatch, capsys):
-    from auto_agents import cli
-    root, state, _, _ = setup_acceptance(tmp_path, monkeypatch, legacy=True)
-    def failure(*args):
-        raise RuntimeError('internal detail /private/worktree/hf-123')
-    monkeypatch.setattr(Session, 'resume', failure)
-    monkeypatch.setattr(cli, '_triage_terminal_run_error', lambda *args: None)
-    assert cli.main(['collab', '--project', str(root), '--session', state.session_id,
-                     '--auto-approve', '--no-health-watch']) == 1
-    output = capsys.readouterr()
-    assert 'internal detail' not in output.err + output.out
-    assert 'Failed' in output.err or '执行失败' in output.err
 
 
 def test_cli_acceptance_uses_completed_child_and_preserves_stopped_run(tmp_path, monkeypatch, capsys):
     from auto_agents.cli import main
-    from test_engine_child_recovery import configure_local_writer, parent_workflow, REAL_PROVIDER_CALL
+    from workflow_support import configure_local_writer, parent_workflow, REAL_PROVIDER_CALL
     root, child = project(tmp_path)
     exclude = root / '.git/info/exclude'
     exclude.write_text(exclude.read_text() + '\n.env\n.data/\n')
@@ -224,7 +212,7 @@ def test_cli_acceptance_uses_completed_child_and_preserves_stopped_run(tmp_path,
             reply = json.dumps({'approved': True, 'reason': 'The observation establishes the existing goal'})
         return AgentResult(True, [], request.output_path, summary=reply)
     monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
-    assert main(['collab', '--project', str(root), '--session', 'parent', '--auto-approve', '--no-health-watch']) == 0
+    assert main(['collab', '--project', str(root), '--session', 'parent', '--auto-approve', '--no-supervisor']) == 0
     assert calls == ['fix', 'collab', 'acceptance_execute', 'acceptance_review']
     assert load_session_state(root, child.session_id).current_attempt == 1
     assert load_session_state(root, 'parent').status == 'completed'
@@ -270,13 +258,13 @@ def test_blocked_acceptance_resume_diagnoses_before_retry_and_retains_evidence(t
     monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
     argv = (['collab', '--session', state.session_id, '--auto-approve'] if entrypoint == 'session' else
             ['resume', '--workflow', first.workflow_id])
-    assert main([*argv, '--project', str(root), '--no-health-watch']) == 0
+    assert main([*argv, '--project', str(root), '--no-supervisor']) == 0
     result = load_session_state(root, state.session_id)
     assert result.status == 'completed'
     assert calls == ['acceptance_execute', 'collab', 'collab', 'acceptance_execute', 'acceptance_review']
     assert (prior / 'observation.txt').read_bytes() == prior_bytes
     assert {p: (root / p).read_bytes() for p in protected} == protected
-    assert main([*argv, '--project', str(root), '--no-health-watch']) == 0
+    assert main([*argv, '--project', str(root), '--no-supervisor']) == 0
     assert len(calls) == 5
 
 
@@ -311,7 +299,7 @@ def test_acceptance_recovery_cannot_replace_evidence_review_with_completion_mark
 
 def test_blocked_acceptance_routes_fix_and_rechecks_delivered_candidate_without_restart(tmp_path, monkeypatch):
     from auto_agents.cli import main
-    from test_engine_child_recovery import configure_local_writer, REAL_PROVIDER_CALL
+    from workflow_support import configure_local_writer, REAL_PROVIDER_CALL
 
     root, state, calls, protected = setup_acceptance(tmp_path, monkeypatch)
     child = load_session_state(root, 'owned-child')
@@ -368,7 +356,7 @@ def test_blocked_acceptance_routes_fix_and_rechecks_delivered_candidate_without_
         return AgentResult(True, [], request.output_path, summary=reply)
     monkeypatch.setattr(Orchestrator, '_call_with_failover', provider)
     monkeypatch.setattr(Orchestrator, '_prompt_user', lambda *a, **kw: pytest.fail('unexpected approval'))
-    argv = ['collab', '--project', str(root), '--session', state.session_id, '--auto-approve', '--no-health-watch']
+    argv = ['collab', '--project', str(root), '--session', state.session_id, '--auto-approve', '--no-supervisor']
     assert main(argv) == 0
     result = load_session_state(root, state.session_id)
     assert result.status == 'completed'

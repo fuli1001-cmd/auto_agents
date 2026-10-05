@@ -32,7 +32,7 @@ from .models import (
     VerificationStep,
 )
 from .process_supervision import run_supervised_shell_command
-from .repair_client import gate_boundary
+from .supervision_api import gate_boundary
 
 
 _PYTEST_SHORT_SUMMARY = re.compile(

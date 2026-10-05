@@ -16,8 +16,7 @@ from test_session_verification_ownership import project
 
 @pytest.mark.parametrize('mode', ['fresh', 'fresh_new_file', 'fresh_new_file_target', 'resume',
                                   'collection_fault', 'resume_collection_fault'])
-@pytest.mark.parametrize('managed', [False, True])
-def test_candidate_selection_failure_has_durable_feedback_and_preserves_budget(tmp_path, monkeypatch, mode, managed):
+def test_candidate_selection_failure_has_durable_feedback_and_preserves_budget(tmp_path, monkeypatch, mode):
     root, state = project(tmp_path)
     new_file = mode in {'fresh_new_file', 'fresh_new_file_target'}
     required = ('tests/test_planned.py' if mode == 'fresh_new_file_target' else
@@ -33,9 +32,6 @@ def test_candidate_selection_failure_has_durable_feedback_and_preserves_budget(t
         'reproduction': ['Read the existing value'], 'decision': 'fix',
         'verification_scope': {'mode': 'focused_fix'},
         'verification_command': state.fix_verify_command})
-    if managed:
-        from test_recovery_native import activate
-        activate(root,tmp_path/'kernel-control',monkeypatch)
     calls = []
     collection_fault = mode.endswith('collection_fault')
     def writer(request):
@@ -59,18 +55,7 @@ def test_candidate_selection_failure_has_durable_feedback_and_preserves_budget(t
                            summary=reply, stdout=reply, returncode=0)
     def resume():
         orch = Orchestrator(root, user_input_fn=lambda *_args, **_kwargs: 'y')
-        if managed:
-            def local(self,request):
-                if request.purpose != 'review': return writer(request)
-                props = request.response_schema['properties']['change_coverage']['items']['properties']
-                checks = props['requirement']['enum'][:-1]
-                text = json.dumps({'decision':'APPROVE','findings':[],
-                    'coverage':[{'requirement':check,'nodes':[required]} for check in checks],
-                    'change_coverage':[{'change':key,'requirement':checks[0],'reason':'Required regression',
-                                        'evidence':required} for key in props['change'].get('enum',[])]})
-                return AgentResult(True,['independent-fixture-reviewer'],request.output_path,summary=text)
-            monkeypatch.setattr(Orchestrator,'_call_with_failover_owned',local)
-        else: monkeypatch.setattr(orch, '_call_with_failover', writer)
+        monkeypatch.setattr(orch, '_call_with_failover', writer)
         return Session(orch, mode='fix', auto_approve=True).resume(state.session_id)
     if mode.startswith('resume'):
         from auto_agents import session_candidate

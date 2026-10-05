@@ -21,7 +21,7 @@ import time
 
 from .gate_result_cache import GateResultCache
 from .models import CommandResult
-from .repair_control import digest, private_directory, atomic_json
+from .local_io import digest, private_directory, atomic_json
 
 LEDGER_VERSION = 3
 

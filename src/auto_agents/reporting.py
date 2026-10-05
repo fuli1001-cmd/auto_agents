@@ -1242,7 +1242,7 @@ class Reporter:
     @_synchronized
     def repair_update(self, job: dict, subscriber: dict) -> None:
         """Refresh one live action from supervisor observations, never its leases."""
-        from .repair_display import observation
+        from .maintenance_display import observation
         owner = self.parent or self
         owner.ensure_bound()
         from .workflow_display import repair_problem, repair_topic

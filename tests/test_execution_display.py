@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from auto_agents.models import CommandResult, GateResult, RunState, TaskSpec
-from auto_agents.repair_display import observation as repair_observation
+from auto_agents.maintenance_display import observation as repair_observation
 from auto_agents.reporting import GateObservation, Reporter
 
 
@@ -436,37 +436,8 @@ def test_repair_plain_progress_keeps_one_action_and_detailed_control_stays_in_ev
     assert '最近输出' not in frame(report) and '1/3' not in frame(report)
 
 
-def test_resumed_command_output_is_relayed_once_without_rewriting_user_log(report, tmp_path):
-    from auto_agents.repair_client import _ResumeOutputRelay
-
-    relay = _ResumeOutputRelay()
-    path = tmp_path / 'resume.log'
-    line = '[17:54:09] [实现]：7/19 继续验证'
-    encoded = (line + '\n').encode()
-    relay.drain(path, report)
-    path.write_bytes(encoded[:25])
-    relay.drain(path, report)
-    assert report.presenter.stream.getvalue() == ''
-    with path.open('ab') as output:
-        output.write(encoded[25:])
-    relay.drain(path, report)
-    relay.drain(path, report)
-    assert report.presenter.stream.getvalue().splitlines() == [line]
-    assert line not in history(report)
-    with path.open('ab') as output:
-        output.write(b'last line without newline')
-    relay.drain(path, report, final=True)
-    assert report.presenter.stream.getvalue().splitlines()[-1] == 'last line without newline'
 
 
-def test_resumed_command_output_uses_live_presenter(report, screen, tmp_path):
-    from auto_agents.repair_client import _ResumeOutputRelay
-
-    path = tmp_path / 'resume.log'
-    path.write_text('[17:54:09] [实现]：7/19 继续验证\n')
-    _ResumeOutputRelay().drain(path, report)
-    assert screen.history == ['[17:54:09] [实现]：7/19 继续验证']
-    assert report.presenter.stream.getvalue() == ''
 
 
 def test_repair_diagnosis_uses_actual_provider_output(report, screen, monkeypatch):
@@ -494,23 +465,6 @@ def test_repair_short_actions_between_polls_are_not_lost(report):
         '修复中', '检查测试完整性', '检查任务恢复', '验证']
 
 
-def test_repair_display_can_resume_old_worker_and_keep_health_state_unchanged(report, tmp_path):
-    from test_repair_control import registration, failure
-    from auto_agents.repair_control import Store
-    store = Store(tmp_path / 'control')
-    subscriber = store.register(registration(tmp_path / 'project'))
-    identity = store.submit(subscriber, failure(tmp_path / 'project'))
-    store.transition(identity, 'repairing')
-    store.event(identity, 'phase_started', {'phase': 'implement'})
-    # Older retained workers supply item events rather than agent_output.
-    store.event(identity, 'agent_progress', {'role': 'implement', 'event': 'item/completed'})
-    report.repair_update(store.job(identity, include_progress=True), {'state': 'waiting'})
-    assert '修复中 | 最近输出' in frame(report)
-    stamp = report.display.output_times['']
-    store.event(identity, 'agent_progress', {'role': 'implement', 'event': 'thread/status/changed'})
-    report.repair_update(store.job(identity, include_progress=True), {'state': 'waiting'})
-    assert abs(report.display.output_times[''] - stamp) < .1
-    assert not (report.project_root / '.auto-agents/state/run_state.json').exists()
 
 
 def test_repair_english_and_confirmed_handoff_finalize_without_stale_checks(report, screen):
@@ -569,36 +523,6 @@ def test_terminated_worker_does_not_leave_a_live_action(report, tmp_path):
         worker.close()
 
 
-def test_repair_retries_and_terminal_failure_survive_one_poll(report, tmp_path):
-    from test_repair_control import registration, failure
-    from auto_agents.repair_control import Store
-    store = Store(tmp_path / 'control')
-    subscriber = store.register(registration(tmp_path / 'project'))
-    identity = store.submit(subscriber, failure(tmp_path / 'project'))
-    store.transition(identity, 'repairing')
-    store.event(identity, 'phase_started', {'phase': 'implement', 'attempt': 0})
-    report.repair_update(store.job(identity, include_progress=True), {'state': 'waiting'})
-    finding = {'requirement': 'internal', 'reason': 'private verbose review',
-               'summary_zh': '原任务恢复证据不足', 'summary_en': 'Task recovery evidence is incomplete'}
-    store.event(identity, 'acceptance_failed', {'attempt': 1, 'failures': [finding]})
-    store.event(identity, 'phase_started', {'phase': 'plan', 'attempt': 1, 'replans': 1})
-    store.event(identity, 'phase_started', {'phase': 'implement', 'attempt': 1, 'correcting': True})
-    store.event(identity, 'acceptance_failed', {'attempt': 2, 'failures': [finding]})
-    store.transition(identity, 'blocked', {'error': 'repair made no verified progress after its bounded rediagnosis'})
-    job = store.job(identity, include_progress=True)
-    report.repair_update(job, {'state': 'blocked'})
-    value = history(report)
-    expected = ['第1轮 · 修复中', '第1轮 · 验收未通过：原任务恢复证据不足',
-                '重新规划：调整修复方案', '第2轮 · 继续修复上次检查发现的问题',
-                '第2轮 · 验收未通过：原任务恢复证据不足', '连续修正未取得新的验证进展']
-    positions = [value.index(label) for label in expected]
-    assert positions == sorted(positions)
-    assert '剩余：原任务恢复证据不足' in value
-    assert '累计2轮' in value
-    assert 'private verbose review' not in value
-    report.repair_update(job, {'state': 'blocked'})
-    assert history(report) == value
-    assert frame(report) == ''
 
 
 def test_repair_first_poll_marks_history_and_keeps_current_counts(report):
@@ -615,7 +539,7 @@ def test_repair_first_poll_marks_history_and_keeps_current_counts(report):
 
 
 def test_repair_summary_is_bounded_safe_and_supports_legacy_events():
-    from auto_agents.repair_display import failure_summary
+    from auto_agents.maintenance_display import failure_summary
     assert failure_summary([{'unit': 'original-boundary'}]) == '原任务恢复检查未通过'
     assert failure_summary([{'requirement': 'old', 'reason': 'long private text'}]) == '审查发现问题'
     assert failure_summary([{'requirement': 'x', 'summary_zh': 'password=secret /private/path'}]) == '审查发现问题'

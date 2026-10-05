@@ -1,13 +1,13 @@
 import pytest
+import json
+import tempfile
+from pathlib import Path
 
 
 @pytest.fixture(autouse=True)
-def isolate_repair_control(monkeypatch):
-    """Unit tests never enroll real workflows in the installation daemon.
-
-    Control-plane tests explicitly opt in with private state and local remotes.
-    """
-    monkeypatch.setenv("AUTO_AGENTS_REPAIR_CONTROL_DISABLED", "1")
+def isolate_optional_supervision(monkeypatch):
+    """Tests use explicit private watcher instances instead of operator state."""
+    monkeypatch.setenv("AUTO_AGENTS_NO_SUPERVISOR", "1")
 
 
 @pytest.fixture(autouse=True)
@@ -26,8 +26,14 @@ def isolate_verification_state(tmp_path, monkeypatch):
     finally:
         artifact_runtime.release_owned()
         artifact_runtime._context.reset(token)
-        # Real Docker integration tests must not outlive their private registry.
-        # Only this test's positively owned, unpinned images are eligible.
-        from auto_agents.repair_v2 import images
-        images.release_process()
-        images.maintain(keep=0, age_days=0, registry_root=tmp_path / 'storage-state/v2-images')
+
+
+@pytest.fixture(autouse=True)
+def isolate_short_verification_runtime(monkeypatch):
+    """Fixed fixture job IDs must never collide with operator /tmp runtimes."""
+    from auto_agents.verification_input_trace import file_identity
+    with tempfile.TemporaryDirectory(prefix='aagt-',dir='/tmp') as directory:
+        monkeypatch.setenv('AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT', directory)
+        monkeypatch.setenv('AUTO_AGENTS_VERIFICATION_RUNTIME_ID',
+                           json.dumps(file_identity(Path(directory).stat())))
+        yield

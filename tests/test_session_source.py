@@ -9,7 +9,7 @@ from auto_agents.git_ops import head_ref
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.session import Session
-from test_engine_child_recovery import ObservationBoundary, parent_workflow
+from workflow_support import ObservationBoundary, parent_workflow
 from test_session_verification_ownership import project
 
 

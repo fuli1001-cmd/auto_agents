@@ -39,7 +39,7 @@ def test_collab_consumed_delivery_preserves_legacy_config_without_verification_b
     from auto_agents.orchestrator import Orchestrator
     from auto_agents.run_lock import ProjectRunLock, require_project_run_lock
     from auto_agents.session import Session
-    from test_engine_child_recovery import (configure_local_writer, parent_workflow,
+    from workflow_support import (configure_local_writer, parent_workflow,
                                             ObservationBoundary, REAL_PROVIDER_CALL)
 
     root, child = project(tmp_path)

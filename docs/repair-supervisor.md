@@ -1,367 +1,161 @@
-# Independent repair control
+# Optional external maintenance
 
-Eligible engine failures in `run`, `fix`, `collab`, and workflow resume are now
-handed to a user-local supervisor. The foreground becomes a waiting relay;
-it no longer generates candidates or owns the recovered business execution.
-The existing sidecar remains an observer and does not acquire publishing rights.
+`auto-agents` owns business execution. `auto-agents-watch` is an independently
+installed package in `supervisor/`. It starts a business process and uses JSON
+commands and observations; it never imports the business engine. Neither package
+requires the other's database to start.
 
-The supervisor uses an immutable bootstrap and a committed implementation
-worktree, Unix-domain IPC with descriptor transfer, and a private SQLite task
-store. The project lock remains held across quiescence and process replacement.
-The resumed CLI loads a verified SHA in a fresh interpreter, retaining the
-original command, workflow/session, provider and approval arguments.
+## Installation and invocation
 
-Verification and replay subprocesses use the installed Codex CLI's local sandbox
-command (no model/API call). The permission profile makes the live target and
-other filesystem paths read-only, allowing writes only to the verification
-workspace and a private temporary directory. A private Linux network namespace
-contains loopback test services; verification receives a credential-free
-environment, private HOME and private `/tmp`. Nested sandbox checks retain the
-outer isolation and use Landlock to narrow their own write roots. Linux/WSL
-hosts need `unshare`, `mount`, `ip`, and Landlock ABI 3 or newer in addition to
-the local Codex sandbox command. The sandbox is probed before generation; an unavailable or
-incompatible host fails closed. This follows the official
-[Codex permissions](https://learn.chatgpt.com/docs/permissions) model; it is
-independent of which provider generates the repair.
+```bash
+python -m pip install .
+python -m pip install ./supervisor
 
-## Operator configuration and commands
-
-The first registration pins the engine installation's explicitly tracked Git
-remote and branch. Operator configuration and jobs live under
-`$XDG_STATE_HOME/auto-agents/repair-control` (default
-`~/.local/state/auto-agents/repair-control`). `AUTO_AGENTS_REPAIR_CONTROL_ROOT`
-can select another private directory. Each engine identity has `operator.json`
-with `remote`, `ref`, `python`, and `publish`. These are operator settings, not
-project/model-controlled route fields. Embedded HTTP Git credentials are refused;
-use the configured credential helper or SSH agent.
-
-This directory is persistent state, not a temporary workspace. Dependency venvs
-under `environments/`, Git worktrees under `runtimes/`, the repository cache and
-job evidence survive process exits and restarts. New producer invocations register
-these resources with the storage lifecycle service. Unused registered environments
-can expire, while active runtimes and recovery/publication evidence remain protected;
-unregistered legacy paths are retained. Each venv is created with the configured Python
-and keyed by `pyproject.toml` contents and that interpreter's path. A successful
-`ready.json` receipt allows reuse. Repair dependencies are installed into this
-venv rather than the launching Conda environment so preparing a candidate does
-not replace the running engine or change its dependencies; the venv does not
-inherit the launching environment's site-packages.
-
-On startup, the foreground compares the running controller's committed revision
-with the installation HEAD, even when their IPC protocol is identical. An idle
-older controller is replaced without resetting jobs or recovery evidence. Active
-work defers the update with an explicit error. Repair progress and stop reasons
-use the normal user-event renderer and are saved in the invocation's user log.
-
-Before self-repair, the engine installation must be on a clean local branch.
-Staged, unstaged and nonignored untracked files stop admission with a request to
-commit first; nothing is automatically stashed, committed or discarded. The worker
-fetches the configured remote and compares Git ancestry. Equal/local-ahead histories
-use the local commit without requiring a push. Remote-ahead histories use the remote
-commit. Divergent histories merge in an isolated directory; a conflict leaves that
-directory available for resolution and a commit, while the installation stays intact.
-A successful refresh is required at startup; a stale cache cannot establish the latest
-known version. A conflicting branch upstream configuration also stops synchronization.
-
-After runtime compatibility checks, the still-clean installation branch is fast-forwarded
-to the selected commit. The worker runs an independent snapshot of that same commit.
-`source-selection.json` binds the source branch, local/remote revisions and selected
-revision across worker replacement. It appears in `repair status --job JOB`, together
-with `source-delivery.json` after delivery. Switching branches, advancing HEAD or making
-uncommitted edits while an update is prepared prevents overwriting the operator's work.
-The existing behavioral proof and recovery gates remain mandatory.
-
-The foreground shows an eight-character job ID and explains the problem once,
-using the current workflow's engine request or approved diagnosis. Without an
-approved diagnosis it labels the error as a symptom under investigation. Later
-lines show only progress in plain Chinese; repeated polls do not repeat messages.
-The full job log directory appears on first observation and again if repair stops.
-Validation and resume failures retain a sanitized, generation-specific reason
-with the affected subscriber, including the exit code when a resumed process
-provides no explanation. A passed recovery check means the original workflow is
-continuing, not that the entire workflow has finished.
-
-Package installation honors pip configuration and the invocation environment.
-If a configured mirror is unavailable, an operator can select an index for one
-invocation with `PIP_INDEX_URL=https://pypi.org/simple auto-agents ...`; this does
-not modify the global pip configuration or silently introduce an index fallback.
-
-Commands and current retention behavior are documented in
-[Storage maintenance](storage-maintenance.md), with the cross-stage design in
-[Artifact cleanup design](artifact-cleanup-design.md).
-
-Environment preparation saves each command's sanitized `stdout.txt`, `stderr.txt`
-and `command.json` under `jobs/JOB/environment-setup/ATTEMPT/STEP/`. Direct setup
-calls without a job use `environment-setup/ATTEMPT/STEP/` under the controller root.
-This covers venv creation, pip installation, dependency listing and import checks,
-including captured partial output on timeout. A failed worker result includes
-`environment_diagnostics` with these paths, and its error message links to the
-command metadata. If persistence fails, `environment_diagnostics_error` explains
-the logging failure while retaining the original setup failure.
-
-Engine proof prerequisites use a shared software-failure classifier, covering
-executables, Python imports, Node packages and shared libraries. Trusted pytest
-receipts distinguish subprocess launch failures from missing input files, while
-collection and non-pytest errors use the same classification boundary. Missing
-repository modules/scripts and ordinary assertions remain candidate failures.
-
-Preparation comes from the bundled recipe catalog or operator-owned dependency
-declarations, rather than software-name branches in the repair loop. Supported
-recipes install hash-locked Python wheels, install locked npm toolchains without
-lifecycle scripts, or snapshot a supplied executable/library with a declared
-SHA-256. Undeclared or unsuccessful prerequisites return a structured environment
-blocker and preserve the candidate. A trusted verification worker also signals
-the matching owner/generation so a running code-generation call stops instead of
-continuing to rewrite code around an unavailable tool.
-
-After preparation, the same candidate and required checks run again. Tooling is
-read-only inside the private HOME/network/filesystem sandbox and participates in
-proof identity. Concurrent failures from an older environment retry the newer
-environment without duplicating setup; failed setup cannot repeat in the same
-repair generation. See [Verification dependencies](verification-dependencies.md)
-for declarations and recovery behavior.
-
-The foreground relays the current candidate, phase and elapsed minutes while
-the top-level job remains `repairing`, including dependency preparation and
-contract/design work. It also retains the previous candidate's failure reason.
-A new generation clears the displayed phase history. Native candidate
-continuations separate stable scope/authorization/design from changing failure
-evidence. Compatible retries bound historical summaries but carry complete current
-review findings, including reasons, counterexamples, required tests and evidence.
-Candidate regressions remain actionable even though they do not become new root
-contract obligations. Both full prompts and native continuations receive this feedback.
-A changed contract, component, settings or workspace still requires a fresh full prompt.
-
-Candidate lineage follows the actual retained commit, which can differ from the
-highest-scoring search candidate. Feedback is checked against the experiment,
-candidate and commit before use. If cancellation interrupted result registration,
-the next attempt can recover the previous review through Git ancestry or a scoped
-candidate ref and matching checkpoint diff. That historical review does not grant
-verification proof to the unreviewed commit. Resolved findings remain visible as
-constraints to preserve, and unrelated review observations remain outside repair scope.
-
-Cancelling a repair still cancels its workflow registration. Running the original
-command again creates a newly authorized job. If every request input except the
-engine base revision matches, that job can import a quiescent cancelled job's
-retained code and review history. It preserves committed, staged, unstaged and
-untracked candidate changes, then integrates the current trusted engine revision.
-The cancelled job and its subscribers remain cancelled; the new job must earn
-fresh verification and recovery approval. Native provider sessions and full-suite
-checkpoints are not imported. Active or mismatched jobs and a new job that already
-started an attempt are never replaced. `prior-repair-import.json` records the source,
-and foreground progress explicitly confirms that the previous candidate was retained.
-
-Import has a durable preparation marker and a separate completion receipt. An
-interruption before completion rolls back only the new job's partial import and
-allows retry; an interruption after completion keeps the imported code. Cleanup
-can resume after a process dies before rollback. The worker waits briefly for a
-cancelled source's processes to exit and reports a stopping blocker if they remain
-alive, instead of silently generating from an older candidate or the base.
-
-Upstream integration checks actual Git ancestry, completes any pending merge and
-commits the merged tree before recording its revision. A stale `base.json` cannot
-make an unfinished integration count as complete. Failure before semantic review
-retains the last actual review, including candidate regressions; a completed review
-can explicitly replace it. Validation milestones follow the current execution order:
-replay failure alone grants neither focused-test nor semantic-review proof, and a
-failed differential does not invalidate a separately successful boundary replay.
-
-Bounded failure excerpts preserve both the beginning and end of diagnostics, so a
-primary replay failure cannot disappear behind later passing-test output. Under
-acceleration, failed boundary replay returns the candidate immediately; the expensive
-diagnosis differential waits until the replay passes. Invalid replay evidence also
-stops later proof. No final validation requirement is removed.
-
-Output is redacted before writing: configured secret values and their URL-encoded
-forms, URL userinfo/query/fragment, secret assignments and authorization headers.
-Environment variables are not dumped. Each stream retains up to approximately
-2 MiB of its head/tail with explicit truncation metadata; files are private to the
-user. Dependency receipts also redact credential-bearing URLs, while retaining
-the dependency fingerprint. These logs live outside the disposable venv so that
-failed-environment cleanup does not remove the diagnostic evidence.
-
-```
-auto-agents repair status
-auto-agents repair status --job JOB
-auto-agents repair resume --job JOB
-auto-agents repair cancel --job JOB
-auto-agents repair retry-publish --job JOB
-auto-agents stop --project PROJECT
+auto-agents collab --project /path/to/project --provider existing-alias --session SESSION
+# Standalone execution, even when the watcher is installed:
+auto-agents collab --project /path/to/project --session SESSION --no-supervisor
+# Explicit supervision:
+auto-agents-watch run --engine /path/to/auto_agents -- auto-agents collab --project /path/to/project --session SESSION
 ```
 
-For ordinary recovery, rerun the original command with the same session, for
-example `auto-agents collab --project PROJECT --provider codex --auto-approve
---session SESSION`. There is no prerequisite `repair cancel` or `repair resume`:
-the command first continues the saved workflow using the current installation.
-If the failure is gone, no repair is submitted. If repair is still required, a
-new project-lock owner automatically retries the same blocked request using its
-existing candidate history. Changed requests retire the same workflow's old
-blocked subscriptions and receive fresh evidence; compatible stopped candidates
-are imported under the existing proof guards. Other projects and sessions are
-not cancelled. Automatic recovery within the same invocation cannot renew a
-blocked search, and starting another command does not cancel active work.
-The `repair` commands above remain available for inspection and explicit control.
+Ordinary business commands automatically start an installed watcher when
+`execution.supervision.mode` is `auto`. If it is absent, they run independently.
+Set the mode to `off` to disable automatic startup. Engine maintenance requires a
+clean engine Git branch and Docker. Business execution has no Docker requirement.
 
-The default is automatic publication to the explicitly tracked upstream after
-proof and recovery. Set `publish` to false to disable writes to that remote.
-`--autonomy off` disables enrollment; guarded mode may reuse proven remote fixes
-but cannot generate code. `--no-health-watch` affects observation, not terminal
-error recovery. `AUTO_AGENTS_REPAIR_CONTROL_DISABLED=1` retains the legacy
-in-process path for compatibility and isolated tests.
+```json
+{
+  "efforts": {"self_repair": "deep", "self_repair_review": "max"},
+  "execution": {
+    "supervision": {
+      "mode": "auto",
+      "no_progress_limit": 2,
+      "loop_repeat_limit": 3,
+      "heartbeat_timeout_seconds": 120,
+      "max_model_calls": null,
+      "max_duration_seconds": null,
+      "publish": true
+    }
+  }
+}
+```
 
-## Update, repair and recovery
+The repair writer and independent reviewer use the invocation's `--provider`, or
+`active_provider`. They use distinct native CLI sessions and the existing effort
+profile mappings. No repair-provider setting is added. The initial native CLI
+adapters cover Codex, Claude Code and Copilot CLI. Other provider kinds stop with
+an explicit unsupported-adapter message instead of substituting another account.
 
-1. Quiesce managed project children and transfer the held project lock. Freeze
-   project evidence; no engine patch is applied to the target project.
-2. Require a clean installation, fetch the trusted branch, select or merge the
-   latest local/remote histories, then safely synchronize the installation.
-   A failed refresh stops startup instead of silently selecting an older cache.
-3. Prepare an engine-specific dependency environment. A behavior differential
-   and an original-boundary replay must both pass to reuse an existing fix.
-   Collection/import/setup failure is not proof that the engine is repaired.
-4. Otherwise retain one repair workspace and provider continuation for focused
-   edits and tests. Three non-improving attempts or rejected reviews of the same
-   component enter deeper design review while continuing the same workspace.
-   Repeated resolution of old findings cannot reset the progress counter. A second
-   exhausted attempt window without accepted component/root progress returns a
-   `search_stalled` blocker with the candidates and evidence intact. Approved proofs,
-   reviews, full-suite checks and resumable validation retain their existing gates.
-5. Independently validate each subscribing project, then launch its original
-   invocation against the approved runtime. Native gate/stage/engine-route
-   receipts can confirm recovery before the whole business goal finishes.
-   Unknown boundaries conservatively require successful workflow completion.
-6. After recovery confirmation, integrate the verified commit into the installation
-   before publishing. Uncommitted changes or a switched branch defer delivery.
-   New committed local/remote work is merged and reverified in isolation first.
+The tool image is built from the selected installed CLI and engine dependencies.
+An operator can supply a prepared image with `AUTO_AGENTS_WATCH_IMAGE`; it must
+contain `python`, Git, pytest, engine dependencies and that selected CLI. Writer
+and reviewer get private copies of the selected account configuration. Offline
+verification has no account credentials or network access.
 
-When recovering cancelled jobs from older engines that abandoned their continuous
-workspace during deep search, import the latest candidate or its verified interrupted
-patch instead of the stale continuous HEAD. Resolve recorded parent refs to immutable
-commits before applying patches. A compatible approved design is retained as a plan,
-with all components pending fresh validation against the selected engine revision.
+## One maintenance loop
 
-Explicit engine routes use a separate admission path: `EngineRepairRequired`
-is an internal work request, not an exception that a model must first prove is
-an engine defect. The CLI checks the registered repository and invocation/saved
-workflow authorization, then submits directly, including when resuming a saved
-collab handoff or using `resume --workflow`. Ordinary exceptions retain their
-root-cause adjudication.
+The watcher has six states: RUNNING, REPAIRING, VERIFYING, RESTARTING, DONE and
+STOPPED. A project file lock prevents two owners from executing the business
+workflow simultaneously. Child processes inherit the lock; there is no descriptor
+transfer service, controller daemon, registration protocol or recursive repair.
 
-After fetching upstream, the worker makes one read-only acceptance-planning
-request (180-second timeout) and caches its result by route and upstream SHA.
-Every requested behavior must map to named engine tests; missing coverage must
-be supplied by a candidate, not treated as success. This unverified contract is
-not a diagnosis or an approval. Already-satisfied work requires successful tests
-without skipped checks and an isolated replay that consumes the exact original
-engine route before the next execution boundary. Candidate changes still require
-the existing differential, review and full-suite proofs. The same frozen contract
-is carried into subscriber validation and publication integration. Older cached
-workers reject the request marker rather than invoking the legacy no-diagnosis
-repair path.
+An engine exception produces a durable checkpoint. A repeated business step
+without a new verified milestone can also stop the owned process and request a
+checkpoint. Waiting for a user suspends cycle detection. Heartbeat loss and an
+operation timeout preserve the scene and stop: they do not alone prove an engine
+bug. There is no model continually interpreting workflow health.
 
-The replay receipt lives only in the copied target and is explicitly passed
-through the verification sandbox's credential-free environment. Reaching an
-unrelated provider boundary without consuming the original route is not recovery.
+Maintenance takes a private project snapshot, including settled call receipts.
+Registered native candidate repositories outside the project are copied too;
+offline execution mounts these copies at their logical paths. Only the private
+inode registration changes. Goals, source descriptors and call receipts remain
+constraints. Unregistered sources and ownership conflicts stop as state errors,
+without starting an engine repair. Offline checks do not send notifications.
+Unconfirmed external requests require reconciliation before automatic recovery.
+The original defect must reproduce before editing. The writer changes one engine
+candidate. Verification first checks the original offline resume boundary, then
+the fixed regression manifest from the admission commit. An independent reviewer
+must accept the immutable revision before delivery. Existing tests cannot be
+rewritten to approve a patch. The original goal, authorization and session limits
+remain constraints during recovery.
 
-Failures with the same fingerprint, contract, base and environment share one
-local job, including its blocked state. Changing a child ID does not reset the
-job. Each subscribing project still needs its own boundary check. There is one
-code-repair/validation/integration worker at a time per supervisor; a separate
-lightweight Git publication lane prevents an unrelated long repair from delaying
-an already-verified fast-forward push. Healthy business processes continue
-independently on their own versions.
+A correction earns progress only when its verified passing checks strictly
+extend the best previously passing set. Losing a passed check does not count as
+improvement. Two consecutive corrections without improvement stop by default.
+Unknown or unavailable verification prerequisites stop without inventing a pass.
+Counters and candidate history survive watcher restarts and repeated invocations.
+Optional total call/time limits are additional ceilings.
 
-The supervisor records worker and resumed-process identities and adopts live
-processes after restart. A foreground relay can transfer its still-held lock
-again after a control restart. A late result from an obsolete generation is not
-accepted. A user stop writes cancellation before signaling processes and prevents
-automatic restart. An unexplained business crash without a durable repair request
-is not treated as permission to repeat external side effects.
+The watcher commits accepted candidate changes locally and only fast-forwards
+an unchanged, clean engine branch. It installs an immutable revision in a private
+venv, records successful installation, updates the normal installation pointer,
+and starts a fresh business process with the original arguments. No manual
+`upgrade` step is necessary. The pointer belongs to ordinary engine installation;
+standalone execution can use it without a running watcher.
 
-Terminal subscribers release their controller registration. The foreground
-reads their durable result before attempting to register again: a finished
-subscriber exits with code 0, and a blocked or cancelled repair/subscriber exits
-with code 3. Only ongoing work needs registration recovery. Environment setup
-failure blocks the job; it does not automatically start another repair generation.
-After resolving the blocker, `repair resume --job JOB` can queue another attempt.
+## Git publication across machines
 
-Scope reviews retain their logical round and request identity before provider
-dispatch. A process death, including an out-of-space interruption, does not
-silently start a new diagnosis round. The controller first checks the retained
-request, input and admitted result bindings. Complete static dependencies and
-unchanged execution inputs permit recovery of that result; raw provider output
-does not. Incomplete or external dependencies require a fresh independent
-inspection, with the recovered result supplied only as evidence. Each interrupted
-round permits at most two additional calls, persisted across restarts.
+Publishing uses the branch's configured Git upstream and an ordinary push.
+Divergent remote history is merged in a separate copy, then verified and reviewed
+again. Content conflicts retain that copy for manual resolution. Failed merged
+validation or repeated remote advancement retains a pending publication. There
+is one additional refresh retry, no force push and no model resolving conflicts.
+Publication failure preserves accepted local code and does not block local
+business recovery.
 
-Successful scope decisions and unresolved diagnoses have separate accounting.
-Rechecking a previously completed decision does not spend another unresolved
-diagnosis slot. This does not cache opaque external inputs: those inputs still
-require independent inspection on each revalidation. Historical call totals are
-preserved. Legacy exhausted states with authentic completed scope receipts can
-enter this bounded revalidation path without deleting the experiment, candidates,
-or child session. A recheck returning `unknown` cannot repeatedly use the old
-completed decision to renew its allowance. Exhaustion reports the finding,
-revalidation reason and unresolved dependency locations in its structured result.
+```bash
+auto-agents-watch status --json
+auto-agents-watch status --job JOB --json
+auto-agents-watch resume --job JOB
+auto-agents-watch cancel --job JOB
+auto-agents-watch retry-publish --job JOB
+```
 
-Completed components have a separate revalidation path. An authentic completion
-receipt with unchanged contract and acceptance restores the existing plan in
-`verify_existing` mode. It does not repeat scope diagnosis, planning probes or
-component-plan review. The normal quick/expanded verification pipeline remains;
-one compact, read-only delta review covers changed mechanisms and any historical
-scope conclusions that need fresh inspection. Full receipts and command inventories
-remain referenced artifacts rather than repeated prompt history. A new or reopened
-related defect, changed contract, missing evidence, failed deterministic check or
-rejected delta assessment returns to the ordinary repair path. The recovered plan
-never authorizes a writer by itself, and final integration always retains full review.
+The watcher store defaults to `$XDG_STATE_HOME/auto-agents-watch` (otherwise
+`~/.local/state/auto-agents-watch`). `AUTO_AGENTS_WATCH_ROOT` overrides it. An
+unconfirmed model dispatch is retained and never automatically repeated on
+resume. Cancellation remains durable and prevents automatic restart.
 
-Execution evidence is bound separately from review configuration. A reviewer or
-planning-policy change can require a new review while retaining independently
-valid checks; execution-policy/environment changes and unproved input closures
-still require affected commands to run. Existing receipts without the separate
-binding can retain their plan, but do not infer portable execution evidence.
-After source integration, previously failed checks of a completed component run
-before another diagnosis of the old failure. Progress reports distinguish historical
-completion, current acceptance, components awaiting revalidation and reusable versus
-required check commands. Historical completion is never counted as new repair progress.
+## Business state and retirement
 
-## Publication and evidence
+Business records and call receipts live in `.auto-agents/state/business.sqlite3`.
+JSON files remain display projections; stale writes and corrupt records fail
+closed. Public commands are `business-status`, `snapshot`, `resume-check`,
+`checkpoint` and `migrate-state`. Offline resume checks are sandbox-only and stop
+before a new provider request or delivery.
 
-Local and remote commits arriving during repair are integrated in a private delivery
-worktree. Integration conflicts use
-the scoped conflict resolver; the result must pass behavior, boundary and full
-suite checks. Cached integration receipts avoid repeating successful validation
-after a network-only push failure. Before copying the verified commit into the
-installation, the source branch, HEAD and clean status are checked again. The update
-is a Git fast-forward, never a reset or forced checkout. A concurrent change defers
-delivery for another integration; it is not overwritten. All pushes are ordinary,
-non-forced pushes. Remote publication permission and a fresh remote check remain
-required for pushing. Revoked publication or a temporary remote outage does not undo
-a completed local delivery; the outbox retains the pending publication.
+```bash
+auto-agents migrate-state --project /path/to/project --check --json
+auto-agents migrate-state --project /path/to/project --json
+```
 
-Successful delivery pins the exact Git commit under `refs/auto-agents/delivered/`
-in the private repository and records its installation branch. Cancelled candidates
-remain protected until a completed successor has durably delivered their imported
-history. Pending subscribers, publication, recovery and running processes continue
-to protect worktrees. After all references are released, the existing storage policy
-can reclaim clean registered worktrees (normally after seven days). Diagnostic
-scratch cleanup remains separate; core job records and required audit evidence are
-not removed as part of worktree cleanup.
+Migration reads the old controller database and content-addressed objects,
+hydrates original business records, preserves settled/cancelled calls and unknown
+outcomes, and archives the original database, marker and referenced objects.
+It acquires both old and current project locks before switching authority. Old
+controller data is retained; stop any old maintenance process before migration.
 
-Publication retries are durable with delays of 1, 5, 15, then 60 minutes. A
-permission failure becomes `authorization_required`; fix the credentials or
-operator policy and use `retry-publish`. Publication failure does not regenerate
-the repair and does not stop a recovered project. Local-runtime and published
-commit identities remain distinct.
+The former repair command family, semantic health sidecar, internal engine-repair
+handoffs, multi-model diagnosis controller and runtime adoption protocol are
+retired. Historical incident documents describe the former implementation and
+are not operational instructions for this design.
 
-`repair status` exposes task state and publication state. Per-job logs, phase
-events, candidate/proof artifacts, frozen evidence and recovery receipts live
-under the private job directory. Environment credentials are transported in
-memory, not serialized into job records. Nothing from project diagnostics or
-operator configuration is added to the engine Git commit.
+For an unresolved **business** model call, inspect the native output first. A
+confirmed result file has `{"operation_id":"ID","result":{...AgentResult...}}`.
+Use `auto-agents reconcile-call --project PROJECT --call ID --result FILE`.
+`--confirm-cancelled` is an explicit operator confirmation that the original
+request was cancelled; it does not authorize repeating that request.
 
-The v1 controller is for Linux/WSL and one user on one host. Cross-host duplicate
-generation is possible; remote advancement is handled safely through fetch,
-integration, revalidation and normal push rejection rather than a distributed
-lease service. Installed controller code upgrades at a new controller generation,
-not through hot reload. Installing this feature does not resume stopped projects.
+For an unresolved **maintenance** CLI call, `auto-agents-watch reconcile --job JOB
+--result FILE` accepts an operator-confirmed receipt with `job_id`, `call` (the
+retained call number), and `result` containing `confirmed: true` and a boolean
+`ok`. It preserves counters and requires an explicit `resume`. Writer changes
+are verified before another implementation call; a receipt grants no code
+approval. Cancellation stops only positively identified processes/containers.
+
+Automatic process replacement preserves native session attempt budgets. A later
+fault can start another isolated candidate only after new verified business
+progress. A repeated fault, or a changed symptom without such progress, stops
+with the new evidence retained. Previous candidates and publication conflicts
+remain separate. `quiesce` is a lock-owned public engine command for stopping
+registered business children; it does not terminate the watcher owner.

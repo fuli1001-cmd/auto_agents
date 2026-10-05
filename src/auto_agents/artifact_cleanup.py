@@ -52,7 +52,7 @@ def clean(*, store=None, scope=None, seconds=None, progress=None):
 def _clean(store, scope, started, deadline, progress):
     from .artifact_cache import maintain_caches
     from .artifact_legacy import repair_roots, clean_legacy
-    from .repair_v2.store import atomic_json
+    from .proof_support.store import atomic_json
     results, reasons = Counter(), Counter()
     total, retained, measured = 0, 0, True
     name = 'cleanup-' + uuid4().hex + '.jsonl'
@@ -71,12 +71,8 @@ def _clean(store, scope, started, deadline, progress):
             if progress: progress(dict(results), total)
 
         maintain_caches(store, min(deadline, time.monotonic() + 5), scope)
-        from .storage_admission import windows_backing_roots
-        try:
-            backing_pressure = any(shutil.disk_usage(path).free < shutil.disk_usage(path).total * .1
-                                   for path in windows_backing_roots())
-        except RuntimeError:
-            backing_pressure = False
+        # Cleanup is local. WSL capacity probes belong to admission, not deletion.
+        backing_pressure = False
         # Capture a finite inventory: concurrent producers need not finish for
         # this command to complete. Automatic rounds rotate by last scan time.
         rows = [r for r in store.rows(scope, oldest=True) if r['id'] != report_id]
@@ -98,19 +94,6 @@ def _clean(store, scope, started, deadline, progress):
                 record(item)
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
                 record({'path': row['path'], 'result': 'error', 'reason': str(error), 'freed_bytes': 0})
-        from .recovery.store import KernelStore
-        from .recovery.runtime_lifecycle import maintain as maintain_runtimes
-        for root in roots:
-            if time.monotonic() >= deadline: complete = False; break
-            if KernelStore(root, readonly=True).meta('active_runtime'):
-                for item in maintain_runtimes(KernelStore(root), deadline=deadline): record(item)
-                if KernelStore(root, readonly=True).meta('kernel_storage_format') == 2 and time.monotonic() < deadline:
-                    from .recovery.evidence_maintenance import collect_objects
-                    try:
-                        item = collect_objects(KernelStore(root), deadline=min(deadline, time.monotonic() + phase_seconds))
-                        record({**item,'kind':'kernel_objects','result':'collected' if item['ok'] else 'deferred'})
-                    except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
-                        record({'result':'deferred','reason':'kernel_object_collection: '+str(error),'freed_bytes':0})
         complete = clean_legacy(store, roots, min(deadline, time.monotonic() + phase_seconds), record, scope) and complete
         from .artifact_compaction import compact_repair_copies
         if roots and time.monotonic() < deadline:
@@ -134,62 +117,5 @@ def _clean(store, scope, started, deadline, progress):
 
 
 def _clean_docker(store, roots, scope, deadline, record):
-    # Only an existing, local Docker connection is eligible. Never contact a
-    # remote worker/daemon or create an image just to perform cleanup.
-    default = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'auto-agents/storage'
-    discover_origins = store.root == default.absolute()
-    if (scope is not None or not (roots or (store.root / 'v2-images').is_dir() or discover_origins)
-            or not shutil.which('docker')): return
-    from .repair_v2.docker import run
-    host = os.environ.get('DOCKER_HOST', '') if not os.environ.get('DOCKER_CONTEXT') else ''
-    if not host:
-        code, output = run(['docker', 'context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'], timeout=5)
-        if code:
-            record({'result': 'deferred', 'reason': 'docker_context_unavailable', 'freed_bytes': 0}); return
-        try: host = json.loads(output)
-        except ValueError: host = ''
-    if not isinstance(host, str) or not host.startswith(('unix:///', 'npipe:////./pipe/')):
-        record({'result': 'retained', 'reason': 'nonlocal_or_unknown_docker_endpoint', 'freed_bytes': 0}); return
-    code, ids = run(['docker', 'ps', '-aq'], timeout=5)
-    if code:
-        record({'result': 'deferred', 'reason': 'docker_unavailable', 'freed_bytes': 0}); return
-    def active_mounts(ids):
-        if not ids.strip(): return []
-        code, text = run(['docker', 'inspect', *ids.split()], timeout=10)
-        if code:
-            raise RuntimeError('docker_mounts_unavailable')
-        return [Path(m['Source']).resolve() for c in json.loads(text) for m in c.get('Mounts', []) if m.get('Source')]
-    mounts = active_mounts(ids)
-    from .repair_v2.cleanup import reap_containers
-    from .repair_v2.storage import recover_executions
-    from .artifact_legacy import enclosing_protection
     for root in roots:
-        if time.monotonic() >= deadline: break
-        verification = root / 'v2-verification'
-        if verification.is_dir() and not verification.is_symlink():
-            protection = enclosing_protection(store, verification)
-            if protection:
-                record({'result': 'retained', 'path': str(verification), 'reason': protection, 'freed_bytes': 0})
-            else:
-                removed = reap_containers(verification, kind='verification')
-                for container in removed:
-                    record({'result': 'deleted', 'kind': 'container', 'id': container, 'freed_bytes': 0})
-                if removed:
-                    code, current = run(['docker', 'ps', '-aq'], timeout=5)
-                    if code: raise RuntimeError('docker_mounts_unavailable_after_reaping')
-                    mounts = active_mounts(current)
-                recover_executions(verification, mounts, deadline=deadline, record=record)
-        for transaction in (root / 'v2-transactions').glob('*'):
-            if time.monotonic() >= deadline: break
-            if transaction.is_symlink() or not transaction.is_dir(): continue
-            provider = transaction / 'provider-state'
-            if provider.is_dir() and not provider.is_symlink() and not enclosing_protection(store, provider):
-                for container in reap_containers(provider, kind='provider'):
-                    record({'result': 'deleted', 'kind': 'container', 'id': container, 'freed_bytes': 0})
-    if scope is None:
-        from .repair_v2 import images
-        images.maintain(deadline=deadline, registry_root=store.root / 'v2-images', record=record)
-        # Only default maintenance visits positively identified owned registries.
-        # A missing registry is collectible only for explicit disposable tests.
-        if discover_origins:
-            images.reap_ephemeral(deadline=deadline, record=record)
+        record({"path":str(root),"result":"retained","reason":"legacy_archive","freed_bytes":0})

@@ -101,42 +101,26 @@ class WorkflowStoreTests(unittest.TestCase):
                 self.assertEqual(rebuilt.event_sequence, 3)
                 self.assertEqual(rebuilt.active_frame, child.active_frame)
 
-    def test_event_index_is_rebuilt_from_authoritative_hash_chain(self) -> None:
+    def test_display_journal_loss_does_not_hide_authoritative_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "demo"
-            store = WorkflowStore(root)
-            snapshot = store.create_root(WorkflowRef("collab", "session-a"))
-            store.append_event(snapshot, "diagnostic_progress", details={"step": 1})
-            index = store.event_index_path(snapshot.workflow_id)
-            self.assertTrue(index.is_file())
-            with sqlite3.connect(index) as connection:
-                connection.execute(
-                    "UPDATE workflow_events SET payload = ? WHERE sequence = 1",
-                    ("{}",),
-                )
+            root=Path(tmp)/"demo"
+            store=WorkflowStore(root)
+            snapshot=store.create_root(WorkflowRef("collab","session-a"))
+            store.append_event(snapshot,"diagnostic_progress",details={"step":1})
+            for path in (store.workflow_root(snapshot.workflow_id)/"events").glob("*.json"):
+                path.unlink()
+            self.assertEqual([item["sequence"] for item in store.events(snapshot.workflow_id)],[1,2])
 
-            events = store.events(snapshot.workflow_id)
-
-            self.assertEqual([item["sequence"] for item in events], [1, 2])
-            with sqlite3.connect(index) as connection:
-                restored = connection.execute(
-                    "SELECT payload FROM workflow_events WHERE sequence = 1"
-                ).fetchone()
-            self.assertIn("workflow_started", str(restored[0]))
-
-    def test_event_index_never_hides_authoritative_journal_tampering(self) -> None:
+    def test_authoritative_journal_tampering_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "demo"
-            store = WorkflowStore(root)
-            snapshot = store.create_root(WorkflowRef("collab", "session-a"))
-            event_path = sorted(
-                (store.workflow_root(snapshot.workflow_id) / "events").glob("*.json")
-            )[0]
-            payload = json.loads(event_path.read_text(encoding="utf-8"))
-            payload["kind"] = "tampered"
-            event_path.write_text(json.dumps(payload), encoding="utf-8")
-
-            with self.assertRaisesRegex(RuntimeError, "hash chain is invalid"):
+            root=Path(tmp)/"demo"
+            store=WorkflowStore(root)
+            snapshot=store.create_root(WorkflowRef("collab","session-a"))
+            from auto_agents.business_state import BusinessStore
+            with BusinessStore(root).connect() as db:
+                db.execute("UPDATE records SET payload='{}' WHERE path LIKE ?",
+                           ('workflows/'+snapshot.workflow_id+'/events/%',))
+            with self.assertRaisesRegex(RuntimeError,"hash chain is invalid"):
                 store.events(snapshot.workflow_id)
 
     def test_iteration_spec_is_immutable_idempotent_and_has_commit_trailer(self) -> None:
@@ -251,7 +235,7 @@ class WorkflowStoreTests(unittest.TestCase):
                         str(root),
                         "--workflow",
                         snapshot.workflow_id,
-                        "--no-health-watch",
+                        "--no-supervisor",
                     ]
                 )
             self.assertEqual(exit_code, 0)
@@ -850,225 +834,8 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "completed")
 
-    def test_engine_recovery_refuses_rollback_without_child_ownership(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = _make_project(tmp)
-            write_text(root / "app.py", "value = 1\n")
-            _commit_baseline(root)
-            orchestrator = Orchestrator(root)
-            coordinator = WorkflowCoordinator(orchestrator)
-            snapshot = coordinator.store.create_root(
-                WorkflowRef("collab", "parent-collab")
-            )
-            handoff = coordinator.store.prepare_handoff(
-                snapshot,
-                parent=WorkflowRef("collab", "parent-collab"),
-                target="fix",
-                goal="Generate a video",
-                reason="repair installed engine blocker",
-                payload={"head_before": "baseline"},
-            )
-            coordinator._ensure_handoff_checkpoint(snapshot, handoff)
-            coordinator.store.bind_child(
-                snapshot,
-                handoff,
-                WorkflowRef("fix", "bad-child"),
-            )
-            write_text(root / "app.py", "invalid child mutation\n")
-            parent = SessionState(
-                session_id="parent-collab",
-                mode="collab",
-                status="waiting_child",
-                workflow_id=snapshot.workflow_id,
-                active_handoff_id=handoff.handoff_id,
-            )
 
-            with patch.object(
-                orchestrator,
-                "_prepare_installed_self_repair_resume",
-                return_value=True,
-            ):
-                returned = coordinator._drive_handoff(parent, parent, snapshot)
 
-            self.assertIsNotNone(returned)
-            self.assertEqual((root / "app.py").read_text(), "invalid child mutation\n")
-            recorded = coordinator.store.load_handoff(handoff.handoff_id)
-            self.assertEqual(recorded.status, "blocked")
-            self.assertEqual(
-                recorded.result["resolution"],
-                "verification_ownership",
-            )
-            self.assertEqual(recorded.result["rolled_back_paths"], [])
-
-    def test_run_route_finishes_recovered_engine_run_before_new_iteration(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = _make_project(tmp)
-            _commit_baseline(root)
-            old_spec = root / "old-spec.md"
-            write_text(old_spec, "# Existing iteration\n")
-            current = load_run_state(root)
-            old_run_id = current.run_id
-            current.status = "blocked"
-            current.current_stage = "readme"
-            current.resume_context = {"spec_file": str(old_spec)}
-            current.active_blocker = {
-                "owner": "auto_agents",
-                "category": "engine_boundary",
-                "status": "blocked",
-                "self_repair_commit": "repair-commit",
-                "self_repair_failure": {"verification": "1 passed; exit=0"},
-                "root_cause_diagnosis": {
-                    "final": {"expected_postconditions": ["run can resume"]}
-                },
-            }
-            save_run_state(root, current)
-            orchestrator = Orchestrator(root)
-            coordinator = WorkflowCoordinator(orchestrator, auto_approve=True)
-            snapshot = coordinator.store.create_root(
-                WorkflowRef("collab", "parent-collab")
-            )
-            handoff = coordinator.store.prepare_handoff(
-                snapshot,
-                parent=WorkflowRef("collab", "parent-collab"),
-                target="run",
-                goal="Add provider capability",
-                reason="new capability",
-                payload={
-                    "spec_seed": {
-                        "title": "Provider capability",
-                        "goal": "Add provider capability",
-                        "gap": "Capability is missing",
-                        "capability": "Generate a real video",
-                        "acceptance": ["A real video is generated"],
-                        "non_goals": [],
-                        "evidence": [],
-                        "open_decisions": [],
-                    }
-                },
-            )
-            calls = []
-
-            def fake_run(**kwargs):
-                state = load_run_state(root)
-                calls.append((state.run_id, Path(kwargs["spec_file"])))
-                state.status = "completed"
-                state.current_stage = "readme"
-                save_run_state(root, state)
-                return state
-
-            orchestrator.run = fake_run
-            with (
-                patch.object(
-                    orchestrator,
-                    "_installed_engine_revision",
-                    return_value="engine-revision-2",
-                ),
-                patch.object(
-                    orchestrator,
-                    "_installed_engine_contains_commit",
-                    return_value=True,
-                ),
-            ):
-                result = coordinator._drive_run_child(handoff, snapshot)
-
-            self.assertEqual(result["status"], "completed")
-            self.assertEqual(len(calls), 2)
-            self.assertEqual(calls[0], (old_run_id, old_spec))
-            self.assertNotEqual(calls[1][0], old_run_id)
-            self.assertIsNotNone(handoff.child)
-            self.assertEqual(handoff.child.kind, "run")
-            self.assertEqual(handoff.child.native_id, calls[1][0])
-
-    def test_run_route_preflight_recovers_equivalent_engine_before_handoff(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = _make_project(tmp)
-            _commit_baseline(root)
-            old_spec = root / "old-spec.md"
-            write_text(old_spec, "# Existing iteration\n")
-            current = load_run_state(root)
-            current.status = "blocked"
-            current.resume_context = {
-                "spec_file": str(old_spec),
-                "auto_approve": True,
-            }
-            current.active_blocker = {
-                "owner": "auto_agents",
-                "category": (
-                    "session_health_projection_and_resume_boundary_mismatch"
-                ),
-                "fingerprint": "equivalent-health-fix",
-                "status": "blocked",
-                "self_repair_commit": "non-ancestor",
-                "self_repair_failure": {"verification": "tests passed"},
-                "root_cause_diagnosis": {
-                    "diagnosis_id": "diagnosis",
-                    "final": {
-                        "expected_postconditions": [
-                            "session health boundaries are compatible"
-                        ]
-                    },
-                },
-            }
-            save_run_state(root, current)
-            orchestrator = Orchestrator(root)
-            coordinator = WorkflowCoordinator(orchestrator, auto_approve=True)
-            parent = create_session(root, "collab")
-            parent.status = "executing"
-            parent.goal = "Add a capability"
-            parent.auto_approve = True
-            _confirm_collab_state(parent, "real")
-            snapshot = coordinator.store.create_root(
-                WorkflowRef("collab", parent.session_id)
-            )
-            parent.workflow_id = snapshot.workflow_id
-            save_session_state(root, parent)
-            session = Session(
-                orchestrator,
-                mode="collab",
-                auto_approve=True,
-                coordinator=coordinator,
-            )
-            calls = []
-
-            def complete_old_run(**_kwargs):
-                state = load_run_state(root)
-                calls.append(state.run_id)
-                state.status = "completed"
-                save_run_state(root, state)
-                return state
-
-            orchestrator.run = complete_old_run
-            with (
-                patch.object(
-                    orchestrator,
-                    "_installed_engine_revision",
-                    return_value="equivalent-engine",
-                ),
-                patch.object(
-                    orchestrator,
-                    "_installed_engine_contains_commit",
-                    return_value=False,
-                ),
-            ):
-                routed = session._prepare_workflow_handoff(
-                    parent,
-                    target="run",
-                    reason="new capability",
-                    payload={"spec_seed": {"title": "Capability"}},
-                )
-
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(routed.status, "waiting_child")
-            handoffs = list(
-                (root / ".auto-agents" / "state" / "handoffs").glob("*.json")
-            )
-            self.assertEqual(len(handoffs), 1)
-            self.assertTrue(
-                any(
-                    item.get("action") == "run_route_preflight_passed"
-                    for item in routed.execution_log
-                )
-            )
 
     def test_run_route_preflight_raises_engine_repair_before_empty_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1619,5 +1386,4 @@ if __name__ == "__main__":
 
 
 # Preserve executable node IDs referenced by retained acceptance contracts.
-RoutedWorkflowTests.test_installed_engine_recovery_supersedes_bad_fix_child_and_rolls_back = RoutedWorkflowTests.test_engine_recovery_refuses_rollback_without_child_ownership
 RoutedWorkflowTests.test_failed_child_rollback_preserves_preexisting_staged_content = RoutedWorkflowTests.test_unbound_handoff_preserves_live_edits_and_staged_content

@@ -42,7 +42,7 @@ class VerificationDependencyError(RuntimeError):
                 setattr(self, name, getattr(cause, name))
 
     def to_result(self):
-        from .repair_environment_log import sanitize
+        from .diagnostic_redaction import sanitize
         requirement = self.requirement.to_dict()
         requirement["evidence"] = sanitize(requirement["evidence"])
         return {"ok": False, "status": "verification_environment_blocked",

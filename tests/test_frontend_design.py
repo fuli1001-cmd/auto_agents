@@ -247,7 +247,7 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertEqual(len(requests), 1)
             self.assertFalse(orchestrator._provider_health_map())
 
-    def test_interrupted_prototype_is_preserved_and_resumed_before_becoming_candidate(self):
+    def test_interrupted_prototype_is_preserved_and_unconfirmed_call_is_not_repeated(self):
         for error_type in (RuntimeError, KeyboardInterrupt):
             with self.subTest(error_type=error_type), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "demo"
@@ -303,13 +303,14 @@ class FrontendDesignTests(unittest.TestCase):
                 # Reconstruct the host to exercise durable recovery, not memory.
                 resumed = Orchestrator(root)
                 resumed.adapter = adapter
-                entry = resumed._create_prototype_variant(**kwargs)
-                self.assertEqual(entry["id"], checkpoint["variant_id"])
-                self.assertEqual(requests[-1].resume_session_id, "saved-session")
-                self.assertTrue(all(not hasattr(request, "timeout_seconds") for request in requests))
-                self.assertFalse((draft / "interruption.json").exists())
-                self.assertEqual(len(candidate_variants(load_registry(root))), 1)
-                self.assertEqual(json.loads(checkpoints[0].read_text())["status"], "candidate")
+                from auto_agents.business_state import BusinessStateError, BusinessStore
+                with self.assertRaises(BusinessStateError):
+                    resumed._create_prototype_variant(**kwargs)
+                self.assertEqual(len(requests), 1)
+                self.assertTrue((draft / "interruption.json").exists())
+                self.assertEqual(candidate_variants(load_registry(root)), [])
+                self.assertEqual(len(BusinessStore(root).pending()), 1)
+                self.assertEqual(json.loads(checkpoints[0].read_text())["status"], "interrupted")
 
     def test_changed_spec_does_not_reuse_interrupted_prototype(self):
         from auto_agents.prototype_recovery import PrototypeGenerationCheckpoint
