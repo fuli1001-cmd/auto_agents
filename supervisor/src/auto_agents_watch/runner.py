@@ -342,7 +342,10 @@ class Runner:
 
     def resume(self,identity, *, explicit=False):
         job=self.store.get(identity); self.directory=self.store.root/'jobs'/identity
-        if job['state']=='DONE': return job
+        if job['state']=='DONE':
+            with self.locked(job):self.clean_completed(job)
+            self.clean_business(job)
+            return self.store.get(identity)
         if job.get('cancel_requested') and not explicit:
             return job
         if job.get('active_call'):
@@ -356,13 +359,45 @@ class Runner:
                     self.maintain(job)
                 while self.business(job):
                     self.maintain(job)
+                if job['state']=='DONE':self.clean_completed(job)
         except Exception as error:
             self.store.save(job,'STOPPED',reason=str(error))
+        if job['state']=='DONE':self.clean_business(job)
         return self.store.get(identity)
+
+    def clean_completed(self,job):
+        from .cleanup import completed_job
+        try:result=completed_job(self.store,job)
+        except (OSError,RuntimeError,ValueError,subprocess.SubprocessError) as error:
+            result={'state':'pending','reason':str(error)}
+        self.store.save(job,cleanup=result)
+
+    def clean_business(self,job):
+        """Request bounded project maintenance after releasing its run lock."""
+        if os.environ.get('AUTO_AGENTS_STORAGE_MAINTENANCE')=='off':return
+        argv=job.get('runtime_argv') or job['argv']
+        if 'auto_agents' in argv and '-m' in argv:
+            prefix=argv[:argv.index('auto_agents')+1]
+        elif len(argv)>1 and Path(argv[1]).name=='auto_agents.py':prefix=argv[:2]
+        elif Path(argv[0]).name in {'auto-agents','auto-agents.exe'}:prefix=argv[:1]
+        else:return
+        environment=self.env(job)
+        for key in ('AUTO_AGENTS_RUN_LOCK_FD','AUTO_AGENTS_RUN_TOKEN','AUTO_AGENTS_RUN_LOCK_KEY','AUTO_AGENTS_OBSERVATION_FILE'):
+            environment.pop(key,None)
+        try:
+            result=subprocess.run([*prefix,'storage','maintain','--project',job['project']],
+                cwd=job.get('cwd',job['engine']),env=environment,capture_output=True,text=True,timeout=45)
+            report=json.loads(result.stdout)
+        except (OSError,ValueError,subprocess.SubprocessError) as error:
+            report={'ok':False,'reason':str(error)}
+        self.store.save(job,business_cleanup=report)
 
 
 def retry_publication(store, identity):
     job=store.get(identity)
+    if isinstance(job.get('publication'),dict) and job['publication'].get('state')=='published':return job
+    if job.get('cleanup',{}).get('state')=='released':
+        raise RuntimeError('Completed task inputs were released; publish the accepted revision with normal Git')
     if job.get('active_call') or alive(job.get('process')):
         raise RuntimeError('Publication requires a quiescent job with confirmed model outcomes')
     if job.get('cancel_requested'):

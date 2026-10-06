@@ -185,6 +185,23 @@ def test_completed_command_requests_maintenance_after_releasing_leases(store, tm
     assert calls == [{}, {'completed': True}]
 
 
+@pytest.mark.parametrize('completed',[False,True])
+def test_command_reclaims_only_successful_unreferenced_scratch(store,tmp_path,monkeypatch,completed):
+    from auto_agents import artifact_runtime
+    monkeypatch.delenv('AUTO_AGENTS_STORAGE_MAINTENANCE',raising=False)
+    monkeypatch.setattr(artifact_runtime,'schedule',lambda **kwargs:None)
+    project=tmp_path/'project';project.mkdir()
+    scratch=project/'scratch';scratch.mkdir();(scratch/'data').write_text('temporary')
+    retained=project/'referenced';retained.mkdir();(retained/'data').write_text('needed')
+    with command_context(project):
+        scratch_id=artifact_runtime.track(scratch)
+        artifact_runtime.track(retained,reference='other-consumer')
+        if completed:artifact_runtime.workflow_completed()
+    assert scratch.exists() is not completed
+    assert retained.exists()
+    assert store.get(scratch_id)['state']==('deleted' if completed else 'released')
+
+
 def test_fix_delivery_preserves_dirty_receipt_and_can_be_resumed(store, tmp_path):
     from types import SimpleNamespace
     from auto_agents.session_candidate import _inventory, fingerprint, deliver_candidate

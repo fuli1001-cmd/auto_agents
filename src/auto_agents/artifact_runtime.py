@@ -106,13 +106,13 @@ def release(identity, *, failed=False):
                 _acquired.pop(key, None)
 
 
-def release_owned(all_owners=False):
+def release_owned(all_owners=False, *, completed=False):
     for root, identity, encoded in list(_owned):
         owner = json.loads(encoded)
         if not all_owners and owner != _lease():
             continue
         with contextlib.suppress(OSError, ValueError, RuntimeError, sqlite3.Error):
-            ArtifactStore(root).release(identity, owner=owner)
+            ArtifactStore(root).release(identity, owner=owner, completed=completed)
         _owned.discard((root, identity, encoded))
         for key, value in list(_acquired.items()):
             if value == identity and key[3] == encoded:
@@ -202,6 +202,15 @@ def command_context(project=None):
         schedule()
         yield
     finally:
-        release_owned()
-        schedule(completed=bool((_context.get() or {}).get('workflow_completed')))
+        completed=bool((_context.get() or {}).get('workflow_completed'))
+        owned=[(root,identity) for root,identity,encoded in list(_owned)
+               if json.loads(encoded)==_lease()] if completed else []
+        release_owned(completed=completed)
+        if completed and enabled() and os.environ.get('AUTO_AGENTS_STORAGE_MAINTENANCE')!='off':
+            deadline=time.monotonic()+30
+            for root,identity in owned:
+                if time.monotonic()>=deadline:break
+                with contextlib.suppress(OSError,ValueError,RuntimeError,sqlite3.Error):
+                    ArtifactStore(root).clean_artifact(identity,deadline=deadline)
+        schedule(completed=completed)
         _context.reset(token)

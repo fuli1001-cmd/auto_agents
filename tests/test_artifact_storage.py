@@ -44,6 +44,16 @@ def test_status_does_not_create_storage(store):
     assert not store.root.exists()
 
 
+def test_reacquiring_scratch_revokes_completed_task_disposal(store,tmp_path):
+    path=tmp_path/'scratch';path.mkdir()
+    identity=store.register(path)
+    store.release(identity,completed=True)
+    assert store.classify(store.get(identity),time.time())=='eligible'
+    store.register(path)
+    store.release(identity)
+    assert store.classify(store.get(identity),time.time())=='retention'
+
+
 def test_expired_scratch_deleted_but_unknown_neighbor_retained(store, tmp_path):
     identity, path = artifact(store, tmp_path)
     unknown = tmp_path / "unknown.tmp"

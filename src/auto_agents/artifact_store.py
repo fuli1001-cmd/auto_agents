@@ -286,10 +286,11 @@ class ArtifactStore:
             if reference and reference not in row["references"]:
                 row["references"].append(reference)
             row.update(state="live", last_used=now, released=None)
+            row['metadata'].pop('completed_task_disposable',None)
             self._save(row, "acquired")
             return row["id"]
 
-    def release(self, identity, *, owner=None, failed=False, reference=None):
+    def release(self, identity, *, owner=None, failed=False, reference=None, completed=False):
         with self.locked():
             row = self.get(identity)
             row["leases"] = [x for x in row["leases"] if x != (owner or process_identity()) and alive(x)]
@@ -298,6 +299,8 @@ class ArtifactStore:
             row["released"] = time.time()
             row["last_used"] = time.time()
             row["failed"] = failed
+            if completed and row['kind'] in {'scratch','incomplete'}:
+                row['metadata']['completed_task_disposable'] = True
             if not row["leases"]:
                 row["state"] = "released"
                 if not row.get("trash") and not Path(row["path"]).exists():
@@ -375,6 +378,8 @@ class ArtifactStore:
                     return "eligible"
                 return "eligible" if now >= row.get("purge_after", now + DAY) else "quarantine_grace"
             ttl = self.policy()["ttl"][row["kind"]]
+            if row['kind'] in {'scratch','incomplete'} and row['metadata'].get('completed_task_disposable'):
+                ttl = 0
             if row['metadata'].get('candidate_lifecycle'):
                 ttl = 0  # Completed, delivered candidates have no remaining consumer.
             if row.get("failed") and row["kind"] in {"evidence", "log"}:

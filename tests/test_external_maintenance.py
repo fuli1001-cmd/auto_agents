@@ -24,6 +24,52 @@ from auto_agents_watch.process import cycle, run
 from auto_agents_watch.git_delivery import git, commit, publish
 
 
+def test_completed_supervisor_requests_core_cleanup_without_inherited_lock(tmp_path,monkeypatch):
+    import fcntl
+    from auto_agents_watch.runner import Runner
+    from auto_agents_watch import runner as module
+    watch=Store(tmp_path/'watch')
+    project=tmp_path/'project';engine=tmp_path/'engine';engine.mkdir()
+    job=watch.create([sys.executable,'-m','auto_agents','collab','--project',str(project)],project,engine)
+    runner=Runner(watch);runner.directory=watch.root/'jobs'/job['id']
+    with runner.locked(job):pass
+    monkeypatch.delenv('AUTO_AGENTS_STORAGE_MAINTENANCE',raising=False)
+    def execute(argv,**kwargs):
+        assert argv[-4:]==['storage','maintain','--project',str(project)]
+        assert 'AUTO_AGENTS_RUN_LOCK_FD' not in kwargs['env']
+        with (project/'.auto-agents/state/run.lock').open('r') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return SimpleNamespace(stdout='{"ok":true}',returncode=0)
+    monkeypatch.setattr(module.subprocess,'run',execute)
+    runner.clean_business(job)
+    assert watch.get(job['id'])['business_cleanup']['ok']
+
+
+@pytest.mark.parametrize('pending,dirty',[(False,False),(True,False),(False,True)])
+def test_completed_supervisor_reclaims_inputs_only_after_publication_and_durable_code(tmp_path,pending,dirty):
+    from auto_agents_watch.cleanup import completed_job
+    watch=Store(tmp_path/'watch');job=watch.create([],tmp_path/'project',tmp_path/'engine')
+    directory=watch.root/'jobs'/job['id']
+    candidate=directory/'candidate';candidate.mkdir()
+    git(candidate,'init','-q');(candidate/'code.py').write_text('original')
+    revision=commit(candidate,'accepted')
+    (directory/'project').mkdir();(directory/'project/input').write_text('checkpoint')
+    (directory/'verification').mkdir();(directory/'verification/report.json').write_text('{"ok":true}')
+    watch.save(job,'DONE',candidate=str(candidate),candidate_revision=revision,
+               publication={'state':'pending' if pending else 'published'})
+    if dirty:(candidate/'code.py').write_text('uncommitted user change')
+    result=completed_job(watch,job)
+    if pending or dirty:
+        assert result['state']=='retained' and candidate.exists() and (directory/'project').exists()
+    else:
+        assert result['state']=='released' and not candidate.exists() and not (directory/'project').exists()
+        restored=tmp_path/'restored'
+        git(tmp_path,'clone',str(directory/'candidate.bundle'),str(restored))
+        assert git(restored,'rev-parse','HEAD')==revision
+        assert (restored/'code.py').read_text()=='original'
+    assert (directory/'verification/report.json').exists()
+
+
 @pytest.mark.parametrize('crashed',[False,True])
 def test_offline_check_reclaims_its_copy_and_preserves_input_and_report(tmp_path,crashed):
     from auto_agents_watch.verification import Verifier

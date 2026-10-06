@@ -89,6 +89,16 @@ Unknown or unavailable verification prerequisites stop without inventing a pass.
 Counters and candidate history survive watcher restarts and repeated invocations.
 Optional total call/time limits are additional ceilings.
 
+When the original business task is DONE and publication is complete or disabled,
+the watcher bundles candidate Git history, then removes project snapshots,
+candidate and publication workspaces, and private agent homes. Checkpoints,
+verification reports and call receipts remain. Dirty candidates, unconfirmed
+calls, active containers and pending/conflicting publication retain their inputs.
+Completed publication retries are idempotent; after inputs are released, a new
+publication destination uses normal Git rather than replaying the finished job.
+The watcher also requests bounded project storage maintenance after releasing
+the business lock. Cleanup errors are recorded without undoing task completion.
+
 The watcher commits accepted candidate changes locally and only fast-forwards
 an unchanged, clean engine branch. It installs an immutable revision in a private
 venv, records successful installation, updates the normal installation pointer,
