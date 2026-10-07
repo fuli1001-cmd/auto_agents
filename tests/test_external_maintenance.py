@@ -448,6 +448,140 @@ def test_snapshot_preserves_settled_calls_without_live_database(tmp_path):
     assert retained['state']=='finished' and json.loads(retained['result'])['summary']=='retained'
 
 
+def test_snapshot_cli_returns_small_receipt_and_keeps_full_history(tmp_path,capsys):
+    from auto_agents.supervision_api import command
+    source=tmp_path/'live';source.mkdir()
+    original={'session_id':'s','goal':'original '+('x'*1_000_000),'status':'paused'}
+    BusinessStore(source).save('sessions/s/session_state.json',original)
+    destination=tmp_path/'copy'
+    assert command(['snapshot','--project',str(source),'--output',str(destination)])==0
+    output=capsys.readouterr().out
+    assert len(output)<2000
+    receipt=json.loads(output)
+    assert receipt['record_count']==1 and 'records' not in receipt['state']
+    assert receipt['state']['project']==str(source)
+    assert BusinessStore(destination,readonly=True).get('sessions/s/session_state.json')==original
+
+
+def test_verification_infrastructure_fault_retains_command_evidence_without_engine_repair(tmp_path):
+    from auto_agents.gates import GateCommandInfrastructureError
+    from auto_agents.models import CommandResult
+    result=CommandResult(command='npm exec -- vitest run browser.test.ts',ok=False,returncode=1,
+        stdout='expected SURFACE-001; approved contract is SURFACE-004',
+        stderr='AUTO_AGENTS_INFRA_FAILURE id=browser_unavailable: page not ready',
+        infrastructure_error=True,infrastructure_failure_id='browser_unavailable')
+    with Observer(tmp_path,['collab','--project',str(tmp_path)]) as observer:
+        fault=observer.fault(GateCommandInfrastructureError('verification could not run',result=result))
+    assert fault['category']=='verification'
+    diagnostic=json.loads(Path(fault['diagnostics_path']).read_text())
+    evidence=diagnostic['evidence']['verification']
+    assert evidence['command']==result.command and evidence['returncode']==1
+    assert 'SURFACE-004' in evidence['stdout'] and 'page not ready' in evidence['stderr']
+
+
+@pytest.mark.parametrize('category',['verification','state','reconciliation'])
+def test_resume_does_not_reclassify_non_engine_fault_as_maintenance(tmp_path,monkeypatch,category):
+    from auto_agents_watch.runner import Runner
+    watch=Store(tmp_path/'watch');job=watch.create([],tmp_path/'project',tmp_path/'engine')
+    watch.save(job,'STOPPED',fault={'category':category,'message':'requires operator recovery'})
+    runner=Runner(watch)
+    monkeypatch.setattr(runner,'maintain',lambda *_:pytest.fail('Non-engine fault triggered model repair'))
+    monkeypatch.setattr(runner,'business',lambda *_:pytest.fail('Implicit resume repeated business execution'))
+    assert runner.resume(job['id'])['state']=='STOPPED'
+    assert watch.get(job['id'])['model_calls']==0
+
+
+def test_explicit_business_recheck_keeps_fault_history_and_spent_budget(tmp_path,monkeypatch):
+    from auto_agents_watch.runner import Runner
+    watch=Store(tmp_path/'watch');job=watch.create([],tmp_path/'project',tmp_path/'engine')
+    original={'category':'verification','message':'missing prerequisite'}
+    watch.save(job,'STOPPED',fault=original,model_calls=2,attempts=1,no_progress=1,needs_maintenance=True)
+    runner=Runner(watch)
+    monkeypatch.setattr(runner,'maintain',lambda *_:pytest.fail('Explicit business recheck ran maintenance'))
+    def business(retained):
+        assert runner.env(retained)['AUTO_AGENTS_MAINTENANCE_RESUME']=='1'
+        watch.save(retained,'STOPPED',reason='business rechecked')
+        return False
+    monkeypatch.setattr(runner,'business',business)
+    result=runner.resume(job['id'],retry_business=True)
+    assert result['retained_faults'][-1]['fault']==original
+    assert (result['model_calls'],result['attempts'],result['no_progress'])==(2,1,1)
+    assert result['needs_maintenance'] is False
+
+
+def test_resume_cli_forwards_explicit_business_recheck(tmp_path,monkeypatch,capsys):
+    from auto_agents_watch import cli
+    calls=[]
+    class Stub:
+        def __init__(self,store):pass
+        def resume(self,job,**options):
+            calls.append((job,options));return {'state':'STOPPED','reason':'retained'}
+    monkeypatch.setattr(cli,'Runner',Stub)
+    assert cli.main(['resume','--root',str(tmp_path),'--job','original','--retry-business','--json'])==3
+    capsys.readouterr()
+    assert calls==[('original',{'explicit':True,'retry_business':True})]
+
+
+@pytest.mark.parametrize('physical_failure',[False,True])
+@pytest.mark.parametrize('repair_scope',['','target_project','execution_environment'])
+def test_browser_content_prerequisite_stays_failed_without_hiding_real_infrastructure(physical_failure,repair_scope):
+    from auto_agents.gates import classify_reported_infrastructure_failure,extract_failure_info
+    from auto_agents.models import CommandResult,GateResult
+    marker=('AUTO_AGENTS_INFRA_FAILURE id=browser_verification_infrastructure_failed '
+            'capability=chrome contract=cdp-v1'+(f' repair_scope={repair_scope}' if repair_scope else '')+': ')
+    output='FAIL src/e2e/page.test.ts > approved prototype\n'+marker+'Timed out waiting for expression: document.querySelectorAll(".card").length === 3\n'
+    if physical_failure:output+=marker+'Browser launch attempt 3/3 failed\n'
+    result=CommandResult(command='vitest run page.test.ts',ok=False,returncode=1,stderr=output)
+    classify_reported_infrastructure_failure(result)
+    info=extract_failure_info(GateResult(ok=False,commands=[result]))
+    assert result.ok is False and result.returncode==1
+    infrastructure=physical_failure or repair_scope=='execution_environment'
+    assert result.infrastructure_error is infrastructure
+    assert info.comparable is (not infrastructure)
+    if not infrastructure:
+        assert info.failure_ids==['src/e2e/page.test.ts > approved prototype']
+
+
+@pytest.mark.parametrize('structured', [True,False])
+def test_failed_supervisor_snapshot_reports_exit_and_reclaims_partial_copy(tmp_path,monkeypatch,structured):
+    from auto_agents_watch.runner import Runner
+    from auto_agents_watch import runner as module
+    watch=Store(tmp_path/'watch')
+    job=watch.create([],tmp_path/'project',tmp_path/'engine')
+    runner=Runner(watch);runner.directory=watch.root/'jobs'/job['id']
+    snapshot=runner.directory/'project'
+    snapshot.mkdir();(snapshot/'old-partial').write_text('previous failed copy')
+    calls=[]
+    def execute(argv,**kwargs):
+        output=Path(argv[argv.index('--output')+1]);output.mkdir()
+        (output/'partial').write_text('interrupted export')
+        calls.append(output)
+        return SimpleNamespace(returncode=3 if structured else -9,
+            stdout=json.dumps({'ok':False,'error':'registered source unavailable'}) if structured else '',stderr='')
+    monkeypatch.setattr(module.subprocess,'run',execute)
+    for _ in range(2):
+        with pytest.raises(RuntimeError,match='exit 3.*registered source' if structured else 'exit -9.*no diagnostic'):
+            runner.export_snapshot(job,snapshot)
+        assert not snapshot.exists() and not list(runner.directory.glob('.snapshot-*'))
+    assert len(calls)==2 and calls[0]!=calls[1]
+
+
+def test_supervisor_publishes_only_complete_snapshot(tmp_path,monkeypatch):
+    from auto_agents_watch.runner import Runner
+    from auto_agents_watch import runner as module
+    watch=Store(tmp_path/'watch');job=watch.create([],tmp_path/'project',tmp_path/'engine')
+    runner=Runner(watch);runner.directory=watch.root/'jobs'/job['id']
+    snapshot=runner.directory/'project'
+    def execute(argv,**kwargs):
+        output=Path(argv[argv.index('--output')+1]);output.mkdir()
+        (output/'complete').write_text('receipt')
+        return SimpleNamespace(returncode=0,stdout=json.dumps({'ok':True,'state':{'pending_external':[]}}),stderr='')
+    monkeypatch.setattr(module.subprocess,'run',execute)
+    result=runner.export_snapshot(job,snapshot)
+    assert result['snapshot']==str(snapshot) and (snapshot/'complete').read_text()=='receipt'
+    assert not list(runner.directory.glob('.snapshot-*'))
+
+
 def test_snapshot_exports_only_registered_external_native_checkout(tmp_path):
     from auto_agents.supervision_api import snapshot
     from auto_agents.session_source import register_checkout

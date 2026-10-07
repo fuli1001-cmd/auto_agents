@@ -319,6 +319,7 @@ def _trace_loop(leader, tasks, names, pending):
             if error.errno != errno.ESRCH:
                 raise
     retired = set()
+    exited_before_registration = set()
     while tasks or pending:
         pid, status = os.waitpid(-1, 0x40000000)  # __WALL includes traced threads.
         if os.WIFEXITED(status) or os.WIFSIGNALED(status):
@@ -330,7 +331,11 @@ def _trace_loop(leader, tasks, names, pending):
             if pid == leader:
                 return os.waitstatus_to_exitcode(status)
             if not known:
-                raise RuntimeError(f'metadata child {pid} exited before its parent policy was registered')
+                # A killed, initially stopped child (or a reaped untraced
+                # helper) cannot perform a metadata operation. Its terminal
+                # event can precede the parent's creation event; never resume
+                # it or invent an inherited policy when the latter arrives.
+                exited_before_registration.add(pid)
             continue
         event = status >> 16
         delivered = os.WSTOPSIG(status)
@@ -354,6 +359,10 @@ def _trace_loop(leader, tasks, names, pending):
             if event in (1, 2, 3):  # fork, vfork, clone
                 child = ctypes.c_ulonglong()
                 _ptrace(0x4201, pid, data=ctypes.byref(child))
+                if child.value in exited_before_registration:
+                    exited_before_registration.discard(child.value)
+                    resume(pid)
+                    continue
                 if child.value in tasks:
                     raise RuntimeError('metadata child already has an active policy')
                 retired.discard(child.value)

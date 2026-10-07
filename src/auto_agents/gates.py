@@ -238,6 +238,23 @@ def classify_reported_infrastructure_failure(
     lines = _diagnostic_output_lines(result)
     if not lines and not markers:
         return result
+    # Older browser harnesses label a missing expected DOM/text state as
+    # infrastructure failure. With real failed test IDs, an unmet content
+    # predicate is a project test failure, not evidence that Chrome could not
+    # launch or speak CDP. Keep it failed and eligible for baseline comparison.
+    def content_predicate(line):
+        line = line.removeprefix('BrowserVerificationInfrastructureError: ')
+        match = _STANDARD_INFRA_FAILURE.match(line)
+        return (match is not None and match.group('id').lower() == 'browser_verification_infrastructure_failed'
+                and (match.group('capability') or '').lower() == 'chrome'
+                and (match.group('contract') or '').lower() == 'cdp-v1'
+                and (match.group('repair_scope') or '').lower() in {'', 'target_project'}
+                and line[match.end():].lstrip(' :').startswith('Timed out waiting for expression:'))
+    if (lines and not markers and all(content_predicate(line) for line in lines)
+            and (_VITEST_FAILED.search(full_output) or _PYTEST_SHORT_SUMMARY.search(full_output))):
+        result.process_snapshot = {**dict(result.process_snapshot),
+                                   'reported_browser_content_failure': lines[0]}
+        return result
     diagnostic = "\n".join(lines)
     standard = next(
         (

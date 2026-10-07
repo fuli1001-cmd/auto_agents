@@ -57,7 +57,11 @@ def main(argv=None):
     parser.add_argument('--root')
     parser.add_argument('--json',action='store_true')
     parser.add_argument('--result')
+    parser.add_argument('--retry-business',action='store_true',
+                        help='Recheck the retained business task after fixing its prerequisite')
     args=parser.parse_args(argv[:separator])
+    if args.retry_business and args.action!='resume':
+        parser.error('--retry-business requires resume')
     try:
         store=Store(args.root)
         if args.action=='run':
@@ -71,7 +75,9 @@ def main(argv=None):
             cancel_owned(value.get('process'))
         elif args.action=='resume':
             if not args.job: parser.error('--job required')
-            value=Runner(store).resume(args.job,explicit=True)
+            options={'explicit':True}
+            if args.retry_business:options['retry_business']=True
+            value=Runner(store).resume(args.job,**options)
         elif args.action=='reconcile':
             if not args.job or not args.result:parser.error('reconcile requires --job and --result')
             from .process import alive

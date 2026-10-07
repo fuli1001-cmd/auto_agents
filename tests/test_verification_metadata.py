@@ -446,6 +446,21 @@ def test_unregistered_syscall_never_gets_a_guessed_policy(monkeypatch):
     assert 11 in pending and 11 not in tasks and not calls
 
 
+def test_child_terminal_event_before_parent_registration_never_grants_policy(monkeypatch):
+    from auto_agents import verification_metadata as metadata
+    tasks,pending,continued={10:(object(),)},{},[]
+    events=iter([(11,stopped(sig=signal.SIGSTOP)),(11,signal.SIGKILL),
+                 (10,stopped(1)),(10,0)])
+    def ptrace(operation,pid,address=0,data=0):
+        if operation==0x4201:
+            ctypes.cast(data,ctypes.POINTER(ctypes.c_ulonglong))[0]=11
+        if operation==7:continued.append(pid)
+    monkeypatch.setattr(metadata.os,'waitpid',lambda *_:next(events))
+    monkeypatch.setattr(metadata,'_ptrace',ptrace)
+    assert metadata._trace_loop(10,tasks,{},pending)==0
+    assert 11 not in continued and 11 not in tasks and not pending
+
+
 def test_exec_keeps_the_origin_threads_narrower_policy(monkeypatch):
     from auto_agents import verification_metadata as metadata
     outer, narrowed = (object(),), (object(), object())

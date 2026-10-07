@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import re
+import tempfile
 
 from .store import Store, atomic, digest
 from .process import run, alive
@@ -221,12 +222,7 @@ class Runner:
         if not job.get('candidate'):
             suffix='-'+str(job['episode']) if job.get('episode') else ''
             snapshot=self.directory/('project'+suffix)
-            request=[sys.executable,'-m','auto_agents']
-            env={**os.environ,'PYTHONPATH':str(Path(job['engine'])/'src'),'AUTO_AGENTS_NO_SUPERVISOR':'1'}
-            proc=subprocess.run([*request,'snapshot','--project',job['project'],'--output',str(snapshot)],
-                                env=env,capture_output=True,text=True)
-            if proc.returncode: raise RuntimeError('Business snapshot failed: '+proc.stderr)
-            exported=json.loads(proc.stdout)
+            exported=self.export_snapshot(job,snapshot)
             if exported['state']['pending_external']: raise RuntimeError('External outcomes require reconciliation')
             candidate=self.directory/('candidate'+suffix)
             binding=delivery.prepare(job['engine'],candidate)
@@ -359,6 +355,12 @@ class Runner:
             raise RuntimeError('Unconfirmed model operation retained; automatic redispatch refused')
         if alive(job.get('process')):
             raise RuntimeError('Original process is still alive; duplicate execution refused')
+        fault=job.get('fault')
+        if (job['state']=='STOPPED' and fault
+                and fault.get('category') not in {'engine','unknown'} and not retry_business):
+            # Retrying a stopped verification/state incident must not bypass
+            # the category check enforced by business() on its first return.
+            return job
         try:
             with self.locked(job):
                 if explicit:self.store.acknowledge_resume(job)
@@ -379,6 +381,34 @@ class Runner:
             self._rechecking_business = False
         if job['state']=='DONE':self.clean_business(job)
         return self.store.get(identity)
+
+    def export_snapshot(self,job,snapshot):
+        """Publish only a complete copy; a failed export must be retryable."""
+        snapshot=Path(snapshot)
+        if snapshot.parent!=self.directory or snapshot.name not in {
+                'project', 'project-'+str(job.get('episode',0))}:
+            raise ValueError('Snapshot path is outside this maintenance job')
+        if job.get('candidate'):
+            raise RuntimeError('An admitted candidate already owns its snapshot')
+        # Earlier versions left this directory behind before recording any
+        # admitted candidate. It is a regenerable copy, not live business state.
+        if snapshot.exists():shutil.rmtree(snapshot)
+        env={**os.environ,'PYTHONPATH':str(Path(job['engine'])/'src'),'AUTO_AGENTS_NO_SUPERVISOR':'1'}
+        with tempfile.TemporaryDirectory(prefix='.snapshot-',dir=self.directory) as temporary:
+            output=Path(temporary)/'project'
+            proc=subprocess.run([sys.executable,'-m','auto_agents','snapshot',
+                '--project',job['project'],'--output',str(output)],
+                env=env,cwd=job['engine'],capture_output=True,text=True)
+            try:exported=json.loads(proc.stdout)
+            except (ValueError,TypeError):exported={}
+            if proc.returncode or exported.get('ok') is not True:
+                reason=exported.get('error') or proc.stderr.strip() or proc.stdout.strip()
+                reason=str(reason)[-4000:] or 'Snapshot process returned no diagnostic output'
+                raise RuntimeError(f'Business snapshot failed (exit {proc.returncode}): {reason}')
+            if exported['state']['pending_external']:
+                raise RuntimeError('External outcomes require reconciliation')
+            os.replace(output,snapshot)
+        return {**exported,'snapshot':str(snapshot)}
 
     def clean_completed(self,job):
         from .cleanup import completed_job

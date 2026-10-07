@@ -104,10 +104,28 @@ class Observer:
     def fault(self, error):
         from .engine_fault import EngineFault
         from .diagnostic_redaction import sanitize
+        from .gates import GateCommandInfrastructureError
         step = self.value['step_id']
         category = 'engine' if isinstance(error, EngineFault) or isinstance(error, (KeyError, AttributeError, TypeError)) else 'unknown'
         if isinstance(error, BusinessStateError):
             category = 'reconciliation' if error.code == 'outcome_unknown' else 'state'
+        evidence = dict(getattr(error, 'evidence', {}))
+        if isinstance(error, GateCommandInfrastructureError):
+            # A project test's unavailable browser/server is not evidence that
+            # editing the supervising engine will repair it.
+            category = 'verification'
+            result = error.result
+            if result is not None:
+                evidence['verification'] = {
+                    'command': sanitize(result.command), 'returncode': result.returncode,
+                    'failure_id': result.infrastructure_failure_id,
+                    'capability': result.infrastructure_capability,
+                    'contract': result.infrastructure_contract,
+                    'repair_scope': result.infrastructure_repair_scope,
+                    'marker': result.process_snapshot.get('reported_infrastructure_marker', {}),
+                    'stdout': sanitize(result.stdout[:8000] + '\n' + result.stdout[-8000:]),
+                    'stderr': sanitize(result.stderr[:8000] + '\n' + result.stderr[-8000:]),
+                }
         state = self.project / '.auto-agents/state'
         checkpoint = state / 'resume-checkpoints' / (uuid.uuid4().hex + '.json')
         records = status(self.project)
@@ -133,7 +151,7 @@ class Observer:
         atomic(checkpoint, token)
         self.value.update(status='failed', fault={'category': category, 'step_id': step,
             'type': type(error).__name__, 'message': sanitize(str(error)), 'traceback': sanitize(traceback.format_exc()),
-            'resume_token': str(checkpoint), 'evidence': getattr(error, 'evidence', {})})
+            'resume_token': str(checkpoint), 'evidence': evidence})
         diagnostics = checkpoint.with_suffix('.diagnostics.json')
         self.value['fault']['diagnostics_path'] = str(diagnostics)
         atomic(diagnostics, self.value['fault'])
@@ -287,8 +305,13 @@ def snapshot(project, destination):
             # Account secrets stay in the selected native CLI's private HOME.
             provider['environment'] = {}
         atomic(config_file, config)
+    # The records and receipts are already in the copied database. Returning
+    # every historical candidate preimage again can produce hundreds of MB
+    # on stdout and exhaust both the exporter and its supervising process.
     return {'ok': True, 'project': str(project), 'snapshot': str(destination),
-            'state': {**exported, 'project': str(project)}}
+            'state': {**{key: value for key, value in exported.items() if key != 'records'},
+                      'project': str(project)},
+            'record_count': len(exported['records'])}
 
 
 def offline_isolated():
@@ -338,7 +361,9 @@ def resume_check(project, resume_token):
                     'next_operation': boundary.operation, 'steps': observer.value['steps'],
                     'retained_constraints':preserved}
         except Exception as error:
-            category='state' if isinstance(error,BusinessStateError) else 'engine'
+            from .gates import GateCommandInfrastructureError
+            category=('state' if isinstance(error,BusinessStateError) else
+                      'verification' if isinstance(error,GateCommandInfrastructureError) else 'engine')
             return {'ok': False, 'blocked_step_cleared':False, 'external_calls':0,
                     'category': category, 'type': type(error).__name__,
                     'reason': str(error), 'traceback': traceback.format_exc(), 'steps':observer.value['steps']}

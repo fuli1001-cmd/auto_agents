@@ -88,6 +88,26 @@ inode registration changes. Goals, source descriptors and call receipts remain
 constraints. Unregistered sources and ownership conflicts stop as state errors,
 without starting an engine repair. Offline checks do not send notifications.
 Unconfirmed external requests require reconciliation before automatic recovery.
+The snapshot command returns a small receipt; full records and settled calls
+remain in the copied database. Failed exports are discarded before retry, and
+their exit code and structured error are reported even when stderr is empty.
+Project verification infrastructure incidents are recorded as `verification`
+faults, with command output in the checkpoint diagnostics. They do not authorize
+engine editing. An ordinary supervisor resume retains such a stop; after fixing
+the prerequisite, use `auto-agents-watch resume --job JOB --retry-business` to
+recheck the original business task without replenishing maintenance budgets.
+Legacy Chrome/CDP markers for an unmet expected DOM/text predicate remain
+failed project tests when their failed test IDs are available. They can be
+compared with the original baseline; they never count as passing browser proof.
+Mixed or actual browser launch/protocol failures remain infrastructure stops.
+
+Verification uses disposable HOME and private shared memory even when it retains
+the admitted operator environment. The original read-only tool cache remains
+available through `USER_CACHE_DIR`; a private HOME does not silently switch the
+selected browser. Live project paths and the operator's actual HOME stay
+read-only. Verification clears inherited DISPLAY, WAYLAND_DISPLAY and session
+DBus addresses: their WSL desktop sockets are absent from the private runtime,
+and retaining them can hang headless screenshots after successful navigation.
 Each offline recovery check uses a temporary working copy and removes it on
 success or failure. The original snapshot and diagnostic reports remain retained
 for resume; correction commits do not accumulate additional project copies.

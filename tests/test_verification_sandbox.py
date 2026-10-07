@@ -17,6 +17,32 @@ def test_missing_sandbox_blocks_instead_of_running_unrestricted(tmp_path):
                 raise AssertionError("unrestricted fallback")
 
 
+def test_retained_environment_keeps_operator_values_and_uses_private_home(tmp_path):
+    import os
+    candidate,shared=tmp_path/'candidate',tmp_path/'shared'
+    candidate.mkdir();shared.mkdir()
+    real_home=tmp_path/'operator-home';real_home.mkdir()
+    code='''
+import os
+from pathlib import Path
+assert os.environ['RETAINED_OPERATOR_VALUE']=='original'
+assert all(os.environ[key]=='' for key in ['DISPLAY','WAYLAND_DISPLAY','DBUS_SESSION_BUS_ADDRESS'])
+home=Path(os.environ['HOME'])
+assert str(home)!=os.environ['ORIGINAL_OPERATOR_HOME']
+assert os.environ['USER_CACHE_DIR']==str(Path(os.environ['ORIGINAL_OPERATOR_HOME'])/'.cache')
+for relative in ['.config/chromium','.pki/nssdb','.local/share/applications']:
+    path=home/relative;path.mkdir(parents=True,exist_ok=True)
+    (path/'probe').write_text('private')
+'''
+    env={**os.environ,'HOME':str(real_home),'ORIGINAL_OPERATOR_HOME':str(real_home),
+         'RETAINED_OPERATOR_VALUE':'original','DISPLAY':':0','WAYLAND_DISPLAY':'wayland-0',
+         'DBUS_SESSION_BUS_ADDRESS':'unix:path=/run/user/1000/bus'}
+    with verification_argv([sys.executable,'-c',code],candidate,shared,execution_environment=env) as argv:
+        result=subprocess.run(argv,env=env,capture_output=True,text=True,timeout=30)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert not list(real_home.iterdir())
+
+
 def test_verification_cannot_grant_write_access_to_live_project(tmp_path):
     with pytest.raises(RuntimeError, match="overlaps"):
         with verification_argv(["true"], tmp_path, tmp_path / "project"):
@@ -116,7 +142,8 @@ finally: os.close(fd)
     assert (candidate / "result.txt").read_text() == "allowed"
 
 
-def test_private_shared_memory_supports_multiprocessing_across_nested_boundaries(tmp_path):
+@pytest.mark.parametrize('retained_environment',[False,True])
+def test_private_shared_memory_supports_multiprocessing_across_nested_boundaries(tmp_path,retained_environment):
     import os
     from uuid import uuid4
     from auto_agents.verification_input_trace import owner_identity
@@ -138,7 +165,8 @@ with verification_argv([sys.executable,'-c',{inner!r}],Path.cwd()/'inner',Path({
 assert result.returncode==0,result.stderr
 '''
     try:
-        with verification_argv([sys.executable, '-c', program], candidate, shared) as argv:
+        with verification_argv([sys.executable, '-c', program], candidate, shared,
+                               execution_environment=dict(os.environ) if retained_environment else None) as argv:
             result = subprocess.run(argv, capture_output=True, text=True, timeout=20)
         assert result.returncode == 0, result.stdout + result.stderr
         assert marker.exists() is bool(inherited)

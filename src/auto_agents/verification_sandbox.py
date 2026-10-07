@@ -284,7 +284,10 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
     from auto_agents.verification_input_trace import owner_identity
     owner = owner_identity()
     nested = bool(owner['metadata'] or os.environ.get('AUTO_AGENTS_VERIFICATION_SANDBOX'))
-    private_shm = not nested and execution_environment is None
+    # Retaining the admitted command environment does not turn disposable
+    # IPC resources into shared host state. Browsers and multiprocessing still
+    # need writable private shared memory in the outer namespace.
+    private_shm = not nested
     inherited_shm = bool(owner['metadata'] and os.environ.get(SHM_ENV) == '1')
     if root == target or root in target.parents or target in root.parents:
         raise RuntimeError("verification workspace overlaps the live target project")
@@ -391,9 +394,22 @@ def verification_argv(argv, cwd: Path, real_project: Path, *, read_roots=(), wri
             reservation_identity[2] = 0
         runtime_identity = json.dumps(reservation_identity)
         bookkeeping_environment = {
-            'CODEX_HOME': str(codex_home), 'AUTO_AGENTS_VERIFICATION_SANDBOX': '1',
+            # HOME is a disposable runtime directory even when semantic
+            # operator variables are retained. Chromium's NSS/crash databases
+            # must not target the read-only real user's home.
+            'HOME': str(home), 'CODEX_HOME': str(codex_home), 'AUTO_AGENTS_VERIFICATION_SANDBOX': '1',
+            # The private /tmp and denied /run do not contain the operator's
+            # WSL desktop sockets. Inheriting those session addresses can let
+            # headless Chrome load a page but hang indefinitely on screenshots.
+            'DISPLAY': '', 'WAYLAND_DISPLAY': '', 'DBUS_SESSION_BUS_ADDRESS': '',
             RUNTIME_ROOT_ENV: str(runtime_parent), RUNTIME_ID_ENV: runtime_identity,
         }
+        operator_environment = os.environ if execution_environment is None else execution_environment
+        # Keep read-only tool discovery on the admitted operator cache while
+        # HOME itself is private. Existing browser locks use USER_CACHE_DIR;
+        # changing HOME must not silently select a different browser binary.
+        bookkeeping_environment['USER_CACHE_DIR'] = operator_environment.get(
+            'USER_CACHE_DIR', str(Path(operator_environment.get('HOME', str(home))) / '.cache'))
         if execution_environment is not None and path_entries:
             bookkeeping_environment['PATH'] = os.pathsep.join([
                 *map(str, path_entries), effective_environment.get('PATH', os.defpath)])
