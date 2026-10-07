@@ -472,10 +472,10 @@ class WorkflowCoordinator:
 
 
     def _retained_classification_child(self, state, payload):
-        """Recheck a saved engine diagnosis after a guarded recovery becomes available.
+        """Prove that this returned child's pre-writer classification can resume.
 
-        This authorizes a fresh parent diagnosis, never product implementation.
-        The original child's native resume still owns the actual recovery.
+        This probe changes no authority or product code. Native child resume
+        still owns recovery, classification and subsequent implementation.
         """
         from types import SimpleNamespace
         from .engine_fault import engine_root
@@ -489,6 +489,7 @@ class WorkflowCoordinator:
             return None
         try:
             handoff = self.store.load_handoff(Path(state.last_child_result_ref).stem)
+            original = self.store.resolve_handoff_chain(handoff,workflow_id=state.workflow_id)[-1]
             if (handoff.workflow_id != state.workflow_id
                     or handoff.parent != WorkflowRef(state.mode, state.session_id)
                     or not handoff.returned_at or handoff.result.get('status') != 'blocked'
@@ -496,7 +497,7 @@ class WorkflowCoordinator:
                     or handoff.child is None or handoff.child.kind != 'fix'):
                 return None
             child = load_session_state(self.project_root, handoff.child.native_id)
-            if child.workflow_id != state.workflow_id or child.parent_handoff_id != handoff.handoff_id:
+            if child.workflow_id != state.workflow_id or child.parent_handoff_id != original.handoff_id:
                 return None
             if recover_classification_command(SimpleNamespace(project_root=self.project_root),child,check_only=True):
                 return child

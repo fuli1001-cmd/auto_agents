@@ -60,15 +60,23 @@ def routed_issue(session, state, *, _retained_issue=None):
     return authoritative
 
 
-def validate_classification(session, state, disposition):
-    """Reject conflicting commands before materializing an issue or mutation."""
+def authoritative_command(session, state):
+    """Use the sealed command or original routed command as a single contract."""
     issue = routed_issue(session, state)
     binding = state.verification_binding
     command = binding.get('fix_verify_command') if binding else None
-    if command is None and issue is not None:
-        command = issue.get('verification_command', '')
+    routed = issue.get('verification_command', '') if issue is not None else ''
+    if command and routed and command != routed:
+        raise ownership_error(state, 'bound command conflicts with original routed issue')
+    return command or routed
+
+
+def validate_classification(session, state, disposition):
+    """Reject conflicting commands before materializing an issue or mutation."""
+    issue = routed_issue(session, state)
+    command = authoritative_command(session,state)
     proposed = disposition.get('verification_command', '')
-    if proposed and command and str(proposed).strip() != command:
+    if command and (not isinstance(proposed,str) or proposed and proposed.strip() != command):
         raise ownership_error(state, 'classification conflicts with authoritative fix verification command',
                               original_command=command, proposed_command=str(proposed).strip())
     if issue is not None:
@@ -81,12 +89,23 @@ def validate_classification(session, state, disposition):
 
 
 def recover_classification_command(session, state, *, check_only=False):
-    """Repair only a proven pre-writer classification overwrite on resume."""
+    """Reclassify only a proven pre-writer overwrite or rejected proposal."""
     binding = state.verification_binding
     original = binding.get('fix_verify_command') if binding else None
+    rejected = state.execution_log[-1] if state.execution_log else {}
+    diagnostic = rejected.get('diagnostic', {})
+    protocol_rejection = bool(original and original == state.fix_verify_command
+        and rejected.get('action') == 'execution_preflight_blocked'
+        and rejected.get('failure_kind') == 'verification_ownership'
+        and rejected.get('result') == 'classification conflicts with authoritative fix verification command'
+        and diagnostic.get('original_command') == original
+        and diagnostic.get('proposed_command') and diagnostic['proposed_command'] != original
+        and diagnostic.get('session_id') == state.session_id
+        and diagnostic.get('handoff_id') == state.parent_handoff_id
+        and diagnostic.get('workflow_id') == state.workflow_id)
     if (state.mode != 'fix' or state.status != 'blocked'
             or state.resolution != 'verification_ownership' or not state.source_descriptor
-            or not original or original == state.fix_verify_command):
+            or not original or (original == state.fix_verify_command and not protocol_rejection)):
         return False
     if (state.current_attempt or state.candidate_paths or state.lineage_changed_paths
             or state.persistence_actions or state.candidate_custody.get('receipt')
@@ -160,7 +179,8 @@ def recover_classification_command(session, state, *, check_only=False):
     state.status, state.resolution, state.resume_phase = 'conversing', '', ''
     state.execution_log.append({'action': 'routed_issue_classification_recovered',
         'previous_command': previous, 'restored_command': original,
-        'source_handoff_id': state.parent_handoff_id})
+        'source_handoff_id': state.parent_handoff_id,
+        **({'rejected_classification':dict(rejected)} if protocol_rejection else {})})
     from .config import save_session_state
     save_session_state(session.project_root, state)
     return True

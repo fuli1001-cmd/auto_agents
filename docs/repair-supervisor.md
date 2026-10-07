@@ -103,11 +103,18 @@ Unconfirmed external requests require reconciliation before automatic recovery.
 Routed fixes read their issue from the control repository and authenticate the
 session, handoff and original command, including inside private source clones.
 Classification replies remain evidence and cannot replace that authority or an
-already bound verification command. Legacy pre-writer command overwrites may
+already bound verification command. A bound classifier can omit the command
+or repeat it verbatim; generic environment and gate-selection advice applies
+only when no command is owned. Legacy pre-writer command overwrites may
 be recovered only when the original handoff, retained issue and sealed binding
 agree and no product changes, writer history or receipt exists. The overwritten
 classification is retained in the execution log; conflicting sources remain
 blocked.
+An unchanged, authenticated pre-writer command conflict can likewise re-enter
+classification with the corrected prompt. The rejected proposal remains
+evidence; reclassification neither expands targets nor resets implementation
+budgets. A parent holding the old repair request can resume that same child
+without another parent model call when the command has stayed intact.
 When a parent still holds the old engine repair reply, a proven recoverable
 child triggers a fresh parent diagnosis instead of replaying that reply as a
 new engine failure. Eligibility alone neither resumes nor completes product
@@ -125,6 +132,10 @@ their exit code and structured error are reported even when stderr is empty.
 Existing physical issue projections retain their original bytes during export,
 so a legacy canonical overwrite cannot erase recovery evidence. The copied
 database remains authoritative and all recovery authentication still applies.
+Engine repair requests emit a boundary derived from their durable payload and
+business subject. Its identity stays the same when a saved reply skips the
+original model call; the offline verifier still requires an exact fault and
+checkpoint match.
 Project verification infrastructure incidents are recorded as `verification`
 faults, with command output in the checkpoint diagnostics. They do not authorize
 engine editing. An ordinary supervisor resume retains such a stop; after fixing

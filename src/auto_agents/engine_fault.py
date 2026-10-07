@@ -50,6 +50,15 @@ def request_engine_repair(orchestrator, payload):
         path = Path(orchestrator.project_root) / path
     if path.resolve() != engine_root().resolve():
         return False
+    # A saved reply can bypass the original model call on resume. Attribute
+    # its failure to this durable route instead of whichever phase ran last.
+    from .business_calls import _location
+    from .supervision_api import operation_boundary
+    root,subject = _location(orchestrator)
+    if root is not None and subject:
+        if subject.startswith(('session:','run:')):
+            subject = subject.split(':',1)[1]
+        operation_boundary(root,'engine-route:'+digest(payload),subject)
     raise EngineFault(source.get('user_summary') or source.get('reason') or source.get('summary')
                       or payload.get('reason') or payload.get('summary') or 'Engine execution failed',
                       step_id='engine-route', evidence=payload)

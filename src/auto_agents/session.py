@@ -1838,6 +1838,12 @@ class Session:
                 payload = {}
             child = self._coordinator._retained_classification_child(state,payload)
             if child is not None:
+                if child.fix_verify_command == child.verification_binding.get('fix_verify_command'):
+                    # A rejected suggestion left the owned command intact.
+                    # Its guarded reclassification needs no new parent call.
+                    return self._prepare_workflow_handoff(state,target='resume',
+                        reason='重新分类原聚焦修复，保留已绑定验证命令',
+                        payload={'resume_handoff_id':child.parent_handoff_id}), ''
                 state.conversation.append({'role':'orchestrator','content':
                     'The installed engine now supports guarded recovery of the classified command overwrite '
                     f'for retained handoff {child.parent_handoff_id}. Recovery eligibility was checked without '
@@ -3627,22 +3633,35 @@ class Session:
                 "- This clarification/classification phase is read-only. Do not modify files, create generated artifacts, or run mutating commands.",
                 "- Classify the work and put the disposition in the final response before any implementation begins.",
                 USER_SUMMARY_INSTRUCTION,
-                "- decision='fix' only for a bounded defect against existing behavior; include summary, reason, reproduction, expected, actual, evidence_refs, affected_contracts, verification_command, and persistence_change.",
+                "- decision='fix' only for a bounded defect against existing behavior; include summary, reason, reproduction, expected, actual, evidence_refs, affected_contracts, and persistence_change.",
                 "- decision='run_iteration' when resolution needs new public capability, changed requirements, architecture expansion, or a persistence-model change; include reason and spec_seed with title, goal, gap, capability, acceptance, non_goals, evidence, and open_decisions.",
                 "- decision='not_bug' for expected/configuration/user-misunderstanding cases, decision='need_user' with question when evidence is insufficient, or decision='resume_child' with resume_handoff_id for a prior routed child.",
                 PromptBlock("- Preferred exact wire form: FIX_DISPOSITION v1: {\"decision\":\"...\",...}", kind="output"),
                 PromptBlock("- Do not encode the marker only as a JSON field and do not place the disposition only in commentary or tool output.", kind="output"),
                 PromptBlock("- The final response must contain the valid one-line disposition and no other disposition marker; put the explanation inside its JSON fields.", kind="output"),
-                "- Match repository verification conventions when choosing verification_command.",
-                "- If the project uses a local conda env at ./.conda, every Python-oriented "
-                "verification_command must run inside it via 'conda run -p ./.conda ...'.",
             ])
-            gate_commands = self._gate_commands()
-            if gate_commands:
-                lines.append(
-                    "- Current repository gate commands (reuse them as guidance for FIX_VERIFY when relevant):"
-                )
-                lines.extend(f"  - {command}" for command in gate_commands)
+            from .session_issue import authoritative_command
+            command = authoritative_command(self,state)
+            if command:
+                lines.extend([
+                    '- The controller already owns the exact verification command below. '
+                    'Omit verification_command from the disposition or copy it verbatim. '
+                    'Preserve its interpreter, environment prefix, arguments and test targets. '
+                    'Do not add a conda launcher or append/delete targets. '
+                    'Additional coverage suggestions remain prose and cannot change this contract.',
+                    PromptBlock(command,kind='output'),
+                ])
+            else:
+                lines.extend([
+                    '- Include a concrete verification_command for a fix disposition.',
+                    '- Match repository verification conventions when choosing verification_command.',
+                    "- If the project uses a local conda env at ./.conda, every Python-oriented "
+                    "verification_command must run inside it via 'conda run -p ./.conda ...'.",
+                ])
+                gate_commands = self._gate_commands()
+                if gate_commands:
+                    lines.append('- Current repository gate commands (reuse them as guidance for FIX_VERIFY when relevant):')
+                    lines.extend(f'  - {command}' for command in gate_commands)
         else:
             lines.extend(
                 [
