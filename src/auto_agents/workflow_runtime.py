@@ -887,6 +887,14 @@ class WorkflowCoordinator:
             return state
         session._coordinator = self
         session._coordinator_managed = True
+        if state.active_handoff_id:
+            from .session_source import recover_resume_source
+            try:
+                handoff = self.store.load_handoff(state.active_handoff_id)
+            except (OSError,ValueError,TypeError):
+                pass  # The normal chain guard retains the missing/corrupt handoff failure.
+            else:
+                recover_resume_source(self.project_root,state,handoff)
         from .session_acceptance import begin_recovery
         # Explicit resume shares the automatic diagnosis boundary without
         # replaying acceptance execution or resetting its budget.

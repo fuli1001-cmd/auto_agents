@@ -114,6 +114,11 @@ new engine failure. Eligibility alone neither resumes nor completes product
 implementation. A business recheck that produces a different checkpoint starts
 with new snapshot and candidate inputs; old inputs remain evidence and spent
 model, attempt and no-progress budgets are preserved.
+Resume handoffs reference the original handoff's source instead of registering
+a new source. A legacy prepared wrapper can drop an incorrectly minted source
+only when its controller registration exactly matches the retained parent,
+original handoff and child, apart from the wrapper ID and resulting fingerprint.
+The old descriptor remains in the execution log; other source conflicts stop.
 The snapshot command returns a small receipt; full records and settled calls
 remain in the copied database. Failed exports are discarded before retry, and
 their exit code and structured error are reported even when stderr is empty.

@@ -41,7 +41,8 @@ def private_seeded_fix(tmp_path, monkeypatch):
           'verification_command':command,'verification_scope':{'mode':'focused_fix'}}
     handoff=store.prepare_handoff(snapshot,parent=snapshot.root,target='fix',goal=parent.goal,
         reason='current isolated startup repair',payload={'issue_seed':seed,
-            'authorization_policy':parent.authorization_policy})
+            'authorization_policy':parent.authorization_policy,
+            'goal_execution_environment':parent.goal_execution_environment,'auto_approve':parent.auto_approve})
     register_source(root,parent,handoff);store.save_handoff(handoff)
     parent.active_handoff_id=handoff.handoff_id;parent.status='waiting_child';save_session_state(root,parent)
     coordinator=WorkflowCoordinator(Orchestrator(root),auto_approve=True)
@@ -211,3 +212,120 @@ def test_parent_resume_rechecks_saved_engine_request_only_for_recoverable_child(
         assert not observed
     retained_child=load_session_state(root,child.session_id)
     assert retained_child.fix_verify_command=='npm test' and retained_child.status=='blocked'
+
+
+@pytest.mark.parametrize('legacy_wrapper',[False,True])
+def test_parent_resume_preserves_original_source_through_child_delivery_and_restart(tmp_path,monkeypatch,legacy_wrapper):
+    """Parent route, resumed private writer, real checks, delivery, then restart."""
+    from auto_agents.business_state import BusinessStore
+    from auto_agents.local_io import atomic_json
+    from auto_agents.session_candidate import execution_checkout
+    from auto_agents.session_source import _identity
+    from auto_agents.session_verification import bind_session,fingerprint
+    from auto_agents.workflow_chain import WorkflowStore
+    root,child,command=private_seeded_fix(tmp_path,monkeypatch)
+    session=Session(Orchestrator(root),mode='fix',auto_approve=True)
+    bind_session(session,child)
+    with execution_checkout(session,child):pass
+    original_source=dict(child.source_descriptor)
+    child.fix_verify_command='npm test';child.status,child.resolution='blocked','verification_ownership'
+    save_session_state(root,child)
+    business=BusinessStore(root);relative='sessions/'+child.session_id+'/issue.json'
+    old=business.get(relative)
+    business.save(relative,{**old,'decision':'fix','verification_command':'npm test'},old.reference)
+    store=WorkflowStore(root);original=store.load_handoff(child.parent_handoff_id)
+    snapshot=store.load(child.workflow_id)
+    store.record_result(snapshot,original,status='blocked',result={'status':'blocked','resolution':'verification_ownership'})
+    store.consume_result(snapshot,original,operation_id='old-blocked-return')
+    parent=load_session_state(root,'parent')
+    parent.active_handoff_id='';parent.status='executing';parent.resolution=''
+    parent.last_child_result_ref=str(store.handoff_path(original.handoff_id))
+    parent.conversation.append({'role':'orchestrator','content':'Resume the same retained product repair.'})
+    save_session_state(root,parent)
+    if legacy_wrapper:
+        wrapper=store.prepare_handoff(snapshot,parent=WorkflowRef('collab','parent'),target='resume',
+            goal=parent.goal,reason='resume the original product repair',
+            payload={'resume_handoff_id':original.handoff_id,'authorization_policy':parent.authorization_policy,
+                'goal_execution_environment':parent.goal_execution_environment,'auto_approve':parent.auto_approve})
+        minted=_identity(root,parent,wrapper);minted['source_id']=fingerprint(minted)
+        atomic_json(root/'.auto-agents/state/sources'/(minted['source_id']+'.json'),minted)
+        wrapper.payload['source_descriptor']=minted;store.save_handoff(wrapper)
+        parent.active_handoff_id=wrapper.handoff_id;parent.status='blocked';parent.resolution='verification_ownership'
+        save_session_state(root,parent)
+    classifications=[];writers=[];returned=[]
+    def agent(self,request):
+        if request.purpose=='collab':
+            current=load_session_state(root,child.session_id)
+            if current.status=='completed':
+                returned.append(request.cwd)
+                assert (request.cwd/'startup-isolation.txt').read_text()=='retained repair'
+                raise ObservationBoundary()
+            assert not legacy_wrapper
+            reply='ROUTE_WORKFLOW v1: '+json.dumps({'target':'resume','resume_handoff_id':original.handoff_id})
+        elif request.purpose.endswith('_converse'):
+            classifications.append(request.cwd)
+            assert 'Startup incorrectly queues a historical project' in request.prompt
+            assert command in request.prompt
+            reply='FIX_DISPOSITION v1: '+json.dumps({'decision':'fix','summary':'original startup isolation repair',
+                'verification_command':command})
+        else:
+            assert request.purpose=='fix'
+            writers.append(request.cwd)
+            (request.cwd/'startup-isolation.txt').write_text('retained repair')
+            reply='Fixed\nCOMMIT_MESSAGE: Preserve resumed startup isolation repair'
+        request.output_path.parent.mkdir(parents=True,exist_ok=True);request.output_path.write_text(reply)
+        return AgentResult(True,['fixture'],request.output_path,summary=reply,stdout=reply,returncode=0)
+    monkeypatch.setattr(Orchestrator,'_call_with_failover',agent)
+    shared=(root/'value.py').read_bytes()
+    with pytest.raises(ObservationBoundary):
+        Session(Orchestrator(root),mode='collab',auto_approve=True).resume('parent')
+    result=load_session_state(root,child.session_id)
+    assert result.status=='completed' and result.fix_verify_command==command
+    assert result.source_descriptor==original_source and result.parent_handoff_id==original.handoff_id
+    assert result.candidate_custody.get('receipt') and result.candidate_custody.get('delivered_revision')
+    assert len(classifications)==len(writers)==len(returned)==1
+    assert (root/'value.py').read_bytes()==shared and not (root/'startup-isolation.txt').exists()
+    parent=load_session_state(root,'parent')
+    assert parent.candidate_custody['consumed_delivery']['revision']==result.candidate_custody['delivered_revision']
+    wrapper=store.load_handoff(Path(parent.last_child_result_ref).stem)
+    assert wrapper.target=='resume' and 'source_descriptor' not in wrapper.payload
+    assert store.resolve_handoff_chain(wrapper,workflow_id=child.workflow_id)[-1].handoff_id==original.handoff_id
+    if legacy_wrapper:
+        evidence=next(row for row in parent.execution_log if row.get('action')=='resume_source_registration_recovered')
+        assert evidence['previous_source_descriptor']==minted
+    with pytest.raises(ObservationBoundary):
+        Session(Orchestrator(root),mode='collab',auto_approve=True).resume('parent')
+    assert len(writers)==1 and len(returned)==2
+
+
+def test_legacy_resume_source_recovery_rejects_unregistered_or_conflicting_authority(tmp_path,monkeypatch):
+    from copy import deepcopy
+    from auto_agents.local_io import atomic_json
+    from auto_agents.session_source import _identity,recover_resume_source
+    from auto_agents.session_verification import fingerprint
+    from auto_agents.workflow_chain import WorkflowStore
+    root,child,_=private_seeded_fix(tmp_path,monkeypatch)
+    parent=load_session_state(root,'parent')
+    store=WorkflowStore(root);snapshot=store.load(child.workflow_id)
+    wrapper=store.prepare_handoff(snapshot,parent=WorkflowRef('collab','parent'),target='resume',goal=parent.goal,
+        reason='legacy continuation',payload={'resume_handoff_id':child.parent_handoff_id,
+            'authorization_policy':parent.authorization_policy})
+    minted=_identity(root,parent,wrapper);minted['source_id']=fingerprint(minted)
+    registration=root/'.auto-agents/state/sources'/(minted['source_id']+'.json')
+    atomic_json(registration,minted);wrapper.payload['source_descriptor']=minted;store.save_handoff(wrapper)
+    parent.active_handoff_id=wrapper.handoff_id;parent.status='blocked';parent.resolution='verification_ownership'
+    save_session_state(root,parent)
+    assert recover_resume_source(root,parent,wrapper,check_only=True)
+    before=parent.to_dict()
+    changed=deepcopy(wrapper);changed.payload['source_descriptor']['tree']='0'*40
+    assert not recover_resume_source(root,parent,changed)
+    changed=deepcopy(wrapper);changed.payload['authorization_policy']={'mode':'manual'}
+    assert not recover_resume_source(root,parent,changed)
+    registration.unlink()
+    assert not recover_resume_source(root,parent,wrapper)
+    registration.write_text('corrupt registration')
+    assert not recover_resume_source(root,parent,wrapper)
+    atomic_json(registration,minted)
+    child.source_descriptor['source_id']='other-source';save_session_state(root,child)
+    assert not recover_resume_source(root,parent,wrapper)
+    assert parent.to_dict()==before and store.load_handoff(wrapper.handoff_id).payload['source_descriptor']==minted

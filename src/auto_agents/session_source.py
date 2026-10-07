@@ -88,6 +88,11 @@ def register_source(root, state, handoff):
     """Ignore model-provided source fields; derive them from durable parent state."""
     from .session_verification import fingerprint
     root = Path(root).resolve()
+    if handoff.target == 'resume':
+        # A continuation references the original handoff's source. It never
+        # registers a new implementation source under its own handoff ID.
+        handoff.payload.pop('source_descriptor', None)
+        return
     existing = handoff.payload.get('source_descriptor', {})
     if (isinstance(existing, dict) and existing.get('source_id') == fingerprint(
             {key: value for key, value in existing.items() if key != 'source_id'})
@@ -104,6 +109,61 @@ def register_source(root, state, handoff):
     atomic_json(root / '.auto-agents/state/sources' / (source['source_id'] + '.json'), source)
     handoff.payload['source_descriptor'] = source
     handoff.payload['head_before'] = source['revision']
+
+
+def recover_resume_source(root, state, handoff, *, check_only=False):
+    """Remove only the exact source registration minted by the old resume path."""
+    from copy import deepcopy
+    from .workflow_chain import WorkflowStore, WorkflowRef
+    from .session_verification import fingerprint
+    root = Path(root).resolve()
+    proposed = handoff.payload.get('source_descriptor')
+    if (handoff.target != 'resume' or not proposed or handoff.child is not None
+            or handoff.status != 'prepared' or handoff.returned_at or handoff.result
+            or state.active_handoff_id != handoff.handoff_id
+            or handoff.workflow_id != state.workflow_id
+            or handoff.parent != WorkflowRef(state.mode, state.session_id)):
+        return False
+    # Check every other chain authority before considering this one exact
+    # controller registration. Arbitrary source disagreements stay rejected.
+    trial = deepcopy(handoff)
+    trial.payload.pop('source_descriptor')
+    store = WorkflowStore(root)
+    try:
+        original = store.resolve_handoff_chain(trial,workflow_id=state.workflow_id)[-1]
+        if original.child is None or original.child.kind != 'fix' or not state.candidate_custody:
+            return False
+        expected = _identity(root,state,handoff)
+        expected['source_id'] = fingerprint(expected)
+        child = load_session_state(root,original.child.native_id)
+        registered = read_json(root/'.auto-agents/state/sources'/(expected['source_id']+'.json'),default={})
+        inherited = {**expected,'handoff_id':original.handoff_id}
+        inherited.pop('source_id')
+        inherited['source_id'] = fingerprint(inherited)
+        original_registration = read_json(root/'.auto-agents/state/sources'/(inherited['source_id']+'.json'),default={})
+    except (OSError,ValueError,RuntimeError,KeyError,TypeError):
+        return False
+    if proposed != expected or registered != expected:
+        return False
+    if (original.payload.get('source_descriptor') != inherited
+            or original_registration != inherited
+            or child.source_descriptor != inherited or child.parent_handoff_id != original.handoff_id
+            or child.workflow_id != state.workflow_id):
+        return False
+    if check_only:
+        return True
+    from .config import save_session_state
+    state.execution_log.append({'action':'resume_source_registration_recovered',
+        'handoff_id':handoff.handoff_id,'original_handoff_id':original.handoff_id,
+        'previous_source_descriptor':dict(proposed)})
+    if state.status == 'blocked' and state.resolution == 'verification_ownership':
+        state.status,state.resolution,state.resume_phase = 'waiting_child','',''
+    # Save the evidence and continuation phase first. If interrupted, the
+    # normal chain guard still rejects the old wrapper until recovery retries.
+    save_session_state(root,state)
+    handoff.payload.pop('source_descriptor')
+    store.save_handoff(handoff)
+    return True
 
 
 def resolve_source(root, state):
