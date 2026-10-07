@@ -64,8 +64,11 @@ def perform(owner, phase, key, function, classify=None, *, usage=None, model=Fal
     prior = store.reserve(identity, subject, phase, model=model)
     if prior:
         if prior['state'] != 'finished':
-            raise BusinessStateError('outcome_unknown', 'The original call has no confirmed result', operation=identity)
+            raise store.unconfirmed_call_error([
+                {name: prior[name] for name in ('id', 'subject', 'phase')}
+            ])
         return json.loads(prior['result'])
+    from .models import ProvidersExhaustedError
     try:
         result = function()
         serialized = asdict(result) if is_dataclass(result) else result
@@ -73,13 +76,26 @@ def perform(owner, phase, key, function, classify=None, *, usage=None, model=Fal
         canonical(serialized)
         store.settle(identity, serialized)
         return result
+    except ProvidersExhaustedError as error:
+        # Exhaustion is a confirmed failure: adapters returned terminal
+        # results, or no executable was available to dispatch. Preserve the
+        # exception so replay retains the same contract without another call.
+        if error.result is not None and error.result.cleanup_incomplete:
+            store.settle(identity, None, state='unknown')
+        else:
+            store.settle(identity, {'providers_exhausted': {
+                'message': str(error), 'providers': error.providers,
+                'category': error.category,
+                'result': asdict(error.result) if error.result is not None else None,
+            }})
+        raise
     except BaseException:
         store.settle(identity, None, state='unknown' if model or phase == 'deliver' else 'interrupted')
         raise
 
 
 def provider(orchestrator, request, execute):
-    from .models import AgentResult, AgentTermination, AgentUsage
+    from .models import ProvidersExhaustedError
     root, subject = _location(orchestrator, request.usage_context)
     phase = ('acceptance' if 'acceptance' in request.purpose else 'review' if 'review' in request.purpose
              else 'implement' if request.purpose in {'fix', 'implement'} else 'route' if request.purpose == 'collab'
@@ -95,16 +111,26 @@ def provider(orchestrator, request, execute):
     result = perform(orchestrator, phase, identity, lambda: execute(request),
                      usage=request.usage_context, model=True)
     if isinstance(result, dict):
+        if 'providers_exhausted' in result:
+            failure = result['providers_exhausted']
+            native = _agent_result(failure['result']) if failure['result'] is not None else None
+            raise ProvidersExhaustedError(failure['message'], providers=failure['providers'],
+                                         result=native, category=failure['category'])
         if result.get('legacy_terminal'):
             raise BusinessStateError('settled_terminal', result['legacy_terminal'].get('reason', 'The original request was cancelled'))
-        value = dict(result)
-        value['output_path'] = Path(value['output_path'])
-        if isinstance(value.get('termination'), dict):
-            value['termination'] = AgentTermination(**value['termination'])
-        if isinstance(value.get('usage'), dict):
-            value['usage'] = AgentUsage(**value['usage'])
-        return AgentResult(**value)
+        return _agent_result(result)
     return result
+
+
+def _agent_result(result):
+    from .models import AgentResult, AgentTermination, AgentUsage
+    value = dict(result)
+    value['output_path'] = Path(value['output_path'])
+    if isinstance(value.get('termination'), dict):
+        value['termination'] = AgentTermination(**value['termination'])
+    if isinstance(value.get('usage'), dict):
+        value['usage'] = AgentUsage(**value['usage'])
+    return AgentResult(**value)
 
 
 def verification(owner, scope, execute):

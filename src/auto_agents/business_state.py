@@ -11,6 +11,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import time
@@ -126,11 +127,24 @@ class BusinessStore:
             row = db.execute('SELECT * FROM calls WHERE id=?', (identity,)).fetchone()
             if row:
                 return dict(row)
-            if model and db.execute("SELECT 1 FROM calls WHERE state IN ('dispatched','unknown') AND model=1").fetchone():
-                raise BusinessStateError('outcome_unknown', 'Reconcile the retained external request before another call')
+            if model:
+                pending = db.execute("SELECT id,subject,phase FROM calls WHERE state IN ('dispatched','unknown') AND model=1").fetchall()
+                if pending:
+                    raise self.unconfirmed_call_error([dict(item) for item in pending])
             db.execute('INSERT INTO calls VALUES(?,?,?,?,?,?,?)',
                        (identity, subject, phase, 'dispatched', None, int(model), time.time()))
         return None
+
+    def unconfirmed_call_error(self, calls):
+        project = shlex.quote(str(self.project))
+        identity = shlex.quote(calls[0]['id'])
+        return BusinessStateError('outcome_unknown',
+            'Reconcile the retained external request before another call. '
+            f'Pending call: {calls[0]["id"]} (subject={calls[0]["subject"]}, phase={calls[0]["phase"]}). '
+            f'Inspect: auto-agents business-status --project {project}. '
+            'After verifying the original outcome, supply its confirmed result: '
+            f'auto-agents reconcile-call --project {project} --call {identity} --result FILE',
+            pending_calls=calls)
 
 
     def settle(self, identity, result, *, state='finished'):

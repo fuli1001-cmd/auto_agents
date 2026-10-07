@@ -36,6 +36,8 @@ class Observer:
         self.value = {'schema': 1, 'project': str(self.project), 'status': 'running', 'phase': 'startup',
                       'step_id': 'startup', 'progress_seq': 0, 'steps': [], 'waiting_for': '',
                       'operation': '', 'subject': '', 'milestones': []}
+        self.value['root_subject'] = next((self.argv[i+1] for i,arg in enumerate(self.argv[:-1])
+                                          if arg == '--session'), '')
         revision=os.environ.get('AUTO_AGENTS_PINNED_RUNTIME')
         module_source=Path(__file__).resolve().parents[2]
         if not revision and (module_source/'.git').exists():
@@ -79,16 +81,19 @@ class Observer:
             if self.output:
                 atomic(self.output, {**self.value, 'heartbeat_at': time.time()})
 
-    def step(self, phase, subject='', *, external=False):
+    def step(self, phase, subject='', *, external=False, counted=True):
         from .business_calls import OfflineBoundary
         step = str(subject) + ':' + phase
         with self.lock:
             self.value.update(phase=phase, step_id=step, subject=subject, operation=phase, waiting_for='')
-            self.value['steps'] = [*self.value['steps'][-31:],
-                                   {'step_id': step, 'progress_seq': self.value['progress_seq']}]
+            row = {'step_id': step, 'progress_seq': self.value['progress_seq']}
+            if not counted:
+                row['counted'] = False
+            self.value['steps'] = [*self.value['steps'][-31:], row]
             self.publish()
-        if self.offline and not self.value.get('waiting_for'):
-            repeated = sum(row['step_id'] == step and row['progress_seq'] == self.value['progress_seq']
+        if counted and self.offline and not self.value.get('waiting_for'):
+            repeated = sum(row.get('counted', True) and row['step_id'] == step
+                           and row['progress_seq'] == self.value['progress_seq']
                            for row in self.value['steps'])
             if repeated >= 3:
                 from .engine_fault import EngineFault
@@ -108,7 +113,10 @@ class Observer:
         records = status(self.project)
         token = {'schema': 1, 'project': str(self.project), 'argv': self.argv,
                  'step_id': step, 'state_identity': records['identity'], 'subject': self.value['subject']}
-        root_id = next((self.argv[i+1] for i,arg in enumerate(self.argv[:-1]) if arg=='--session'), '')
+        root_id = self.value.get('root_subject') or next(
+            (self.argv[i+1] for i,arg in enumerate(self.argv[:-1]) if arg=='--session'), '')
+        if root_id and self.argv and self.argv[0] in {'collab', 'fix', 'provider-resolve'} and '--session' not in self.argv:
+            token['argv'] = [*self.argv, '--session', root_id]
         target = root_id or self.value['subject']
         root_record = records['records'].get('sessions/' + root_id + '/session_state.json', {})
         handoff_id = root_record.get('active_handoff_id')
@@ -126,13 +134,17 @@ class Observer:
         self.value.update(status='failed', fault={'category': category, 'step_id': step,
             'type': type(error).__name__, 'message': sanitize(str(error)), 'traceback': sanitize(traceback.format_exc()),
             'resume_token': str(checkpoint), 'evidence': getattr(error, 'evidence', {})})
+        diagnostics = checkpoint.with_suffix('.diagnostics.json')
+        self.value['fault']['diagnostics_path'] = str(diagnostics)
+        atomic(diagnostics, self.value['fault'])
         self.publish()
         return self.value['fault']
 
     def finish(self, code):
         if self.value['status'] != 'failed':
             records=status(self.project)['records']
-            root=next((self.argv[i+1] for i,arg in enumerate(self.argv[:-1]) if arg=='--session'),self.value['subject'])
+            root=self.value.get('root_subject') or next(
+                (self.argv[i+1] for i,arg in enumerate(self.argv[:-1]) if arg=='--session'),self.value['subject'])
             completed=(records.get('run_state.json',{}).get('status')=='completed' if self.argv and self.argv[0]=='run'
                        else any(value.get('session_id')==root and value.get('status')=='completed' for value in records.values()))
             self.value['status'] = 'completed' if code == 0 and completed else 'stopped'
@@ -146,10 +158,10 @@ class Observer:
         _active.reset(self.token)
 
 
-def operation_boundary(project, phase, subject='', *, external=False):
+def operation_boundary(project, phase, subject='', *, external=False, counted=True):
     observer = _active.get()
     if observer and Path(project).resolve() == observer.project:
-        observer.step(phase, subject, external=external)
+        observer.step(phase, subject, external=external, counted=counted)
 
 
 def milestone(project, identity):
@@ -441,10 +453,22 @@ class BusinessTelemetry:
     def __init__(self, project_root, **kwargs):
         self.project_root = Path(project_root)
         self.enabled = bool(kwargs.get('enabled', True))
+        self.subject_id = ''
     def start(self, subject_id=''): pass
-    def bind_subject(self, subject_id): pass
+    def bind_subject(self, subject_id):
+        self.subject_id = subject_id
+        observer = _active.get()
+        if observer and self.project_root.resolve() == observer.project and subject_id:
+            with observer.lock:
+                if not observer.value.get('root_subject'):
+                    observer.value['root_subject'] = subject_id
+                observer.value['subject'] = subject_id
+                observer.publish()
     def set_phase(self, phase):
-        operation_boundary(self.project_root, phase)
+        # Returning from a child is a phase transition, not another execution
+        # of the same business operation. Actual call/verification boundaries
+        # retain their repetition checks and never earn progress from routing.
+        operation_boundary(self.project_root, phase, self.subject_id, counted=False)
     def set_active_operation(self, *args, **kwargs): pass
     def close(self, **kwargs): pass
     def check_action(self): return None

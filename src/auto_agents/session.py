@@ -76,7 +76,7 @@ from .persistence import (
     persistence_change_strategy,
 )
 from .performance_trace import PerformanceTrace
-from .business_state import entry as kernel_entry
+from .business_state import BusinessStateError, entry as kernel_entry
 from .verification_sandbox import ConfinementPreflightError
 from .session_verification import (
     SessionOwnershipError, bind_session, collection_command, diagnostic_owners,
@@ -639,6 +639,20 @@ class Session:
             state.status = "paused"
             state.resolution = "interrupted_by_user"
             self._save(state)
+        except BusinessStateError as exc:
+            if exc.code == 'outcome_unknown':
+                state.resume_phase = active_phase
+                state.status = 'blocked'
+                state.resolution = 'external_call_reconciliation_required'
+                state.execution_log.append({
+                    'attempt': state.current_attempt,
+                    'action': 'reconciliation_required',
+                    'result': str(exc),
+                    'details': exc.details,
+                    'timestamp': self._now(),
+                })
+                self._save(state)
+            raise
         except RuntimeError as exc:
             from .engine_fault import EngineFault as EngineRepairRequired
             if isinstance(exc, EngineRepairRequired):
@@ -758,7 +772,7 @@ class Session:
             prompt = self._build_converse_prompt(state)
             try:
                 reply = self._call_agent(state, f"converse-{rounds}", prompt)
-            except ProviderCleanupIncompleteError:
+            except (ProviderCleanupIncompleteError, BusinessStateError):
                 raise
             except RuntimeError as exc:
                 err_msg = str(exc)
@@ -2068,10 +2082,15 @@ class Session:
         if binding_error and self._coordinator is not None and state.workflow_id:
             snapshot = self._coordinator.store.load(state.workflow_id)
             child = self._coordinator._retained_proof_child(payload, snapshot)
+            inventory_resume = False
+            if child is None:
+                child = self._coordinator._retained_inventory_child(state, payload, snapshot)
+                inventory_resume = child is not None
             if child is not None:
                 # Preserve the original engine request as history. The new
                 # continuation owns only the retained product candidate.
-                target, reason = 'resume', '独立审核现有候选的测试修订并继续验证'
+                target, reason = 'resume', ('验证选择已更新，继续验证保留候选' if inventory_resume
+                                            else '独立审核现有候选的测试修订并继续验证')
                 payload = {'resume_handoff_id': child.parent_handoff_id}
                 binding_error = ''
                 proof_resume = True
@@ -2271,7 +2290,7 @@ class Session:
             except SessionOwnershipError as error:
                 restore_guard.cleanup()
                 return self._block_execution_binding(state, error, "verification_ownership")
-            except ProviderCleanupIncompleteError:
+            except (ProviderCleanupIncompleteError, BusinessStateError):
                 restore_guard.cleanup()
                 raise
             except RuntimeError as exc:
@@ -2716,7 +2735,7 @@ class Session:
                     if durable_restore is not None:
                         shutil.rmtree(durable_restore, ignore_errors=True)
                     raise
-                except ProviderCleanupIncompleteError:
+                except (ProviderCleanupIncompleteError, BusinessStateError):
                     raise
                 except RuntimeError as exc:
                     from .recovery.model import KernelError
@@ -3101,7 +3120,7 @@ class Session:
                         f"provider-resolve-{state.current_attempt}",
                         prompt,
                     )
-                except ProviderCleanupIncompleteError:
+                except (ProviderCleanupIncompleteError, BusinessStateError):
                     raise
                 except RuntimeError as exc:
                     from .recovery.model import KernelError
@@ -3238,7 +3257,7 @@ class Session:
                     self._save(state)
                     try:
                         resumed = self.orch.resume_saved_run()
-                    except ProviderCleanupIncompleteError:
+                    except (ProviderCleanupIncompleteError, BusinessStateError):
                         raise
                     except RuntimeError:
                         state.status = "failed"
@@ -3358,7 +3377,7 @@ class Session:
                 self._print("Provider references and full preflight now pass. Resuming run...")
                 try:
                     resumed = self.orch.resume_saved_run()
-                except ProviderCleanupIncompleteError:
+                except (ProviderCleanupIncompleteError, BusinessStateError):
                     raise
                 except RuntimeError as exc:
                     err_msg = str(exc)

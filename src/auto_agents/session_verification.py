@@ -22,7 +22,9 @@ from .io_utils import read_json
 
 # Re-seal older receipts before reuse: v5 can omit checks inherited through
 # parameterized generic bases, even when the selected node remains unchanged.
-_PROOF_INVENTORY_VERSION = 7
+# v8 projects absent foreign class selectors with ordinary runner arguments;
+# receipt upgrades must re-attest the same projection before delivery.
+_PROOF_INVENTORY_VERSION = 8
 _REFERENCE_ROLE_VERSION = 1
 _REFERENCE_CATALOGS = ('.auto-agents/state/requirements_trace.json',
                        '.auto-agents/state/provider_references.lock.json')
@@ -475,6 +477,102 @@ def _step_affected(session, state, step):
     return bool(changed.intersection(dependencies))
 
 
+def _ordinary_projection_args(args):
+    """Only presentation and scratch-directory options preserve static coverage."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {'--basetemp', '--tb', '--capture'}:
+            index += 1
+            if index == len(args):
+                return False
+        elif (arg in {'-s', '--disable-warnings'} or arg.startswith(('--basetemp=', '--tb=', '--capture='))
+              or arg.startswith('-') and len(arg) > 1 and set(arg[1:]) <= {'q', 'v'}):
+            pass
+        elif arg == '-p' and index + 1 < len(args) and args[index + 1] == 'no:cacheprovider':
+            index += 1
+        else:
+            return False
+        index += 1
+    return True
+
+
+def _effective_projection_args(args):
+    # Retained -m/-k defaults narrow collection but cannot synthesize a node
+    # absent from a statically classified source. Keep those defaults intact;
+    # unknown plugins and custom configuration still prevent projection.
+    remaining = []
+    index = 0
+    while index < len(args):
+        if args[index] in {'-m', '-k'}:
+            index += 1
+            if index == len(args):
+                return False
+        else:
+            remaining.append(args[index])
+        index += 1
+    return _ordinary_projection_args(remaining)
+
+
+def _static_absent_selector(tree, parts):
+    """Prove absence without evaluating imports, inheritance or generated tests."""
+    if len(parts) not in {2, 3} or any('[' in part for part in parts[1:]):
+        return False
+    # Dynamic exports and collectors can supply nodes absent from local defs.
+    if any(isinstance(node, ast.Call) and (
+            isinstance(node.func, ast.Name) and node.func.id in {'exec', 'eval', 'setattr', 'globals', 'locals'}
+            or isinstance(node.func, ast.Attribute) and node.func.attr == 'setattr')
+           for node in ast.walk(tree)):
+        return False
+    if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+           and (node.name.startswith('pytest_') or node.name == '__getattr__') for node in tree.body):
+        return False
+    definitions = {node.name: node for node in tree.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    exports, testcase, unittest_modules = set(), set(), set()
+    for node in tree.body:
+        if isinstance(node, ast.Expr) and any(isinstance(item, ast.Call) for item in ast.walk(node)):
+            return False  # An import-time registrar may synthesize test members.
+        if isinstance(node, (ast.ImportFrom, ast.Import)):
+            exports.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+            if isinstance(node, ast.ImportFrom) and node.module == 'unittest':
+                testcase.update(alias.asname or alias.name for alias in node.names if alias.name == 'TestCase')
+            if isinstance(node, ast.Import):
+                unittest_modules.update(alias.asname or alias.name for alias in node.names if alias.name == 'unittest')
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            assigned = {name.id for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                        for name in ast.walk(target) if isinstance(name, ast.Name)}
+            exports.update(assigned)
+            testcase.difference_update(assigned)
+            unittest_modules.difference_update(assigned)
+        elif (isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(
+                ast.parse("__name__ == '__main__'", mode='eval').body)):
+            continue
+        elif not isinstance(node, (ast.Expr, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False  # Conditional definitions and module mutation are unresolved.
+    name = parts[1]
+    if name in exports or '*' in exports or 'pytest_plugins' in exports or 'load_tests' in definitions:
+        return False
+    node = definitions.get(name)
+    if len(parts) == 2:
+        return node is None
+    if not isinstance(node, ast.ClassDef) or node.decorator_list or node.keywords:
+        return False
+    # unittest.TestCase supplies runner infrastructure, not product test bodies.
+    # Other bases may supply inherited tests and require collection evidence.
+    if any(not (isinstance(base, ast.Name) and base.id in testcase
+                or isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name)
+                and base.value.id in unittest_modules and base.attr == 'TestCase') for base in node.bases):
+        return False
+    for member in node.body:
+        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if member.name == parts[2] or member.name == '__getattr__':
+                return False
+        elif not isinstance(member, (ast.Expr, ast.Pass)):
+            return False  # Assigned aliases and conditional/generated methods.
+    return True
+
+
 def _future_foreign_step(session, state, step, excluded):
     """Recognize only absent Python selectors exclusively owned by future work.
 
@@ -482,7 +580,9 @@ def _future_foreign_step(session, state, step, excluded):
     uses the retained revision, so candidate edits cannot change projection.
     """
     targets = step.get('targets', [])
-    if step.get('command') or step.get('args') or step.get('runner', 'pytest') != 'pytest':
+    runner = step.get('runner', 'pytest')
+    if (step.get('command') or runner not in {'pytest', 'vitest'}
+            or not _ordinary_projection_args(step.get('args', []))):
         return False  # Declared targets alone cannot establish command coverage.
     if not targets or (step.get('proof_id') not in excluded
                        and any(target not in excluded for target in targets)):
@@ -492,9 +592,33 @@ def _future_foreign_step(session, state, step, excluded):
     revision = _contract_source_revision(session, state)
     if not revision:
         return False
+    context = getattr(session, '_proof_execution_context', None)
+    environment = context.environment if context is not None else os.environ
+    try:
+        if not _effective_projection_args(shlex.split(environment.get('PYTEST_ADDOPTS', ''))):
+            return False
+    except ValueError:
+        return False
+    for path, source in state.verification_binding.get('proof_sources', {}).items():
+        if path.endswith('conftest.py') and source and any(hook in source for hook in (
+                'pytest_collect_file', 'pytest_pycollect_makeitem', 'pytest_pycollect_makemodule',
+                'pytest_collection_modifyitems', 'pytest_generate_tests', 'pytest_plugins')):
+            return False  # Retained collection hooks can synthesize absent nodes.
+        if Path(path).name in _PYTEST_CONFIG_NAMES and source:
+            import configparser
+            try:
+                options = _pytest_config_options(path, source) or {}
+                addopts = options.get('addopts', [])
+                if not _effective_projection_args(shlex.split(addopts) if isinstance(addopts, str) else addopts):
+                    return False
+            except (ValueError, configparser.Error):
+                # Configuration parser errors leave the obligation intact;
+                # native preparation reports the actual failure.
+                return False
     for target in targets:
         parts = target.split('::')
-        if len(parts) > 2 or not parts[0].endswith('.py'):
+        if (len(parts) > 3 or runner == 'pytest' and not parts[0].endswith('.py')
+                or runner == 'vitest' and (len(parts) != 1 or Path(parts[0]).suffix not in {'.js', '.jsx', '.ts', '.tsx'})):
             return False
         root = getattr(session, '_retained_source_root', session.project_root)
         memo = getattr(session, '_proof_selection_pass', None)
@@ -502,39 +626,29 @@ def _future_foreign_step(session, state, step, excluded):
         key = (str(root), revision, parts[0])
         if key not in cache:
             result = subprocess.run(['git', 'show', f'{revision}:{parts[0]}'], cwd=root, capture_output=True, text=True)
-            record = {'exists': result.returncode == 0, 'parseable': False, 'functions': set(), 'exports': set()}
-            if not result.returncode:
+            record = {'exists': result.returncode == 0, 'absent': False, 'tree': None}
+            if result.returncode:
+                probe = subprocess.run(['git', 'ls-tree', revision, '--', parts[0]], cwd=root,
+                                       capture_output=True, text=True)
+                record['absent'] = probe.returncode == 0 and not probe.stdout.strip()
+            elif runner == 'pytest':
                 try:
-                    tree = ast.parse(result.stdout)
-                    record['parseable'] = True
-                    record['functions'] = {node.name for node in ast.walk(tree)
-                                           if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
-                    for node in tree.body:
-                        if isinstance(node, (ast.ImportFrom, ast.Import)):
-                            record['exports'].update(alias.asname or alias.name for alias in node.names)
-                        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                            record['exports'].update(name.id
-                                for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
-                                for name in ast.walk(target) if isinstance(name, ast.Name))
+                    record['tree'] = ast.parse(result.stdout)
                 except SyntaxError:
                     pass
             cache[key] = record
         record = cache[key]
         if not record['exists']:
-            continue
+            if record['absent']:
+                continue
+            return False  # An unreadable revision is not proof of absence.
         if len(parts) == 1:
             return False  # Existing whole-file coverage is regression evidence.
-        if not record['parseable']:
-            return False
-        # Parameter IDs are collection-time identities, not Python function
-        # names. A retained function is regression evidence even when static
-        # inspection cannot establish whether the requested parameter exists.
-        function_name = parts[1].split('[', 1)[0]
-        if function_name in record['functions']:
-            return False
-        # Imported/re-exported tests have no local FunctionDef. Their retained
-        # binding is regression evidence; only proven absence permits removal.
-        if function_name in record['exports'] or '*' in record['exports']:
+        selectors = record.setdefault('selectors', {})
+        selector = tuple(parts[1:])
+        if selector not in selectors:
+            selectors[selector] = record['tree'] is not None and _static_absent_selector(record['tree'], parts)
+        if not selectors[selector]:
             return False
     return True
 
@@ -1995,8 +2109,6 @@ def _session_gates(session, state):
     # workflow owns it. Default-target regressions have dependencies too.
     refs = _mandatory_refs(state)
     def keep_command(command):
-        from .orchestrator import Orchestrator
-
         # Containment proves coverage, not exclusive ownership. A file or
         # directory command still runs existing regressions when a foreign
         # workflow has planned an additional node inside it. Remove only a
@@ -2009,9 +2121,17 @@ def _session_gates(session, state):
         seen = False
         try:
             for start, end in command_spans(command):
-                args = executable_tokens(command[start:end])
-                targets = Orchestrator._pytest_targets_from_command(shlex.join(args))
-                if not targets or not _future_foreign_step(session, state, {'targets': targets}, foreign_targets):
+                raw = command[start:end]
+                invocations = test_invocations(raw)
+                if len(invocations) != 1 or invocations[0].runner != 'pytest' or 'PYTEST_ADDOPTS' in raw:
+                    return True
+                invocation = invocations[0]
+                options = list(invocation.arguments)
+                for target in invocation.targets:
+                    options.remove(target)
+                targets = invocation.repository_targets
+                if not targets or not _future_foreign_step(session, state,
+                        {'targets': targets, 'args': options}, foreign_targets):
                     return True
                 seen = True
         except ValueError:

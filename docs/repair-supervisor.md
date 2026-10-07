@@ -65,6 +65,22 @@ checkpoint. Waiting for a user suspends cycle detection. Heartbeat loss and an
 operation timeout preserve the scene and stop: they do not alone prove an engine
 bug. There is no model continually interpreting workflow health.
 
+Returning from a child workflow records a phase transition, without counting it
+as repeated execution or awarding a milestone. Call and verification boundaries
+still count toward cycle detection. Checkpoints retain the root session selected
+or created during the invocation, so recovery resumes it explicitly even when
+the original command omitted `--session`.
+
+Interactive termination prints a short reason and the retained log location.
+Full faults, tracebacks and evidence are saved beside the resume checkpoint;
+`auto-agents-watch status --job JOB --json` returns the full maintenance record.
+Watcher commands emit JSON only when `--json` is supplied.
+
+If automatic repair stopped before making any model call because the engine
+checkout was dirty, rerunning the business command checks the current engine
+against the retained session once. The previous fault remains in history and
+budgets are preserved; another fault still goes through normal repair admission.
+
 Maintenance takes a private project snapshot, including settled call receipts.
 Registered native candidate repositories outside the project are copied too;
 offline execution mounts these copies at their logical paths. Only the private
@@ -158,6 +174,13 @@ confirmed result file has `{"operation_id":"ID","result":{...AgentResult...}}`.
 Use `auto-agents reconcile-call --project PROJECT --call ID --result FILE`.
 `--confirm-cancelled` is an explicit operator confirmation that the original
 request was cancelled; it does not authorize repeating that request.
+
+Provider exhaustion is a confirmed failure, including when no provider binary
+is available. Its receipt preserves the original exception and any terminal
+provider result; replay never dispatches that same request again. A genuinely
+unconfirmed dispatch blocks the session immediately with
+`external_call_reconciliation_required`, preserves its resume phase, and reports
+the pending call ID and reconciliation command instead of retrying clarification.
 
 For an unresolved **maintenance** CLI call, `auto-agents-watch reconcile --job JOB
 --result FILE` accepts an operator-confirmed receipt with `job_id`, `call` (the

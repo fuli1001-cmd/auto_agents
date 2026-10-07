@@ -41,8 +41,8 @@ def digest(value):
 def request_engine_repair(orchestrator, payload):
     """Only an explicitly engine-owned repository route becomes an engine fault."""
     from .execution_binding import route_sources
-    target = next((row.get('target_repository') for row in route_sources(payload)
-                   if row.get('target_repository')), '')
+    source = next((row for row in route_sources(payload) if row.get('target_repository')), {})
+    target = source.get('target_repository', '')
     if not target:
         return False
     path = Path(target).expanduser()
@@ -50,5 +50,6 @@ def request_engine_repair(orchestrator, payload):
         path = Path(orchestrator.project_root) / path
     if path.resolve() != engine_root().resolve():
         return False
-    raise EngineFault(payload.get('reason') or payload.get('summary') or 'Engine execution failed',
+    raise EngineFault(source.get('user_summary') or source.get('reason') or source.get('summary')
+                      or payload.get('reason') or payload.get('summary') or 'Engine execution failed',
                       step_id='engine-route', evidence=payload)

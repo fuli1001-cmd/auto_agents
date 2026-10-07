@@ -683,8 +683,11 @@ def require_release_verification(session, state):
     if binding.get('gates', {}).get('verification_policy_version', 1) < 5:
         return
     identity = verification_identity(session, state, scope='final')
-    required = {step['proof_id'] for step in binding['gates'].get('steps', [])
-                if step.get('proof_id') and set(step.get('levels', ['affected', 'release'])) & {'affected', 'release'}}
+    # The sealed graph includes unadopted future work. Delivery must attest
+    # the same authenticated projection used by final execution, including
+    # mandatory prerequisites and generated changed-test proofs.
+    plan, _ = session._verification_plan_commands('final')
+    required = set(plan.proof_ids)
     receipt = state.candidate_custody['receipt']['fingerprint']
     valid = any(row.get('action') == 'receipt_verification'
                 and row.get('identity') == identity and row.get('receipt_fingerprint') == receipt

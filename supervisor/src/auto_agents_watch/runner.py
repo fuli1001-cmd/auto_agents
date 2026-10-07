@@ -79,7 +79,7 @@ class Runner:
         if job.get('runtime_source'):
             environment.update(PYTHONPATH=str(Path(job['runtime_source'])/'src'),
                                AUTO_AGENTS_PINNED_RUNTIME=job['candidate_revision'])
-        if job.get('runtime_argv'):
+        if job.get('runtime_argv') or getattr(self, '_rechecking_business', False):
             environment['AUTO_AGENTS_MAINTENANCE_RESUME']='1'
         return {**environment,'AUTO_AGENTS_NO_SUPERVISOR':'1','AUTO_AGENTS_ENGINE_SOURCE_ROOT':job['engine'],
                 'AUTO_AGENTS_OBSERVATION_FILE':str(self.directory/'observation.json'),
@@ -102,6 +102,13 @@ class Runner:
             if alive(retained.get('process')) or retained.get('active_call'):
                 return self.resume(retained['id'])
             self.store.save(retained,argv=list(argv))
+            if (retained['state'] == 'STOPPED' and not retained.get('candidate')
+                    and not retained.get('model_calls') and not retained.get('attempts')
+                    and retained.get('reason') == 'Engine source has uncommitted changes; candidate admission preserves user work'):
+                # A user rerunning the command after fixing the local engine
+                # should reach business recovery, rather than replaying an
+                # admission refusal forever. This grants no maintenance credit.
+                return self.resume(retained['id'], retry_business=True)
             return self.resume(retained['id'])
         job=self.store.create(argv,project,engine)
         return self.resume(job['id'])
@@ -340,7 +347,7 @@ class Runner:
             argv=[str(python),'-m','auto_agents',*argv[1:]]
         return argv
 
-    def resume(self,identity, *, explicit=False):
+    def resume(self,identity, *, explicit=False, retry_business=False):
         job=self.store.get(identity); self.directory=self.store.root/'jobs'/identity
         if job['state']=='DONE':
             with self.locked(job):self.clean_completed(job)
@@ -355,6 +362,12 @@ class Runner:
         try:
             with self.locked(job):
                 if explicit:self.store.acknowledge_resume(job)
+                if retry_business:
+                    self._rechecking_business = True
+                    self.store.save(job, needs_maintenance=False, fault=None,
+                        retained_faults=[*job.get('retained_faults', []),
+                                         {'fault': job.get('fault'), 'reason': job.get('reason'),
+                                          'resume_token': job.get('resume_token')}])
                 if (job.get('needs_maintenance') or job.get('fault') and not job.get('runtime_argv')) and job['state'] in {'STOPPED','REPAIRING','VERIFYING','RESTARTING'}:
                     self.maintain(job)
                 while self.business(job):
@@ -362,6 +375,8 @@ class Runner:
                 if job['state']=='DONE':self.clean_completed(job)
         except Exception as error:
             self.store.save(job,'STOPPED',reason=str(error))
+        finally:
+            self._rechecking_business = False
         if job['state']=='DONE':self.clean_business(job)
         return self.store.get(identity)
 

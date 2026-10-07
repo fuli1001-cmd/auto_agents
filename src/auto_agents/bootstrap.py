@@ -7,6 +7,16 @@ import subprocess
 import sys
 
 
+def print_failure(message, *, diagnostics=None):
+    from .diagnostic_redaction import sanitize
+    summary = ' '.join(sanitize(str(message)).split())
+    if len(summary) > 400:
+        summary = summary[:397] + '…'
+    print('执行已停止：' + summary, file=sys.stderr)
+    if diagnostics:
+        print('详细诊断：' + str(diagnostics), file=sys.stderr)
+
+
 def select_runtime(argv=None):
     """A normal installation pointer, independent of the maintenance database."""
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -49,7 +59,7 @@ def main(argv=None):
         try:
             config=json.loads(config_path.read_text()) if config_path.exists() else {}
         except (OSError,ValueError) as error:
-            print(json.dumps({'ok':False,'error':str(error)},ensure_ascii=False))
+            print_failure(error)
             return 3
         execution=config.get('execution',{})
         fallback='off' if execution.get('self_repair_diagnosis',{}).get('mode')=='off' else 'auto'
@@ -79,5 +89,5 @@ def main(argv=None):
             return 130
         except Exception as error:
             fault=observer.fault(error)
-            print(json.dumps({'ok':False,'error':fault['message'],'fault':fault},ensure_ascii=False))
+            print_failure(fault['message'], diagnostics=fault['diagnostics_path'])
             return 3

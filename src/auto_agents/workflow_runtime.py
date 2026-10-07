@@ -481,6 +481,63 @@ class WorkflowCoordinator:
             return None  # Missing custody is not an amendment; keep the engine binding check.
         return child if pending(child) else None
 
+    def _retained_inventory_child(self, state, payload, snapshot):
+        """Revalidate a retained candidate when a parser upgrade clears its blocker.
+
+        This redirects only an engine route whose failed, unadopted selectors
+        are now proven absent. Native resume still authenticates and migrates
+        custody, reruns verification, and decides whether delivery is possible.
+        """
+        from .engine_fault import engine_root
+        from .execution_binding import route_sources, test_invocations, validate_custody_binding
+        from .session_verification import (_PROOF_INVENTORY_VERSION, session_gates,
+                                           _command_covers, _ref_covered, SessionOwnershipError)
+        from .session_candidate import validate_receipt
+        from .session import Session
+        from .models import VerificationStep
+        if not state.last_child_result_ref:
+            return None
+        targets = [row.get('target_repository') for row in route_sources(payload) if row.get('target_repository')]
+        if not targets or any((self.project_root / Path(target).expanduser()).resolve() != engine_root().resolve()
+                              for target in targets):
+            return None
+        try:
+            handoff = self.store.load_handoff(Path(state.last_child_result_ref).stem)
+            if (handoff.workflow_id != snapshot.workflow_id or handoff.parent != WorkflowRef(state.mode, state.session_id)
+                    or handoff.child is None or handoff.child.kind != 'fix' or not handoff.returned_at
+                    or handoff.result.get('status') not in {'failed', 'blocked'}):
+                return None
+            child = load_session_state(self.project_root, handoff.child.native_id)
+            binding = child.verification_binding
+            scope = binding.get('task_scope', {})
+            if (child.parent_handoff_id != handoff.handoff_id or child.workflow_id != state.workflow_id
+                    or scope.get('mode') != 'focused_fix' or scope.get('task_ids') or scope.get('requirement_ids')
+                    or not child.candidate_custody.get('receipt')
+                    or binding.get('proof_inventory_version', 0) >= _PROOF_INVENTORY_VERSION):
+                return None
+            validate_custody_binding(child)
+            validate_receipt(child)
+            failed = next((entry['verification'] for entry in reversed(child.execution_log)
+                           if entry.get('action') == 'receipt_verification'), {})
+            if failed.get('failure_kind') != 'verification_entry_unavailable' or failed.get('ok'):
+                return None
+            command = failed.get('diagnostic', {}).get('original_command', '')
+            invocations = test_invocations(command)
+            if not invocations or any(invocation.runner != 'pytest' for invocation in invocations):
+                return None
+            refs = [ref for invocation in invocations for ref in invocation.repository_targets]
+            if not refs or any(_command_covers(child.fix_verify_command, ref) for ref in refs):
+                return None
+            session = Session(self.orch, mode='fix', coordinator=self)
+            projected = session_gates(session, child)
+            original = [VerificationStep.from_dict(step) for step in binding['proof_graph']['gates']['steps']]
+            if any(not any(_ref_covered(ref, step) for step in original)
+                   or any(_ref_covered(ref, step) for step in projected.steps) for ref in refs):
+                return None
+            return child
+        except (OSError, ValueError, RuntimeError, KeyError, SessionOwnershipError):
+            return None
+
     def _returned_blocked_handoff(self, state, snapshot):
         """Resolve only this parent's durable blocked return, without changing it."""
         if (state.status != "blocked" or state.resolution not in {

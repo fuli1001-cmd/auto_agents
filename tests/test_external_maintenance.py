@@ -240,6 +240,64 @@ def test_cycle_requires_repetition_without_milestones():
     assert not cycle({'steps':steps,'progress_seq':0,'waiting_for':'user'})
 
 
+@pytest.mark.parametrize('offline', [False, True])
+def test_collab_child_returns_do_not_trigger_execution_cycle(tmp_path, monkeypatch, offline):
+    from auto_agents.supervision_api import BusinessTelemetry, operation_boundary
+    from auto_agents.engine_fault import EngineFault
+    monkeypatch.setenv('AUTO_AGENTS_OFFLINE_RESUME', '1' if offline else '0')
+    with Observer(tmp_path, ['collab', '--project', str(tmp_path)]) as observer:
+        telemetry = BusinessTelemetry(tmp_path)
+        telemetry.bind_subject('parent')
+        telemetry.set_phase('collab')
+        for child in ('fix-one', 'fix-two'):
+            telemetry.bind_subject(child)
+            telemetry.set_phase('fix')
+            operation_boundary(tmp_path, 'plan:unique-' + child, child)
+            telemetry.bind_subject('parent')
+            telemetry.set_phase('collab')
+        assert observer.value['subject'] == 'parent'
+        assert observer.value['progress_seq'] == 0
+        assert not cycle(observer.value)
+        operation_boundary(tmp_path, 'verify:progress', 'fix-two')
+        operation_boundary(tmp_path, 'verify:progress', 'fix-two')
+        if offline:
+            with pytest.raises(EngineFault, match='Repeated business step'):
+                operation_boundary(tmp_path, 'verify:progress', 'fix-two')
+        else:
+            operation_boundary(tmp_path, 'verify:progress', 'fix-two')
+        assert cycle(observer.value)
+
+
+@pytest.mark.parametrize('in_child', [False, True])
+def test_new_collab_checkpoint_resumes_exact_root_without_session_chooser(tmp_path, in_child):
+    from auto_agents.supervision_api import BusinessTelemetry
+    store = BusinessStore(tmp_path)
+    store.save('sessions/parent/session_state.json', {
+        'session_id': 'parent', 'status': 'waiting_child' if in_child else 'executing',
+        'active_handoff_id': 'handoff' if in_child else '', 'goal': 'retained goal',
+    })
+    store.save('handoffs/handoff.json', {
+        'parent': {'native_id': 'parent'}, 'child': {'native_id': 'child'},
+    })
+    argv = ['collab', '--project', str(tmp_path), '--provider', 'selected', '--auto-approve']
+    with Observer(tmp_path, argv) as observer:
+        telemetry = BusinessTelemetry(tmp_path)
+        telemetry.bind_subject('parent')
+        telemetry.set_phase('collab')
+        if in_child:
+            telemetry.bind_subject('child')
+            telemetry.set_phase('fix')
+        # The watcher reconstructs an observer in its public checkpoint command.
+        saved_observation = dict(observer.value)
+    with Observer(tmp_path, argv) as observer:
+        observer.value.update(saved_observation)
+        fault = observer.fault(RuntimeError('retained failure'))
+    token = json.loads(Path(fault['resume_token']).read_text())
+    assert token['argv'] == [*argv, '--session', 'parent']
+    assert token['target_subject'] == ('child' if in_child else 'parent')
+    assert token['protected']['sessions/parent/session_state.json']['goal'] == 'retained goal'
+
+
 def test_actual_child_timeout_preserves_log_and_stops_process(tmp_path):
     result=run([sys.executable,'-c','import time; print("started",flush=True); time.sleep(30)'],
         cwd=tmp_path,env=os.environ,log=tmp_path/'process.log',timeout=.3)
@@ -515,6 +573,30 @@ def test_cancelled_task_does_not_dispatch_another_model(tmp_path):
     store.save(job,'STOPPED',cancel_requested=True)
     assert Runner(store).start(job['argv'],job['engine'])['id']==job['id']
     assert len(store.list())==1 and store.get(job['id'])['model_calls']==0
+
+
+def test_user_rerun_rechecks_business_after_dirty_engine_admission_refusal(tmp_path):
+    from auto_agents_watch.runner import Runner
+    store = Store(tmp_path / 'watch')
+    argv = ['auto-agents', 'collab', '--project', str(tmp_path / 'project'), '--session', 'parent']
+    job = store.create(argv, tmp_path / 'project', tmp_path / 'engine')
+    original = {'category': 'engine', 'message': 'old selector failure'}
+    store.save(job, 'STOPPED', needs_maintenance=True, fault=original, no_progress=2,
+               reason='Engine source has uncommitted changes; candidate admission preserves user work')
+    visits = []
+    class RepairedRunner(Runner):
+        def business(self, job):
+            visits.append('business')
+            assert self.env(job)['AUTO_AGENTS_MAINTENANCE_RESUME'] == '1'
+            self.store.save(job, 'STOPPED', reason='Business task stopped without an engine defect')
+            return False
+        def maintain(self, job):
+            raise AssertionError('Old admission refusal must not preempt business recovery')
+    result = RepairedRunner(store).start(argv, tmp_path / 'engine')
+    assert visits == ['business']
+    assert result['id'] == job['id'] and len(store.list()) == 1
+    assert result['model_calls'] == 0 and result['attempts'] == 0 and result['no_progress'] == 2
+    assert result['retained_faults'][0]['fault'] == original
 
 
 def test_container_client_failure_still_removes_owned_container(tmp_path,monkeypatch):

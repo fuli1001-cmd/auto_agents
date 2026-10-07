@@ -95,6 +95,8 @@ def test_cache_explains_environment_and_metadata_changes(tmp_path):
 
 
 def test_v5_delivery_requires_current_complete_release_receipt(monkeypatch):
+    session = SimpleNamespace(_verification_plan_commands=lambda scope:
+                              (SimpleNamespace(proof_ids=['affected.one', 'release.two']), []))
     monkeypatch.setattr('auto_agents.session_candidate.verification_identity', lambda *a, **kw:'final-id')
     state = SimpleNamespace(session_id='s', workflow_id='w', parent_handoff_id='',
         verification_binding={'binding_fingerprint':'binding','gates':{'verification_policy_version':5,
@@ -104,10 +106,10 @@ def test_v5_delivery_requires_current_complete_release_receipt(monkeypatch):
            'binding_fingerprint':'binding','verification':{'ok':True,'execution_identity':'final-id',
            'scope':'progress','attestation_level':'affected','proof_ids':['affected.one']}}
     state.execution_log = [row]
-    with pytest.raises(SessionOwnershipError): require_release_verification(None, state)
+    with pytest.raises(SessionOwnershipError): require_release_verification(session, state)
     row['verification'].update(scope='final', attestation_level='release')
-    with pytest.raises(SessionOwnershipError): require_release_verification(None, state)
+    with pytest.raises(SessionOwnershipError): require_release_verification(session, state)
     row['verification']['proof_ids'].append('release.two')
-    require_release_verification(None, state)
+    require_release_verification(session, state)
     row['receipt_fingerprint'] = 'old-candidate'
-    with pytest.raises(SessionOwnershipError): require_release_verification(None, state)
+    with pytest.raises(SessionOwnershipError): require_release_verification(session, state)

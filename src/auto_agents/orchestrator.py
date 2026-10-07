@@ -44307,6 +44307,7 @@ class Orchestrator:
                 )
                 self.logger.info(f"[failover] provider={kind} binary not found, skipping")
                 tried.append(kind)
+                last_error = f"provider={kind} binary is unavailable"
                 continue
 
             self._current_provider = kind
