@@ -157,3 +157,57 @@ def test_preimplementation_command_recovery_requires_three_consistent_sources(tm
     else:
         with pytest.raises(SessionOwnershipError):recover_classification_command(session,child)
         assert child.fix_verify_command=='npm test' and child.status=='blocked'
+
+
+@pytest.mark.parametrize('change',['valid','writer','canonical_and_projection'])
+def test_parent_resume_rechecks_saved_engine_request_only_for_recoverable_child(tmp_path,monkeypatch,change):
+    from auto_agents.business_state import BusinessStore
+    from auto_agents.engine_fault import EngineFault,engine_root
+    from auto_agents.session_candidate import execution_checkout
+    from auto_agents.session_verification import bind_session
+    from auto_agents.workflow_chain import WorkflowStore
+    root,child,command=private_seeded_fix(tmp_path,monkeypatch)
+    session=Session(Orchestrator(root),mode='fix',auto_approve=True)
+    bind_session(session,child)
+    with execution_checkout(session,child):pass
+    child.fix_verify_command='npm test'
+    child.status,child.resolution='blocked','verification_ownership'
+    if change=='writer':child.execution_log.append({'action':'fix','attempt':1})
+    save_session_state(root,child)
+    issue_path=root/'.auto-agents/state/sessions'/child.session_id/'issue.json'
+    business=BusinessStore(root);relative='sessions/'+child.session_id+'/issue.json'
+    old=business.get(relative)
+    broken={**old,'decision':'fix','verification_command':'npm test'}
+    business.save(relative,broken,old.reference)
+    if change=='canonical_and_projection':issue_path.write_text(json.dumps(broken))
+    store=WorkflowStore(root);handoff=store.load_handoff(child.parent_handoff_id)
+    snapshot=store.load(child.workflow_id)
+    store.record_result(snapshot,handoff,status='blocked',result={'status':'blocked','resolution':'verification_ownership'})
+    store.consume_result(snapshot,handoff,operation_id='blocked-return')
+    parent=load_session_state(root,'parent')
+    parent.status='executing';parent.active_handoff_id=''
+    parent.last_child_result_ref=str(store.handoff_path(handoff.handoff_id))
+    reply='ROUTE_WORKFLOW v1: '+json.dumps({'target':'fix','target_repository':str(engine_root()),
+        'issue_seed':{'summary':'repair classification overwrite','verification_command':'python -m pytest'}})
+    parent.conversation.append({'role':'agent','content':reply});save_session_state(root,parent)
+    observed=[]
+    def agent(self,request):
+        assert request.purpose=='collab'
+        assert 'Recovery eligibility was checked without changing the child' in request.prompt
+        assert handoff.handoff_id in request.prompt
+        observed.append(request.cwd)
+        raise ObservationBoundary()
+    monkeypatch.setattr(Orchestrator,'_call_with_failover',agent)
+    if change=='valid':
+        with pytest.raises(ObservationBoundary):
+            Session(Orchestrator(root),mode='collab',auto_approve=True).resume('parent')
+        assert observed and observed[0]!=root
+        retained=load_session_state(root,'parent')
+        assert any(row.get('action')=='engine_route_revalidated' for row in retained.execution_log)
+        assert any(row.get('content')==reply for row in retained.conversation)
+    else:
+        with pytest.raises(EngineFault):
+            Session(Orchestrator(root),mode='collab',auto_approve=True).resume('parent')
+        assert not observed
+    retained_child=load_session_state(root,child.session_id)
+    assert retained_child.fix_verify_command=='npm test' and retained_child.status=='blocked'

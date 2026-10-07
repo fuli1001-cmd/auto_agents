@@ -488,6 +488,29 @@ def test_snapshot_preserves_settled_calls_without_live_database(tmp_path):
     assert retained['state']=='finished' and json.loads(retained['result'])['summary']=='retained'
 
 
+def test_snapshot_retains_original_issue_bytes_alongside_corrupted_canonical_record(tmp_path):
+    from auto_agents.supervision_api import snapshot,status
+    from auto_agents.io_utils import read_json
+    source=tmp_path/'source';source.mkdir()
+    store=BusinessStore(source)
+    relative='sessions/child/issue.json'
+    path=store.root/relative;path.parent.mkdir(parents=True)
+    original={'issue_id':'issue-child','source_handoff_id':'handoff',
+              'verification_command':'python -m pytest','verification_scope':{'mode':'focused_fix'}}
+    path.write_text(json.dumps(original))
+    original_bytes=path.read_bytes()
+    broken={**original,'verification_command':'npm test'}
+    store.save(relative,broken)
+    before=status(source)
+    destination=tmp_path/'snapshot'
+    result=snapshot(source,destination)
+    assert result['state']['identity']==before['identity']
+    copied=destination/'.auto-agents/state'/relative
+    assert copied.read_bytes()==original_bytes and path.read_bytes()==original_bytes
+    assert read_json(copied)['verification_command']=='npm test'
+    assert status(source)['identity']==before['identity']
+
+
 def test_snapshot_cli_returns_small_receipt_and_keeps_full_history(tmp_path,capsys):
     from auto_agents.supervision_api import command
     source=tmp_path/'live';source.mkdir()
@@ -529,6 +552,42 @@ def test_resume_does_not_reclassify_non_engine_fault_as_maintenance(tmp_path,mon
     monkeypatch.setattr(runner,'business',lambda *_:pytest.fail('Implicit resume repeated business execution'))
     assert runner.resume(job['id'])['state']=='STOPPED'
     assert watch.get(job['id'])['model_calls']==0
+
+
+@pytest.mark.parametrize('changed_checkpoint',[False,True])
+def test_business_recheck_pairs_new_checkpoint_with_fresh_inputs_without_refilling_budget(tmp_path,monkeypatch,changed_checkpoint):
+    from auto_agents_watch.runner import Runner
+    from auto_agents_watch import runner as module
+    watch=Store(tmp_path/'watch');project=tmp_path/'project';project.mkdir()
+    job=watch.create(['business','--project',str(project)],project,tmp_path/'engine')
+    runner=Runner(watch);runner.directory=watch.root/'jobs'/job['id'];runner.fd=0;runner.token='test-token'
+    old=runner.directory/'candidate';old.mkdir();(old/'preserved-edit').write_text('old evidence')
+    token={'schema':1,'state_identity':'old','step_id':'parent:resume'}
+    current={**token,'state_identity':'new'} if changed_checkpoint else token
+    checkpoint=runner.directory/'new-token.json';checkpoint.write_text(json.dumps(current))
+    watch.save(job,'STOPPED',fault=None,candidate=str(old),snapshot=str(runner.directory/'project'),
+        resume_token=token,base='original-base',model_calls=7,attempts=3,no_progress=1,
+        best_passed=['original-check'],original_reproduction_confirmed=True,
+        original_reproduction={'status':'passed'},needs_verification=True,existing_source_clears_fault=True)
+    def execute(*args,**kwargs):
+        kwargs['observation'].write_text(json.dumps({'fault':{'category':'engine','type':'EngineFault',
+            'message':'current defect','resume_token':str(checkpoint)}}))
+        return {'reason':'','returncode':3}
+    monkeypatch.setattr(module,'run',execute)
+    monkeypatch.setattr(module.subprocess,'run',lambda *args,**kwargs:SimpleNamespace(returncode=0))
+    assert runner.business(job)
+    result=watch.get(job['id'])
+    assert (result['model_calls'],result['attempts'],result['no_progress'])==(7,3,1)
+    assert (old/'preserved-edit').read_text()=='old evidence'
+    assert result['resume_token']==current and result['best_passed']==['original-check']
+    if changed_checkpoint:
+        assert result['episode']==1 and result['candidate'] is None and result['snapshot'] is None
+        assert result['original_reproduction_confirmed'] is False and result['original_reproduction'] is None
+        assert result['needs_verification'] is False and result['existing_source_clears_fault'] is False
+        assert result['history'][0]['candidate']==str(old) and result['history'][0]['resume_token']==token
+    else:
+        assert result['candidate']==str(old) and 'episode' not in result
+        assert result['original_reproduction_confirmed'] is True
 
 
 def test_explicit_business_recheck_keeps_fault_history_and_spent_budget(tmp_path,monkeypatch):

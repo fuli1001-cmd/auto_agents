@@ -471,6 +471,39 @@ class WorkflowCoordinator:
 
 
 
+    def _retained_classification_child(self, state, payload):
+        """Recheck a saved engine diagnosis after a guarded recovery becomes available.
+
+        This authorizes a fresh parent diagnosis, never product implementation.
+        The original child's native resume still owns the actual recovery.
+        """
+        from types import SimpleNamespace
+        from .engine_fault import engine_root
+        from .execution_binding import route_sources
+        from .session_issue import recover_classification_command
+        if not state.last_child_result_ref or state.active_handoff_id:
+            return None
+        targets = [row.get('target_repository') for row in route_sources(payload) if row.get('target_repository')]
+        if not targets or any((self.project_root / Path(target).expanduser()).resolve() != engine_root().resolve()
+                              for target in targets):
+            return None
+        try:
+            handoff = self.store.load_handoff(Path(state.last_child_result_ref).stem)
+            if (handoff.workflow_id != state.workflow_id
+                    or handoff.parent != WorkflowRef(state.mode, state.session_id)
+                    or not handoff.returned_at or handoff.result.get('status') != 'blocked'
+                    or handoff.result.get('resolution') != 'verification_ownership'
+                    or handoff.child is None or handoff.child.kind != 'fix'):
+                return None
+            child = load_session_state(self.project_root, handoff.child.native_id)
+            if child.workflow_id != state.workflow_id or child.parent_handoff_id != handoff.handoff_id:
+                return None
+            if recover_classification_command(SimpleNamespace(project_root=self.project_root),child,check_only=True):
+                return child
+        except (OSError, ValueError, RuntimeError, KeyError):
+            return None
+        return None
+
     def _retained_proof_child(self, payload, snapshot):
         """A current product proof amendment is not an engine repair request."""
         from .proof_amendments import pending

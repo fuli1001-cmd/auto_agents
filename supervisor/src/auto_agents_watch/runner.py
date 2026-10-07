@@ -175,17 +175,25 @@ class Runner:
         token=json.loads(Path(fault['resume_token']).read_text())
         fingerprint=digest([fault['type'],fault['message'],str(value.get('phase','')).split(':')[0],value.get('subject')])
         sequence=value.get('progress_seq',0)
-        if job.get('runtime_argv') and job.get('fault'):
+        advanced = bool(job.get('runtime_argv') and job.get('fault'))
+        changed_checkpoint = bool(job.get('candidate') and token != job.get('resume_token'))
+        if advanced:
             if (fingerprint==job.get('fault_fingerprint') or sequence<=job.get('fault_progress_seq',0)):
                 self.store.save(job,'STOPPED',reason='Verified repair did not yield new business progress; new evidence retained',
                                 subsequent_fault=fault)
                 return False
-            history=[*job.get('history',[]),{'fault':job['fault'],'candidate':job.get('candidate'),
+        if advanced or changed_checkpoint:
+            history=[*job.get('history',[]),{'fault':job.get('fault'),'candidate':job.get('candidate'),
+                     'snapshot':job.get('snapshot'),'resume_token':job.get('resume_token'),
+                     'base':job.get('base'),
                      'revision':job.get('candidate_revision'),'verification':job.get('verification'),
                      'publication':job.get('publication')}]
             self.store.save(job,history=history,episode=job.get('episode',0)+1,
                 candidate=None,candidate_revision=None,snapshot=None,verification=None,
-                original_reproduction_confirmed=False,best_passed=[],no_progress=0,publication='not_requested')
+                original_reproduction=None,original_reproduction_confirmed=False,
+                existing_source_clears_fault=False,needs_verification=False,
+                best_passed=[] if advanced else job.get('best_passed',[]),
+                no_progress=0 if advanced else job.get('no_progress',0),publication='not_requested')
         self.store.save(job,fault=fault,resume_token=token,fault_fingerprint=fingerprint,
                         fault_progress_seq=sequence,needs_maintenance=True,
                         maintenance_started=job.get('maintenance_started') or time.time())
@@ -248,7 +256,9 @@ class Runner:
             else:
                 report=reproduced.get('report') or {}
                 if (report.get('category')!='engine' or report.get('type')!=job['fault']['type']):
-                    raise RuntimeError('Offline check did not reproduce the original engine exception; evidence retained')
+                    detail=report.get('reason') or reproduced.get('status','unknown')
+                    raise RuntimeError('Offline check did not reproduce the original engine exception: '
+                                       +str(report.get('category','unknown'))+': '+str(detail)+'; evidence retained')
                 cycle_fault=job['fault'].get('evidence',{}).get('monitor')=='control_cycle'
                 same=(report.get('reason')=='Repeated business step without verified progress' if cycle_fault
                       else normalized_error(report.get('reason'))==normalized_error(job['fault']['message']))

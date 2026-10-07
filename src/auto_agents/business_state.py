@@ -313,7 +313,16 @@ def export_snapshot(source, destination):
             rows = list(db.execute('SELECT path,payload FROM records'))
         from .io_utils import _atomic_write
         for row in rows:
-            _atomic_write(destination / '.auto-agents/state' / row['path'], row['payload'] + '\n')
+            projection = destination / '.auto-agents/state' / row['path']
+            parts = Path(row['path']).parts
+            if (len(parts) == 3 and parts[0] == 'sessions' and parts[2] == 'issue.json'
+                    and projection.is_file() and not projection.is_symlink()
+                    and projection.resolve().is_relative_to(destination)):
+                # The original physical issue can authenticate a legacy
+                # pre-writer overwrite. Keep those bytes as evidence; reads
+                # still use the canonical SQLite record copied above.
+                continue
+            _atomic_write(projection, row['payload'] + '\n')
     (destination / LEGACY_MARKER).unlink(missing_ok=True)
 
 

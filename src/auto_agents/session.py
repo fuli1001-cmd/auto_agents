@@ -1829,9 +1829,30 @@ class Session:
             "assistant",
         }:
             return None, ""
+        reply = str(latest.get('content', ''))
+        route, error = self._parse_workflow_route(reply)
+        if not error and route and route.get('target') == 'fix' and self._coordinator is not None:
+            try:
+                payload = self._fix_workflow_payload(route)
+            except ValueError:
+                payload = {}
+            child = self._coordinator._retained_classification_child(state,payload)
+            if child is not None:
+                state.conversation.append({'role':'orchestrator','content':
+                    'The installed engine now supports guarded recovery of the classified command overwrite '
+                    f'for retained handoff {child.parent_handoff_id}. Recovery eligibility was checked without '
+                    'changing the child. The saved engine repair request remains historical evidence. '
+                    'Diagnose the current blocker again; if the original product repair is still required, '
+                    'use ROUTE_WORKFLOW v1 target=resume with this original resume_handoff_id. '
+                    'Do not treat eligibility as completed product repair or restart paid work.'})
+                state.execution_log.append({'action':'engine_route_revalidated',
+                    'handoff_id':child.parent_handoff_id,'result':'guarded classification recovery available',
+                    'timestamp':self._now()})
+                self._save(state)
+                return None, ''
         return self._route_collab_workflow_reply(
             state,
-            str(latest.get("content", "")),
+            reply,
         )
 
     def _resume_pending_collab_goal_clear(

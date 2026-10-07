@@ -108,9 +108,18 @@ be recovered only when the original handoff, retained issue and sealed binding
 agree and no product changes, writer history or receipt exists. The overwritten
 classification is retained in the execution log; conflicting sources remain
 blocked.
+When a parent still holds the old engine repair reply, a proven recoverable
+child triggers a fresh parent diagnosis instead of replaying that reply as a
+new engine failure. Eligibility alone neither resumes nor completes product
+implementation. A business recheck that produces a different checkpoint starts
+with new snapshot and candidate inputs; old inputs remain evidence and spent
+model, attempt and no-progress budgets are preserved.
 The snapshot command returns a small receipt; full records and settled calls
 remain in the copied database. Failed exports are discarded before retry, and
 their exit code and structured error are reported even when stderr is empty.
+Existing physical issue projections retain their original bytes during export,
+so a legacy canonical overwrite cannot erase recovery evidence. The copied
+database remains authoritative and all recovery authentication still applies.
 Project verification infrastructure incidents are recorded as `verification`
 faults, with command output in the checkpoint diagnostics. They do not authorize
 engine editing. An ordinary supervisor resume retains such a stop; after fixing
