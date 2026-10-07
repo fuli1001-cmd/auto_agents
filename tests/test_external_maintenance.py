@@ -148,6 +148,46 @@ def test_supervision_config_preserves_off_and_effort_defaults():
     assert 'self_repair_diagnosis' not in config.to_dict()
 
 
+def test_repair_image_uses_configured_local_base_and_invalidates_on_identity_change(tmp_path,monkeypatch):
+    from auto_agents_watch import sandbox as module
+    binary=tmp_path/'native-cli';binary.write_text('local executable')
+    monkeypatch.setattr(module.shutil,'which',lambda *_args,**_kwargs:str(binary))
+    monkeypatch.delenv('AUTO_AGENTS_WATCH_BASE_IMAGE',raising=False)
+    identity=['sha256:first'];builds=[]
+    def run(argv,**kwargs):
+        if argv[:3]==['docker','image','inspect']:
+            return SimpleNamespace(returncode=0 if '--format' in argv else 1,stdout=identity[0])
+        assert argv[:3]==['docker','build','--pull=false']
+        recipe=(Path(argv[-1])/'Dockerfile').read_text()
+        assert recipe.startswith('FROM mirror.example/node:22-bookworm\n')
+        builds.append(argv[argv.index('-t')+1]);return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(module.subprocess,'run',run)
+    docker=module.Docker(tmp_path/'sandbox',provider={'kind':'codex','binary':'native-cli'},
+                         base_image='mirror.example/node:22-bookworm')
+    first=docker.build();identity[0]='sha256:second';second=docker.build()
+    assert first!=second and builds==[first,second]
+    configured=ExecutionConfig.from_dict({'supervision':{'base_image':'mirror.example/node:22-bookworm'}})
+    assert configured.to_dict()['supervision']['base_image']=='mirror.example/node:22-bookworm'
+
+
+def test_repair_image_build_failure_reports_local_log_and_registry_error(tmp_path,monkeypatch):
+    from auto_agents_watch import sandbox as module
+    binary=tmp_path/'native-cli';binary.write_text('local executable')
+    monkeypatch.setattr(module.shutil,'which',lambda *_args,**_kwargs:str(binary))
+    def run(argv,**kwargs):
+        if argv[:3]==['docker','image','inspect']:
+            return SimpleNamespace(returncode=1,stdout='')
+        kwargs['stdout'].write('registry manifest request failed: 503 Service Unavailable\n')
+        raise subprocess.CalledProcessError(1,argv)
+    monkeypatch.setattr(module.subprocess,'run',run)
+    root=tmp_path/'sandbox'
+    with pytest.raises(RuntimeError) as failure:
+        module.Docker(root,provider={'kind':'codex','binary':'native-cli'}).build()
+    assert str(root/'image-build.log') in str(failure.value)
+    assert '503 Service Unavailable' in str(failure.value)
+    assert not [path for path in root.glob('image-*') if path.is_dir()]
+
+
 @pytest.mark.parametrize('kind', ['codex','claude-code'])
 def test_provider_uses_existing_alias_profile_and_effort(kind):
     config={'active_provider':'fallback','providers':{'selected':{'kind':kind,'binary':'custom-cli',

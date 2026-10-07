@@ -446,6 +446,9 @@ class Session:
         if state.mode != 'fix':
             return True
         try:
+            from .session_issue import recover_classification_command
+            if recover_classification_command(self, state):
+                self._resumed_verification_state = deepcopy(state)
             if state.verification_binding:
                 bind_session(self, state)
             elif not state.source_descriptor and not state.parent_handoff_id and head_ref(self.project_root):
@@ -653,6 +656,8 @@ class Session:
                 })
                 self._save(state)
             raise
+        except SessionOwnershipError as exc:
+            return self._block_execution_binding(state, exc, 'verification_ownership')
         except RuntimeError as exc:
             from .engine_fault import EngineFault as EngineRepairRequired
             if isinstance(exc, EngineRepairRequired):
@@ -789,6 +794,12 @@ class Session:
 
             state.conversation.append({"role": "agent", "content": reply})
             self._save(state)
+
+            if self.mode == 'fix':
+                legacy_command = _FIX_VERIFY.search(reply)
+                if legacy_command:
+                    from .session_issue import validate_classification
+                    validate_classification(self, state, {'verification_command': legacy_command.group(1).strip()})
 
             if self.mode == "collab":
                 if not self._goal_environment_confirmed(state):
@@ -928,6 +939,8 @@ class Session:
                     binding_error = repository_binding_error(self.project_root, disposition)
                     if binding_error:
                         return self._block_execution_binding(state, binding_error)
+                    from .session_issue import validate_classification
+                    validate_classification(self, state, disposition)
                     issue_ref = self._materialize_fix_issue(state, disposition)
                     if decision == "fix":
                         verify_command = str(
@@ -1167,6 +1180,8 @@ class Session:
                 # Extract optional FIX_VERIFY command from the reply
                 fv_match = _FIX_VERIFY.search(reply)
                 if fv_match and self.mode == "fix":
+                    from .session_issue import validate_classification
+                    validate_classification(self, state, {'verification_command': fv_match.group(1).strip()})
                     state.fix_verify_command = fv_match.group(1).strip()
                 if self.mode == "fix":
                     self._materialize_fix_issue(
@@ -2050,6 +2065,10 @@ class Session:
         disposition: Dict[str, object],
     ) -> str:
         from .workflow_chain import IssueBriefBuilder
+
+        from .session_issue import validate_classification
+        if validate_classification(self, state, disposition) is not None:
+            return '.auto-agents/state/sessions/' + state.session_id + '/issue.json'
 
         payload = dict(disposition)
         payload.setdefault("reported_goal", state.goal)
@@ -3547,22 +3566,18 @@ class Session:
             state.goal,
         ]
         if self.mode == "fix" and state.parent_handoff_id:
-            issue_path = (
-                self.project_root
-                / ".auto-agents"
-                / "state"
-                / "sessions"
-                / state.session_id
-                / "issue.md"
-            )
-            routed_issue = read_text(issue_path).strip() if issue_path.is_file() else ""
-            if routed_issue:
+            from .session_issue import routed_issue
+            from .workflow_chain import IssueBriefBuilder
+            issue = routed_issue(self, state)
+            control = Path(getattr(self, '_custody_control_root', self.project_root))
+            issue_path = control / '.auto-agents/state/sessions' / state.session_id / 'issue.json'
+            if issue is not None:
                 lines.extend(
                     [
                         "",
                         "--- Authoritative Routed Issue Brief ---",
                         f"Source: {issue_path}",
-                        routed_issue,
+                        IssueBriefBuilder.render(issue),
                         "",
                         (
                             "This routed issue brief defines the child fix scope. "
@@ -3757,6 +3772,9 @@ class Session:
                     or issue.get('source_handoff_id', state.parent_handoff_id) != state.parent_handoff_id):
                 raise ownership_error(state, 'retained fix issue belongs to another session or handoff')
             from .workflow_chain import IssueBriefBuilder
+            if state.parent_handoff_id:
+                from .session_issue import routed_issue
+                issue = routed_issue(self, state) or issue
             brief_text = IssueBriefBuilder.render(issue)
             lines.extend(['Owned fix issue (the deliverable for this stage):',
                           ContextBlock(brief_text, 'Classified fix issue', 'fix-issue'), ''])

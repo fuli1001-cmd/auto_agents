@@ -228,7 +228,8 @@ class Runner:
             binding=delivery.prepare(job['engine'],candidate)
             self.store.save(job,candidate=str(candidate),snapshot=str(snapshot),binding=binding,
                             provider=name,base=binding['base'])
-        sandbox=self.sandbox_factory(self.store.root/'sandboxes'/job['id'],provider=provider,engine=job['engine'])
+        sandbox=self.sandbox_factory(self.store.root/'sandboxes'/job['id'],provider=provider,engine=job['engine'],
+                                     base_image=settings.get('base_image'))
         if settings.get('max_duration_seconds'):
             sandbox.deadline=job.get('maintenance_started',job['created'])+settings['max_duration_seconds']
         sandbox.prepare()
@@ -450,10 +451,11 @@ def retry_publication(store, identity):
     if not job.get('candidate_revision') or not job.get('verification',{}).get('ok'):
         raise RuntimeError('Publication requires an accepted local revision')
     runner=Runner(store);runner.directory=store.root/'jobs'/identity
-    config,_,provider,_=runner.configured(job)
+    config,_,provider,settings=runner.configured(job)
     with runner.locked(job):
         runner.check_cancelled(job)
-        sandbox=runner.sandbox_factory(store.root/'sandboxes'/job['id'],provider=provider,engine=job['engine']);sandbox.prepare()
+        sandbox=runner.sandbox_factory(store.root/'sandboxes'/job['id'],provider=provider,engine=job['engine'],
+                                      base_image=settings.get('base_image'));sandbox.prepare()
         driver=runner.driver_factory(provider,sandbox,config.get('efforts',{}))
         verification_root=runner.directory/('verification-'+str(job['episode']) if job.get('episode') else 'verification')
         verifier=runner.verifier_factory(job['engine'],job['base'],verification_root,sandbox)

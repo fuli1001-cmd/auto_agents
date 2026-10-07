@@ -298,6 +298,8 @@ class WorkflowCoordinator:
                 return session._block_execution_binding(state, ownership_error(
                     state, 'retained child identity conflicts with seeded handoff'), 'verification_ownership')
             try:
+                from .session_issue import recover_classification_command
+                recover_classification_command(session, state)
                 self._bind_focused_seed_command(state, handoff, recovering=True)
             except SessionOwnershipError as error:
                 return session._block_execution_binding(state, error, 'verification_ownership')

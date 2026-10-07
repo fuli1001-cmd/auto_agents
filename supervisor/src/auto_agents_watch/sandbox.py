@@ -17,12 +17,13 @@ from .process import run
 
 
 class Docker:
-    def __init__(self, root, *, image=None, provider=None, engine=None):
+    def __init__(self, root, *, image=None, provider=None, engine=None, base_image=None):
         self.root = Path(root)
         self.root.mkdir(parents=True,exist_ok=True)
         self.image = image or os.environ.get('AUTO_AGENTS_WATCH_IMAGE')
         self.provider = provider or {}
         self.engine = Path(engine) if engine else None
+        self.base_image = os.environ.get('AUTO_AGENTS_WATCH_BASE_IMAGE') or base_image or 'node:22-bookworm-slim'
         self.deadline = None
 
     def time_limit(self, maximum):
@@ -64,14 +65,19 @@ class Docker:
             dependencies=list(dict.fromkeys(['pytest',*tomllib.loads((self.engine/'pyproject.toml').read_text())['project'].get('dependencies',[])]))
         tools=self.engine/'src/auto_agents/verification_tools' if self.engine else None
         lock=tools/'package-lock.json' if tools else None
-        recipe = json.dumps({'version':3,'dependencies':dependencies,'kind':self.provider.get('kind'),
+        base_info=subprocess.run(['docker','image','inspect','--format','{{.Id}}',self.base_image],
+            capture_output=True,text=True,timeout=self.time_limit(30))
+        # A local image is sufficient; Docker Hub is not needed merely to
+        # recheck its tag. Include its immutable identity in the tool cache.
+        base_identity=base_info.stdout.strip() if base_info.returncode==0 else self.base_image
+        recipe = json.dumps({'version':4,'base_image':base_identity,'dependencies':dependencies,'kind':self.provider.get('kind'),
                             'verification_tools':hashlib.sha256(lock.read_bytes()).hexdigest() if lock and lock.exists() else '',
                             'package':(package/'package.json').read_text() if package else ''},sort_keys=True)
         identity = hashlib.sha256(actual.read_bytes()+recipe.encode()).hexdigest()[:20]
         tag = 'auto-agents-watch-tools:'+identity
         exists = subprocess.run(['docker','image','inspect',tag],capture_output=True,timeout=self.time_limit(30))
         if exists.returncode == 0: return tag
-        base = 'node:22-bookworm-slim'
+        base = self.base_image
         with tempfile.TemporaryDirectory(prefix='image-',dir=self.root) as temporary:
             context = Path(temporary)
             if package:
@@ -89,7 +95,12 @@ class Docker:
                 + ('COPY verification-tools /opt/verification-tools\nRUN npm ci --prefix /opt/verification-tools --ignore-scripts --no-audit --no-fund\nENV PATH=/opt/verification-tools/node_modules/.bin:$PATH\n' if tools and tools.is_dir() else ''))
             (context/'Dockerfile').write_text(dockerfile)
             with (self.root/'image-build.log').open('w') as output:
-                subprocess.run(['docker','build','-t',tag,str(context)],stdout=output,stderr=subprocess.STDOUT,check=True,timeout=self.time_limit(900))
+                try:
+                    subprocess.run(['docker','build','--pull=false','-t',tag,str(context)],stdout=output,stderr=subprocess.STDOUT,check=True,timeout=self.time_limit(900))
+                except (subprocess.CalledProcessError,subprocess.TimeoutExpired) as error:
+                    output.flush()
+                    tail=(self.root/'image-build.log').read_text(errors='replace')[-2000:]
+                    raise RuntimeError('Repair tool image build failed; log: '+str(self.root/'image-build.log')+'\n'+tail) from error
         return tag
 
     def base(self, *, network):

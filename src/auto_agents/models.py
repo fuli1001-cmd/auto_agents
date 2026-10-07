@@ -1296,6 +1296,7 @@ class SupervisionConfig:
     max_model_calls: Optional[int] = None
     max_duration_seconds: Optional[int] = None
     publish: bool = True
+    base_image: str = "node:22-bookworm-slim"
 
     @property
     def enabled(self):
@@ -1320,6 +1321,8 @@ class SupervisionConfig:
                 raise ValueError("execution.supervision." + key + " must be positive or null")
         if "publish" in values and type(values["publish"]) is not bool:
             raise ValueError("execution.supervision.publish must be boolean")
+        if 'base_image' in values and (not isinstance(values['base_image'],str) or not values['base_image'].strip()):
+            raise ValueError('execution.supervision.base_image must be a nonempty image reference')
         return cls(mode=mode, **values)
 
     def to_dict(self):

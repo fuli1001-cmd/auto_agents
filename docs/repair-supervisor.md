@@ -47,6 +47,18 @@ adapters cover Codex, Claude Code and Copilot CLI. Other provider kinds stop wit
 an explicit unsupported-adapter message instead of substituting another account.
 
 The tool image is built from the selected installed CLI and engine dependencies.
+`execution.supervision.base_image` selects its Node/Debian base (default
+`node:22-bookworm-slim`). `AUTO_AGENTS_WATCH_BASE_IMAGE` overrides that value.
+A compatible locally pulled mirror can be used, for example:
+
+```json
+{"execution":{"supervision":{"base_image":"registry.cn-hangzhou.aliyuncs.com/fuli1001/node:lts-slim"}}}
+```
+
+The locally inspected image identity is part of the tool-image cache key;
+updating a mutable base tag cannot reuse a tool image built from the old base.
+Builds use `--pull=false`, and failures include the build-log path and final
+diagnostic output.
 An operator can supply a prepared image with `AUTO_AGENTS_WATCH_IMAGE`; it must
 contain `python`, Git, pytest, engine dependencies and that selected CLI. Writer
 and reviewer get private copies of the selected account configuration. Offline
@@ -88,6 +100,14 @@ inode registration changes. Goals, source descriptors and call receipts remain
 constraints. Unregistered sources and ownership conflicts stop as state errors,
 without starting an engine repair. Offline checks do not send notifications.
 Unconfirmed external requests require reconciliation before automatic recovery.
+Routed fixes read their issue from the control repository and authenticate the
+session, handoff and original command, including inside private source clones.
+Classification replies remain evidence and cannot replace that authority or an
+already bound verification command. Legacy pre-writer command overwrites may
+be recovered only when the original handoff, retained issue and sealed binding
+agree and no product changes, writer history or receipt exists. The overwritten
+classification is retained in the execution log; conflicting sources remain
+blocked.
 The snapshot command returns a small receipt; full records and settled calls
 remain in the copied database. Failed exports are discarded before retry, and
 their exit code and structured error are reported even when stderr is empty.

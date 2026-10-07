@@ -965,6 +965,8 @@ class IssueBriefBuilder:
         for key in ('task_id', 'task_ids', 'requirement_ids', 'verification_scope', 'retained_task_relation'):
             if key in payload:
                 issue[key] = payload[key]
+        if 'required_behavior' in payload:
+            issue['required_behavior'] = _string_list(payload['required_behavior'])
         if isinstance(payload.get('user_summary'), str) and payload['user_summary'].strip():
             issue['user_summary'] = payload['user_summary'].strip()
         json_path = self.root / "issue.json"
@@ -1014,6 +1016,10 @@ class IssueBriefBuilder:
                 "## Constraints",
                 "",
                 *(_markdown_items(constraints) or ["- No additional constraints recorded."]),
+                "",
+                "## Required Behavior",
+                "",
+                *(_markdown_items(_string_list(issue.get('required_behavior'))) or ["- Not recorded."]),
                 "",
                 "## Verification",
                 "",
