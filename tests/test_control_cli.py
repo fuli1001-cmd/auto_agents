@@ -128,14 +128,25 @@ def test_unborn_project_delivers_without_sweeping_user_index(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["run", "fix", "collab"])
-def test_all_public_modes_share_the_controller(tmp_path, capsys, monkeypatch, mode):
+@pytest.mark.parametrize("repo_map", [False, True])
+def test_all_public_modes_share_the_controller(tmp_path, capsys, monkeypatch, mode, repo_map):
     from auto_agents.control import cli
+    from auto_agents.control.effects import Provider
+
+    class ContextWorker(Worker, Provider):
+        """Keep provider context construction; replace only the external call."""
+        def run(self, ctx, phase, prompt, output, **kwargs):
+            if repo_map and phase in {'classify','diagnose','implement','review'}:
+                assert 'repository_map' in prompt
+            return super().run(ctx, phase, prompt, output, **kwargs)
 
     root = project(tmp_path)
-    save_project_config(root, ProjectConfig("fixture"))
+    config = ProjectConfig("fixture")
+    config.repo_map.enabled = repo_map
+    save_project_config(root, config)
     actual = Engine
     monkeypatch.setattr(
-        cli, "Engine", lambda *a, **kw: actual(*a, **kw, transport=Worker())
+        cli, "Engine", lambda *a, **kw: actual(*a, **kw, transport=ContextWorker())
     )
     code = main(
         [

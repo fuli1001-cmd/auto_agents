@@ -79,6 +79,9 @@ Repair uses this sequence:
 5. Confirm that offline resume visits the original blocked step and crosses it.
 6. Commit the verified engine delta and restart the same business root.
 
+The snapshot helper inherits the watcher's project lock descriptor and ownership
+token. It does not acquire a competing lock or replace the business observation.
+
 Offline acceptance has no account credentials, network or model calls. Reaching
 another model-call boundary in the **same** phase is insufficient. Frozen goals,
 source, scope, checks, authorization and call limits must remain intact. An
@@ -99,6 +102,8 @@ Interactive output shows a short reason and log location; full fault evidence an
 tracebacks live beside the business checkpoint. `--retry-business` resumes the
 same retained work and accounting. It does not turn a business problem into an
 engine defect or erase missing historical checks.
+Schema-2 retries use the checkpoint's original root selector, including when the
+initial command omitted `--session`; an explicit replacement provider is retained.
 
 If an old stopped job's maintenance snapshots were explicitly retired, repeating
 the business command creates a linked successor and runs the current business

@@ -493,6 +493,33 @@ def test_explicit_business_recheck_keeps_fault_history_and_spent_budget(tmp_path
     assert (result['model_calls'], result['attempts'], result['no_progress']) == (2, 1, 1)
     assert result['needs_maintenance'] is False
 
+def test_business_recheck_without_original_selector_resumes_checkpoint_root(tmp_path, monkeypatch):
+    from auto_agents_watch.runner import Runner
+    from auto_agents_watch import runner as module
+    watch=Store(tmp_path/'watch')
+    argv=[sys.executable,'-m','auto_agents','collab','--project',str(tmp_path),'--provider','replacement']
+    job=watch.create(argv,tmp_path,tmp_path)
+    token={'schema':2,'project':str(tmp_path),'root_id':'original-root',
+        'argv':['collab','--project',str(tmp_path),'--provider','original','--session','original-root']}
+    watch.save(job,'STOPPED',fault={'category':'engine','message':'original defect'},resume_token=token,
+        needs_maintenance=True,model_calls=3)
+    observed=[]
+    def execute(command,**kwargs):
+        observed.append(command)
+        assert command[:3]==[sys.executable,'-m','auto_agents']
+        assert command[command.index('--session')+1]=='original-root'
+        assert command[-2:]==['--provider','replacement']
+        kwargs['observation'].write_text(json.dumps({'status':'stopped',
+            'fault':{'category':'state','message':'current operator decision'}}))
+        return {'reason':'','returncode':3}
+    monkeypatch.setattr(module,'run',execute)
+    monkeypatch.setattr(module.subprocess,'run',lambda *a,**kw:SimpleNamespace(returncode=0))
+    runner=Runner(watch)
+    monkeypatch.setattr(runner,'maintain',lambda *_:pytest.fail('Recheck dispatched old repair'))
+    result=runner.resume(job['id'],retry_business=True)
+    assert len(observed)==1 and result['model_calls']==3
+    assert result['argv']==argv and result['fault']['message']=='current operator decision'
+
 def test_resume_cli_forwards_explicit_business_recheck(tmp_path, monkeypatch, capsys):
     from auto_agents_watch import cli
     calls = []
@@ -549,10 +576,11 @@ def test_failed_supervisor_snapshot_reports_exit_and_reclaims_partial_copy(tmp_p
         calls.append(output)
         return SimpleNamespace(returncode=3 if structured else -9, stdout=json.dumps({'ok': False, 'error': 'registered source unavailable'}) if structured else '', stderr='')
     monkeypatch.setattr(module.subprocess, 'run', execute)
-    for _ in range(2):
-        with pytest.raises(RuntimeError, match='exit 3.*registered source' if structured else 'exit -9.*no diagnostic'):
-            runner.export_snapshot(job, snapshot)
-        assert not snapshot.exists() and (not list(runner.directory.glob('.snapshot-*')))
+    with runner.locked(job):
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match='exit 3.*registered source' if structured else 'exit -9.*no diagnostic'):
+                runner.export_snapshot(job, snapshot)
+            assert not snapshot.exists() and (not list(runner.directory.glob('.snapshot-*')))
     assert len(calls) == 2 and calls[0] != calls[1]
 
 def test_supervisor_publishes_only_complete_snapshot(tmp_path, monkeypatch):
@@ -570,9 +598,44 @@ def test_supervisor_publishes_only_complete_snapshot(tmp_path, monkeypatch):
         (output / 'complete').write_text('receipt')
         return SimpleNamespace(returncode=0, stdout=json.dumps({'ok': True, 'state': {'pending_external': []}}), stderr='')
     monkeypatch.setattr(module.subprocess, 'run', execute)
-    result = runner.export_snapshot(job, snapshot)
+    with runner.locked(job):
+        result = runner.export_snapshot(job, snapshot)
     assert result['snapshot'] == str(snapshot) and (snapshot / 'complete').read_text() == 'receipt'
     assert not list(runner.directory.glob('.snapshot-*'))
+
+def test_supervisor_snapshot_cli_inherits_ownership_without_overwriting_fault(tmp_path):
+    from auto_agents_watch.runner import Runner
+    from auto_agents.control import Store as BusinessStore
+    from auto_agents.control.engine import Engine
+    from auto_agents.control.api import status
+    from auto_agents.models import ProjectConfig
+    from auto_agents.config import save_project_config
+    from test_control_engine import project, Worker
+
+    root=project(tmp_path)
+    config=ProjectConfig('fixture')
+    save_project_config(root,config)
+    business=BusinessStore(root)
+    work=Engine(root,business,config,transport=Worker(),print_fn=lambda *a:None).start('run','Set value')
+    before=status(root)
+    engine=Path(__file__).resolve().parents[1]
+    watch=Store(tmp_path/'watch')
+    job=watch.create([sys.executable,'-m','auto_agents','run','--project',str(root)],root,engine)
+    runner=Runner(watch)
+    runner.directory=watch.root/'jobs'/job['id']
+    observation=runner.directory/'observation.json'
+    observation.write_text('{"fault":{"message":"original fault"}}')
+    with runner.locked(job):
+        # An unrelated process still cannot acquire the same project lock.
+        refused=subprocess.run([sys.executable,'-m','auto_agents','snapshot','--project',str(root),
+            '--output',str(tmp_path/'unauthorized-copy')],cwd=engine,
+            env={**runner.env(job),'PYTHONPATH':str(engine/'src')},capture_output=True,text=True)
+        assert refused.returncode==3 and 'already active' in refused.stdout
+        result=runner.export_snapshot(job,runner.directory/'project')
+    assert result['state']['identity']==before['identity']
+    assert BusinessStore(runner.directory/'project').work(work['id'])['contract']==work['contract']
+    assert status(root)['identity']==before['identity']
+    assert json.loads(observation.read_text())=={'fault':{'message':'original fault'}}
 
 def test_offline_recovery_does_not_send_notifications(monkeypatch):
     from auto_agents.notifications import send_wechat_markdown

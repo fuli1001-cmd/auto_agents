@@ -52,6 +52,8 @@ def context_inputs(context, phase, config, store):
             task_id=context.work_id,
             title=context.contract.goal,
             description=context.contract.goal,
+            acceptance=[spec.command for spec in context.contract.checks],
+            scope_boundaries="\n".join(context.contract.scope),
             verification_refs=[
                 ref for spec in context.contract.checks for ref in spec.targets
             ],

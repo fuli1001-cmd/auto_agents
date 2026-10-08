@@ -46,6 +46,23 @@ def retired_inputs(job):
     return cleanup.get('old_snapshot_available') is False or cleanup.get('original_in_place_recovery') is False
 
 
+def checkpoint_arguments(job):
+    """Resume the original root even when its launch had no session selector."""
+    argv=list(job['argv'])
+    token=job.get('resume_token') or {}
+    if token.get('schema')!=2 or token.get('project')!=job['project']:
+        return argv
+    arguments=list(token['argv'])
+    # Keep an explicitly selected replacement provider on a retry.
+    for index,arg in enumerate(argv):
+        if arg=='--provider' and index+1<len(argv):
+            arguments.extend(['--provider',argv[index+1]])
+        elif arg.startswith('--provider='):
+            arguments.append(arg)
+    prefix=argv[:argv.index('auto_agents')+1] if 'auto_agents' in argv else argv[:1]
+    return [*prefix,*arguments]
+
+
 def review_prompt(job, report):
     return ('Independently review the immutable candidate, including any merged changes, '
         'against the original fault and fixed checks. Require a generic engine fix and '
@@ -143,7 +160,7 @@ class Runner:
         config_path=Path(job['project'])/'.auto-agents/config.json'
         config=json.loads(config_path.read_text()) if config_path.exists() else {}
         settings=config.get('execution',{}).get('supervision',{})
-        result=run(job.get('runtime_argv') or job['argv'],cwd=job.get('cwd',job['engine']),env=self.env(job),
+        result=run(job.get('runtime_argv') or checkpoint_arguments(job),cwd=job.get('cwd',job['engine']),env=self.env(job),
             log=self.directory/'business.log',observation=observation,pass_fds=(self.fd,),
             repeat_limit=settings.get('loop_repeat_limit',3),
             heartbeat_timeout=settings.get('heartbeat_timeout_seconds',120),stream=True,
@@ -424,12 +441,15 @@ class Runner:
         # Earlier versions left this directory behind before recording any
         # admitted candidate. It is a regenerable copy, not live business state.
         if snapshot.exists():shutil.rmtree(snapshot)
-        env={**os.environ,'PYTHONPATH':str(Path(job['engine'])/'src'),'AUTO_AGENTS_NO_SUPERVISOR':'1'}
+        env={**self.env(job),'PYTHONPATH':str(Path(job['engine'])/'src')}
+        # Snapshot is a helper of the existing owner, not another business run.
+        # Its observer must not overwrite the business fault observation.
+        env.pop('AUTO_AGENTS_OBSERVATION_FILE',None)
         with tempfile.TemporaryDirectory(prefix='.snapshot-',dir=self.directory) as temporary:
             output=Path(temporary)/'project'
             proc=subprocess.run([sys.executable,'-m','auto_agents','snapshot',
                 '--project',job['project'],'--output',str(output)],
-                env=env,cwd=job['engine'],capture_output=True,text=True)
+                env=env,pass_fds=(self.fd,),cwd=job['engine'],capture_output=True,text=True)
             try:exported=json.loads(proc.stdout)
             except (ValueError,TypeError):exported={}
             if proc.returncode or exported.get('ok') is not True:
