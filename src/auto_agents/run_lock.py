@@ -71,6 +71,14 @@ class ProjectRunLock:
 
         inherited_fd = self._inherited_fd()
         if inherited_fd is not None:
+            control = read_process_control(self.control_path)
+            if str(control.get("run_token", "")) != self.run_token:
+                orphaned = _live_control_processes(self.control_path, expected_project=str(self.project_root))
+                if orphaned:
+                    raise RunAlreadyActiveError(
+                        f"orphaned auto_agents subprocesses are still active for {self.project_root}; "
+                        "stop the original owned processes before starting another run"
+                    )
             self._fd = inherited_fd
             self._acquired_pid = os.getpid()
             self._write_owner(inherited_fd)

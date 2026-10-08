@@ -46,3 +46,29 @@ code, shared Git HEAD, provider configuration and application data were not
 modified. Historical missing or conflicting proofs remain blocked with the
 original database archive retained. This migration does not claim that the SDGP
 video-generation business goal is complete.
+
+## Follow-up launch and supervision audit (2026-10-08)
+
+New-session intent is now resolved once by the business kernel and exposed through
+the read-only `execution-request` protocol. Identical bare collab/fix/provider
+commands create new roots; explicit selectors and the unique unfinished run select
+existing roots and preserve accounting. This was also checked against SDGP through
+the read-only CLI, without advancing its work or invoking a model.
+
+Process tests exercise the real bootstrap, watcher and native shell adapter with
+a local deterministic provider. They cover new sessions, waiting-user resumes,
+provider aliases, changed launch flags, unknown calls, concurrent admission, lock
+refusal, orphan preservation, goal-input heartbeats and original-root attribution.
+Snapshot helpers inherit the owner's descriptor while unrelated processes remain
+excluded. No account or paid media service is used by these tests.
+
+The full regression passed **1,379 tests and 57 subtests**, with one optional
+Docker integration test skipped because no local test image was selected. After
+the final alias and atomic-admission changes, **179 focused tests and 8 subtests**
+passed. The initial missing-Vitest prerequisites were supplied from the pinned
+lockfile in a temporary tool directory; all 15 real-selector tests then passed.
+An additional static audit checked 554 constructor calls against their installed
+signatures without finding other missing required arguments. Compilation and
+whitespace checks passed. Temporary tool directories and full-suite working
+directories were released; these results do not claim native Docker or live SDGP
+business completion for the new changes.

@@ -61,6 +61,7 @@ def main(argv=None):
     arguments = [arg for arg in arguments if arg != "--no-supervisor"]
     public = {
         "business-status",
+        "execution-request",
         "snapshot",
         "resume-check",
         "migrate-state",
@@ -80,12 +81,12 @@ def main(argv=None):
     project = None
     for i, arg in enumerate(arguments):
         if arg == "--project" and i + 1 < len(arguments):
-            project = Path(arguments[i + 1]).resolve()
+            project = Path(arguments[i + 1]).expanduser().resolve()
         elif arg.startswith("--project="):
-            project = Path(arg.split("=", 1)[1]).resolve()
+            project = Path(arg.split("=", 1)[1]).expanduser().resolve()
     managed = bool(
         arguments
-        and arguments[0] in {"run", "fix", "collab", "resume", "provider-resolve"}
+        and arguments[0] in {"run", "fix", "collab", "resume", "provider-resolve", "provider-research"}
     )
     if managed and project and not standalone:
         config_path = project / ".auto-agents/config.json"

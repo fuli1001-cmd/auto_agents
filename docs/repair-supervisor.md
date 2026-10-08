@@ -23,6 +23,17 @@ with business commands; an absent watcher does not prevent execution. `off`
 disables automatic startup. Engine repair needs a clean engine Git checkout and
 Docker. Ordinary business execution does not need Docker.
 
+The business kernel resolves launch intent through the read-only
+`execution-request` CLI protocol. A `collab`, `fix` or `provider-resolve` command
+without a selector starts a new root and a new watcher job, even if an identical
+command previously stopped. An explicit `--session`/`--workflow` selects existing
+work. `run` continues its unique unfinished product root and refuses ambiguous
+selection; release and prototype-variant roots are excluded from that default.
+Jobs are matched by the selected root, so changing provider, logging, launcher or
+verification flags cannot replenish maintenance accounting.
+Job lookup and admission run in one database transaction; simultaneous resumes
+of one root cannot create separate maintenance budgets.
+
 ```json
 {
   "efforts": {"self_repair": "deep", "self_repair_review": "max"},
@@ -65,6 +76,10 @@ work, approvals and verified improvement count as milestones. Repeated steps
 without a milestone can request a checkpoint. Waiting for a user suspends cycle
 detection. Heartbeat loss and timeouts stop with evidence; neither alone proves
 an engine bug. No model continually interprets workflow health.
+Startup and the initial interactive goal prompt also emit heartbeats. A failed
+new admission cannot acquire the previous goal's identity. Duplicate lock refusal
+preserves the existing owner's job, and inherited locks cannot adopt live children
+from an earlier owner.
 
 Only an evidenced engine fault enters repair. Business failure, missing test
 infrastructure, operator decisions, migration conflicts and unknown request
@@ -106,7 +121,7 @@ Schema-2 retries use the checkpoint's original root selector, including when the
 initial command omitted `--session`; an explicit replacement provider is retained.
 
 If an old stopped job's maintenance snapshots were explicitly retired, repeating
-the business command creates a linked successor and runs the current business
+a command that selects the same root creates a linked successor and runs the current business
 before considering repair. `resume --retry-business` has the same behavior and
 subsequent resumes of the old job follow its successor. Old faults and checkpoints
 remain in the predecessor for diagnosis; model-call counts, attempts, stagnation

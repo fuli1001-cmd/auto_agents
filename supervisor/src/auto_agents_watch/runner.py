@@ -20,11 +20,24 @@ from .verification import Verifier
 from . import git_delivery as delivery
 
 
+class ProjectBusyError(RuntimeError):
+    pass
+
+
+def launch_arguments(argv):
+    argv=list(argv)
+    if 'auto_agents' in argv and '-m' in argv:
+        offset=argv.index('auto_agents')+1
+    elif len(argv)>1 and Path(argv[1]).name=='auto_agents.py':
+        offset=2
+    else:
+        offset=1
+    return argv[:offset],argv[offset:]
+
+
 def task_arguments(argv):
     """Provider/launcher changes do not create new credit for the same task."""
-    args=list(argv)
-    start=args.index('auto_agents')+1 if 'auto_agents' in args else 1
-    args=args[start:]
+    _,args=launch_arguments(argv)
     normalized=[];index=0
     while index<len(args):
         arg=args[index]
@@ -48,19 +61,37 @@ def retired_inputs(job):
 
 def checkpoint_arguments(job):
     """Resume the original root even when its launch had no session selector."""
-    argv=list(job['argv'])
+    argv=list(job.get('runtime_argv') or job['argv'])
     token=job.get('resume_token') or {}
     if token.get('schema')!=2 or token.get('project')!=job['project']:
+        if job.get('selected_work'):
+            _,arguments=launch_arguments(argv)
+            if not any(arg.split('=',1)[0] in {'--session','--workflow','--run'} for arg in arguments):
+                argv.extend(['--session',job['selected_work']])
         return argv
     arguments=list(token['argv'])
     # Keep an explicitly selected replacement provider on a retry.
-    for index,arg in enumerate(argv):
-        if arg=='--provider' and index+1<len(argv):
-            arguments.extend(['--provider',argv[index+1]])
+    selected_argv=job['argv']
+    for index,arg in enumerate(selected_argv):
+        if arg=='--provider' and index+1<len(selected_argv):
+            arguments.extend(['--provider',selected_argv[index+1]])
         elif arg.startswith('--provider='):
             arguments.append(arg)
-    prefix=argv[:argv.index('auto_agents')+1] if 'auto_agents' in argv else argv[:1]
+    prefix,_=launch_arguments(argv)
     return [*prefix,*arguments]
+
+
+def business_root(job):
+    token=job.get('resume_token') or {}
+    observation=job.get('observation') or {}
+    if job.get('root_id') or token.get('root_id') or observation.get('root_subject'):
+        return job.get('root_id') or token.get('root_id') or observation['root_subject']
+    _,arguments=launch_arguments(job['argv'])
+    for index,arg in enumerate(arguments):
+        if arg in {'--session','--workflow','--run'} and index+1<len(arguments):
+            return arguments[index+1]
+        if arg.split('=',1)[0] in {'--session','--workflow','--run'} and '=' in arg:
+            return arg.split('=',1)[1]
 
 
 def review_prompt(job, report):
@@ -84,7 +115,10 @@ class Runner:
         path.parent.mkdir(parents=True,exist_ok=True)
         fd=os.open(path,os.O_RDWR|os.O_CREAT,0o600)
         try:
-            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            try:
+                fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ProjectBusyError('Another business owner is active; duplicate execution refused') from error
             self.fd=fd
             self.token=digest([job['id'],time.time()])
             from .process import process_identity
@@ -115,14 +149,18 @@ class Runner:
             if arg=='--project' and i+1<len(argv): project=argv[i+1]
             elif arg.startswith('--project='): project=arg.split('=',1)[1]
         if not project: raise ValueError('Supervised business commands require --project')
-        normalized_project = str(Path(project).resolve())
-        # Re-running the same maintenance task must not replenish its budget.
-        existing = [job for job in self.store.list() if job['project'] == normalized_project
-                    and job['engine']==str(Path(engine).resolve())
-                    and task_arguments(job['argv'])==task_arguments(argv) and job['state'] != 'DONE'
-                    and not job.get('superseded_by')]
-        if existing:
-            retained=max(existing,key=lambda job:job['created'])
+        normalized_project = str(Path(project).expanduser().resolve())
+        engine=str(Path(engine).expanduser().resolve())
+        request=self.execution_request(argv,project,engine)
+        # New business roots own new jobs. Only a selected existing root may
+        # reuse maintenance accounting, regardless of launcher/provider flags.
+        if request:
+            matches=lambda job:request['intent']=='resume' and business_root(job)==request['root_id']
+        else:
+            matches=lambda job:job['state']!='DONE' and task_arguments(job['argv'])==task_arguments(argv)
+        retained,created=self.store.admit(argv,normalized_project,engine,matches=matches,
+            root_id=request['root_id'] if request else None,selected_work=request['work_id'] if request else None)
+        if not created:
             if alive(retained.get('process')) or retained.get('active_call'):
                 return self.resume(retained['id'])
             if retained['state']=='STOPPED' and retired_inputs(retained):
@@ -130,7 +168,7 @@ class Runner:
                     return retained
                 successor=self.store.successor(retained,argv)
                 return self.resume(successor['id'])
-            self.store.save(retained,argv=list(argv))
+            self.store.save(retained,argv=list(argv),root_id=request['root_id'] if request else business_root(retained))
             if (retained['state'] == 'STOPPED' and not retained.get('candidate')
                     and not retained.get('model_calls') and not retained.get('attempts')
                     and retained.get('reason') == 'Engine source has uncommitted changes; candidate admission preserves user work'):
@@ -139,8 +177,35 @@ class Runner:
                 # admission refusal forever. This grants no maintenance credit.
                 return self.resume(retained['id'], retry_business=True)
             return self.resume(retained['id'])
-        job=self.store.create(argv,project,engine)
-        return self.resume(job['id'])
+        job=retained
+        try:
+            return self.resume(job['id'])
+        except ProjectBusyError as error:
+            self.store.save(job,'STOPPED',reason=str(error))
+            raise
+
+    def execution_request(self,argv,project,engine):
+        prefix,arguments=launch_arguments(argv)
+        native=Path(prefix[-1]).name in {'auto_agents','auto_agents.py','auto-agents','auto-agents.exe'}
+        if not native or not arguments or arguments[0] not in {
+                'run','fix','collab','resume','provider-resolve','provider-research'}:
+            return None
+        with tempfile.TemporaryDirectory(prefix='.invocation-',dir=self.store.root) as temporary:
+            path=Path(temporary)/'argv.json'
+            atomic(path,arguments)
+            proc=subprocess.run([sys.executable,'-m','auto_agents','execution-request',
+                '--project',str(project),'--invocation',str(path)],cwd=os.getcwd(),
+                env={**os.environ,'PYTHONPATH':str(Path(engine)/'src'),'AUTO_AGENTS_NO_SUPERVISOR':'1'},
+                capture_output=True,text=True,timeout=30)
+        try:value=json.loads(proc.stdout)
+        except (ValueError,TypeError):value={}
+        if proc.returncode or value.get('ok') is not True:
+            raise RuntimeError('Business invocation rejected: '+str(value.get('error') or proc.stderr.strip() or proc.stdout.strip()))
+        if (value.get('schema')!=2 or value.get('project')!=str(Path(project).expanduser().resolve())
+                or value.get('intent') not in {'start','resume'}
+                or value['intent']=='resume' and not value.get('root_id')):
+            raise RuntimeError('Business invocation returned an invalid selection contract')
+        return value
 
     def configured(self,job):
         config=json.loads((Path(job['project'])/'.auto-agents/config.json').read_text())
@@ -160,14 +225,14 @@ class Runner:
         config_path=Path(job['project'])/'.auto-agents/config.json'
         config=json.loads(config_path.read_text()) if config_path.exists() else {}
         settings=config.get('execution',{}).get('supervision',{})
-        result=run(job.get('runtime_argv') or checkpoint_arguments(job),cwd=job.get('cwd',job['engine']),env=self.env(job),
+        result=run(checkpoint_arguments(job),cwd=job.get('cwd',job['engine']),env=self.env(job),
             log=self.directory/'business.log',observation=observation,pass_fds=(self.fd,),
             repeat_limit=settings.get('loop_repeat_limit',3),
             heartbeat_timeout=settings.get('heartbeat_timeout_seconds',120),stream=True,
             on_start=lambda process:self.store.save(job,process=process),
             cancelled=lambda:self.store.get(job['id']).get('cancel_requested',False))
         value=json.loads(observation.read_text()) if observation.exists() else {}
-        self.store.save(job,process=None,observation=value)
+        self.store.save(job,process=None,observation=value,root_id=value.get('root_subject') or job.get('root_id'))
         if self.store.get(job['id']).get('cancel_requested'):result['reason']='cancelled'
         if result['reason'] or value.get('fault'):
             cleanup=subprocess.run([sys.executable,'-m','auto_agents','quiesce','--project',job['project']],
@@ -423,6 +488,8 @@ class Runner:
                 while self.business(job):
                     self.maintain(job)
                 if job['state']=='DONE':self.clean_completed(job)
+        except ProjectBusyError:
+            raise
         except Exception as error:
             self.store.save(job,'STOPPED',reason=str(error))
         finally:

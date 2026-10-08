@@ -806,6 +806,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in (
         "capabilities",
         "business-status",
+        "execution-request",
         "snapshot",
         "resume-check",
         "migrate-state",
@@ -833,5 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--process-file")
         if name == "checkpoint":
             command.add_argument("--observation", required=True)
+            command.add_argument("--invocation", required=True)
+        if name == "execution-request":
             command.add_argument("--invocation", required=True)
     return parser

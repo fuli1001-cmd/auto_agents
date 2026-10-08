@@ -39,6 +39,7 @@ class Observer:
         self.thread = None
         self.lock = threading.RLock()
         self.current_fault = None
+        self.waiting_for_goal = False
 
     def __enter__(self):
         if self.output:
@@ -68,6 +69,15 @@ class Observer:
         root_id = store.meta("active_root")
         root = next((w for w in works if w["id"] == root_id), None)
         if not root:
+            self._write({
+                "schema": 2, "project": str(self.project),
+                "status": "waiting" if self.waiting_for_goal else "running",
+                "subject": "", "root_subject": "",
+                "phase": "goal" if self.waiting_for_goal else "startup",
+                "waiting_for": "user" if self.waiting_for_goal else "",
+                "progress_seq": 0, "milestones": [], "steps": [],
+                "heartbeat_at": time.time(),
+            })
             return
         active = next(
             (
@@ -134,6 +144,10 @@ class Observer:
             old = json.loads(path.read_text())
             if old.get("fault") and old.get("root_subject", root["id"]) == root["id"]:
                 value["fault"] = old["fault"]
+        self._write(value)
+
+    def _write(self, value):
+        path = Path(self.output)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(canonical(value))
         os.replace(temporary, path)

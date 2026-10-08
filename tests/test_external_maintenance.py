@@ -20,6 +20,10 @@ from auto_agents_watch.providers import selection, arguments
 from auto_agents_watch.process import cycle, run
 from auto_agents_watch.git_delivery import git, commit, publish
 
+def retained_business(project, identity):
+    from auto_agents.control.store import Store as ControlStore
+    return ControlStore(project).create_workflow('collab','Original goal','original-source',identity=identity)
+
 def test_completed_supervisor_requests_core_cleanup_without_inherited_lock(tmp_path, monkeypatch):
     import fcntl
     from auto_agents_watch.runner import Runner
@@ -657,7 +661,8 @@ def test_native_partial_output_is_never_a_confirmed_result(tmp_path, kind, termi
 def test_cancelled_task_does_not_dispatch_another_model(tmp_path):
     from auto_agents_watch.runner import Runner
     store = Store(tmp_path / 'watch')
-    job = store.create(['auto-agents', 'collab', '--project', str(tmp_path / 'project')], tmp_path / 'project', tmp_path / 'engine')
+    retained_business(tmp_path/'project','original')
+    job = store.create(['auto-agents', 'collab', '--project', str(tmp_path / 'project'),'--session','original'], tmp_path / 'project', tmp_path / 'engine')
     store.save(job, 'STOPPED', cancel_requested=True)
     assert Runner(store).start(job['argv'], job['engine'])['id'] == job['id']
     assert len(store.list()) == 1 and store.get(job['id'])['model_calls'] == 0
@@ -666,6 +671,7 @@ def test_user_rerun_rechecks_business_after_dirty_engine_admission_refusal(tmp_p
     from auto_agents_watch.runner import Runner
     store = Store(tmp_path / 'watch')
     argv = ['auto-agents', 'collab', '--project', str(tmp_path / 'project'), '--session', 'parent']
+    retained_business(tmp_path/'project','parent')
     job = store.create(argv, tmp_path / 'project', tmp_path / 'engine')
     original = {'category': 'engine', 'message': 'old selector failure'}
     store.save(job, 'STOPPED', needs_maintenance=True, fault=original, no_progress=2, reason='Engine source has uncommitted changes; candidate admission preserves user work')
@@ -711,6 +717,7 @@ def test_provider_change_does_not_create_a_new_maintenance_budget(tmp_path):
     from auto_agents_watch.runner import Runner
     store = Store(tmp_path / 'watch')
     argv = ['auto-agents', 'collab', '--project', str(tmp_path), '--session', 's', '--provider', 'first']
+    retained_business(tmp_path,'s')
     job = store.create(argv, tmp_path, tmp_path)
     store.reserve(job, 'implement')
     store.settle(job, {'ok': True})
@@ -775,6 +782,7 @@ def test_retired_job_starts_business_in_successor_without_old_docker_repair(tmp_
     project=tmp_path/'project';project.mkdir()
     store=Store(tmp_path/'watch')
     argv=['auto-agents','collab','--project',str(project),'--session','original','--provider','first']
+    retained_business(project,'original')
     old=store.create(argv,project,tmp_path/'engine')
     store.save(old,'STOPPED',fault={'category':'engine','message':'obsolete classification conflict'},
         needs_maintenance=True,resume_token={'schema':1},candidate=str(tmp_path/'old-candidate'),snapshot=None,
@@ -808,6 +816,7 @@ def test_retired_job_unknown_call_cannot_be_bypassed_by_successor(tmp_path):
     from auto_agents_watch.runner import Runner
     store=Store(tmp_path/'watch')
     argv=['auto-agents','collab','--project',str(tmp_path),'--session','original']
+    retained_business(tmp_path,'original')
     old=store.create(argv,tmp_path,tmp_path)
     store.reserve(old,'implement')
     store.save(old,'STOPPED',cleanup={'old_snapshot_available':False})

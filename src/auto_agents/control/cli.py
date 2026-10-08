@@ -15,6 +15,7 @@ from . import api, cleanup
 EXECUTION = {"run", "fix", "collab", "resume", "provider-resolve", "provider-research"}
 PUBLIC = {
     "business-status",
+    "execution-request",
     "snapshot",
     "resume-check",
     "checkpoint",
@@ -160,6 +161,11 @@ def invoke(argv=None):
     if args.command == "business-status":
         emit(api.status(project))
         return 0
+    if args.command == "execution-request":
+        from .invocation import request
+
+        emit(request(project, json.loads(Path(args.invocation).read_text())))
+        return 0
     if args.command == "resume-check":
         result = api.resume_check(project, args.resume_token)
         emit(result)
@@ -180,11 +186,20 @@ def invoke(argv=None):
 
     try:
         with ProjectRunLock(project):
+            prepared = None
+            selected = None
+            if args.command in EXECUTION:
+                from .invocation import selected_work
+
+                prepared = ready(project)
+                selected = selected_work(prepared, args)
+                root = prepared.workflow(selected["workflow"])["root"] if selected else ""
+                prepared.set_meta("active_root", root)
             from .observer import Observer
 
             with Observer(project) as observer:
                 try:
-                    return dispatch(project, args, arguments)
+                    return dispatch(project, args, arguments, store=prepared, selected=selected, observer=observer)
                 except Exception as error:
                     if not isinstance(error, ControlError):
                         import traceback
@@ -216,7 +231,7 @@ def invoke(argv=None):
         raise
 
 
-def dispatch(project, args, argv):
+def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
     from ..config import load_project_config, save_project_config
     from ..models import ProjectConfig
 
@@ -238,7 +253,7 @@ def dispatch(project, args, argv):
     if args.command == "snapshot":
         emit(api.snapshot(project, args.output))
         return 0
-    store = ready(project)
+    store = store or ready(project)
     if args.command in EXECUTION:
         store.orphan_calls()
     if args.command in {"status", "sessions"}:
@@ -407,40 +422,11 @@ def dispatch(project, args, argv):
             getattr(args, "fresh", False) or getattr(args, "full_verify", False)
         ),
     )
-    identity = (
-        getattr(args, "session", None)
-        or getattr(args, "workflow", None)
-        or getattr(args, "run", None)
-    )
-    if not identity and args.command not in {
-        "fix",
-        "collab",
-        "provider-resolve",
-        "provider-research",
-    }:
-        roots = [
-            x
-            for x in store.works()
-            if not x["parent"] and x["status"] not in {"COMPLETED", "CANCELLED"}
-        ]
-        if args.command == "run":
-            roots = [
-                w
-                for w in roots
-                if w["mode"] == "run"
-                and not store.contract(w["contract"]).inputs.get("release_only")
-            ]
-        if len(roots) == 1:
-            identity = roots[0]["id"]
-        elif len(roots) > 1 and args.command in {
-            "run",
-            "resume",
-            "approve",
-            "reject",
-            "answer",
-            "cancel",
-        }:
-            raise ControlError("selection", "Choose --session or --workflow explicitly")
+    from .invocation import selected_work
+
+    if args.command not in EXECUTION:
+        selected = selected_work(store, args)
+    identity = selected["id"] if selected else None
     if args.command == "prototype" or args.command == "prototype-preview":
         from . import prototypes
 
@@ -789,7 +775,14 @@ def dispatch(project, args, argv):
             if not goal:
                 if not sys.stdin.isatty():
                     raise ControlError("goal", "Supply --goal or --spec-file")
-                goal = input("请输入目标或问题：\n").strip()
+                if observer:
+                    observer.waiting_for_goal = True
+                    observer.publish()
+                try:
+                    goal = input("请输入目标或问题：\n").strip()
+                finally:
+                    if observer:
+                        observer.waiting_for_goal = False
             checks = (
                 (VerificationSpec(args.verify_command),) if args.verify_command else ()
             )

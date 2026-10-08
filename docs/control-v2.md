@@ -46,6 +46,11 @@ auto-agents resume --project /path/to/project --workflow workflow-id
 覆盖保留的降级选择，不会重新授予额度。`run --provider` 和 `--doc-language` 仍会
 保存默认设置。`--max-tasks` 在当前调用完成指定数量后暂停，下一次继续剩余任务。
 
+不带会话选择参数的 `collab`、`fix` 和 `provider-resolve` 每次创建新任务，监督程序也
+创建新作业；不会因命令文字相同而恢复历史失败。`run` 默认续跑唯一未完成的产品任务，
+不选择发布检查或原型变体任务；存在多个候选时要求明确指定 ID。业务和监督共用内核的
+只读启动选择结果，恢复按实际根任务身份关联，修改 provider 或日志参数不会重置额度。
+
 批准或拒绝后用原运行命令继续；回答默认自动续跑，`--no-resume` 只保存回答。待决定的子任务可通过根任务 ID 定位。
 
 ```bash

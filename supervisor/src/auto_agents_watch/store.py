@@ -46,15 +46,27 @@ class Store:
             db.close()
 
     def create(self, argv, project, engine):
+        return self.admit(argv,project,engine)[0]
+
+    def admit(self, argv, project, engine, *, matches=None, root_id=None, selected_work=None):
+        """Select/create a job atomically so concurrent resumes share accounting."""
         identity = uuid.uuid4().hex
         value = {'id': identity, 'argv': list(argv), 'project': str(Path(project).resolve()),
                  'cwd':os.getcwd(),
                  'engine': str(Path(engine).resolve()), 'state': 'RUNNING', 'attempts': 0, 'model_calls': 0,
-                 'no_progress': 0, 'best_passed': [], 'created': time.time(), 'publication': 'not_requested'}
+                 'no_progress': 0, 'best_passed': [], 'created': time.time(), 'publication': 'not_requested',
+                 'root_id':root_id,'selected_work':selected_work}
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if matches:
+                eligible=[json.loads(row[0]) for row in db.execute('SELECT payload FROM jobs')]
+                retained=[job for job in eligible if job['project']==value['project']
+                    and job['engine']==value['engine'] and not job.get('superseded_by') and matches(job)]
+                if retained:
+                    return max(retained,key=lambda job:job['created']),False
+            (self.root / 'jobs' / identity).mkdir(parents=True)
             db.execute('INSERT INTO jobs VALUES(?,?)', (identity, json.dumps(value)))
-        (self.root / 'jobs' / identity).mkdir(parents=True)
-        return value
+        return value,True
 
     def get(self, identity):
         with self.connect() as db:
@@ -70,6 +82,9 @@ class Store:
             current = json.loads(db.execute('SELECT payload FROM jobs WHERE id=?', (previous['id'],)).fetchone()[0])
             if current.get('active_call'):
                 raise RuntimeError('Reconcile the previous model call before replacing maintenance inputs')
+            from .process import alive
+            if alive(current.get('process')):
+                raise RuntimeError('Original process is still alive; duplicate execution refused')
             if current.get('superseded_by'):
                 return json.loads(db.execute('SELECT payload FROM jobs WHERE id=?',
                     (current['superseded_by'],)).fetchone()[0])
@@ -78,6 +93,8 @@ class Store:
             value = {'id': identity, 'argv': list(argv), 'project': current['project'], 'engine': current['engine'],
                      'cwd': os.getcwd(), 'state': 'RUNNING', 'created': time.time(), 'publication': 'not_requested',
                      'predecessor': current['id'],
+                     'root_id': current.get('root_id') or (current.get('resume_token') or {}).get('root_id'),
+                     'selected_work': current.get('selected_work') or (current.get('resume_token') or {}).get('root_id'),
                      'maintenance_started': current.get('maintenance_started') or current['created'],
                      'cancel_requested': current.get('cancel_requested',False)}
             for key, default in [('attempts',0), ('model_calls',0), ('no_progress',0), ('best_passed',[])]:
