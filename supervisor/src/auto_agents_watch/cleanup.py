@@ -56,4 +56,35 @@ def completed_job(store,job):
     if sandbox.exists():
         if sandbox.is_symlink() or sandbox.stat().st_uid!=os.getuid():raise ValueError('Sandbox ownership changed')
         shutil.rmtree(sandbox);released.append('private-agent-homes')
-    return {'state':'released','paths':released,'candidate_history':'verified Git bundles','reports_retained':True}
+    images=tool_images(store)
+    return {'state':'released','paths':released,'candidate_history':'verified Git bundles','reports_retained':True,'images':images}
+
+
+def tool_images(store):
+    """Keep the current recipe for each provider and images leased by live jobs."""
+    import json
+    registry=store.root/'tool-images'
+    if not registry.exists():return {'removed':[]}
+    records=[]
+    for path in registry.glob('*.json'):
+        if path.is_symlink():continue
+        record=json.loads(path.read_text());records.append((path,record))
+    current={}
+    for _,record in records:
+        kind=record['provider_kind']
+        if kind not in current or record['used']>current[kind]['used']:current[kind]=record
+    retained={row['image'] for row in current.values()}
+    retained.update(job.get('tool_image') for job in store.list() if job.get('active_call') or alive(job.get('process')) or job['state'] not in {'DONE','STOPPED'})
+    owner=hashlib.sha256(str(store.root.resolve()).encode()).hexdigest();removed=[]
+    for path,record in records:
+        image=record['image']
+        if image in retained or record.get('owner')!=owner:continue
+        result=subprocess.run(['docker','image','inspect',image],capture_output=True,text=True,timeout=15)
+        if result.returncode:path.unlink();continue
+        labels=json.loads(result.stdout)[0].get('Config',{}).get('Labels') or {}
+        if labels.get('auto-agents-watch.managed')!='tool-image' or labels.get('auto-agents-watch.store')!=owner:continue
+        used=subprocess.run(['docker','ps','-aq','--filter','ancestor='+image],capture_output=True,text=True,timeout=15)
+        if used.returncode or used.stdout.strip():continue
+        result=subprocess.run(['docker','image','rm',image],capture_output=True,text=True,timeout=30)
+        if result.returncode==0:path.unlink();removed.append(image)
+    return {'removed':removed,'current':[r['image'] for r in current.values()]}

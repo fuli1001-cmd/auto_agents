@@ -21,7 +21,6 @@ from .validation import (
     validate_task_plan_payload,
 )
 
-
 _REQUIREMENT_ID_PATTERN = re.compile(r"^REQ-[0-9]+$", re.IGNORECASE)
 _LEGACY_BLOCKER_MARKERS = (
     "target_ids must reference persistence targets, not requirement IDs",
@@ -64,8 +63,7 @@ def _matching_decision(
     matches = [
         item
         for item in decisions
-        if isinstance(item, dict)
-        and str(item.get("id", "")).strip() == decision_id
+        if isinstance(item, dict) and str(item.get("id", "")).strip() == decision_id
     ]
     if len(matches) != 1:
         raise PersistenceRebindError(
@@ -174,6 +172,7 @@ def _replace_json_batch(payloads: Mapping[Path, object]) -> None:
         for path, staged_path in staged.items():
             os.replace(staged_path, path)
         from .business_state import record_location, write_projection
+
         for path, payload in payloads.items():
             if record_location(path):
                 write_projection(path, payload)
@@ -217,6 +216,9 @@ def rebind_legacy_persistence_decision(
     *,
     decision_id: str,
     target_ids: Iterable[str],
+    state_payload=None,
+    publish=None,
+    project_config=None,
 ) -> Dict[str, object]:
     root = project_root.expanduser().resolve()
     normalized_decision_id = str(decision_id).strip()
@@ -228,21 +230,17 @@ def rebind_legacy_persistence_decision(
     if not selected_target_ids:
         raise PersistenceRebindError("at least one target_id is required")
     requirement_targets = [
-        item
-        for item in selected_target_ids
-        if _REQUIREMENT_ID_PATTERN.fullmatch(item)
+        item for item in selected_target_ids if _REQUIREMENT_ID_PATTERN.fullmatch(item)
     ]
     if requirement_targets:
         raise PersistenceRebindError(
             "selected target_ids must identify persistence targets, not "
-            "requirement IDs: "
-            + ", ".join(requirement_targets)
+            "requirement IDs: " + ", ".join(requirement_targets)
         )
 
-    config = load_project_config(root)
+    config = project_config or load_project_config(root)
     configured_targets = {
-        target.target_id: target
-        for target in config.persistence.targets
+        target.target_id: target for target in config.persistence.targets
     }
     missing_targets = [
         target_id
@@ -261,7 +259,11 @@ def rebind_legacy_persistence_decision(
     state_path = run_state_path(root)
     trace = read_json(trace_path, default=None)
     plan = read_json(plan_path, default=None)
-    state = read_json(state_path, default=None)
+    state = (
+        state_payload
+        if state_payload is not None
+        else read_json(state_path, default=None)
+    )
     if not isinstance(trace, dict):
         raise PersistenceRebindError("requirements trace is missing or invalid")
     if not isinstance(plan, dict):
@@ -272,9 +274,7 @@ def rebind_legacy_persistence_decision(
     decision = _matching_decision(trace, normalized_decision_id)
     previous_target_ids = _normalized_ids(decision.get("target_ids", []))
     already_bound = previous_target_ids == selected_target_ids
-    if not already_bound and not _legacy_requirement_targets(
-        previous_target_ids
-    ):
+    if not already_bound and not _legacy_requirement_targets(previous_target_ids):
         raise PersistenceRebindError(
             f"persistence decision {normalized_decision_id} does not contain a "
             "legacy REQ-* target set; refusing to change an established target binding"
@@ -321,8 +321,7 @@ def rebind_legacy_persistence_decision(
             plan,
             trace,
             configured_targets=[
-                target.to_dict()
-                for target in config.persistence.targets
+                target.to_dict() for target in config.persistence.targets
             ],
         )
     )
@@ -332,13 +331,11 @@ def rebind_legacy_persistence_decision(
             + "\n- ".join(dict.fromkeys(errors))
         )
 
-    _replace_json_batch(
-        {
-            trace_path: trace,
-            plan_path: plan,
-            state_path: state,
-        }
-    )
+    documents = {trace_path: trace, plan_path: plan}
+    if publish is None:
+        _replace_json_batch({**documents, state_path: state})
+    else:
+        publish(documents, state)
     return {
         "ok": True,
         "decision_id": normalized_decision_id,
@@ -348,9 +345,6 @@ def rebind_legacy_persistence_decision(
         "updated_run_state_tasks": state_tasks,
         "blocker_cleared": blocker_cleared,
         "no_op": (
-            already_bound
-            and not plan_tasks
-            and not state_tasks
-            and not blocker_cleared
+            already_bound and not plan_tasks and not state_tasks and not blocker_cleared
         ),
     }

@@ -43,6 +43,11 @@ class Docker:
         result = subprocess.run(['docker','image','inspect','--format','{{.Id}}',self.image],
                                 check=True,capture_output=True,text=True,timeout=self.time_limit(30))
         self.image = result.stdout.strip()
+        from .store import atomic
+        registry=self.root.parent.parent/'tool-images'
+        atomic(registry/(hashlib.sha256(self.image.encode()).hexdigest()+'.json'),
+               {'image':self.image,'provider_kind':self.provider.get('kind','codex'),
+                'owner':hashlib.sha256(str(self.root.parent.parent.resolve()).encode()).hexdigest(),'used':time.time()})
         return self.image
 
     def build(self):
@@ -70,7 +75,8 @@ class Docker:
         # A local image is sufficient; Docker Hub is not needed merely to
         # recheck its tag. Include its immutable identity in the tool cache.
         base_identity=base_info.stdout.strip() if base_info.returncode==0 else self.base_image
-        recipe = json.dumps({'version':4,'base_image':base_identity,'dependencies':dependencies,'kind':self.provider.get('kind'),
+        owner=hashlib.sha256(str(self.root.parent.parent.resolve()).encode()).hexdigest()
+        recipe = json.dumps({'version':5,'owner':owner,'base_image':base_identity,'dependencies':dependencies,'kind':self.provider.get('kind'),
                             'verification_tools':hashlib.sha256(lock.read_bytes()).hexdigest() if lock and lock.exists() else '',
                             'package':(package/'package.json').read_text() if package else ''},sort_keys=True)
         identity = hashlib.sha256(actual.read_bytes()+recipe.encode()).hexdigest()[:20]
@@ -89,6 +95,7 @@ class Docker:
             (context/'requirements.txt').write_text('\n'.join(dependencies)+'\n')
             if tools and tools.is_dir():shutil.copytree(tools,context/'verification-tools',ignore=shutil.ignore_patterns('node_modules'))
             dockerfile = ('FROM '+base+'\nUSER root\n'
+                + 'LABEL auto-agents-watch.managed="tool-image" auto-agents-watch.store="'+owner+'" auto-agents-watch.recipe="'+identity+'"\n'
                 + 'RUN apt-get update && apt-get install -y python3 python3-venv python3-pip git ripgrep && rm -rf /var/lib/apt/lists/*\nRUN python3 -m venv /opt/venv\nENV PATH=/opt/venv/bin:$PATH\n'
                 + 'COPY cli /opt/cli\nRUN ln -sf '+entry+' /usr/local/bin/'+Path(binary).name+'\n'
                 + 'COPY requirements.txt /opt/requirements.txt\nRUN python -m pip install -r /opt/requirements.txt\n'

@@ -66,6 +66,9 @@ class BusinessStore:
         self.root = self.project / '.auto-agents/state'
         self.path = self.root / 'business.sqlite3'
         self.readonly = readonly
+        from .control.projection import current
+        if current(self.project) and not readonly:
+            raise BusinessStateError('retired_writer','Control v2 owns business state; use its public commands')
         if readonly:
             return
         if (self.project / LEGACY_MARKER).exists():
@@ -103,6 +106,10 @@ class BusinessStore:
     def get(self, path):
         if not self.path.exists():
             return None
+        from .control.projection import current,read
+        if current(self.project):
+            value=read(self.project,path)
+            return Projection(value,digest(value)) if value is not None else None
         with self.connect() as db:
             row = db.execute('SELECT payload,reference FROM records WHERE path=?', (path,)).fetchone()
         if row and hashlib.sha256(row['payload'].encode()).hexdigest() != row['reference']:
@@ -193,6 +200,8 @@ def read_projection(path):
     if not location:
         return NOT_MANAGED
     project, relative = location
+    from .control.projection import current
+    if current(project):return BusinessStore(project,readonly=True).get(relative)
     if (project / LEGACY_MARKER).exists():
         raise BusinessStateError('migration_required', 'Migrate the legacy database before reading business projections')
     value = BusinessStore(project, readonly=True).get(relative)

@@ -87,17 +87,20 @@ def test_unrelated_workflow_and_wrong_mode_never_supply_recovery(tmp_path):
 
 def test_cli_missing_session_does_not_initialize_or_triage_ambient_run(tmp_path):
     from unittest.mock import patch
-    from auto_agents.cli import main
-    from auto_agents.models import RunState
-    _fixture(tmp_path)
-    path = tmp_path / ".auto-agents/state/run_state.json"
-    raw = json.dumps(RunState("unrelated", status="blocked", active_blocker={"owner": "auto_agents", "category": "old_failure"}).to_dict())
-    path.write_text(raw)
-    with patch("auto_agents.cli.Orchestrator") as orchestrator:
-        code = main(["collab", "--project", str(tmp_path), "--session", "nonexistent", "--auto-approve"])
-    assert code == 3
-    orchestrator.assert_not_called()
-    assert path.read_text() == raw
+    from auto_agents.control import Store
+    from auto_agents.control.cli import main
+    from auto_agents.models import ProjectConfig
+    from auto_agents.config import save_project_config
+    save_project_config(tmp_path,ProjectConfig('fixture'))
+    store=Store(tmp_path)
+    ambient=store.create_workflow('run','Unrelated goal','source')
+    store.set_meta('active_root',ambient['id'])
+    before=store.works()
+    with patch('auto_agents.control.cli.Engine.resume') as resume,patch('auto_agents.control.cli.Engine.start') as start:
+        code=main(['collab','--project',str(tmp_path),'--session','nonexistent','--auto-approve','--json'])
+    assert code==3
+    resume.assert_not_called();start.assert_not_called()
+    assert store.works()==before and store.meta('active_root')==ambient['id']
 
 
 
@@ -120,19 +123,19 @@ def test_recovery_can_use_committed_history_without_checkpoint_blobs(tmp_path):
 
 
 def test_old_interruption_cannot_retarget_explicit_session(tmp_path):
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-    from auto_agents.cli import _reconcile_session_interruption
-    session, _ = _fixture(tmp_path)
-    apply_session_recovery(tmp_path, plan_session_recovery(tmp_path, "session-1", "collab"))
-    store = WorkflowStore(tmp_path)
-    store.create_root(WorkflowRef("run", "other-run"), workflow_id="wf-other")
-    coordinator = SimpleNamespace(store=store, reconcile_interruption=Mock())
-    state = SessionState.from_dict(session)
-    _reconcile_session_interruption(coordinator, {"owner": {"subject_id": "other-run"}}, state)
-    coordinator.reconcile_interruption.assert_not_called()
-    assert store.active().workflow_id == "wf-other"
-    payload = {"owner": {"subject_id": "session-1"}}
-    _reconcile_session_interruption(coordinator, payload, state)
-    coordinator.reconcile_interruption.assert_called_once_with(payload)
-    assert store.active().workflow_id == "wf-1"
+    from unittest.mock import patch
+    from auto_agents.control import Store
+    from auto_agents.control.cli import main
+    from auto_agents.models import ProjectConfig
+    from auto_agents.config import save_project_config
+    save_project_config(tmp_path,ProjectConfig('fixture'))
+    store=Store(tmp_path)
+    selected=store.create_workflow('collab','Original selected goal','source')
+    selected=store.transition(selected,'BLOCKED',failure={'code':'state','category':'reconciliation','message':'Retained request'})
+    ambient=store.create_workflow('run','Other run','source')
+    store.set_meta('active_root',ambient['id'])
+    with patch('auto_agents.control.cli.Engine.resume',return_value=selected) as resume:
+        assert main(['collab','--project',str(tmp_path),'--session',selected['id'],'--json'])==3
+    resume.assert_called_once_with(selected['id'])
+    assert store.work(ambient['id'])==ambient
+    assert store.contract(store.work(selected['id'])['contract']).goal=='Original selected goal'

@@ -159,8 +159,7 @@ class Runner:
             atomic(invocation,arguments)
             proc=subprocess.run([sys.executable,'-m','auto_agents','checkpoint','--project',job['project'],
                 '--observation',str(observation),'--invocation',str(invocation)],
-                env={**os.environ,'PYTHONPATH':str(Path(job['engine'])/'src'),
-                     'AUTO_AGENTS_NO_SUPERVISOR':'1'},capture_output=True,text=True)
+                env=self.env(job),pass_fds=(self.fd,),capture_output=True,text=True)
             if proc.returncode == 0:
                 fault=json.loads(proc.stdout)['fault']
         elif result['reason'] in {'heartbeat_lost','operation_timeout'}:
@@ -241,6 +240,7 @@ class Runner:
         if settings.get('max_duration_seconds'):
             sandbox.deadline=job.get('maintenance_started',job['created'])+settings['max_duration_seconds']
         sandbox.prepare()
+        if getattr(sandbox,'image',None):self.store.save(job,tool_image=sandbox.image)
         driver=self.driver_factory(provider,sandbox,config.get('efforts',{}))
         verification_root=self.directory/('verification-'+str(job['episode']) if job.get('episode') else 'verification')
         verifier=self.verifier_factory(job['engine'],job['base'],verification_root,sandbox)
@@ -348,6 +348,8 @@ class Runner:
         if pointer.exists(): shutil.copy2(pointer,installation/'previous.json')
         atomic(pointer,{'schema':1,'source':str(source),'python':str(python),'revision':revision})
         argv=list(job['argv'])
+        if job.get('resume_token',{}).get('schema')==2:
+            argv=[str(python),'-m','auto_agents',*job['resume_token']['argv']]
         if '-m' in argv:
             argv[0]=str(python)
         else:

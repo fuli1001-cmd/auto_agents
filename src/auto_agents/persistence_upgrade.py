@@ -118,16 +118,25 @@ def upgrade_persistence_contract(
     *,
     decision_policies: Mapping[str, tuple[str, str]],
     resume_interrupted: bool = False,
+    state_payload=None,
+    publish=None,
+    project_config=None,
 ) -> dict:
     root = project_root.expanduser().resolve()
     trace = read_json(requirements_trace_path(root), default=None)
     plan = read_json(task_plan_path(root), default=None)
-    state = read_json(run_state_path(root), default=None)
+    state = (
+        state_payload
+        if state_payload is not None
+        else read_json(run_state_path(root), default=None)
+    )
     if not all(isinstance(item, dict) for item in (trace, plan, state)):
         raise PersistenceContractUpgradeError(
             "requirements trace, task plan, and run state must all be valid objects"
         )
-    assert isinstance(trace, dict) and isinstance(plan, dict) and isinstance(state, dict)
+    assert (
+        isinstance(trace, dict) and isinstance(plan, dict) and isinstance(state, dict)
+    )
     decisions = trace.get("persistence_decisions", [])
     if not isinstance(decisions, list):
         raise PersistenceContractUpgradeError("persistence_decisions must be a list")
@@ -168,15 +177,14 @@ def upgrade_persistence_contract(
         state["last_error"] = ""
         state["status"] = "pending"
 
-    config = load_project_config(root).to_dict()
-    _replace_json_batch(
-        {
-            requirements_trace_path(root): trace,
-            task_plan_path(root): plan,
-            run_state_path(root): state,
-            config_path(root): config,
-        }
-    )
+    config = (project_config or load_project_config(root)).to_dict()
+    documents = {requirements_trace_path(root): trace, task_plan_path(root): plan}
+    if publish is None:
+        _replace_json_batch(
+            {**documents, run_state_path(root): state, config_path(root): config}
+        )
+    else:
+        publish(documents, state)
     return {
         "ok": True,
         "persistence_contract_version": 2,

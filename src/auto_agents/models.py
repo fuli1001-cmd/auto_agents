@@ -2161,6 +2161,7 @@ class AgentRequest:
     usage_context: Dict[str, str] = field(default_factory=dict)
     # Engine-owned, ephemeral confinement; retained by provider request copies.
     writer_boundary: Optional[object] = None
+    execution_environment: Optional[Dict[str, str]] = None
     response_schema: Optional[Dict[str, object]] = None
 
     def __post_init__(self) -> None:

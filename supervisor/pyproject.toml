@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-agents-watch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Optional process supervision and bounded engine maintenance."
 requires-python = ">=3.9"
 dependencies = ["tomli>=2; python_version < '3.11'"]

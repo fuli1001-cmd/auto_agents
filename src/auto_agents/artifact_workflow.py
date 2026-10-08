@@ -230,7 +230,7 @@ def _delivery(row, session):
     else:
         # Parent collab commits carry an operation trailer. Merely inheriting a
         # child's base commit does not prove the parent finished delivery.
-        from .workflow_runtime import _head_contains_completed_session
+        from .legacy_artifacts import _head_contains_completed_session
         if not _head_contains_completed_session(checkout, native.session_id):
             raise ValueError('candidate_delivery_unproven')
         revision = _git(checkout, 'rev-parse', 'HEAD')

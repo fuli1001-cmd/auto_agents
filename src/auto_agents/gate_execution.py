@@ -34,7 +34,6 @@ from .git_ops import (
 )
 from .process_supervision import run_supervised_shell_command
 
-
 GateProgressCallback = Callable[[str, str, float], None]
 SHORT_RUNTIME_PROFILE = "short_socket_path_v1"
 LEGACY_RUNTIME_PROFILE = "legacy_v1"
@@ -51,18 +50,32 @@ def short_job_runtime_root(job_id: str, *, create: bool = True) -> Path:
     """Exclusively allocate one job leaf beneath the inherited reservation."""
     from .verification_sandbox import runtime_reservation, ConfinementPreflightError
     from .verification_input_trace import owner_identity, file_identity
+
     normalized = str(job_id).strip()
     if not normalized:
         raise ValueError("gate job id is required for a short runtime")
-    base = runtime_reservation() or Path('/tmp')
-    prefix = '' if os.environ.get('AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT') else f'aag-{os.getuid()}-'
+    base = runtime_reservation() or Path("/tmp")
+    prefix = (
+        ""
+        if os.environ.get("AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT")
+        else f"aag-{os.getuid()}-"
+    )
     root = base / (prefix + hashlib.sha256(normalized.encode()).hexdigest()[:12])
-    diagnostic = dict(phase='runtime_allocation', attempted_location=str(root), errno=None,
-                      socket_byte_budget=_SHORT_RUNTIME_SOCKET_BUDGET, owner=owner_identity(),
-                      launcher_protocol='inherited_metadata', supervisor_version=owner_identity()['metadata'])
+    diagnostic = dict(
+        phase="runtime_allocation",
+        attempted_location=str(root),
+        errno=None,
+        socket_byte_budget=_SHORT_RUNTIME_SOCKET_BUDGET,
+        owner=owner_identity(),
+        launcher_protocol="inherited_metadata",
+        supervisor_version=owner_identity()["metadata"],
+    )
     try:
-        if len(os.fsencode(str(root / 't' / ('s' * 64)))) > _SHORT_RUNTIME_SOCKET_BUDGET:
-            raise OSError(36, 'Unix socket path budget exceeded')
+        if (
+            len(os.fsencode(str(root / "t" / ("s" * 64))))
+            > _SHORT_RUNTIME_SOCKET_BUDGET
+        ):
+            raise OSError(36, "Unix socket path budget exceeded")
         if not create:
             return root
         # One exclusive attempt is sufficient for a fresh random job identity.
@@ -70,12 +83,13 @@ def short_job_runtime_root(job_id: str, *, create: bool = True) -> Path:
         root.mkdir(mode=0o700)
         value = root.lstat()
         if root.is_symlink() or value.st_uid != os.getuid():
-            raise OSError(1, 'invalid runtime ownership')
-        marker = root / '.auto-agents-runtime.json'
-        with marker.open('x') as stream:
-            json.dump({'job_id': normalized, 'identity': file_identity(value)}, stream)
+            raise OSError(1, "invalid runtime ownership")
+        marker = root / ".auto-agents-runtime.json"
+        with marker.open("x") as stream:
+            json.dump({"job_id": normalized, "identity": file_identity(value)}, stream)
         from .artifact_runtime import track
-        track(root, 'scratch')
+
+        track(root, "scratch")
         return root
     except OSError as error:
         diagnostic.update(errno=error.errno, detail=str(error))
@@ -137,10 +151,7 @@ class GateSnapshotManager:
             "ls-files",
             "-z",
             "--",
-            *(
-                f":(top,literal){path}"
-                for path in self.excluded_paths
-            ),
+            *(f":(top,literal){path}" for path in self.excluded_paths),
             env=env,
         )
         entries = [path for path in listed.stdout.split("\0") if path]
@@ -168,7 +179,9 @@ class GateSnapshotManager:
         """
 
         return repository_add_exclusion_pathspecs(
-            self.project_root, self.excluded_paths, env=env,
+            self.project_root,
+            self.excluded_paths,
+            env=env,
         )
 
     def create(self, *, paths: Optional[Sequence[str]] = None) -> GateSourceSnapshot:
@@ -203,22 +216,31 @@ class GateSnapshotManager:
             if paths is None or paths:
                 _run_git(
                     self.project_root,
-                    "add", "-A", "--",
-                    *(["."] if paths is None else [
-                        f":(top,literal){path}"
-                        for path in normalize_repository_exclusions(paths)
-                    ]),
+                    "add",
+                    "-A",
+                    "--",
+                    *(
+                        ["."]
+                        if paths is None
+                        else [
+                            f":(top,literal){path}"
+                            for path in normalize_repository_exclusions(paths)
+                        ]
+                    ),
                     *self._negative_exclusion_pathspecs(env),
                     env=env,
                 )
             self._force_remove_excluded_index_entries(env)
             tree = _run_git(self.project_root, "write-tree", env=env).stdout.strip()
-            commit_args = ["commit-tree", tree, "-m", f"auto_agents gate snapshot {self.plan_id}"]
+            commit_args = [
+                "commit-tree",
+                tree,
+                "-m",
+                f"auto_agents gate snapshot {self.plan_id}",
+            ]
             if head.returncode == 0 and head.stdout.strip():
                 commit_args.extend(["-p", head.stdout.strip()])
-            commit = _run_git(
-                self.project_root, *commit_args, env=env
-            ).stdout.strip()
+            commit = _run_git(self.project_root, *commit_args, env=env).stdout.strip()
             ref_name = f"refs/auto-agents/gate-snapshots/{self.plan_id}"
             _run_git(self.project_root, "update-ref", ref_name, commit)
             self.snapshot = GateSourceSnapshot(
@@ -315,9 +337,10 @@ class GateSnapshotManager:
                 exact_entries = []
                 for item in entries:
                     metadata, separator, raw_path = item.partition(b"\t")
-                    if separator and raw_path.decode(
-                        "utf-8", errors="surrogateescape"
-                    ) == path:
+                    if (
+                        separator
+                        and raw_path.decode("utf-8", errors="surrogateescape") == path
+                    ):
                         exact_entries.append(metadata.split())
                 if (
                     len(exact_entries) != 1
@@ -340,9 +363,7 @@ class GateSnapshotManager:
                 )
 
             self._force_remove_excluded_index_entries(env)
-            tree = _run_git(
-                self.project_root, "write-tree", env=env
-            ).stdout.strip()
+            tree = _run_git(self.project_root, "write-tree", env=env).stdout.strip()
             commit = _run_git(
                 self.project_root,
                 "commit-tree",
@@ -402,27 +423,27 @@ def _metadata_resource_class(metadata: object) -> str:
     return value if value in {"heavy", "exclusive"} else "normal"
 
 
-def _metadata_signature(metadata: object, dependency_links: Optional[Mapping[str, Path]] = None) -> str:
+def _metadata_signature(
+    metadata: object, dependency_links: Optional[Mapping[str, Path]] = None
+) -> str:
     payload = {
         "proof_ids": sorted(_metadata_list(metadata, "proof_ids")),
         "risk": str(getattr(metadata, "risk", "medium")),
         "resource_class": _metadata_resource_class(metadata),
         "cpu_slots": int(getattr(metadata, "cpu_slots", 0) or 0),
         "memory_mb": int(getattr(metadata, "memory_mb", 0) or 0),
-        "memory_reserve_mb": int(
-            getattr(metadata, "memory_reserve_mb", 0) or 0
-        ),
+        "memory_reserve_mb": int(getattr(metadata, "memory_reserve_mb", 0) or 0),
         "memory_guard": str(getattr(metadata, "memory_guard", "off")),
         "requires": sorted(_metadata_list(metadata, "requires")),
-        "exclusive_resources": sorted(
-            _metadata_list(metadata, "exclusive_resources")
-        ),
+        "exclusive_resources": sorted(_metadata_list(metadata, "exclusive_resources")),
         "dynamic_ports": sorted(_metadata_list(metadata, "dynamic_ports")),
         "artifact_globs": sorted(_metadata_list(metadata, "artifact_globs")),
-        "constituents": getattr(metadata, 'constituents', {}),
+        "constituents": getattr(metadata, "constituents", {}),
     }
     if dependency_links:
-        payload['dependency_links'] = {key: str(value) for key, value in dependency_links.items()}
+        payload["dependency_links"] = {
+            key: str(value) for key, value in dependency_links.items()
+        }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
@@ -431,8 +452,7 @@ def _effective_result_cache_scope(metadata: object) -> str:
     if scope != "auto":
         return scope
     if (
-        str(getattr(metadata, "cache_scope", "run_context")).strip().lower()
-        != "source"
+        str(getattr(metadata, "cache_scope", "run_context")).strip().lower() != "source"
         or _metadata_list(metadata, "artifact_globs")
         or _metadata_list(metadata, "exclusive_resources")
         or _metadata_list(metadata, "dynamic_ports")
@@ -453,8 +473,9 @@ def _path_observation_digest(path: Path) -> str:
     return "file:" + _sha256(path)
 
 
-
-def _resolve_observed_path(path: Path, sandbox: Path, dependency_links: Mapping[str, Path]):
+def _resolve_observed_path(
+    path: Path, sandbox: Path, dependency_links: Mapping[str, Path]
+):
     """Walk the actual lookup before excluding private bookkeeping.
 
     A missing or non-directory component cannot be cancelled by a later '..'.
@@ -468,33 +489,40 @@ def _resolve_observed_path(path: Path, sandbox: Path, dependency_links: Mapping[
     followed = 0
     while pending:
         part = pending.pop(0)
-        if part == '..':
+        if part == "..":
             current = current.parent
             continue
         candidate = current / part
         try:
             value = candidate.lstat()
         except FileNotFoundError:
-            if '..' in pending:
-                raise ValueError('unresolved traversal before parent component')
+            if ".." in pending:
+                raise ValueError("unresolved traversal before parent component")
             return candidate.joinpath(*pending), links, candidate
         except PermissionError:
             if pending:
-                raise ValueError('unresolved traversal through denied directory')
+                raise ValueError("unresolved traversal through denied directory")
             return candidate, links, None
         if stat.S_ISLNK(value.st_mode):
             target = os.readlink(candidate)
             if candidate.is_relative_to(sandbox):
-                registered = dependency_links.get(candidate.relative_to(sandbox).as_posix())
-                if (registered is None or not registered.is_absolute()
-                        or target != str(registered)
-                        or registered.resolve(strict=True) != registered
-                        or not registered.is_dir()):
-                    raise ValueError('project symlink observation cannot certify inputs')
-            links[candidate] = 'link:' + target
+                registered = dependency_links.get(
+                    candidate.relative_to(sandbox).as_posix()
+                )
+                if (
+                    registered is None
+                    or not registered.is_absolute()
+                    or target != str(registered)
+                    or registered.resolve(strict=True) != registered
+                    or not registered.is_dir()
+                ):
+                    raise ValueError(
+                        "project symlink observation cannot certify inputs"
+                    )
+            links[candidate] = "link:" + target
             followed += 1
             if followed > 40:
-                raise ValueError('unresolved symlink loop')
+                raise ValueError("unresolved symlink loop")
             target_path = Path(target)
             if target_path.is_absolute():
                 current = Path(target_path.anchor)
@@ -503,7 +531,7 @@ def _resolve_observed_path(path: Path, sandbox: Path, dependency_links: Mapping[
                 pending = list(target_path.parts) + pending
         else:
             if pending and not stat.S_ISDIR(value.st_mode):
-                raise ValueError('unresolved traversal through non-directory')
+                raise ValueError("unresolved traversal through non-directory")
             current = candidate
     return current, links, None
 
@@ -513,15 +541,22 @@ def _observed_input_manifest(
     sandbox: Path,
     dependency_links: Mapping[str, Path],
     runtime_roots: Sequence[Path] = (),
-    *, trace_text: Optional[str] = None, bookkeeping: Optional[Mapping[str, Sequence[int]]] = None,
+    *,
+    trace_text: Optional[str] = None,
+    bookkeeping: Optional[Mapping[str, Sequence[int]]] = None,
 ) -> tuple[dict[str, str], bool]:
     sandbox = sandbox.resolve()
     try:
-        text = trace_text if trace_text is not None else trace_path.read_text(encoding="utf-8", errors="replace")
+        text = (
+            trace_text
+            if trace_text is not None
+            else trace_path.read_text(encoding="utf-8", errors="replace")
+        )
     except OSError:
         return {}, False
-    if text.lstrip().startswith('{'):
+    if text.lstrip().startswith("{"):
         from .verification_input_trace import resolved_trace
+
         text = resolved_trace(text)
         if text is None:
             return {}, False
@@ -535,42 +570,56 @@ def _observed_input_manifest(
         try:
             return path.relative_to(sandbox).as_posix()
         except ValueError:
-            return '@' + str(path)
+            return "@" + str(path)
 
     def classify(raw):
         candidate = Path(raw)
         if not candidate.is_absolute():
             candidate = sandbox / candidate
-        resolved, links, missing = _resolve_observed_path(candidate, sandbox, dependency_links)
+        resolved, links, missing = _resolve_observed_path(
+            candidate, sandbox, dependency_links
+        )
         for path, identity in links.items():
             link_inputs[name_of(path)] = identity
         expected = (bookkeeping or {}).get(str(resolved))
         if expected is not None:
             from .verification_input_trace import file_identity
+
             if file_identity(resolved.lstat()) != list(expected):
-                raise ValueError('bookkeeping identity changed during input admission')
+                raise ValueError("bookkeeping identity changed during input admission")
             return resolved, missing, True
-        return resolved, missing, any(resolved.is_relative_to(root) for root in runtime_roots)
+        return (
+            resolved,
+            missing,
+            any(resolved.is_relative_to(root) for root in runtime_roots),
+        )
 
     enriched = bool(re.search(r"(?m)^(?:\[pid\s+)?\d+\]?\s+", text))
     if enriched:
         from .verification_trace import resolve_file_trace
+
         resolved = resolve_file_trace(text, sandbox)
         if resolved is None:
             return {}, network_observed
         text = resolved
         network_observed = network_observed or "connect(" in text
+
         def denied(match):
             nonlocal classification_failed
             try:
                 path, _missing, excluded = classify(json.loads(match.group(1)))
                 if not excluded:
                     # Do not read content from an EACCES/EPERM observation.
-                    denied_inputs['?' + name_of(path)] = '13' if match.group(2) == 'EACCES' else '1'
+                    denied_inputs["?" + name_of(path)] = (
+                        "13" if match.group(2) == "EACCES" else "1"
+                    )
             except (OSError, ValueError):
                 classification_failed = True
-            return ''
-        text = re.sub(r'stat\(("(?:[^"\\]|\\.)*")\) = -1 (EACCES|EPERM)[^\n]*', denied, text)
+            return ""
+
+        text = re.sub(
+            r'stat\(("(?:[^"\\]|\\.)*")\) = -1 (EACCES|EPERM)[^\n]*', denied, text
+        )
         if classification_failed:
             return {}, network_observed
     descriptor_paths: list[str] = []
@@ -594,7 +643,7 @@ def _observed_input_manifest(
 
     guard_text = re.sub(
         r'\b(?:newfstatat|fstatat64|statx)\(\d+<(?P<target>[^>\n]+)>,\s*"",'
-        r'(?P<arguments>[^\n]*)',
+        r"(?P<arguments>[^\n]*)",
         resolved_descriptor_stat,
         text,
     )
@@ -622,8 +671,10 @@ def _observed_input_manifest(
         if isinstance(raw, str):
             observed_paths.append(raw)
     for raw in dict.fromkeys(observed_paths):
-        if not isinstance(raw, str) or not raw or raw.startswith(
-            ("/dev/", "/proc/", "/sys/")
+        if (
+            not isinstance(raw, str)
+            or not raw
+            or raw.startswith(("/dev/", "/proc/", "/sys/"))
         ):
             continue
         try:
@@ -648,8 +699,9 @@ def _observed_input_manifest(
             if missing is not None:
                 manifest["!" + name_of(missing)] = "missing"
             parent = (missing or resolved).parent
-            if (not parent.is_relative_to(sandbox)
-                    and not any(parent.is_relative_to(target) for target in dependency_links.values())):
+            if not parent.is_relative_to(sandbox) and not any(
+                parent.is_relative_to(target) for target in dependency_links.values()
+            ):
                 continue
             parent_relative = name_of(parent)
             if parent.exists() and parent_relative not in {"", "."}:
@@ -718,11 +770,7 @@ def exclusive_resource_lease(
     try:
         for resource in sorted(set(resources)):
             scope, _, name = resource.partition(":")
-            identity = (
-                f"host:{worker_id}:{name}"
-                if scope == "host"
-                else f"pool:{name}"
-            )
+            identity = f"host:{worker_id}:{name}" if scope == "host" else f"pool:{name}"
             digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
             handle = (root / f"{digest}.lock").open("a+")
             handles.append(handle)
@@ -731,7 +779,7 @@ def exclusive_resource_lease(
             else:
                 while True:
                     if cancel_event.is_set():
-                        raise InterruptedError('resource acquisition cancelled')
+                        raise InterruptedError("resource acquisition cancelled")
                     try:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
@@ -764,9 +812,7 @@ def dynamic_port_lease(
                 for character in name
             )
         ):
-            raise ValueError(
-                "dynamic port names must use lowercase snake_case"
-            )
+            raise ValueError("dynamic port names must use lowercase snake_case")
     if not normalized:
         yield {}
         return
@@ -881,14 +927,20 @@ def gate_environment(
     dynamic_ports: Optional[Mapping[str, int]] = None,
 ) -> dict[str, str]:
     env = dict(os.environ if base is None else base)
+    if "PATH" in env:
+        visible = []
+        for directory in env["PATH"].split(os.pathsep):
+            try:
+                if Path(directory or ".").is_dir():
+                    visible.append(directory)
+            except PermissionError:
+                continue
+        env["PATH"] = os.pathsep.join(visible)
     for key in list(env):
-        if (
-            key in {
-                "AUTO_AGENTS_GATE_HOST",
-                "AUTO_AGENTS_GATE_PORTS_JSON",
-            }
-            or key.startswith("AUTO_AGENTS_GATE_PORT_")
-        ):
+        if key in {
+            "AUTO_AGENTS_GATE_HOST",
+            "AUTO_AGENTS_GATE_PORTS_JSON",
+        } or key.startswith("AUTO_AGENTS_GATE_PORT_"):
             env.pop(key, None)
     runtime_profile = str(runtime_profile or SHORT_RUNTIME_PROFILE).strip()
     if runtime_profile not in {SHORT_RUNTIME_PROFILE, LEGACY_RUNTIME_PROFILE}:
@@ -925,10 +977,7 @@ def gate_environment(
             "npm_config_cache": str(cache_root / "n"),
         }
     )
-    ports = {
-        str(name): int(port)
-        for name, port in dict(dynamic_ports or {}).items()
-    }
+    ports = {str(name): int(port) for name, port in dict(dynamic_ports or {}).items()}
     if ports:
         env["AUTO_AGENTS_GATE_HOST"] = "127.0.0.1"
         env["AUTO_AGENTS_GATE_PORTS_JSON"] = json.dumps(
@@ -978,11 +1027,22 @@ def repository_exclusion_paths(
         if isinstance(dependency_links, Mapping)
         else dependency_links
     )
-    return normalize_repository_exclusions(
+    exclusions = normalize_repository_exclusions(
         (
             *dependency_link_paths(project_root),
             *discovered_paths,
             *surface_paths,
+        )
+    )
+    # A dependency root can itself be a symlink. Its descendants are already
+    # excluded and cannot be passed to git check-ignore across that link.
+    return tuple(
+        path
+        for path in exclusions
+        if not any(
+            (project_root / parent).is_symlink()
+            for parent in Path(path).parents
+            if str(parent) != "."
         )
     )
 
@@ -1005,7 +1065,9 @@ def self_referential_dependency_links(project_root: Path) -> list[str]:
             raw_target = candidate.readlink()
         except OSError:
             continue
-        target = raw_target if raw_target.is_absolute() else candidate.parent / raw_target
+        target = (
+            raw_target if raw_target.is_absolute() else candidate.parent / raw_target
+        )
         candidate_text = os.path.normcase(os.path.abspath(os.fspath(candidate)))
         target_text = os.path.normcase(os.path.abspath(os.fspath(target)))
         if candidate_text == target_text:
@@ -1097,8 +1159,12 @@ class LocalGatePlanExecutor:
         self.preempt_requested = preempt_requested
         self.environment_overrides = dict(environment_overrides or {})
         from types import MappingProxyType
-        self.execution_environment = (None if execution_environment is None else
-                                      MappingProxyType(dict(execution_environment)))
+
+        self.execution_environment = (
+            None
+            if execution_environment is None
+            else MappingProxyType(dict(execution_environment))
+        )
         self.proof_audit_sample_rate = min(
             1.0,
             max(0.0, float(proof_audit_sample_rate)),
@@ -1121,9 +1187,13 @@ class LocalGatePlanExecutor:
         self.ledger = None
         if cache_path is None:
             from .verification_ledger import VerificationLedger
+
             try:
-                self.ledger = VerificationLedger(project_root, environment=environment_fingerprint,
-                    context=result_context_fingerprint)
+                self.ledger = VerificationLedger(
+                    project_root,
+                    environment=environment_fingerprint,
+                    context=result_context_fingerprint,
+                )
                 self.result_cache = self.ledger.cache
                 self.result_cache.max_age_seconds = gate_config.cache_max_age_seconds
             except (OSError, RuntimeError):
@@ -1137,12 +1207,13 @@ class LocalGatePlanExecutor:
 
     def _manifest_matches(self, manifest: Mapping[str, object]) -> bool:
         from .verification_manifest import manifest_matches
+
         # Installed aliases live in disposable checkouts, and need not exist
         # as symlinks in the source repository. Their exact binding is also
         # part of the cache identity. Replay all resolved inputs normally.
         inputs = dict(manifest)
         for relative, target in self.dependency_links.items():
-            if inputs.get(relative) == 'link:' + str(target):
+            if inputs.get(relative) == "link:" + str(target):
                 try:
                     if target.resolve(strict=True) != target or not target.is_dir():
                         return False
@@ -1202,11 +1273,11 @@ class LocalGatePlanExecutor:
                 self._timing_estimates.pop(command, None)
 
     def cached_result(self, command: str) -> Optional[CommandResult]:
-        if getattr(self, 'validate_source_materialization', None) is not None:
+        if getattr(self, "validate_source_materialization", None) is not None:
             # Admission precedes lookup, including callers using the local
             # cache through a distributed executor. Recheck reused lanes.
             with self._source_admission_lock:
-                self._sandbox('receipt-admission', 'receipt-admission')
+                self._sandbox("receipt-admission", "receipt-admission")
         if (
             not self.use_result_cache
             or self.gate_config.verification_policy_version < 2
@@ -1218,24 +1289,34 @@ class LocalGatePlanExecutor:
         result, reason = self.result_cache.lookup_with_reason(
             command,
             source_fingerprint=self.snapshot.tree_sha,
-            cache_scope=str(
-                getattr(metadata, "cache_scope", "run_context")
-            ).strip().lower(),
+            cache_scope=str(getattr(metadata, "cache_scope", "run_context"))
+            .strip()
+            .lower(),
             result_cache_scope=_effective_result_cache_scope(metadata),
             metadata_signature=_metadata_signature(metadata, self.dependency_links),
         )
         self._cache_miss_reasons[command] = reason
-        if (result is not None and self.gate_config.verification_policy_version >= 5
-                and _metadata_list(metadata, 'proof_ids') and 'pytest' in command
-                and '--collect-only' not in command and not result.executed_tests):
+        if (
+            result is not None
+            and self.gate_config.verification_policy_version >= 5
+            and _metadata_list(metadata, "proof_ids")
+            and "pytest" in command
+            and "--collect-only" not in command
+            and not result.executed_tests
+        ):
             result = None
-            self._cache_miss_reasons[command] = 'legacy_execution_receipt_missing'
-        if result is None and getattr(metadata, 'constituents', {}):
+            self._cache_miss_reasons[command] = "legacy_execution_receipt_missing"
+        if result is None and getattr(metadata, "constituents", {}):
             from .verification_batch_cache import constituents, combine
+
             cached, missing = constituents(self, command)
             if cached and not missing:
                 result = combine(command, cached)
-        if result is not None and result.backend == "result-cache-observed-inputs" and self.input_reuse_mode != "on":
+        if (
+            result is not None
+            and result.backend == "result-cache-observed-inputs"
+            and self.input_reuse_mode != "on"
+        ):
             if self.input_reuse_mode == "observe":
                 self._shadow_results[command] = result
             self._cache_miss_reasons[command] = "input_reuse_" + self.input_reuse_mode
@@ -1266,16 +1347,25 @@ class LocalGatePlanExecutor:
         metadata = self.metadata.get(command)
         if result.artifacts and result.mutation_paths:
             from dataclasses import replace
-            tracked = set(_run_git(self.project_root, "ls-files", "-z").stdout.split("\0"))
-            result = replace(result, mutation_paths=[path for path in result.mutation_paths
-                if path not in result.artifacts or path in tracked])
+
+            tracked = set(
+                _run_git(self.project_root, "ls-files", "-z").stdout.split("\0")
+            )
+            result = replace(
+                result,
+                mutation_paths=[
+                    path
+                    for path in result.mutation_paths
+                    if path not in result.artifacts or path in tracked
+                ],
+            )
         self.result_cache.record(
             command,
             result,
             source_fingerprint=self.snapshot.tree_sha,
-            cache_scope=str(
-                getattr(metadata, "cache_scope", "run_context")
-            ).strip().lower(),
+            cache_scope=str(getattr(metadata, "cache_scope", "run_context"))
+            .strip()
+            .lower(),
             result_cache_scope=_effective_result_cache_scope(metadata),
             metadata_signature=_metadata_signature(metadata, self.dependency_links),
         )
@@ -1285,7 +1375,7 @@ class LocalGatePlanExecutor:
             with self._lock:
                 existing = self._shared_sandboxes.get(lane)
                 if existing is not None:
-                    validator = getattr(self, 'validate_source_materialization', None)
+                    validator = getattr(self, "validate_source_materialization", None)
                     if validator is not None:
                         validator(existing, self.snapshot.commit_sha)
                     return existing, False
@@ -1304,15 +1394,22 @@ class LocalGatePlanExecutor:
             self.snapshot.commit_sha,
         )
         from .artifact_runtime import track
-        track(sandbox, "worktree", project=self.project_root, metadata={"repository": str(self.project_root)})
+
+        track(
+            sandbox,
+            "worktree",
+            project=self.project_root,
+            metadata={"repository": str(self.project_root)},
+        )
         install_dependency_links(sandbox, self.dependency_links)
         from .execution_binding import restore_private_modes
-        restore = getattr(self, 'restore_source_modes', None)
+
+        restore = getattr(self, "restore_source_modes", None)
         if restore is not None:
             restore(sandbox)
         else:
             restore_private_modes(sandbox, getattr(self, "source_file_modes", {}))
-        validator = getattr(self, 'validate_source_materialization', None)
+        validator = getattr(self, "validate_source_materialization", None)
         if validator is not None:
             validator(sandbox, self.snapshot.commit_sha)
         if lane:
@@ -1393,9 +1490,7 @@ class LocalGatePlanExecutor:
                 self._published_hashes[relative] = digest
             for destination in (archive_root / relative, self.project_root / relative):
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                temporary = destination.with_name(
-                    f".{destination.name}.{job_id}.tmp"
-                )
+                temporary = destination.with_name(f".{destination.name}.{job_id}.tmp")
                 shutil.copy2(source, temporary)
                 os.replace(temporary, destination)
                 with destination.open("rb") as durable:
@@ -1408,6 +1503,7 @@ class LocalGatePlanExecutor:
             artifacts[relative] = digest
         if archive_root.exists():
             from .artifact_runtime import track
+
             track(archive_root, "evidence", project=self.project_root)
         return artifacts
 
@@ -1443,20 +1539,49 @@ class LocalGatePlanExecutor:
     ) -> CommandResult:
         from contextlib import nullcontext
         from .local_io import digest
-        identity = digest([command, self.snapshot.tree_sha if self.snapshot else "",
-                           _metadata_signature(self.metadata.get(command), self.dependency_links),
-                           self.result_cache.environment_fingerprint, self.result_cache.context_fingerprint])
+
+        identity = digest(
+            [
+                command,
+                self.snapshot.tree_sha if self.snapshot else "",
+                _metadata_signature(self.metadata.get(command), self.dependency_links),
+                self.result_cache.environment_fingerprint,
+                self.result_cache.context_fingerprint,
+            ]
+        )
         started = time.monotonic()
-        with (self.ledger.single_flight(identity, cancelled=cancel_event.is_set if cancel_event else None)
-              if self.ledger else nullcontext()):
+        with (
+            self.ledger.single_flight(
+                identity, cancelled=cancel_event.is_set if cancel_event else None
+            )
+            if self.ledger
+            else nullcontext()
+        ):
+
             def execute(actual):
-                return self._run_command(actual, lane=lane, timeout_seconds=timeout_seconds,
-                    adaptive_timeout_enabled=adaptive_timeout_enabled, idle_timeout_seconds=idle_timeout_seconds,
-                    cancel_event=cancel_event, progress=progress, environment_overrides=environment_overrides,
-                    lease_held=lease_held, named_lease_held=named_lease_held)
+                return self._run_command(
+                    actual,
+                    lane=lane,
+                    timeout_seconds=timeout_seconds,
+                    adaptive_timeout_enabled=adaptive_timeout_enabled,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                    cancel_event=cancel_event,
+                    progress=progress,
+                    environment_overrides=environment_overrides,
+                    lease_held=lease_held,
+                    named_lease_held=named_lease_held,
+                )
+
             result = None
-            if self.snapshot is not None and getattr(self.metadata.get(command), 'constituents', {}):
-                from .verification_batch_cache import constituents, run_remaining, combine
+            if self.snapshot is not None and getattr(
+                self.metadata.get(command), "constituents", {}
+            ):
+                from .verification_batch_cache import (
+                    constituents,
+                    run_remaining,
+                    combine,
+                )
+
                 cached, missing = constituents(self, command)
                 if cached and missing:
                     result = run_remaining(self, command, cached, missing, execute)
@@ -1471,20 +1596,45 @@ class LocalGatePlanExecutor:
                     self.ledger.revoke("observed input shadow verification disagreed")
                 result.ok = False
                 result.stderr += "\ninput proof shadow mismatch; cached proofs revoked"
-            if self._cache_miss_reasons.get(command) == "proof_audit_sample" and not result.ok and self.ledger:
+            if (
+                self._cache_miss_reasons.get(command) == "proof_audit_sample"
+                and not result.ok
+                and self.ledger
+            ):
                 self.ledger.revoke("managed project verification audit disagreed")
             self.record_cached_result(command, result)
             if self.ledger:
-                self.ledger.event(kind="verification", proof=identity, cache="hit" if result.cached else result.cache_miss_reason,
-                    executed=int(not result.cached), duration_seconds=time.monotonic() - started,
+                self.ledger.event(
+                    kind="verification",
+                    proof=identity,
+                    cache="hit" if result.cached else result.cache_miss_reason,
+                    executed=int(not result.cached),
+                    duration_seconds=time.monotonic() - started,
                     execution_seconds=0 if result.cached else result.duration_seconds,
-                    cache_miss_components=result.process_snapshot.get('cache_miss_components', []),
-                    test_count=len(result.executed_tests), slowest=result.test_timings,
-                    queue_seconds=result.queue_seconds, ok=result.ok)
+                    cache_miss_components=result.process_snapshot.get(
+                        "cache_miss_components", []
+                    ),
+                    test_count=len(result.executed_tests),
+                    slowest=result.test_timings,
+                    queue_seconds=result.queue_seconds,
+                    ok=result.ok,
+                )
             return result
 
-    def _run_command(self, command, *, lane, timeout_seconds, adaptive_timeout_enabled,
-                     idle_timeout_seconds, cancel_event, progress, environment_overrides, lease_held, named_lease_held):
+    def _run_command(
+        self,
+        command,
+        *,
+        lane,
+        timeout_seconds,
+        adaptive_timeout_enabled,
+        idle_timeout_seconds,
+        cancel_event,
+        progress,
+        environment_overrides,
+        lease_held,
+        named_lease_held,
+    ):
         job_id = uuid.uuid4().hex
         resource_lease = None
         named_lease = None
@@ -1519,29 +1669,55 @@ class LocalGatePlanExecutor:
                 )
             if not lease_held:
                 from .workers import WorkerSlotLease, load_local_worker_config
+
                 local = load_local_worker_config()
-                named_lease = exclusive_resource_lease(_metadata_list(metadata, "exclusive_resources"), worker_id=self.worker_id)
+                named_lease = exclusive_resource_lease(
+                    _metadata_list(metadata, "exclusive_resources"),
+                    worker_id=self.worker_id,
+                )
                 named_lease.__enter__()
-                required = local.max_slots if self.exclusive(command) else self.required_slots(command)
-                resource_lease = WorkerSlotLease(local.managed_root, local.worker_id, local.max_slots, required,
+                required = (
+                    local.max_slots
+                    if self.exclusive(command)
+                    else self.required_slots(command)
+                )
+                resource_lease = WorkerSlotLease(
+                    local.managed_root,
+                    local.worker_id,
+                    local.max_slots,
+                    required,
                     memory_mb=int(getattr(metadata, "memory_mb", 0)),
                     memory_reserve_mb=int(getattr(metadata, "memory_reserve_mb", 0)),
                     memory_guard=str(getattr(metadata, "memory_guard", "off")),
-                    timeout_seconds=self.gate_config.worker_slot_wait_timeout_seconds, cancel_event=cancel_event,
-                    owner_metadata={"project_root": str(self.project_root), "plan_id": self.plan_id,
-                                    "lane": lane, "priority": 2 if lane else 0,
-                                    "fairness_key": str(self.ledger.root) if self.ledger else str(self.project_root)})
+                    timeout_seconds=self.gate_config.worker_slot_wait_timeout_seconds,
+                    cancel_event=cancel_event,
+                    owner_metadata={
+                        "project_root": str(self.project_root),
+                        "plan_id": self.plan_id,
+                        "lane": lane,
+                        "priority": 2 if lane else 0,
+                        "fairness_key": (
+                            str(self.ledger.root)
+                            if self.ledger
+                            else str(self.project_root)
+                        ),
+                    },
+                )
                 queued_at = time.monotonic()
                 resource_lease.__enter__()
                 queue_seconds = time.monotonic() - queued_at
             # A scheduler lane is ordering, not authority to share mutated
             # pytest scratch. Frozen-candidate admission must see a clean view
             # on every command, including collect-only report writers.
-            separate = (self.gate_config.verification_policy_version >= 5
-                        or getattr(self, 'validate_source_materialization', None) is not None)
+            separate = (
+                self.gate_config.verification_policy_version >= 5
+                or getattr(self, "validate_source_materialization", None) is not None
+            )
             artifact_lane = lane and any(
-                _metadata_list(item, 'artifact_globs') for item in self.metadata.values())
-            sandbox_lane = '' if separate and not artifact_lane else lane
+                _metadata_list(item, "artifact_globs")
+                for item in self.metadata.values()
+            )
+            sandbox_lane = "" if separate and not artifact_lane else lane
             cleanup = not bool(sandbox_lane)
             sandbox, _created = self._sandbox(sandbox_lane, job_id)
             requested_profile = str(
@@ -1557,46 +1733,73 @@ class LocalGatePlanExecutor:
             if requested_profile != SHORT_RUNTIME_PROFILE:
                 runtime_root.mkdir(mode=0o700, parents=True)
             from .verification_input_trace import file_identity
+
             runtime_identity = file_identity(runtime_root.lstat())
             if progress is not None:
                 progress("start", command, 0.0)
             from .pytest_invocation import compile_ini_overrides
-            retained_environment = getattr(self, 'execution_environment', None)
-            base_environment = dict(os.environ if retained_environment is None else retained_environment)
-            merged_environment = {**base_environment, **self.environment_overrides,
-                                  **dict(environment_overrides or {})}
-            if (retained_environment is not None
-                    and merged_environment.get('PYTEST_ADDOPTS', '') != base_environment.get('PYTEST_ADDOPTS', '')):
-                raise RunnerContextError('environment', 'pytest environment changed after source admission', command)
-            compiled = compile_ini_overrides(command, sandbox,
-                merged_environment)
+
+            retained_environment = getattr(self, "execution_environment", None)
+            base_environment = dict(
+                os.environ if retained_environment is None else retained_environment
+            )
+            merged_environment = {
+                **base_environment,
+                **self.environment_overrides,
+                **dict(environment_overrides or {}),
+            }
+            if retained_environment is not None and merged_environment.get(
+                "PYTEST_ADDOPTS", ""
+            ) != base_environment.get("PYTEST_ADDOPTS", ""):
+                raise RunnerContextError(
+                    "environment",
+                    "pytest environment changed after source admission",
+                    command,
+                )
+            compiled = compile_ini_overrides(command, sandbox, merged_environment)
             retained_sources = []
-            prepare_retained = getattr(self, 'prepare_retained_command', None)
+            prepare_retained = getattr(self, "prepare_retained_command", None)
             if prepare_retained is not None:
-                compiled, retained_sources = prepare_retained(compiled, sandbox, runtime_root)
+                compiled, retained_sources = prepare_retained(
+                    compiled, sandbox, runtime_root
+                )
             pytest_reports = []
             if self.record_pytest_execution:
                 from .verification_pytest import prepare_execution_receipts
+
                 compiled, pytest_reports = prepare_execution_receipts(
-                    compiled, sandbox, runtime_root, merged_environment,
-                    strict=self.record_pytest_execution != 'available',
+                    compiled,
+                    sandbox,
+                    runtime_root,
+                    merged_environment,
+                    strict=self.record_pytest_execution != "available",
                 )
                 retained_sources = [*retained_sources, Path(__file__).resolve().parent]
             traced_command = isolated_command(compiled)
             from .verification_input_trace import TraceCustody, owner_identity
+
             trace_requested = result_cache_scope in {"observed_inputs", "auto"}
             # Reusable tracing requires an existing negotiated owner. Plain
             # legacy/strace execution can still populate candidate-key results.
             if owner_identity()["metadata"]:
                 # The reservation's parent is ancestor-permitted but is never
                 # included in the final gate write boundary.
-                evidence_parent = Path(os.environ.get('TMPDIR', '/tmp'))
-                trace_custody = TraceCustody(evidence_parent, job_id, [sandbox, runtime_root],
-                    [*self.dependency_links.values(), *retained_sources], tracing=trace_requested)
-            with (nullcontext() if named_lease is not None or named_lease_held else exclusive_resource_lease(
-                _metadata_list(metadata, "exclusive_resources"),
-                worker_id=self.worker_id,
-            )):
+                evidence_parent = Path(os.environ.get("TMPDIR", "/tmp"))
+                trace_custody = TraceCustody(
+                    evidence_parent,
+                    job_id,
+                    [sandbox, runtime_root],
+                    [*self.dependency_links.values(), *retained_sources],
+                    tracing=trace_requested,
+                )
+            with (
+                nullcontext()
+                if named_lease is not None or named_lease_held
+                else exclusive_resource_lease(
+                    _metadata_list(metadata, "exclusive_resources"),
+                    worker_id=self.worker_id,
+                )
+            ):
                 with dynamic_port_lease(
                     _metadata_list(metadata, "dynamic_ports")
                 ) as dynamic_ports:
@@ -1616,9 +1819,13 @@ class LocalGatePlanExecutor:
                     foreground_preempted = threading.Event()
                     monitor = None
                     if self.preempt_requested is not None and cancel_event is not None:
+
                         def monitor_foreground() -> None:
                             while not monitor_stop.wait(0.5):
-                                if self.preempt_requested is not None and self.preempt_requested():
+                                if (
+                                    self.preempt_requested is not None
+                                    and self.preempt_requested()
+                                ):
                                     foreground_preempted.set()
                                     cancel_event.set()
                                     return
@@ -1632,12 +1839,32 @@ class LocalGatePlanExecutor:
                     try:
                         from .reporting import find_reporter
                         from .diagnostic_output import OutputCapture
-                        reporter = getattr(progress, "reporter", None) or find_reporter(self.project_root)
+
+                        reporter = getattr(progress, "reporter", None) or find_reporter(
+                            self.project_root
+                        )
                         capture = (
-                            reporter.capture(kind="gate", job_id=job_id, worker_id=self.worker_id, cwd=str(sandbox))
-                            if reporter is not None else OutputCapture(
-                                auto_agents_state_root() / "diagnostic-output" / self.plan_id / job_id,
-                                {"kind": "gate", "job_id": job_id, "worker_id": self.worker_id},
+                            reporter.capture(
+                                kind="gate",
+                                job_id=job_id,
+                                worker_id=self.worker_id,
+                                cwd=str(sandbox),
+                            )
+                            if reporter is not None
+                            else OutputCapture(
+                                (
+                                    Path(self.diagnostic_root) / job_id
+                                    if getattr(self, "diagnostic_root", None)
+                                    else auto_agents_state_root()
+                                    / "diagnostic-output"
+                                    / self.plan_id
+                                    / job_id
+                                ),
+                                {
+                                    "kind": "gate",
+                                    "job_id": job_id,
+                                    "worker_id": self.worker_id,
+                                },
                                 register=lambda path, metadata: None,
                                 failed=lambda error: None,
                             )
@@ -1645,23 +1872,70 @@ class LocalGatePlanExecutor:
                         capture.protect(tuple(merged_overrides.values()))
                         if getattr(self, "sandbox_target", None) is not None:
                             from .verification_sandbox import verification_argv
-                            safe = {key: value for key, value in env.items() if key.startswith("AUTO_AGENTS_GATE_")
-                                    or key in {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "XDG_STATE_HOME", "npm_config_cache"}}
-                            retained_environment = env if getattr(self, 'retain_execution_environment', False) else None
-                            shell_argv = ['sh', '-lc' if trace_custody is not None else '-c', traced_command]
-                            kernel_context = verification_argv(shell_argv, sandbox,
-                                self.sandbox_target, read_roots=[*self.dependency_links.values(), *retained_sources],
-                                write_roots=[runtime_root], execution_environment=retained_environment,
-                                trace_custody=trace_custody, gate_environment_overrides=safe)
+
+                            safe = {
+                                key: value
+                                for key, value in env.items()
+                                if key.startswith("AUTO_AGENTS_GATE_")
+                                or key
+                                in {
+                                    "PYTHONDONTWRITEBYTECODE",
+                                    "PYTHONPYCACHEPREFIX",
+                                    "TMPDIR",
+                                    "TMP",
+                                    "TEMP",
+                                    "XDG_RUNTIME_DIR",
+                                    "XDG_CACHE_HOME",
+                                    "XDG_STATE_HOME",
+                                    "npm_config_cache",
+                                }
+                            }
+                            retained_environment = (
+                                env
+                                if getattr(self, "retain_execution_environment", False)
+                                else None
+                            )
+                            shell_argv = [
+                                "sh",
+                                "-lc" if trace_custody is not None else "-c",
+                                traced_command,
+                            ]
+                            kernel_context = verification_argv(
+                                shell_argv,
+                                sandbox,
+                                self.sandbox_target,
+                                read_roots=[
+                                    *self.dependency_links.values(),
+                                    *retained_sources,
+                                ],
+                                write_roots=[runtime_root],
+                                execution_environment=retained_environment,
+                                trace_custody=trace_custody,
+                                gate_environment_overrides=safe,
+                            )
                             traced_command = shlex.join(kernel_context.__enter__())
                         elif trace_custody is not None:
-                            traced_command = shlex.join(trace_custody.command(['sh', '-lc', traced_command], env))
+                            traced_command = shlex.join(
+                                trace_custody.command(
+                                    ["sh", "-lc", traced_command], env
+                                )
+                            )
                         dispatch_env = env
                         if trace_custody is not None:
-                            dispatch_env = {key: value for key, value in os.environ.items() if key in {
-                                'PATH', 'LANG', 'AUTO_AGENTS_VERIFICATION_SANDBOX',
-                                'AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT', 'AUTO_AGENTS_VERIFICATION_RUNTIME_ID'}}
+                            dispatch_env = {
+                                key: value
+                                for key, value in os.environ.items()
+                                if key
+                                in {
+                                    "PATH",
+                                    "LANG",
+                                    "AUTO_AGENTS_VERIFICATION_SANDBOX",
+                                    "AUTO_AGENTS_VERIFICATION_RUNTIME_ROOT",
+                                    "AUTO_AGENTS_VERIFICATION_RUNTIME_ID",
+                                }
+                            }
                             from .verification_input_trace import RETAINED_ENV
+
                             dispatch_env[RETAINED_ENV] = trace_custody.environment
                         process = run_supervised_shell_command(
                             traced_command,
@@ -1708,9 +1982,7 @@ class LocalGatePlanExecutor:
             artifacts: dict[str, str] = {}
             if ok:
                 try:
-                    artifacts = self._publish_artifacts(
-                        sandbox, command, job_id
-                    )
+                    artifacts = self._publish_artifacts(sandbox, command, job_id)
                 except (OSError, RuntimeError, ValueError) as error:
                     ok = False
                     returncode = returncode or 1
@@ -1743,45 +2015,74 @@ class LocalGatePlanExecutor:
                 try:
                     for index, report in enumerate(pytest_reports):
                         payload = json.loads(report.read_text())
-                        passed = payload['passed']
-                        if not isinstance(passed, list) or not all(isinstance(node, str) for node in passed):
-                            raise ValueError('invalid pytest execution nodes')
+                        passed = payload["passed"]
+                        if not isinstance(passed, list) or not all(
+                            isinstance(node, str) for node in passed
+                        ):
+                            raise ValueError("invalid pytest execution nodes")
                         result.executed_tests.extend(passed)
-                        result.process_snapshot.setdefault('collected_tests', []).extend(payload.get('collected', []))
-                        result.test_results.update(payload.get('nodes', {}))
-                        result.test_timings.extend(payload.get('slowest', []))
-                        relative = f'.auto-agents/runs/{self.plan_id}/gate-artifacts/{job_id}/pytest-execution-{index}.json'
+                        result.process_snapshot.setdefault(
+                            "collected_tests", []
+                        ).extend(payload.get("collected", []))
+                        result.test_results.update(payload.get("nodes", {}))
+                        result.test_timings.extend(payload.get("slowest", []))
+                        relative = f".auto-agents/runs/{self.plan_id}/gate-artifacts/{job_id}/pytest-execution-{index}.json"
                         destination = self.project_root / relative
                         destination.parent.mkdir(parents=True, exist_ok=True)
-                        temporary = destination.with_suffix('.tmp')
+                        temporary = destination.with_suffix(".tmp")
                         shutil.copy2(report, temporary)
                         os.replace(temporary, destination)
-                        with destination.open('rb') as durable:
+                        with destination.open("rb") as durable:
                             os.fsync(durable.fileno())
                         result.artifacts[relative] = _sha256(destination)
                 except (OSError, ValueError, KeyError) as error:
                     result.ok = False
                     result.returncode = result.returncode or 1
-                    result.stderr += f'\npytest execution receipt unavailable: {error}'
+                    result.stderr += f"\npytest execution receipt unavailable: {error}"
             from .gates import reject_empty_vitest_selection
-            result.process_snapshot['cache_miss_components'] = self.result_cache.miss_components.get(command, [])
+
+            result.process_snapshot["cache_miss_components"] = (
+                self.result_cache.miss_components.get(command, [])
+            )
             reject_empty_vitest_selection(result, sandbox)
-            if (trace_custody is not None and trace_requested and not result.cleanup_incomplete
-                    and not result.termination_reason and not result.infrastructure_error):
-                trace_text, reason = trace_custody.consume(dispatched=True,
-                    cleanup_complete=not process.cleanup_incomplete and not process.termination_reason)
+            if (
+                trace_custody is not None
+                and trace_requested
+                and not result.cleanup_incomplete
+                and not result.termination_reason
+                and not result.infrastructure_error
+            ):
+                trace_text, reason = trace_custody.consume(
+                    dispatched=True,
+                    cleanup_complete=not process.cleanup_incomplete
+                    and not process.termination_reason,
+                )
                 if trace_text is not None:
                     observed_inputs, network_observed = _observed_input_manifest(
-                        Path(trace_custody.payload['trace']['path']), sandbox, self.dependency_links,
-                        runtime_roots=[runtime_root], trace_text=trace_text,
-                        bookkeeping={str(trace_custody.directory): trace_custody.directory_identity,
-                            **{trace_custody.payload[name]["path"]: trace_custody.payload[name]["identity"]
-                               for name in ("trace", "receipt")}})
+                        Path(trace_custody.payload["trace"]["path"]),
+                        sandbox,
+                        self.dependency_links,
+                        runtime_roots=[runtime_root],
+                        trace_text=trace_text,
+                        bookkeeping={
+                            str(
+                                trace_custody.directory
+                            ): trace_custody.directory_identity,
+                            **{
+                                trace_custody.payload[name][
+                                    "path"
+                                ]: trace_custody.payload[name]["identity"]
+                                for name in ("trace", "receipt")
+                            },
+                        },
+                    )
                     result.observed_inputs = observed_inputs
                     result.input_trace_complete = bool(observed_inputs)
                     result.network_observed = network_observed
                 if not result.input_trace_complete:
-                    result.input_trace_reason = reason or 'input manifest could not be resolved'
+                    result.input_trace_reason = (
+                        reason or "input manifest could not be resolved"
+                    )
             if progress is not None:
                 progress("finish", command, result.duration_seconds)
             self.record_timing(command, result)
@@ -1790,13 +2091,17 @@ class LocalGatePlanExecutor:
             # Keep the structured preflight stop through owned cleanup. It is
             # not a candidate failure and must never trigger another writer.
             error.diagnostic = {
-                **error.diagnostic, "command": command,
-                "original_command": getattr(self, 'original_commands', {}).get(command, command),
+                **error.diagnostic,
+                "command": command,
+                "original_command": getattr(self, "original_commands", {}).get(
+                    command, command
+                ),
                 "proof_ids": _metadata_list(self.metadata.get(command), "proof_ids"),
             }
             raise
         except (OSError, RuntimeError, ValueError) as error:
             from .session_verification import SessionOwnershipError
+
             if isinstance(error, SessionOwnershipError):
                 raise
             result = CommandResult(
@@ -1826,6 +2131,7 @@ class LocalGatePlanExecutor:
                 named_lease.__exit__(None, None, None)
             if runtime_root is not None and not (result and result.cleanup_incomplete):
                 from .verification_input_trace import file_identity
+
                 try:
                     if file_identity(runtime_root.lstat()) == runtime_identity:
                         shutil.rmtree(runtime_root)
@@ -1834,7 +2140,11 @@ class LocalGatePlanExecutor:
                 except OSError:
                     if result is not None:
                         result.cleanup_incomplete = True
-            if cleanup and sandbox is not None and not (result and result.cleanup_incomplete):
+            if (
+                cleanup
+                and sandbox is not None
+                and not (result and result.cleanup_incomplete)
+            ):
                 try:
                     _run_git(
                         self.project_root,
@@ -1846,8 +2156,12 @@ class LocalGatePlanExecutor:
                 except RuntimeError:
                     if result is not None:
                         result.cleanup_incomplete = True
+            if result is not None and result.cleanup_incomplete:
+                self._cleanup_blocked = True
 
     def close(self) -> None:
+        if getattr(self, "_cleanup_blocked", False):
+            return
         for sandbox in list(self._shared_sandboxes.values()):
             try:
                 _run_git(

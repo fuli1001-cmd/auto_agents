@@ -55,51 +55,21 @@ def explain(project, *, engine=False, level="affected", tests=(), changed_from=N
 
 
 def project_focused(orchestrator, targets, *, fresh=False, sandboxed=False):
-    from .gates import run_gate_plan
-    from .verification_selection import select_verification_steps
-    targets = selected_tests(orchestrator.project_root, targets)
-    if not targets:
-        raise ValueError("focused verification requires test targets")
-    steps = orchestrator.config.gates.steps
-    selected = []
-    for target in targets:
-        file = target.split("::", 1)[0]
-        owners = [step for step in steps if any(
-            file == path.split("::", 1)[0] for path in step.targets)]
-        if not owners:
-            # Newly added Python tests inherit the project's existing pytest
-            # environment, not the engine interpreter or an arbitrary command.
-            owners = [step for step in steps if step.runner == "pytest"] if file.endswith(".py") else []
-        if not owners:
-            raise ValueError("test target has no configured verification runner: " + target)
-        owner = owners[0]
-        selected.append(replace(owner, targets=[target]))
-    # Build commands through the same trusted plan builder used by gates.
-    from .gates import resolve_gate_plan_from_verification_steps
-    config = replace(orchestrator.config.gates, steps=selected, commands=[], parallel_groups=[])
-    plan = resolve_gate_plan_from_verification_steps(selected, orchestrator.project_root)
-    with orchestrator._gate_executor_context(plan.metadata) as executor:
-        if executor is None:
-            raise RuntimeError("managed focused verification requires configured isolation")
-        local = getattr(executor, "local", executor)
-        if sandboxed:
-            local.sandbox_target = orchestrator.project_root
-            local.result_cache.environment_fingerprint = digest([
-                local.result_cache.environment_fingerprint, "credential-free-network-namespace-v1"])
-            # Offline sandbox proofs must not be confused with gates that
-            # explicitly depend on a live service or operator credentials.
-            if any(step.operator_input_bindings or step.requires for step in selected):
-                raise RuntimeError("this proof requires native environment verification, not model self-testing")
-        previous = executor.use_result_cache if hasattr(executor, "use_result_cache") else None
-        if fresh and previous is not None:
-            executor.use_result_cache = False
-        result = run_gate_plan(plan.commands, plan.parallel_groups, orchestrator.project_root,
-            collect_all=False, gate_executor=executor,
-            parallel_workers=orchestrator._gate_parallel_workers(),
-            command_timeout_seconds=config.command_timeout_seconds)
-    return {"ok": result.ok, "scope": "project", "level": "focused", "summary": result.summary,
-            "commands": [asdict(command) for command in result.commands],
-            "artifacts": {key: value for command in result.commands for key, value in command.artifacts.items()}}
+    """Compatibility helper entering the same typed verification work item."""
+    from .control.cli import ready
+    from .control.engine import Engine
+    from .control.release import verify
+    root=Path(orchestrator.project_root).resolve()
+    targets=selected_tests(root,targets)
+    if not targets:raise ValueError('focused verification requires test targets')
+    if sandboxed and any(s.operator_input_bindings or s.requires for s in orchestrator.config.gates.steps):
+        raise ValueError('This proof requires native operator inputs')
+    engine=Engine(root,ready(root),orchestrator.config,print_fn=lambda *args:None,fresh=fresh)
+    work=verify(engine,level='affected',tests=targets)
+    report=work['result'].get('verification') or work['failure']
+    return {'ok':work['status']=='COMPLETED','scope':'project','level':'focused',
+        'summary':report.get('message','Verification completed'),'commands':report.get('checks',[]),
+        'artifacts':report.get('outputs',{}),'work_id':work['id']}
 
 
 def execute_engine(project, *, tests=(), level="focused", fresh=False, repository=None, python=None, real_project=None):

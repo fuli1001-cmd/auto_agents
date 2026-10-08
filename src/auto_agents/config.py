@@ -41,6 +41,7 @@ node_modules/
 .antigravitycli/
 """
 AUTO_GITIGNORE_ENTRIES = (
+    "state/",
     "state/business.sqlite3*",
     "state/run.lock*",
     "state/run.processes*",
@@ -533,15 +534,23 @@ def run_state_path(project_root: Path) -> Path:
 
 
 def task_plan_path(project_root: Path) -> Path:
-    return state_dir(project_root) / "task_plan.json"
+    return _domain_artifact_dir(project_root) / "task_plan.json"
 
 
 def requirements_trace_path(project_root: Path) -> Path:
-    return state_dir(project_root) / "requirements_trace.json"
+    return _domain_artifact_dir(project_root) / "requirements_trace.json"
 
 
 def frontend_design_lock_path(project_root: Path) -> Path:
-    return state_dir(project_root) / "frontend_design.lock.json"
+    return _domain_artifact_dir(project_root) / "frontend_design.lock.json"
+
+
+def _domain_artifact_dir(project_root: Path) -> Path:
+    """V2 domain documents are files; only the SQLite controller owns state."""
+    from .control.projection import current
+    if (state_dir(project_root)/'workspace-control.json').is_file() or current(project_root):
+        return docs_dir(project_root)
+    return state_dir(project_root)
 
 
 def frontend_design_docs_dir(project_root: Path) -> Path:
@@ -778,6 +787,9 @@ def create_run(project_root: Path) -> RunState:
 
 
 def load_run_state(project_root: Path) -> RunState:
+    from .control.projection import current,read
+    if current(project_root):
+        return RunState.from_dict(read(project_root,'run_state.json') or {'run_id':'','status':'not_started','current_stage':'clarify'})
     data = read_json(run_state_path(project_root), default=None)
     if data is None or not data.get("run_id"):
         return create_run(project_root)
@@ -897,6 +909,11 @@ def create_session(
 
 
 def load_session_state(project_root: Path, session_id: str) -> SessionState:
+    from .control.projection import current,read
+    if current(project_root):
+        value=read(project_root,'sessions/'+session_id+'/session_state.json')
+        if value is None:raise FileNotFoundError('Session not found: '+session_id)
+        return SessionState.from_dict(value)
     data = read_json(session_state_path(project_root, session_id), default=None)
     if data is None:
         raise FileNotFoundError(

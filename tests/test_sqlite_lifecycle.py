@@ -49,10 +49,11 @@ def test_sqlite_operations_release_connections_without_garbage_collection(
             store.set_worker(status="idle")
             assert store.worker_status()["status"] == "idle"
         else:
-            store = WorkflowStore(tmp_path)
-            snapshot = store.create_root(WorkflowRef("run", "run-1"))
-            store.append_event(snapshot, "progress")
-            assert len(store.events(snapshot.workflow_id)) == 2
+            from auto_agents.control import Store
+            store = Store(tmp_path)
+            work = store.create_workflow("run", "Goal", "source")
+            store.event(work["id"], "progress", {})
+            assert store.work(work["id"])["status"] == "READY"
 
         assert connections
         for connection in connections:

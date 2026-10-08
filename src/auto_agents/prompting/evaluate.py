@@ -53,19 +53,23 @@ CASES = (
 
 
 def seed(root: Path, case: dict):
-    from auto_agents.orchestrator import Orchestrator
-    from auto_agents.models import TaskSpec
-    Orchestrator.init_project(root, "prompt-evaluation", "mock")
+    from auto_agents.models import ProjectConfig,ProviderConfig
+    from auto_agents.config import save_project_config
+    from auto_agents.control.types import Contract,ExecutionContext
+    from auto_agents.control.prompts import build
+    root.mkdir(parents=True,exist_ok=True)
+    config=ProjectConfig('prompt-evaluation');config.providers['mock']=ProviderConfig(kind='mock');config.active_provider='mock'
+    save_project_config(root,config)
     files = {"solution.py": case["source"], **case.get("files", {})}
     for name, text in files.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
-    task = TaskSpec(task_id="eval-001", title=case["id"], description=case["goal"],
-                    acceptance=[case["goal"]], verification_refs=[])
-    orch = Orchestrator(root)
-    purpose = case.get("purpose", "implement")
-    prompt = orch._build_task_prompt(task, purpose)
+    purpose=case.get('purpose','implement')
+    contract=Contract('evaluation','eval-001','fix',case['goal'],'fixture',scope=('solution.py',))
+    prompt=build(ExecutionContext(root,root,'eval-001',contract,'mock'),purpose)
+    from auto_agents.prompting import compose_prompt
+    prompt=compose_prompt([prompt],purpose=purpose)
     if case.get("feedback"):
         # Older checkouts do not have the structured prompting package.
         if hasattr(prompt, "spec"):
@@ -123,7 +127,6 @@ def capture(output: Path):
 def run(args):
     from auto_agents.config import load_project_config
     from auto_agents.models import AgentRequest
-    from auto_agents.orchestrator import Orchestrator
     from auto_agents.prompting import prepare_request
     config = load_project_config(args.project)
     payload = json.loads(args.baseline.read_text(encoding="utf-8"))
@@ -158,10 +161,8 @@ def run(args):
                                 path.parent.mkdir(parents=True, exist_ok=True)
                                 path.write_text(text.replace(PLACEHOLDER, str(root)), encoding="utf-8")
                         # Reuse the configured adapter without changing source-project configuration.
-                        orch = Orchestrator(root)
-                        orch.config.providers = config.providers
-                        orch.config.active_provider = provider
-                        adapter = orch._build_adapter_for_provider(provider)
+                        from auto_agents.control.effects import Provider
+                        adapter=Provider(config,alias=provider).adapter(provider)
                         if not adapter.available():
                             raise ValueError(f"provider unavailable: {provider}")
                         req = AgentRequest(case.get("purpose", "implement"), args.effort,

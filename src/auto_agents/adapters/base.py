@@ -24,7 +24,7 @@ from ..artifact_runtime import capture_output
 class AgentAdapter(ABC):
     def environment(self, request: Optional[AgentRequest] = None) -> Dict[str, str]:
         from ..provider_environment import effective_environment
-        env = effective_environment(self.config)
+        env = effective_environment(self.config,request.execution_environment if request is not None else None)
         if request is not None:
             env["AUTO_AGENTS_STAGE"] = request.stage
             env["AUTO_AGENTS_EFFORT"] = request.effort

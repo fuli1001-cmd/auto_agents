@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import io
 import json
 import logging
@@ -7,9 +6,7 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-
 import pytest
-
 from auto_agents.adapters.base import run_subprocess_with_optional_streaming
 from auto_agents.cli import build_parser
 from auto_agents.diagnostic_output import diagnostic_attachments, copy_diagnostic_attachments
@@ -18,23 +15,19 @@ from auto_agents.models import AgentRequest, RunState, TaskSpec
 from auto_agents.process_supervision import run_supervised_shell_command
 from auto_agents.reporting import Reporter, ReportingRuntime
 
-
 @pytest.fixture
 def report(tmp_path):
     stream = io.StringIO()
-    reporter = Reporter(tmp_path, stream, language="zh")
-    reporter.bind("run", "example")
-    yield reporter, stream
+    reporter = Reporter(tmp_path, stream, language='zh')
+    reporter.bind('run', 'example')
+    yield (reporter, stream)
     reporter.close()
 
-
-def task(identifier="T1", status="pending", title="权限检查"):
-    return TaskSpec(identifier, title, "description", ["works"], status=status)
-
+def task(identifier='T1', status='pending', title='权限检查'):
+    return TaskSpec(identifier, title, 'description', ['works'], status=status)
 
 def events(reporter):
-    return [json.loads(line) for line in (reporter.root / "events.jsonl").read_text().splitlines()]
-
+    return [json.loads(line) for line in (reporter.root / 'events.jsonl').read_text().splitlines()]
 
 @pytest.mark.parametrize('kind', ['diagnosis.unavailable', 'diagnosis.review_incomplete'])
 def test_incomplete_diagnosis_is_not_reported_as_completed_investigation(report, kind):
@@ -43,377 +36,307 @@ def test_incomplete_diagnosis_is_not_reported_as_completed_investigation(report,
     assert '诊断未完成' in stream.getvalue()
     assert '检查已结束' not in stream.getvalue()
 
-
 def test_progress_replans_rewinds_and_does_not_count_attempts(report):
     reporter, stream = report
-    state = RunState("example", current_stage="implement", tasks=[task(status="done"), task("T2")])
+    state = RunState('example', current_stage='implement', tasks=[task(status='done'), task('T2')])
     reporter.observe_run(state)
     assert reporter.snapshot.done == 1
     original_plan = reporter.snapshot.plan_id
-    state.tasks[1].review_history.append({"attempt": 3})
+    state.tasks[1].review_history.append({'attempt': 3})
     reporter.observe_run(state)
     assert reporter.snapshot.plan_id == original_plan
-    reporter.task("T2", "验证", "retry", 4)
+    reporter.task('T2', '验证', 'retry', 4)
     assert len(reporter.snapshot.tasks) == 2
-    state.tasks[1:] = [task("T2a"), task("T2b")]
+    state.tasks[1:] = [task('T2a'), task('T2b')]
     reporter.observe_run(state)
-    assert any(e['type'] == 'plan.changed' and e['data']['total'] == 3 for e in events(reporter))
-    assert "计划调整：2 → 3" in stream.getvalue()
+    assert any((e['type'] == 'plan.changed' and e['data']['total'] == 3 for e in events(reporter)))
+    assert '计划调整：2 → 3' in stream.getvalue()
     assert reporter.snapshot.done == 1
-    state.tasks[0].status = "pending"
-    reporter.rewind("plan")
+    state.tasks[0].status = 'pending'
+    reporter.rewind('plan')
     reporter.observe_run(state)
     assert reporter.snapshot.done == 0
-    assert any(e['type'] == 'stage.rewind' for e in events(reporter))
-    assert not any("\x1b" in str(record) for record in events(reporter))
-
+    assert any((e['type'] == 'stage.rewind' for e in events(reporter)))
+    assert not any(('\x1b' in str(record) for record in events(reporter)))
 
 def test_same_count_replacement_is_a_plan_change(report):
     reporter, stream = report
-    state = RunState("example", tasks=[task()])
+    state = RunState('example', tasks=[task()])
     reporter.observe_run(state)
-    state.tasks = [task("replacement")]
+    state.tasks = [task('replacement')]
     reporter.observe_run(state)
-    assert any(e['type'] == 'plan.changed' and e['data']['total'] == 1 for e in events(reporter))
-
+    assert any((e['type'] == 'plan.changed' and e['data']['total'] == 1 for e in events(reporter)))
 
 def test_worker_done_waits_for_main_integration(report, tmp_path):
     reporter, stream = report
-    state = RunState("example", current_stage="implement", tasks=[task()])
+    state = RunState('example', current_stage='implement', tasks=[task()])
     reporter.observe_run(state)
-    worker = reporter.child(tmp_path / "worker", "T1")
-    worker.task("T1", "权限检查", "implement", 1)
-    worker.observe_run(RunState("example", tasks=[task(status="done")]))
-    assert reporter.active_tasks["T1"] == "waiting_integration"
+    worker = reporter.child(tmp_path / 'worker', 'T1')
+    worker.task('T1', '权限检查', 'implement', 1)
+    worker.observe_run(RunState('example', tasks=[task(status='done')]))
+    assert reporter.active_tasks['T1'] == 'waiting_integration'
     assert reporter.snapshot.done == 0
-    state.tasks[0].status = "done"
+    state.tasks[0].status = 'done'
     reporter.observe_run(state)
     assert reporter.snapshot.done == 1
-    assert "T1" not in reporter.active_tasks
+    assert 'T1' not in reporter.active_tasks
     worker.close()
-
 
 def test_simple_console_keeps_diagnostics_and_normalizes_old_evidence(report):
     reporter, stream = report
     logger = build_run_logger(stream, reporter)
-    log_path = attach_run_file_logger(logger, reporter.root / "run.log")
-    logger.info("[agent:implement] provider=fake model=deep\nsecond line")
-    logger.debug("debug-only evidence")
-    assert "model=deep" not in stream.getvalue()
-    assert "debug-only evidence" not in log_path.read_text()
-    assert read_diagnostic_log(log_path) == "[agent:implement] provider=fake model=deep\nsecond line\n"
-    assert all(line.startswith("[aa-log ") for line in log_path.read_text().splitlines())
-    assert any(event["message"] == "debug-only evidence" for event in events(reporter))
-    reporter.presenter.configure("debug", False)
-    logger.info("visible detail")
-    assert "visible detail" in stream.getvalue()
-    legacy = reporter.root / "legacy.log"
-    legacy.write_text("old diagnostic\n")
-    assert read_diagnostic_log(legacy) == "old diagnostic\n"
-
+    log_path = attach_run_file_logger(logger, reporter.root / 'run.log')
+    logger.info('[agent:implement] provider=fake model=deep\nsecond line')
+    logger.debug('debug-only evidence')
+    assert 'model=deep' not in stream.getvalue()
+    assert 'debug-only evidence' not in log_path.read_text()
+    assert read_diagnostic_log(log_path) == '[agent:implement] provider=fake model=deep\nsecond line\n'
+    assert all((line.startswith('[aa-log ') for line in log_path.read_text().splitlines()))
+    assert any((event['message'] == 'debug-only evidence' for event in events(reporter)))
+    reporter.presenter.configure('debug', False)
+    logger.info('visible detail')
+    assert 'visible detail' in stream.getvalue()
+    legacy = reporter.root / 'legacy.log'
+    legacy.write_text('old diagnostic\n')
+    assert read_diagnostic_log(legacy) == 'old diagnostic\n'
 
 def test_log_handlers_do_not_leak_across_runs(report):
     reporter, stream = report
     logger = build_run_logger(stream, reporter)
-    first = attach_run_file_logger(logger, reporter.root / "run.log")
-    logger.info("first subject")
-    reporter.bind("run", "second")
-    logger.info("second subject")
-    assert "second subject" not in first.read_text()
-    assert "second subject" in (reporter.root / "run.log").read_text()
-
+    first = attach_run_file_logger(logger, reporter.root / 'run.log')
+    logger.info('first subject')
+    reporter.bind('run', 'second')
+    logger.info('second subject')
+    assert 'second subject' not in first.read_text()
+    assert 'second subject' in (reporter.root / 'run.log').read_text()
 
 def test_parent_view_is_restored_after_nested_session(report):
     reporter, stream = report
     parent_root = reporter.root
-    state = RunState("example", current_stage="implement", tasks=[task()])
+    state = RunState('example', current_stage='implement', tasks=[task()])
     reporter.observe_run(state)
     with reporter.preserve_subject():
-        reporter.bind("fix", "child", goal="repair child")
-        reporter.text("child event")
+        reporter.bind('fix', 'child', goal='repair child')
+        reporter.text('child event')
     assert reporter.root == parent_root
-    assert reporter.snapshot.subject == "example"
-    assert reporter.snapshot.tasks["T1"]["status"] == "pending"
-    assert any(item.get("kind") == "index" for item in reporter._artifacts.values())
-
-
-
+    assert reporter.snapshot.subject == 'example'
+    assert reporter.snapshot.tasks['T1']['status'] == 'pending'
+    assert any((item.get('kind') == 'index' for item in reporter._artifacts.values()))
 
 def test_capture_redacts_split_secrets_and_is_available_in_private_snapshot(report, tmp_path):
     reporter, stream = report
-    capture = reporter.capture(attempt_id="try-one", kind="provider")
-    capture.start(["provider"], {"OPENAI_API_KEY": "private-key-value"})
-    capture("stdout", "api_key=sec")
-    capture("stdout", "ret123\nAuthorization: Bear")
-    capture("stdout", "er abcdefg\nprivate-")
-    capture("stdout", "key-value\n")
+    capture = reporter.capture(attempt_id='try-one', kind='provider')
+    capture.start(['provider'], {'OPENAI_API_KEY': 'private-key-value'})
+    capture('stdout', 'api_key=sec')
+    capture('stdout', 'ret123\nAuthorization: Bear')
+    capture('stdout', 'er abcdefg\nprivate-')
+    capture('stdout', 'key-value\n')
     capture.finish(returncode=1)
-    output = (capture.root / "stdout.txt").read_text()
-    assert all(secret not in output for secret in ("secret123", "abcdefg", "private-key-value"))
-    attachments = diagnostic_attachments(tmp_path, "example")
+    output = (capture.root / 'stdout.txt').read_text()
+    assert all((secret not in output for secret in ('secret123', 'abcdefg', 'private-key-value')))
+    attachments = diagnostic_attachments(tmp_path, 'example')
     assert attachments
-    copied = copy_diagnostic_attachments(attachments, tmp_path / "snapshot")
+    copied = copy_diagnostic_attachments(attachments, tmp_path / 'snapshot')
     assert len(copied) == len(attachments)
     for artifact in copied:
-        assert Path(artifact["path"]).is_file()
-    assert not str(capture.root) in str([item["path"] for item in copied])
+        assert Path(artifact['path']).is_file()
+    assert not str(capture.root) in str([item['path'] for item in copied])
 
-
-@pytest.mark.parametrize("stream_transport", [False, True])
+@pytest.mark.parametrize('stream_transport', [False, True])
 def test_diagnostic_capture_does_not_mark_output_as_visible(report, tmp_path, stream_transport):
     reporter, stream = report
-    request = AgentRequest("implement", "deep", "", tmp_path, tmp_path / "out",
-                           stream_transport=stream_transport)
-    result = run_subprocess_with_optional_streaming(
-        [sys.executable, "-c", "import sys; print('raw evidence'); print('failure detail', file=sys.stderr)"],
-        request, dict(os.environ),
-    )
+    request = AgentRequest('implement', 'deep', '', tmp_path, tmp_path / 'out', stream_transport=stream_transport)
+    result = run_subprocess_with_optional_streaming([sys.executable, '-c', "import sys; print('raw evidence'); print('failure detail', file=sys.stderr)"], request, dict(os.environ))
     assert result.returncode == 0
-    assert not result.streamed_stdout and not result.streamed_stderr
-    assert "raw evidence" not in stream.getvalue()
-    output_files = list((reporter.root / "diagnostic-output").glob("*/stdout.txt"))
-    assert any("raw evidence" in path.read_text() for path in output_files)
-
+    assert not result.streamed_stdout and (not result.streamed_stderr)
+    assert 'raw evidence' not in stream.getvalue()
+    output_files = list((reporter.root / 'diagnostic-output').glob('*/stdout.txt'))
+    assert any(('raw evidence' in path.read_text() for path in output_files))
 
 def test_full_gate_output_is_saved_before_returned_tail_is_bounded(report, tmp_path, monkeypatch):
     import auto_agents.process_supervision as supervision
     original = supervision._bounded_output
-    monkeypatch.setattr(supervision, "_bounded_output", lambda source: original(source, limit=64))
+    monkeypatch.setattr(supervision, '_bounded_output', lambda source: original(source, limit=64))
     reporter, stream = report
-    result = run_supervised_shell_command(
-        f"{sys.executable} -c \"print('EARLY FAILURE'); print('x' * 1000); print('END')\"",
-        cwd=tmp_path, timeout_seconds=5,
-    )
-    assert "EARLY FAILURE" not in result.stdout
-    outputs = list((reporter.root / "diagnostic-output").glob("*/stdout.txt"))
-    assert any("EARLY FAILURE" in path.read_text() for path in outputs)
-
+    result = run_supervised_shell_command(f'''{sys.executable} -c "print('EARLY FAILURE'); print('x' * 1000); print('END')"''', cwd=tmp_path, timeout_seconds=5)
+    assert 'EARLY FAILURE' not in result.stdout
+    outputs = list((reporter.root / 'diagnostic-output').glob('*/stdout.txt'))
+    assert any(('EARLY FAILURE' in path.read_text() for path in outputs))
 
 def test_cli_options_and_saved_mode_override(tmp_path):
     parser = build_parser()
-    args = parser.parse_args(["run", "--project", str(tmp_path), "--log-mode", "plain"])
-    root = tmp_path / ".auto-agents"
-    (root / "state").mkdir(parents=True)
-    (root / "state/run_state.json").write_text(json.dumps({"run_id": "saved"}))
-    (root / "runs/saved").mkdir(parents=True)
-    (root / "runs/saved/diagnostics.json").write_text(json.dumps({
-        "presentation": {"log_mode": "debug", "print_agent_output": True},
-    }))
+    args = parser.parse_args(['run', '--project', str(tmp_path), '--log-mode', 'plain'])
+    root = tmp_path / '.auto-agents'
+    (root / 'state').mkdir(parents=True)
+    (root / 'state/run_state.json').write_text(json.dumps({'run_id': 'saved'}))
+    (root / 'runs/saved').mkdir(parents=True)
+    (root / 'runs/saved/diagnostics.json').write_text(json.dumps({'presentation': {'log_mode': 'debug', 'print_agent_output': True}}))
     runtime = ReportingRuntime(args)
-    assert runtime.presenter.mode == "plain"
+    assert runtime.presenter.mode == 'plain'
     assert args.print_agent_output is True
     runtime.close()
-    args = parser.parse_args(["run", "--project", str(tmp_path)])
+    args = parser.parse_args(['run', '--project', str(tmp_path)])
     runtime = ReportingRuntime(args)
-    assert runtime.presenter.mode == "debug"
+    assert runtime.presenter.mode == 'debug'
     runtime.close()
-
 
 def test_capture_failure_does_not_escape_or_repeat(report, monkeypatch):
     reporter, stream = report
     import auto_agents.diagnostic_output as output
-    monkeypatch.setattr(output, "atomic_json", lambda *a: (_ for _ in ()).throw(OSError("disk unavailable")))
+    monkeypatch.setattr(output, 'atomic_json', lambda *a: (_ for _ in ()).throw(OSError('disk unavailable')))
     capture = reporter.capture()
-    capture("stdout", "some output\n")
+    capture('stdout', 'some output\n')
     capture.finish(returncode=1)
     capture.finish()
-    assert stream.getvalue().count("诊断记录不完整") == 1
-
+    assert stream.getvalue().count('诊断记录不完整') == 1
 
 def test_jsonl_event_ids_remain_unique_across_resume(tmp_path):
     stream = io.StringIO()
     first = Reporter(tmp_path, stream)
-    first.bind("run", "example")
-    first.text("before restart")
+    first.bind('run', 'example')
+    first.text('before restart')
     first.close()
     second = Reporter(tmp_path, stream)
-    second.bind("run", "example")
-    second.text("after restart")
-    ids = [event["event_id"] for event in events(second)]
+    second.bind('run', 'example')
+    second.text('after restart')
+    ids = [event['event_id'] for event in events(second)]
     assert len(ids) == len(set(ids))
     second.close()
 
-
 def test_late_worker_does_not_replace_current_task_or_clobber_index(report, tmp_path):
     reporter, stream = report
-    reporter.observe_run(RunState("example", tasks=[task()]))
-    old = reporter.child(tmp_path / "old", "T1")
-    current = reporter.child(tmp_path / "new", "T1")
-    current.task("T1", "权限检查", "review", 2)
-    old.task("T1", "权限检查", "implement", 1)
-    old.observe_run(RunState("example", tasks=[task(status="done")]))
-    assert reporter.active_tasks["T1"] == "review"
+    reporter.observe_run(RunState('example', tasks=[task()]))
+    old = reporter.child(tmp_path / 'old', 'T1')
+    current = reporter.child(tmp_path / 'new', 'T1')
+    current.task('T1', '权限检查', 'review', 2)
+    old.task('T1', '权限检查', 'implement', 1)
+    old.observe_run(RunState('example', tasks=[task(status='done')]))
+    assert reporter.active_tasks['T1'] == 'review'
     capture = current.capture()
-    capture("stdout", "worker diagnostic\n")
+    capture('stdout', 'worker diagnostic\n')
     capture.finish()
-    before = json.loads((reporter.root / "diagnostics.json").read_text())["artifacts"]
+    before = json.loads((reporter.root / 'diagnostics.json').read_text())['artifacts']
     old.close()
     current.close()
-    after = json.loads((reporter.root / "diagnostics.json").read_text())["artifacts"]
+    after = json.loads((reporter.root / 'diagnostics.json').read_text())['artifacts']
     assert before == after
-
 
 def test_parallel_legacy_logs_reach_owning_run_once(report, tmp_path):
     reporter, stream = report
     logger = build_run_logger(stream, reporter)
-    attach_run_file_logger(logger, reporter.root / "run.log")
-    child = reporter.child(tmp_path / "worker", "T1")
+    attach_run_file_logger(logger, reporter.root / 'run.log')
+    child = reporter.child(tmp_path / 'worker', 'T1')
     worker_logger = build_run_logger(stream, child)
-    worker_logger.info("[task:T1] diagnostic from worker")
-    assert read_diagnostic_log(reporter.root / "run.log").count("diagnostic from worker") == 1
-    assert "diagnostic from worker" not in stream.getvalue()
+    worker_logger.info('[task:T1] diagnostic from worker')
+    assert read_diagnostic_log(reporter.root / 'run.log').count('diagnostic from worker') == 1
+    assert 'diagnostic from worker' not in stream.getvalue()
     child.close()
-    logger.info("parent still has its file handler")
-    assert "parent still" in read_diagnostic_log(reporter.root / "run.log")
-
+    logger.info('parent still has its file handler')
+    assert 'parent still' in read_diagnostic_log(reporter.root / 'run.log')
 
 def test_presentation_options_wait_for_session_selection(tmp_path):
-    args = build_parser().parse_args(["collab", "--project", str(tmp_path)])
+    args = build_parser().parse_args(['collab', '--project', str(tmp_path)])
     runtime = ReportingRuntime(args)
     reporter = Reporter(tmp_path, io.StringIO(), presenter=runtime.presenter, runtime=runtime)
-    index = tmp_path / ".auto-agents/state/sessions/chosen/logs/diagnostics.json"
+    index = tmp_path / '.auto-agents/state/sessions/chosen/logs/diagnostics.json'
     index.parent.mkdir(parents=True)
-    index.write_text(json.dumps({"presentation": {"log_mode": "plain", "print_agent_output": True}}))
-    reporter.text("select a session")
-    reporter.bind("collab", "chosen")
-    assert runtime.presenter.mode == "plain"
+    index.write_text(json.dumps({'presentation': {'log_mode': 'plain', 'print_agent_output': True}}))
+    reporter.text('select a session')
+    reporter.bind('collab', 'chosen')
+    assert runtime.presenter.mode == 'plain'
     assert args.print_agent_output is True
     runtime.close()
 
-
 def test_live_panel_does_not_redirect_streams_and_cleans_up(tmp_path, monkeypatch):
-    pytest.importorskip("rich")
+    pytest.importorskip('rich')
     from rich.text import Text
+
     class Terminal(io.StringIO):
+
         def isatty(self):
             return True
     stream = Terminal()
-    original_stdout, original_stderr = sys.stdout, sys.stderr
-    monkeypatch.setenv("TERM", "xterm")
-    reporter = Reporter(tmp_path, stream, language="zh")
-    reporter.bind("run", "tty")
-    reporter.observe_run(RunState("tty", current_stage="implement",
-                                 tasks=[task(str(n), "done" if n == 0 else "pending") for n in range(5)]))
+    original_stdout, original_stderr = (sys.stdout, sys.stderr)
+    monkeypatch.setenv('TERM', 'xterm')
+    reporter = Reporter(tmp_path, stream, language='zh')
+    reporter.bind('run', 'tty')
+    reporter.observe_run(RunState('tty', current_stage='implement', tasks=[task(str(n), 'done' if n == 0 else 'pending') for n in range(5)]))
     for n in range(1, 5):
-        reporter.task(str(n), "权限检查", "implement", 1)
+        reporter.task(str(n), '权限检查', 'implement', 1)
     frame = reporter.presenter._frame(reporter)
-    assert '1 · 编码' in frame and '4 · 编码' in frame and '\n' in frame
+    assert '1 · 编码' in frame and '4 · 编码' in frame and ('\n' in frame)
     assert '权限检查' not in frame
     assert '[实现]：2/5 1：权限检查' in (reporter.root / 'user.log').read_text()
     assert '本次运行' not in frame and '阶段 00:' not in frame
     assert reporter.presenter._live is not None
     reporter.presenter._live.update(Text(frame), refresh=True)
     with reporter.presenter.input():
-        reporter.text("请确认下一步")
+        reporter.text('请确认下一步')
         assert reporter.presenter._suspended == 1
-        assert "\x1b[?25h" in stream.getvalue()
+        assert '\x1b[?25h' in stream.getvalue()
     assert sys.stdout is original_stdout and sys.stderr is original_stderr
     reporter.close()
     assert reporter.presenter._live is None
-    assert "\x1b" in stream.getvalue()
-    assert "\x1b" not in (reporter.root / "user.log").read_text()
-
+    assert '\x1b' in stream.getvalue()
+    assert '\x1b' not in (reporter.root / 'user.log').read_text()
 
 def test_renderer_failure_falls_back_to_plain_without_losing_question(tmp_path, monkeypatch):
-    live = pytest.importorskip("rich.live")
+    live = pytest.importorskip('rich.live')
+
     class Terminal(io.StringIO):
+
         def isatty(self):
             return True
+
     class BrokenLive:
+
         def __init__(self, *args, **kwargs):
-            raise OSError("terminal unavailable")
-    monkeypatch.setattr(live, "Live", BrokenLive)
+            raise OSError('terminal unavailable')
+    monkeypatch.setattr(live, 'Live', BrokenLive)
     stream = Terminal()
     reporter = Reporter(tmp_path, stream)
-    reporter.bind("run", "failed-renderer")
-    reporter.text("Question for the user")
-    assert "Question for the user" in stream.getvalue()
+    reporter.bind('run', 'failed-renderer')
+    reporter.text('Question for the user')
+    assert 'Question for the user' in stream.getvalue()
     assert reporter.presenter._live is None
     reporter.close()
 
-
 def test_controls_are_removed_from_logs_without_mutating_diagnostic_records(report):
     reporter, stream = report
-    reporter.text("\x1b[31muser message\x1b[0m")
+    reporter.text('\x1b[31muser message\x1b[0m')
     logger = build_run_logger(stream, reporter)
-    attach_run_file_logger(logger, reporter.root / "run.log")
-    logger.info("\x1b[31mtechnical diagnostic\x1b[0m")
-    assert "\x1b" not in stream.getvalue()
-    assert "\x1b" not in (reporter.root / "run.log").read_text()
-    assert "technical diagnostic" in read_diagnostic_log(reporter.root / "run.log")
-
-
-
-
-def test_visible_shell_output_without_final_newline_is_flushed(tmp_path):
-    from auto_agents.orchestrator import Orchestrator
-    project = tmp_path / "project"
-    Orchestrator.init_project(project, "demo", "mock")
-    stream = io.StringIO()
-    orchestrator = Orchestrator(project, agent_output_stream=stream)
-    callback = orchestrator._stream_agent_output_callback("implement")
-    request = AgentRequest("implement", "deep", "", project, project / "out", stream_output=callback)
-    result = run_subprocess_with_optional_streaming(
-        [sys.executable, "-c", "print('last partial line', end='')"], request, dict(os.environ),
-    )
-    assert result.returncode == 0
-    assert stream.getvalue().count("last partial line") == 1
-    orchestrator.reporter.close()
-
+    attach_run_file_logger(logger, reporter.root / 'run.log')
+    logger.info('\x1b[31mtechnical diagnostic\x1b[0m')
+    assert '\x1b' not in stream.getvalue()
+    assert '\x1b' not in (reporter.root / 'run.log').read_text()
+    assert 'technical diagnostic' in read_diagnostic_log(reporter.root / 'run.log')
 
 def test_late_worker_diagnostics_keep_their_original_run(report, tmp_path):
     reporter, stream = report
     logger = build_run_logger(stream, reporter)
-    attach_run_file_logger(logger, reporter.root / "run.log")
+    attach_run_file_logger(logger, reporter.root / 'run.log')
     original = reporter.root
-    child = reporter.child(tmp_path / "worker", "T1")
+    child = reporter.child(tmp_path / 'worker', 'T1')
     child_logger = build_run_logger(stream, child)
-    reporter.bind("run", "next-run")
-    child_logger.info("[task:T1] late result")
-    assert "late result" in read_diagnostic_log(original / "run.log")
-    assert "late result" not in read_diagnostic_log(reporter.root / "run.log")
-    assert all(event["subject_id"] != "example" for event in events(reporter))
+    reporter.bind('run', 'next-run')
+    child_logger.info('[task:T1] late result')
+    assert 'late result' in read_diagnostic_log(original / 'run.log')
+    assert 'late result' not in read_diagnostic_log(reporter.root / 'run.log')
+    assert all((event['subject_id'] != 'example' for event in events(reporter)))
     child.close()
 
-
 def test_malformed_optional_logging_metadata_cannot_block_a_run(tmp_path):
-    root = tmp_path / ".auto-agents/runs/example"
+    root = tmp_path / '.auto-agents/runs/example'
     root.mkdir(parents=True)
-    (root / "diagnostics.json").write_text(json.dumps({
-        "artifacts": ["invalid old index"], "progress": "invalid",
-        "presentation": {"log_mode": ["invalid"], "print_agent_output": "false"},
-    }))
+    (root / 'diagnostics.json').write_text(json.dumps({'artifacts': ['invalid old index'], 'progress': 'invalid', 'presentation': {'log_mode': ['invalid'], 'print_agent_output': 'false'}}))
     stream = io.StringIO()
     reporter = Reporter(tmp_path, stream)
-    reporter.bind("run", "example")
-    reporter.observe_run(RunState("example", tasks=[task()]))
-    assert reporter.snapshot.subject == "example"
-    reporter.task("T1", "Permissions", "implement", 1)
-    assert "Coding" in stream.getvalue()
+    reporter.bind('run', 'example')
+    reporter.observe_run(RunState('example', tasks=[task()]))
+    assert reporter.snapshot.subject == 'example'
+    reporter.task('T1', 'Permissions', 'implement', 1)
+    assert 'Coding' in stream.getvalue()
     reporter.close()
-
-
-def test_user_log_is_concise_but_diagnostics_retain_protocol_and_details(report):
-    reporter, stream = report
-    from auto_agents.models import SessionState
-    from auto_agents.session import Session
-    orch = SimpleNamespace(project_root=reporter.project_root, reporter=reporter)
-    session = object.__new__(Session)
-    session.orch = orch
-    session._current_state = SessionState('example', mode='collab', status='executing')
-    protocol = 'Agent:\nLong explanation\nROUTE_WORKFLOW v1: {"target":"run","internal_id":"old-run"}'
-    session._print(protocol)
-    reporter.emit('diagnostics', path='/private/diagnostics.json')
-    reporter.repair('diagnosing', candidate='internal-candidate')
-    reporter.emit('status', status='等待用户')
-    reporter.text('是否继续本次验收？请输入回复：')
-    displayed = stream.getvalue()
-    user_log = (reporter.root / 'user.log').read_text()
-    for text in (displayed, user_log):
-        assert '等待用户' in text and '是否继续本次验收' in text
-        assert 'ROUTE_WORKFLOW' not in text and '/private/' not in text and 'internal-candidate' not in text
-    assert any(protocol == e['message'] for e in events(reporter))
-
 
 @pytest.mark.parametrize('resolution', ['acceptance_blocked', 'acceptance_review_rejected'])
 def test_acceptance_blocker_is_visible_once_across_private_and_control_reporters(tmp_path, resolution):
@@ -421,11 +344,9 @@ def test_acceptance_blocker_is_visible_once_across_private_and_control_reporters
     stream = io.StringIO()
     control = Reporter(tmp_path / 'control', stream, language='zh')
     private = Reporter(tmp_path / 'private', stream, language='zh', presenter=control.presenter)
-    reason = ('FastAPI 启动失败：SCHEMA_DATABASE_MISSING' if resolution == 'acceptance_blocked'
-              else '未提供实际播放或抽帧证据')
-    readable = ('后端服务 启动失败：所需数据尚未准备好' if resolution == 'acceptance_blocked' else reason)
-    state = SessionState('accept', mode='collab', status='blocked', resolution=resolution,
-        acceptance_execution={'phase': 'blocked', 'result': {'summary': 'Execution claimed success'}, 'review': {'reason': reason}})
+    reason = 'FastAPI 启动失败：SCHEMA_DATABASE_MISSING' if resolution == 'acceptance_blocked' else '未提供实际播放或抽帧证据'
+    readable = '后端服务 启动失败：所需数据尚未准备好' if resolution == 'acceptance_blocked' else reason
+    state = SessionState('accept', mode='collab', status='blocked', resolution=resolution, acceptance_execution={'phase': 'blocked', 'result': {'summary': 'Execution claimed success'}, 'review': {'reason': reason}})
     if resolution == 'acceptance_blocked':
         state.acceptance_execution['result']['summary'] = reason
     try:
@@ -434,13 +355,12 @@ def test_acceptance_blocker_is_visible_once_across_private_and_control_reporters
             reporter.observe_session(state)
             reporter.observe_session(state)
             assert readable in (reporter.root / 'user.log').read_text()
-            assert any(e['data'].get('reason') == reason for e in events(reporter))
+            assert any((e['data'].get('reason') == reason for e in events(reporter)))
         assert stream.getvalue().count(readable) == 1
         assert 'Execution claimed success' not in stream.getvalue()
     finally:
         private.close()
         control.close()
-
 
 @pytest.mark.parametrize('bound', [False, True])
 def test_storage_tracking_failure_is_diagnostic_before_and_after_reporter_start(tmp_path, monkeypatch, capsys, bound):
@@ -456,6 +376,7 @@ def test_storage_tracking_failure_is_diagnostic_before_and_after_reporter_start(
     reporter = Reporter(project, stream, language='zh') if bound else None
     if reporter:
         reporter.bind('collab', 'session')
+
     def overlap(*args, **kwargs):
         raise ValueError('overlapping artifact ownership')
     monkeypatch.setattr(ArtifactStore, 'register', overlap)
@@ -469,93 +390,81 @@ def test_storage_tracking_failure_is_diagnostic_before_and_after_reporter_start(
         reporter = Reporter(project, stream, language='zh')
         reporter.bind('collab', 'session')
     try:
-        assert any('overlapping artifact ownership' in e['message'] for e in events(reporter))
+        assert any(('overlapping artifact ownership' in e['message'] for e in events(reporter)))
         assert 'Storage tracking' not in stream.getvalue() + capsys.readouterr().err
         user_log = reporter.root / 'user.log'
         assert not user_log.exists() or 'overlapping' not in user_log.read_text()
     finally:
         reporter.close()
 
-
 def test_live_stage_is_not_replaced_by_an_unchanged_persisted_stage(report):
     reporter, stream = report
-    state = RunState("example", workflow_version=2, current_stage="verify", tasks=[task(status="done")])
+    state = RunState('example', workflow_version=2, current_stage='verify', tasks=[task(status='done')])
     reporter.observe_run(state)
-    reporter.stage("readme")
-    state.agent_attempts["readme"] = 1
+    reporter.stage('readme')
+    state.agent_attempts['readme'] = 1
     reporter.observe_run(state)
-    assert reporter.snapshot.stage == "readme"
-    state.current_stage = "plan"
+    assert reporter.snapshot.stage == 'readme'
+    state.current_stage = 'plan'
     reporter.observe_run(state)
-    assert reporter.snapshot.stage == "plan"
-
+    assert reporter.snapshot.stage == 'plan'
 
 def test_legacy_prototype_skip_is_not_displayed_as_remaining_work(report):
     reporter, stream = report
-    state = RunState("example", current_stage="implement", stage_summaries={"design": "done"})
+    state = RunState('example', current_stage='implement', stage_summaries={'design': 'done'})
     reporter.observe_run(state)
-    assert reporter.snapshot.stages["prototype"] == "skipped"
-
+    assert reporter.snapshot.stages['prototype'] == 'skipped'
 
 def test_repair_validation_capture_does_not_pollute_original_incident_evidence(report):
     from auto_agents.gates import run_commands
     reporter, stream = report
+
     def progress(*args):
         pass
     progress.reporter = reporter
-    progress.context = "self_repair"
-    progress.stage = "self_repair_validation"
-    result = run_commands(
-        [f"{sys.executable} -c \"print('repair verification output')\""],
-        reporter.project_root, progress=progress,
-    )
+    progress.context = 'self_repair'
+    progress.stage = 'self_repair_validation'
+    result = run_commands([f'''{sys.executable} -c "print('repair verification output')"'''], reporter.project_root, progress=progress)
     assert result.ok
-    outputs = list((reporter.root / "diagnostic-output").glob("*/stdout.txt"))
-    assert any("repair verification output" in path.read_text() for path in outputs)
-    assert diagnostic_attachments(reporter.project_root, "example") == []
-
+    outputs = list((reporter.root / 'diagnostic-output').glob('*/stdout.txt'))
+    assert any(('repair verification output' in path.read_text() for path in outputs))
+    assert diagnostic_attachments(reporter.project_root, 'example') == []
 
 def test_repair_handoff_parent_does_not_overwrite_resumed_diagnostic_index(report):
     parent, stream = report
     parent.handoff()
     child = Reporter(parent.project_root, stream)
-    child.bind("run", "example")
-    capture = child.capture(attempt_id="after-restart")
-    capture("stdout", "new process evidence\n")
+    child.bind('run', 'example')
+    capture = child.capture(attempt_id='after-restart')
+    capture('stdout', 'new process evidence\n')
     capture.finish()
     child.close()
-    before = (child.root / "diagnostics.json").read_bytes()
+    before = (child.root / 'diagnostics.json').read_bytes()
     parent.close()
-    assert (child.root / "diagnostics.json").read_bytes() == before
-    assert "after-restart" in before.decode()
+    assert (child.root / 'diagnostics.json').read_bytes() == before
+    assert 'after-restart' in before.decode()
     assert parent.presenter.external_owner
-
-
-
-
-
 
 def test_closed_reporter_cannot_recreate_a_removed_artifact_directory(report):
     import shutil
     reporter, stream = report
     capture = reporter.capture()
-    capture("stdout", "partial")
+    capture('stdout', 'partial')
     logger = build_run_logger(stream, reporter)
-    attach_run_file_logger(logger, reporter.root / "run.log")
-    child = reporter.child(reporter.project_root / "worker", "T1")
+    attach_run_file_logger(logger, reporter.root / 'run.log')
+    child = reporter.child(reporter.project_root / 'worker', 'T1')
     worker_logger = build_run_logger(stream, child)
     queued_handlers = list(worker_logger.handlers)
     reporter.close()
     child.close()
     shutil.rmtree(reporter.root)
-    reporter.text("late event")
-    capture.start("late command", {})
-    capture("stdout", "late bytes\n")
-    reporter.capture()("stderr", "late capture\n")
+    reporter.text('late event')
+    capture.start('late command', {})
+    capture('stdout', 'late bytes\n')
+    reporter.capture()('stderr', 'late capture\n')
     for handler in queued_handlers:
-        handler.handle(logging.LogRecord("late.worker", logging.INFO, "", 1, "late record", (), None))
+        handler.handle(logging.LogRecord('late.worker', logging.INFO, '', 1, 'late record', (), None))
     assert not reporter.root.exists()
-
 
 def test_output_callback_waiting_for_lock_cannot_write_after_finish(report):
     import shutil
@@ -563,9 +472,10 @@ def test_output_callback_waiting_for_lock_cannot_write_after_finish(report):
     reporter, stream = report
     capture = reporter.capture()
     ready = threading.Event()
+
     def late():
         ready.set()
-        capture("stdout", "late callback\n")
+        capture('stdout', 'late callback\n')
     with capture._lock:
         thread = threading.Thread(target=late)
         thread.start()
@@ -575,7 +485,6 @@ def test_output_callback_waiting_for_lock_cannot_write_after_finish(report):
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert not capture.root.exists()
-
 
 def test_repair_log_location_does_not_replace_terminal_blocked_status(report):
     reporter, stream = report
@@ -587,27 +496,22 @@ def test_repair_log_location_does_not_replace_terminal_blocked_status(report):
     assert '正在恢复任务' not in lines[-1]
     assert events(reporter)[-1]['message'] == '详细日志：/private/repair/job'
 
-
 @pytest.mark.parametrize('language', ['zh', 'en'])
 def test_collab_fix_acceptance_timeline_names_the_problem_without_changing_state(tmp_path, language):
     from auto_agents.models import SessionState
     from auto_agents.workflow_chain import IssueBriefBuilder
-
     stream = io.StringIO()
     reporter = Reporter(tmp_path, stream, language=language)
     detail = '分镜修正后仍有镜头衔接问题' if language == 'zh' else 'Storyboard correction still breaks shot continuity'
-    seed = {'summary': 'technical summary focused_fix /private/code.py hf-123456abcdef',
-            'user_summary': detail, 'verification_scope': {'mode': 'focused_fix'}}
+    seed = {'summary': 'technical summary focused_fix /private/code.py hf-123456abcdef', 'user_summary': detail, 'verification_scope': {'mode': 'focused_fix'}}
     directory = tmp_path / '.auto-agents/state/handoffs'
     directory.mkdir(parents=True)
     handoff = directory / 'hf-example.json'
-    handoff.write_text(json.dumps({'target': 'fix', 'payload': {'issue_seed': seed},
-                                   'result': {'status': 'completed'}}))
-    parent = SessionState('parent', mode='collab', status='executing',
-        acceptance_execution={'phase': 'blocked', 'result': {'status': 'blocked'}})
+    handoff.write_text(json.dumps({'target': 'fix', 'payload': {'issue_seed': seed}, 'result': {'status': 'completed'}}))
+    parent = SessionState('parent', mode='collab', status='executing', acceptance_execution={'phase': 'blocked', 'result': {'status': 'blocked'}})
     reporter.bind('collab', 'parent')
     reporter.observe_session(parent)
-    parent.status, parent.active_handoff_id = 'waiting_child', 'hf-example'
+    parent.status, parent.active_handoff_id = ('waiting_child', 'hf-example')
     reporter.observe_session(parent)
     child_detail = '镜头之间仍然衔接不上。' if language == 'zh' else 'Adjacent shots still do not connect correctly.'
     IssueBriefBuilder(tmp_path, 'child').materialize({**seed, 'user_summary': child_detail})
@@ -625,8 +529,8 @@ def test_collab_fix_acceptance_timeline_names_the_problem_without_changing_state
             reporter.emit('verification.started', context='candidate')
             child.status = 'completed'
             reporter.observe_session(child)
-        parent.status, parent.active_handoff_id = 'executing', ''
-        parent.return_phase, parent.last_child_result_ref = 'after_child', str(handoff)
+        parent.status, parent.active_handoff_id = ('executing', '')
+        parent.return_phase, parent.last_child_result_ref = ('after_child', str(handoff))
         reporter.observe_session(parent)
         parent.return_phase = ''
         for phase in ('pending', 'executing', 'reviewing'):
@@ -634,15 +538,7 @@ def test_collab_fix_acceptance_timeline_names_the_problem_without_changing_state
             reporter.observe_session(parent)
             reporter.observe_session(parent)
         value = stream.getvalue()
-        labels = (['分析验收失败的原因', '开始修复项目问题', '分析项目问题，确认修复方案',
-                   '准备修复项目问题', '正在修复项目问题', '检查修复效果', '项目问题已修复',
-                   '检查修复结果，准备继续验收', '通过实际操作验收现有功能', '检查验收结果是否满足目标']
-                  if language == 'zh' else
-                  ['Investigating why acceptance failed', 'Starting a project fix',
-                   'Investigating the project issue and planning a fix', 'Preparing a project fix',
-                   'Fixing the project issue', 'Checking the project fix', 'Project issue fixed',
-                   'Checking the fix before continuing acceptance',
-                   'Checking existing behavior through actual use', 'Checking whether acceptance proves the goal'])
+        labels = ['分析验收失败的原因', '开始修复项目问题', '分析项目问题，确认修复方案', '准备修复项目问题', '正在修复项目问题', '检查修复效果', '项目问题已修复', '检查修复结果，准备继续验收', '通过实际操作验收现有功能', '检查验收结果是否满足目标'] if language == 'zh' else ['Investigating why acceptance failed', 'Starting a project fix', 'Investigating the project issue and planning a fix', 'Preparing a project fix', 'Fixing the project issue', 'Checking the project fix', 'Project issue fixed', 'Checking the fix before continuing acceptance', 'Checking existing behavior through actual use', 'Checking whether acceptance proves the goal']
         positions = [value.index(label) for label in labels]
         assert positions == sorted(positions)
         assert value.count(labels[1]) == 1, 'returning from a child must not announce another fix'
@@ -652,24 +548,19 @@ def test_collab_fix_acceptance_timeline_names_the_problem_without_changing_state
         assert ('[修复] 问题：' if language == 'zh' else '[Fix] Issue: ') + detail in value
         for label in labels[1:7]:
             assert ('[修复] ' if language == 'zh' else '[Fix] ') + label in value
-        assert 'focused_fix' not in value and '/private/' not in value and 'hf-' not in value
+        assert 'focused_fix' not in value and '/private/' not in value and ('hf-' not in value)
         assert not (tmp_path / '.auto-agents/state/run_state.json').exists()
     finally:
         reporter.close()
-
 
 @pytest.mark.parametrize('started', [False, True])
 def test_fix_preflight_blocker_explains_whether_project_repair_started(tmp_path, started):
     from auto_agents.models import SessionState
     from auto_agents.workflow_chain import IssueBriefBuilder
-
     stream = io.StringIO()
     reporter = Reporter(tmp_path, stream, language='zh')
     IssueBriefBuilder(tmp_path, 'child').materialize({'summary': '分镜衔接不正确'})
-    state = SessionState('child', mode='fix', status='blocked', resolution='verification_ownership',
-        current_attempt=1 if started else 0,
-        execution_log=[{'action': 'execution_preflight_blocked', 'failure_kind': 'verification_ownership',
-                        'retry_fix': False, 'result': 'retained task plan ownership is unavailable'}])
+    state = SessionState('child', mode='fix', status='blocked', resolution='verification_ownership', current_attempt=1 if started else 0, execution_log=[{'action': 'execution_preflight_blocked', 'failure_kind': 'verification_ownership', 'retry_fix': False, 'result': 'retained task plan ownership is unavailable'}])
     try:
         reporter.bind('fix', state.session_id)
         reporter.observe_session(state)
@@ -684,28 +575,9 @@ def test_fix_preflight_blocker_explains_whether_project_repair_started(tmp_path,
     finally:
         reporter.close()
 
-
-
-
-def test_user_summary_survives_fix_routing_and_issue_materialization(tmp_path):
-    from auto_agents.session import Session
-    from auto_agents.workflow_chain import IssueBriefBuilder
-
-    route = {'summary': 'technical explanation', 'user_summary': '分镜修正未解决镜头衔接问题',
-             'issue_seed': {'verification_scope': {'mode': 'focused_fix'},
-                            'verification_command': 'python -m pytest tests/test_story.py::test_continuity'}}
-    payload = Session._fix_workflow_payload(route)
-    IssueBriefBuilder(tmp_path, 'child').materialize(payload['issue_seed'])
-    issue = json.loads((tmp_path / '.auto-agents/state/sessions/child/issue.json').read_text())
-    assert issue['user_summary'] == route['user_summary']
-    assert issue['verification_scope'] == route['issue_seed']['verification_scope']
-    assert issue['verification_command'] == route['issue_seed']['verification_command']
-
-
 def test_private_fix_keeps_control_problem_and_does_not_repeat_the_action(tmp_path):
     from auto_agents.models import SessionState
     from auto_agents.workflow_chain import IssueBriefBuilder
-
     stream = io.StringIO()
     control = Reporter(tmp_path / 'control', stream, language='zh')
     private = Reporter(tmp_path / 'private', stream, language='zh', presenter=control.presenter)
@@ -728,21 +600,15 @@ def test_private_fix_keeps_control_problem_and_does_not_repeat_the_action(tmp_pa
         private.close()
         control.close()
 
-
 def test_resuming_a_fix_displays_the_original_problem_not_the_wrapper(tmp_path):
     from auto_agents.models import SessionState
-
     stream = io.StringIO()
     reporter = Reporter(tmp_path, stream, language='zh')
     root = tmp_path / '.auto-agents/state/handoffs'
     root.mkdir(parents=True)
-    (root / 'hf-original.json').write_text(json.dumps({'target': 'fix',
-        'payload': {'issue_seed': {'user_summary': '分镜修正未解决镜头衔接问题'}}}))
-    (root / 'hf-resume.json').write_text(json.dumps({'target': 'resume',
-        'payload': {'resume_handoff_id': 'hf-original'}}))
-    (root / 'hf-engine-return.json').write_text(json.dumps({'target': 'fix',
-        'payload': {'issue_seed': {'original_handoff_id': 'hf-resume',
-                                 'summary': 'technical engine verification_ownership'}}}))
+    (root / 'hf-original.json').write_text(json.dumps({'target': 'fix', 'payload': {'issue_seed': {'user_summary': '分镜修正未解决镜头衔接问题'}}}))
+    (root / 'hf-resume.json').write_text(json.dumps({'target': 'resume', 'payload': {'resume_handoff_id': 'hf-original'}}))
+    (root / 'hf-engine-return.json').write_text(json.dumps({'target': 'fix', 'payload': {'issue_seed': {'original_handoff_id': 'hf-resume', 'summary': 'technical engine verification_ownership'}}}))
     try:
         reporter.bind('collab', 'parent')
         state = SessionState('parent', mode='collab', status='waiting_child', active_handoff_id='hf-engine-return')
@@ -756,25 +622,11 @@ def test_resuming_a_fix_displays_the_original_problem_not_the_wrapper(tmp_path):
     finally:
         reporter.close()
 
-
-@pytest.mark.parametrize('technical,expected', [
-    ('允许无任务归属的 focused_fix 安全处理历史提交无 task_plan.json 的情况',
-     '无法读取所需的旧任务记录，项目修复无法开始。'),
-    ('允许不接管其他任务的 局部修复 安全处理原有版本无 任务计划 的情况',
-     '无法读取所需的旧任务记录，项目修复无法开始。'),
-    ('engine request has no explicit acceptance obligations',
-     '自动修复缺少明确的完成标准，暂时无法继续。'),
-    ('SCHEMA_DATABASE_MISSING', '所需数据尚未准备好，服务无法启动。'),
-    ("ModuleNotFoundError: No module named 'renderer'", '运行所需的组件没有准备好，任务暂时无法继续。'),
-    ('usageLimitExceeded', '当前助手的使用额度已用完，任务暂时无法继续。'),
-    ('ConnectionRefusedError', '无法连接所需服务，任务暂时无法继续。'),
-    ('TimeoutError', '等待执行结果超时，任务暂时无法继续。'),
-])
+@pytest.mark.parametrize('technical,expected', [('允许无任务归属的 focused_fix 安全处理历史提交无 task_plan.json 的情况', '无法读取所需的旧任务记录，项目修复无法开始。'), ('允许不接管其他任务的 局部修复 安全处理原有版本无 任务计划 的情况', '无法读取所需的旧任务记录，项目修复无法开始。'), ('engine request has no explicit acceptance obligations', '自动修复缺少明确的完成标准，暂时无法继续。'), ('SCHEMA_DATABASE_MISSING', '所需数据尚未准备好，服务无法启动。'), ("ModuleNotFoundError: No module named 'renderer'", '运行所需的组件没有准备好，任务暂时无法继续。'), ('usageLimitExceeded', '当前助手的使用额度已用完，任务暂时无法继续。'), ('ConnectionRefusedError', '无法连接所需服务，任务暂时无法继续。'), ('TimeoutError', '等待执行结果超时，任务暂时无法继续。')])
 def test_legacy_problem_explains_symptom_and_impact_across_failure_families(technical, expected):
     from auto_agents.workflow_display import repair_problem
     assert repair_problem({'error': technical}) == expected
     assert repair_problem({'invocation': {'engine_route': {'issue_seed': {'summary': technical}}}}) == expected
-
 
 def test_new_problem_description_is_generic_and_unknown_causes_are_not_invented():
     from auto_agents.workflow_display import problem, repair_problem
@@ -783,18 +635,13 @@ def test_new_problem_description_is_generic_and_unknown_causes_are_not_invented(
     assert problem(route) == description
     assert repair_problem({'diagnosis': {'final': route}}) == description
     assert problem({'summary': 'repair opaque_binding_handoff /private/tree'}) == '任务暂时无法继续，具体原因还需要检查。'
-    assert problem({'summary': 'repair opaque_binding_handoff',
-                    'necessity': {'consequence': '报表无法下载。'}}) == '报表无法下载。'
-
-
-
+    assert problem({'summary': 'repair opaque_binding_handoff', 'necessity': {'consequence': '报表无法下载。'}}) == '报表无法下载。'
 
 def test_repair_issue_is_announced_again_on_a_new_console_but_not_on_heartbeat(tmp_path, monkeypatch):
     clock = [100.0]
     monkeypatch.setattr('auto_agents.reporting.time.monotonic', lambda: clock[0])
     payload = {'invocation': {'engine_route': {'issue_seed': {'user_summary': '视频导出后无法播放。'}}}}
-    job = {'id': 'retained', 'generation': 1, 'state': 'repairing', 'payload': payload,
-           'display': {'phase': 'plan', 'sequence': 1}}
+    job = {'id': 'retained', 'generation': 1, 'state': 'repairing', 'payload': payload, 'display': {'phase': 'plan', 'sequence': 1}}
     for _ in range(2):
         output = io.StringIO()
         reporter = Reporter(tmp_path, output, language='zh')

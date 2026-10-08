@@ -13,11 +13,12 @@ from auto_agents.managed_verification import execute_engine, selected_tests
 
 
 def execute_project(payload):
-    from auto_agents.orchestrator import Orchestrator
+    from types import SimpleNamespace
+    from auto_agents.config import load_project_config
     from auto_agents.managed_verification import project_focused
     workspace = Path(payload["workspace"])
     selected_tests(workspace, payload["tests"])
-    return project_focused(Orchestrator(workspace), payload["tests"], fresh=payload.get("fresh", False), sandboxed=True)
+    return project_focused(SimpleNamespace(project_root=workspace,config=load_project_config(workspace)), payload["tests"], fresh=payload.get("fresh", False), sandboxed=True)
 
 
 def main():
