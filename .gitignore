@@ -9,5 +9,6 @@ build/
 *.egg-info/
 .DS_Store
 .auto-agents/state/repomap_cache.json
+.auto-agents/state/
 .antigravitycli
 .auto-agents/maintenance/
