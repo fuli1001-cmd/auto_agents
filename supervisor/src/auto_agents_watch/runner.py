@@ -221,7 +221,7 @@ class Runner:
         self.check_cancelled(job)
         observation=self.directory/'observation.json'
         observation.unlink(missing_ok=True)
-        self.store.save(job,'RUNNING')
+        self.store.save(job,'RUNNING',waiting_for=None)
         config_path=Path(job['project'])/'.auto-agents/config.json'
         config=json.loads(config_path.read_text()) if config_path.exists() else {}
         settings=config.get('execution',{}).get('supervision',{})
@@ -244,6 +244,10 @@ class Runner:
             self.store.save(job,'STOPPED',reason='Cancelled; checkpoint retained'); return False
         if value.get('status')=='completed' and result['returncode']==0:
             self.store.save(job,'DONE',reason='Original business task completed'); return False
+        if value.get('status')=='waiting' and not value.get('fault') and not result['reason'] and result['returncode']==0:
+            self.store.save(job,'STOPPED',reason='Business task is waiting for operator input',
+                waiting_for=value.get('waiting_for') or 'pending')
+            return False
         fault=value.get('fault')
         if result['reason']=='control_cycle':
             invocation=self.directory/'invocation.json'

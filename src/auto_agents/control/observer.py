@@ -136,6 +136,9 @@ class Observer:
             "heartbeat_at": time.time(),
             "runtime_revision": revision,
         }
+        from .interaction import pending_decisions
+
+        value["pending_decisions"] = pending_decisions(store, root)
         path = Path(self.output)
         if self.current_fault:
             value["fault"] = self.current_fault

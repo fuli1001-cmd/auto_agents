@@ -650,7 +650,8 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                         {
                             "key": request.key,
                             "request_id": request.request_id,
-                            "answer_ref": record.get("answer_ref", ""),
+                            "answer_ref": request.key + ":" + str(record["revision"]),
+                            "revision": record["revision"],
                         },
                     ],
                     "input_requests": [
@@ -814,6 +815,13 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
             emit({"ok": result["status"] == "COMPLETED", "work": result})
         else:
             print("任务状态：" + result["status"] + "；ID：" + result["id"])
+            from .interaction import pending_decisions
+
+            for decision in pending_decisions(store, result):
+                print("待处理：" + decision["question"])
+                print("处理命令：" + decision["command"])
+            if result["status"] == "WAITING":
+                print("保留当前会话；处理上述事项后，用原命令加 --session " + result["id"] + " 继续。")
         if result["status"] == "COMPLETED" and result["result"].get("release_work_id"):
             from .release import ensure_worker
 
@@ -851,26 +859,15 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
 def decision_owner(store, root, command):
     """Locate a pending decision through owned child links, without a repair path."""
     pending = []
-    queue = [root]
-    seen = set()
-    while queue:
-        work = queue.pop()
-        if work["id"] in seen:
-            raise ControlError("work_cycle", "Owned work graph contains a cycle")
-        seen.add(work["id"])
+    from .interaction import owned_work
+
+    for work in owned_work(store, root):
         state = work["context"]
         waiting = state.get("waiting_for")
         if work["status"] == "WAITING" and waiting == (
             "user" if command == "answer" else "approval"
         ):
             pending.append(work)
-        for identity in state.get("children", []) or (
-            [state["child"]] if state.get("child") else []
-        ):
-            child = store.work(identity)
-            if child["parent"] != work["id"]:
-                raise ControlError("child_authority", "Child belongs to another parent")
-            queue.append(child)
     if len(pending) != 1:
         raise ControlError(
             "selection", "Choose the work item with one pending decision"

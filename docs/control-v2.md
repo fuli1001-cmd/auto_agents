@@ -53,6 +53,10 @@ auto-agents resume --project /path/to/project --workflow workflow-id
 
 批准或拒绝后用原运行命令继续；回答默认自动续跑，`--no-resume` 只保存回答。待决定的子任务可通过根任务 ID 定位。
 
+等待时终端会列出每个待回答问题或审批事项及具体处理命令；并行子任务显示各自的 ID。
+保存回答后用原命令加 `--session` 继续。普通回答按已保存的输入引用提供给模型，秘密值
+通过声明的绑定提供，不写入模型提示；回答被另外修改时会要求核对，而不会悄悄换用新值。
+
 ```bash
 auto-agents approve --project /path/to/project --session existing-id --gate prototype
 auto-agents reject --project /path/to/project --session existing-id --reason '具体调整'

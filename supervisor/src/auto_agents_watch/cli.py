@@ -18,7 +18,8 @@ def readable_result(value, store):
         return
     labels = {'DONE': '已完成', 'STOPPED': '已停止', 'RUNNING': '运行中',
               'REPAIRING': '修复中', 'VERIFYING': '验证中', 'RESTARTING': '恢复中'}
-    print('监督任务' + labels.get(value.get('state'), value.get('state', '已结束')) + '。')
+    paused=value.get('state')=='STOPPED' and value.get('waiting_for') and not value.get('cancel_requested')
+    print('监督任务已暂停。' if paused else '监督任务' + labels.get(value.get('state'), value.get('state', '已结束')) + '。')
     reason = value.get('reason', '')
     if reason:
         explanations = {
@@ -26,12 +27,13 @@ def readable_result(value, store):
                 '引擎仓库有未提交改动，自动修复暂时无法启动；现有改动和会话已保留。',
             'Original business task completed': '原任务已完成。',
             'Business task stopped without an engine defect': '业务流程已停止，未检测到引擎异常。',
+            'Business task is waiting for operator input': '业务等待用户处理待办事项，会话已保留。',
             'Execution health is uncertain; checkpoint retained': '无法确认运行状态，已保存恢复检查点。',
         }
         summary = ' '.join(str(explanations.get(reason, reason)).split())
         print('原因：' + (summary if len(summary) <= 400 else summary[:397] + '…'))
     fault = value.get('fault') or value.get('subsequent_fault') or {}
-    if fault.get('message') and fault['message'] != reason:
+    if not paused and fault.get('message') and fault['message'] != reason:
         evidence = fault.get('evidence') or {}
         seed = evidence.get('issue_seed') or evidence.get('spec_seed') or {}
         message = seed.get('user_summary') or fault['message']
@@ -39,6 +41,10 @@ def readable_result(value, store):
             message = '同一操作反复执行，未产生已验证的进展。'
         message = ' '.join(str(message).split())
         print('问题：' + (message if len(message) <= 400 else message[:397] + '…'))
+    if paused:
+        for decision in value.get('observation',{}).get('pending_decisions',[]):
+            print('待处理：'+decision['question'])
+            print('处理命令：'+decision['command'])
     if value.get('id'):
         directory = store.root / 'jobs' / value['id']
         print('日志：' + str(directory / 'business.log'))
@@ -106,7 +112,8 @@ def main(argv=None):
             print(json.dumps(value,ensure_ascii=False,indent=2))
         else:
             readable_result(value, store)
-        return 0 if value.get('state') in {'DONE','RUNNING','RESTARTING'} or args.action in {'status','cancel','reconcile'} else 3
+        paused=value.get('state')=='STOPPED' and value.get('waiting_for') and not value.get('cancel_requested')
+        return 0 if paused or value.get('state') in {'DONE','RUNNING','RESTARTING'} or args.action in {'status','cancel','reconcile'} else 3
     except (OSError,RuntimeError,ValueError) as error:
         if args.json:
             print(json.dumps({'ok':False,'reason':str(error)},ensure_ascii=False),file=sys.stderr)

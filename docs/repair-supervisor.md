@@ -117,6 +117,9 @@ Interactive output shows a short reason and log location; full fault evidence an
 tracebacks live beside the business checkpoint. `--retry-business` resumes the
 same retained work and accounting. It does not turn a business problem into an
 engine defect or erase missing historical checks.
+Waiting for input or approval is a normal pause: the watcher retains STOPPED
+internally, shows the pending question and response command, and returns exit 0.
+Waiting does not enter engine repair or declare the business goal completed.
 Schema-2 retries use the checkpoint's original root selector, including when the
 initial command omitted `--session`; an explicit replacement provider is retained.
 

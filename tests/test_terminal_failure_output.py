@@ -117,3 +117,23 @@ def test_nested_engine_route_uses_user_visible_problem(tmp_path, monkeypatch):
     with pytest.raises(EngineFault, match="修复被不存在的历史测试阻塞") as result:
         request_engine_repair(type("Owner", (), {"project_root": tmp_path})(), payload)
     assert result.value.evidence == payload
+
+
+@pytest.mark.parametrize('machine',[False,True])
+def test_waiting_operator_is_a_successful_pause_with_actionable_question(tmp_path,monkeypatch,capsys,machine):
+    store=Store(tmp_path/'watch')
+    job=store.create(['auto-agents','collab'],tmp_path/'project',tmp_path/'engine')
+    store.save(job,'STOPPED',waiting_for='user',reason='Business task is waiting for operator input',
+        observation={'status':'waiting','pending_decisions':[{'question':'是否支持继续生成按钮？',
+            'command':'auto-agents answer --session original --value "<你的回答>"'}]})
+    monkeypatch.setattr(watch_cli.Runner,'start',lambda *a:store.get(job['id']))
+    args=['run','--root',str(store.root),'--engine',str(tmp_path/'engine')]
+    if machine:args+=['--json']
+    assert watch_cli.main([*args,'--','auto-agents','collab'])==0
+    output=capsys.readouterr().out
+    if machine:
+        value=json.loads(output)
+        assert value['state']=='STOPPED' and value['waiting_for']=='user'
+    else:
+        assert '监督任务已暂停' in output and '是否支持继续生成按钮' in output
+        assert '处理命令' in output and '未检测到引擎异常' not in output

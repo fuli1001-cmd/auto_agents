@@ -873,3 +873,21 @@ def test_docker_service_failure_reports_prerequisite_without_building(tmp_path,m
     with pytest.raises(RuntimeError,match='start Docker.*Cannot connect'):
         module.Docker(tmp_path).prepare()
     assert calls==[['docker','info']]
+
+
+def test_waiting_observation_does_not_hide_a_reported_fault(tmp_path,monkeypatch):
+    from auto_agents_watch.runner import Runner
+    from auto_agents_watch import runner as module
+    store=Store(tmp_path/'watch')
+    job=store.create(['business'],tmp_path/'project',tmp_path/'engine')
+    runner=Runner(store)
+    runner.directory=store.root/'jobs'/job['id'];runner.fd=0;runner.token='fixture'
+    def execute(*args,**kwargs):
+        kwargs['observation'].write_text(json.dumps({'status':'waiting','waiting_for':'user',
+            'fault':{'category':'state','message':'Actual prerequisite failed'}}))
+        return {'returncode':0,'reason':''}
+    monkeypatch.setattr(module,'run',execute)
+    monkeypatch.setattr(module.subprocess,'run',lambda *a,**kw:SimpleNamespace(returncode=0))
+    assert runner.business(job) is False
+    stopped=store.get(job['id'])
+    assert not stopped.get('waiting_for') and stopped['fault']['message']=='Actual prerequisite failed'

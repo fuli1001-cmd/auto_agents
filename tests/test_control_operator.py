@@ -30,6 +30,8 @@ def test_answer_continues_owned_root_without_refunding_calls(
                         {"decision": "need_user", "question": "Confirm required value"}
                     )
                 }
+            if phase == "classify":
+                assert '"value": "yes"' in a[0], "The model did not receive the ordinary operator answer"
             return super().run(ctx, phase, *a, **kw)
 
     worker = Question()

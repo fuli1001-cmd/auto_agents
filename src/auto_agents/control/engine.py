@@ -218,6 +218,9 @@ class Engine:
         from .interaction import pending_questions
 
         requests, bindings = pending_questions(self.project, work, questions)
+        if not requests:
+            raise ControlError("model_output", "Requested inputs are already available; use the recorded operator answers",
+                category="model")
         state = {
             **work["context"],
             "input_requests": requests,
@@ -350,9 +353,11 @@ class Engine:
                 **(inputs or {}),
             }
         if work["context"].get("operator_answers"):
+            from .interaction import resolved_answers
+
             inputs = {
                 **(inputs or {}),
-                "operator_answers": work["context"]["operator_answers"],
+                "operator_answers": resolved_answers(self.project, work["context"]["operator_answers"]),
             }
         prompt = build(
             context, phase, inputs=inputs, feedback=work["context"].get("feedback")
