@@ -107,6 +107,7 @@ def test_new_goal_prompt_reports_waiting_without_claiming_previous_root(tmp_path
     save_project_config(tmp_path,ProjectConfig('fixture'))
     before=store.work(old['id'])
     observation=tmp_path/'observation.json'
+    (tmp_path/'spec.md').write_text('Project reference must not replace the interactive collab goal')
     monkeypatch.setenv('AUTO_AGENTS_OBSERVATION_FILE',str(observation))
     monkeypatch.setattr(sys.stdin,'isatty',lambda:True)
     def interrupted_input(prompt):

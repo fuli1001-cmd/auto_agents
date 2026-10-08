@@ -460,6 +460,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use a configured provider entry by name for this session.",
     )
     collab_parser.add_argument(
+        "--spec-file",
+        help="Explicitly read this file as the new collab goal instead of asking interactively.",
+    )
+    collab_parser.add_argument(
         "--print-agent-output",
         action="store_true",
         help="Print each agent output to stderr as it completes.",

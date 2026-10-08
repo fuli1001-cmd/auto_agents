@@ -770,9 +770,17 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
             if args.command == "resume":
                 raise ControlError("selection", "No unique resumable workflow")
             goal = args.goal
-            spec = Path(args.spec_file or project / "spec.md")
-            if not goal and spec.is_file():
+            if not goal and args.spec_file:
+                spec = Path(args.spec_file).expanduser()
+                if not spec.is_file():
+                    raise ControlError("goal", "Goal file is unavailable: " + str(spec))
                 goal = spec.read_text()
+                if not goal.strip():
+                    raise ControlError("goal", "Goal file is empty: " + str(spec))
+            elif not goal and mode != "collab":
+                spec = project / "spec.md"
+                if spec.is_file():
+                    goal = spec.read_text()
             if not goal:
                 if not sys.stdin.isatty():
                     raise ControlError("goal", "Supply --goal or --spec-file")
@@ -784,6 +792,8 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 finally:
                     if observer:
                         observer.waiting_for_goal = False
+            if not goal.strip():
+                raise ControlError("goal", "A non-empty goal is required")
             checks = (
                 (VerificationSpec(args.verify_command),) if args.verify_command else ()
             )
