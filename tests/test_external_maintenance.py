@@ -705,3 +705,99 @@ def test_same_exception_type_with_different_reason_is_not_same_fault():
     from auto_agents_watch.runner import normalized_error
     assert normalized_error('missing file /tmp/a/file.py') == normalized_error('missing file /tmp/b/file.py')
     assert normalized_error('credentials unavailable') != normalized_error('original engine state corrupt')
+
+
+def test_retired_job_starts_business_in_successor_without_old_docker_repair(tmp_path):
+    from auto_agents_watch.runner import Runner
+    project=tmp_path/'project';project.mkdir()
+    store=Store(tmp_path/'watch')
+    argv=['auto-agents','collab','--project',str(project),'--session','original','--provider','first']
+    old=store.create(argv,project,tmp_path/'engine')
+    store.save(old,'STOPPED',fault={'category':'engine','message':'obsolete classification conflict'},
+        needs_maintenance=True,resume_token={'schema':1},candidate=str(tmp_path/'old-candidate'),snapshot=None,
+        cleanup={'old_snapshot_available':False},model_calls=7,attempts=3,no_progress=1,best_passed=['retained'])
+    old_created=old['created'];visits=[]
+    class Recheck(Runner):
+        def business(self,job):
+            visits.append(job['id'])
+            assert not job.get('fault') and not job.get('needs_maintenance')
+            assert not job.get('candidate') and not job.get('resume_token')
+            assert job['argv']==argv
+            self.store.save(job,'STOPPED',reason='current business requires operator decision')
+            return False
+        def maintain(self,job):
+            pytest.fail('Retired fault entered Docker before business ran')
+    result=Recheck(store,sandbox_factory=lambda *a,**k:pytest.fail('Docker invoked')).start(argv,tmp_path/'engine')
+    assert visits==[result['id']] and result['id']!=old['id']
+    assert result['predecessor']==old['id']
+    assert (result['model_calls'],result['attempts'],result['no_progress'])==(7,3,1)
+    assert result['maintenance_started']==old_created and result['best_passed']==['retained']
+    assert store.get(old['id'])['fault']['message']=='obsolete classification conflict'
+    assert store.get(old['id'])['superseded_by']==result['id']
+    with pytest.raises(RuntimeError,match='model-call limit'):
+        store.reserve(result,'implement',max_calls=7)
+    # Repeating the command reuses the successor, not another budget/fault.
+    assert Recheck(store).start(argv,tmp_path/'engine')['id']==result['id']
+    assert len(store.list())==2
+
+
+def test_retired_job_unknown_call_cannot_be_bypassed_by_successor(tmp_path):
+    from auto_agents_watch.runner import Runner
+    store=Store(tmp_path/'watch')
+    argv=['auto-agents','collab','--project',str(tmp_path),'--session','original']
+    old=store.create(argv,tmp_path,tmp_path)
+    store.reserve(old,'implement')
+    store.save(old,'STOPPED',cleanup={'old_snapshot_available':False})
+    with pytest.raises(RuntimeError,match='Unconfirmed model operation'):
+        Runner(store).start(argv,tmp_path)
+    assert len(store.list())==1 and store.get(old['id'])['model_calls']==1
+
+
+def test_explicit_retry_of_retired_job_observes_current_business(tmp_path):
+    from auto_agents_watch.runner import Runner
+    store=Store(tmp_path/'watch')
+    old=store.create(['auto-agents','collab','--project',str(tmp_path),'--session','original'],tmp_path,tmp_path)
+    store.save(old,'STOPPED',cleanup={'original_in_place_recovery':False},fault={'category':'engine','message':'obsolete'},model_calls=4)
+    class Recheck(Runner):
+        def business(self,job):
+            assert not job.get('fault')
+            self.store.save(job,'STOPPED',reason='rechecked')
+            return False
+        def maintain(self,job):pytest.fail('Old fault dispatched')
+    with pytest.raises(RuntimeError,match='inputs were retired'):
+        Recheck(store).resume(old['id'],explicit=True)
+    result=Recheck(store).resume(old['id'],explicit=True,retry_business=True)
+    assert result['id']!=old['id'] and result['model_calls']==4
+    assert Recheck(store).resume(old['id'],retry_business=True)['id']==result['id']
+
+
+def test_successor_uses_durable_counters_and_preserves_cancellation(tmp_path):
+    store=Store(tmp_path/'watch')
+    old=store.create(['auto-agents'],tmp_path,tmp_path)
+    stale=dict(old)
+    store.save(old,'STOPPED',model_calls=5,attempts=2,cancel_requested=True,
+        maintenance_started=None,cleanup={'old_snapshot_available':False})
+    successor=store.successor(stale,old['argv'])
+    assert successor['model_calls']==5 and successor['attempts']==2
+    assert successor['cancel_requested'] is True
+    assert successor['maintenance_started']==old['created']
+    assert (store.root/'jobs'/successor['id']).is_dir()
+    assert store.successor(stale,old['argv'])==successor
+    assert len(store.list())==2
+    from auto_agents_watch.runner import Runner
+    assert Runner(store).resume(successor['id'])==successor
+    with pytest.raises(RuntimeError,match='Only a stopped'):
+        store.successor(successor,old['argv'])
+
+
+def test_docker_service_failure_reports_prerequisite_without_building(tmp_path,monkeypatch):
+    from auto_agents_watch import sandbox as module
+    monkeypatch.setattr(module.shutil,'which',lambda name:'/usr/bin/docker')
+    calls=[]
+    def execute(argv,**kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1,stderr='Cannot connect to the Docker daemon',stdout='')
+    monkeypatch.setattr(module.subprocess,'run',execute)
+    with pytest.raises(RuntimeError,match='start Docker.*Cannot connect'):
+        module.Docker(tmp_path).prepare()
+    assert calls==[['docker','info']]

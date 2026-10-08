@@ -62,6 +62,34 @@ class Store:
         if row is None: raise ValueError('Unknown maintenance job: ' + identity)
         return json.loads(row[0])
 
+    def successor(self, previous, argv):
+        """Replace retired inputs, without granting another maintenance budget."""
+        identity = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = json.loads(db.execute('SELECT payload FROM jobs WHERE id=?', (previous['id'],)).fetchone()[0])
+            if current.get('active_call'):
+                raise RuntimeError('Reconcile the previous model call before replacing maintenance inputs')
+            if current.get('superseded_by'):
+                return json.loads(db.execute('SELECT payload FROM jobs WHERE id=?',
+                    (current['superseded_by'],)).fetchone()[0])
+            if current['state'] != 'STOPPED':
+                raise RuntimeError('Only a stopped maintenance job can be replaced')
+            value = {'id': identity, 'argv': list(argv), 'project': current['project'], 'engine': current['engine'],
+                     'cwd': os.getcwd(), 'state': 'RUNNING', 'created': time.time(), 'publication': 'not_requested',
+                     'predecessor': current['id'],
+                     'maintenance_started': current.get('maintenance_started') or current['created'],
+                     'cancel_requested': current.get('cancel_requested',False)}
+            for key, default in [('attempts',0), ('model_calls',0), ('no_progress',0), ('best_passed',[])]:
+                value[key] = current.get(key,default)
+            # Old faults, candidates, checkpoints and accepted runtime pointers
+            # stay in the predecessor. The successor observes current business.
+            (self.root/'jobs'/identity).mkdir(parents=True)
+            current['superseded_by'] = identity
+            db.execute('INSERT INTO jobs VALUES(?,?)', (identity,json.dumps(value)))
+            db.execute('UPDATE jobs SET payload=? WHERE id=?', (json.dumps(current),current['id']))
+        return value
+
     def list(self):
         with self.connect() as db:
             return [json.loads(row[0]) for row in db.execute('SELECT payload FROM jobs')]

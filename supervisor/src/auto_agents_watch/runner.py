@@ -41,6 +41,11 @@ def normalized_error(message):
     return re.sub(r'\b[0-9a-f]{8,}\b','<id>',value)
 
 
+def retired_inputs(job):
+    cleanup=job.get('cleanup') or {}
+    return cleanup.get('old_snapshot_available') is False or cleanup.get('original_in_place_recovery') is False
+
+
 def review_prompt(job, report):
     return ('Independently review the immutable candidate, including any merged changes, '
         'against the original fault and fixed checks. Require a generic engine fix and '
@@ -97,11 +102,17 @@ class Runner:
         # Re-running the same maintenance task must not replenish its budget.
         existing = [job for job in self.store.list() if job['project'] == normalized_project
                     and job['engine']==str(Path(engine).resolve())
-                    and task_arguments(job['argv'])==task_arguments(argv) and job['state'] != 'DONE']
+                    and task_arguments(job['argv'])==task_arguments(argv) and job['state'] != 'DONE'
+                    and not job.get('superseded_by')]
         if existing:
             retained=max(existing,key=lambda job:job['created'])
             if alive(retained.get('process')) or retained.get('active_call'):
                 return self.resume(retained['id'])
+            if retained['state']=='STOPPED' and retired_inputs(retained):
+                if retained.get('cancel_requested'):
+                    return retained
+                successor=self.store.successor(retained,argv)
+                return self.resume(successor['id'])
             self.store.save(retained,argv=list(argv))
             if (retained['state'] == 'STOPPED' and not retained.get('candidate')
                     and not retained.get('model_calls') and not retained.get('attempts')
@@ -358,6 +369,8 @@ class Runner:
 
     def resume(self,identity, *, explicit=False, retry_business=False):
         job=self.store.get(identity); self.directory=self.store.root/'jobs'/identity
+        if job.get('superseded_by'):
+            return self.resume(job['superseded_by'],explicit=explicit,retry_business=retry_business)
         if job['state']=='DONE':
             with self.locked(job):self.clean_completed(job)
             self.clean_business(job)
@@ -368,6 +381,11 @@ class Runner:
             raise RuntimeError('Unconfirmed model operation retained; automatic redispatch refused')
         if alive(job.get('process')):
             raise RuntimeError('Original process is still alive; duplicate execution refused')
+        if job['state']=='STOPPED' and retired_inputs(job):
+            if not retry_business:
+                raise RuntimeError('Maintenance inputs were retired; use resume --retry-business to recheck the original task')
+            successor=self.store.successor(job,job['argv'])
+            return self.resume(successor['id'],explicit=explicit)
         fault=job.get('fault')
         if (job['state']=='STOPPED' and fault
                 and fault.get('category') not in {'engine','unknown'} and not retry_business):

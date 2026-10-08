@@ -37,7 +37,12 @@ class Docker:
     def prepare(self):
         if not shutil.which('docker'):
             raise RuntimeError('Maintenance requires Docker; standalone business execution remains available')
-        subprocess.run(['docker','info'],check=True,capture_output=True,timeout=self.time_limit(30))
+        result=subprocess.run(['docker','info'],capture_output=True,text=True,timeout=self.time_limit(30))
+        if result.returncode:
+            detail=(result.stderr.strip() or result.stdout.strip())[-2000:]
+            raise RuntimeError('Engine repair requires a working Docker service; start Docker '
+                'and check WSL integration. Ordinary business execution does not require Docker. '
+                +detail)
         if not self.image:
             self.image = self.build()
         result = subprocess.run(['docker','image','inspect','--format','{{.Id}}',self.image],

@@ -100,6 +100,15 @@ tracebacks live beside the business checkpoint. `--retry-business` resumes the
 same retained work and accounting. It does not turn a business problem into an
 engine defect or erase missing historical checks.
 
+If an old stopped job's maintenance snapshots were explicitly retired, repeating
+the business command creates a linked successor and runs the current business
+before considering repair. `resume --retry-business` has the same behavior and
+subsequent resumes of the old job follow its successor. Old faults and checkpoints
+remain in the predecessor for diagnosis; model-call counts, attempts, stagnation
+and the maintenance deadline are carried forward. Unknown model calls still need
+reconciliation and cancellation still requires an explicit resume. Retired inputs
+are never passed to Docker as if they were available.
+
 An unconfirmed business call requires a receipt or an explicit confirmation that
 the original request was cancelled:
 
