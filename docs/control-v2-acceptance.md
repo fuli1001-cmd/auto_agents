@@ -95,3 +95,23 @@ tests** passed. The wider terminal/control suite passed **191 tests and 8 subtes
 Compilation, whitespace checks and a 324-call constructor signature audit passed.
 Tests used a local deterministic shell provider, not paid model or media services.
 Pinned Vitest tools and suite directories were temporary and released at exit.
+
+## Goal feedback and runtime configuration (2026-10-09)
+
+The CLI now acknowledges a submitted goal before workspace admission and flushes
+stage output while the provider is running. A synchronized local-provider test
+holds the reply until the test releases it, proving that both messages appear
+before the model response. Project `.env` defaults now precede launcher defaults
+while explicit environment values retain precedence. Configuration travels in
+the controlled process environment; no credential file is added to a workspace,
+and fixture secret values were absent from prompts, operation receipts and logs.
+The watcher avoids repeating questions already streamed by the business CLI;
+explicit status still shows pending decisions.
+
+The targeted suite passed 156 tests. The full suite passed **1,420 tests and 57
+subtests**, with one optional Docker recovery integration skipped. Compilation
+and whitespace checks passed, and temporary tools/workspaces were released.
+No paid model, media generation or SDGP business operation was executed. The
+existing SDGP session `beb99ded1e85` received only the verified configuration
+location as a non-secret answer with `--no-resume`; its goal, ceiling and one
+consumed call were retained, and it is READY for the user's next invocation.

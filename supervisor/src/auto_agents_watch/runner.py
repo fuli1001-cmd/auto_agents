@@ -257,7 +257,8 @@ class Runner:
             on_start=lambda process:self.store.save(job,process=process),
             cancelled=lambda:self.store.get(job['id']).get('cancel_requested',False))
         value=json.loads(observation.read_text()) if observation.exists() else {}
-        self.store.save(job,process=None,observation=value,root_id=value.get('root_subject') or job.get('root_id'))
+        self.store.save(job,process=None,observation=value,root_id=value.get('root_subject') or job.get('root_id'),
+            business_output_streamed=result.get('streamed_output',False))
         if self.store.get(job['id']).get('cancel_requested'):result['reason']='cancelled'
         if result['reason'] or value.get('fault'):
             cleanup=self.quiesce(job)

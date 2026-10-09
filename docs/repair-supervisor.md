@@ -127,6 +127,9 @@ engine defect or erase missing historical checks.
 Waiting for input or approval is a normal pause: the watcher retains STOPPED
 internally, shows the pending question and response command, and returns exit 0.
 Waiting does not enter engine repair or declare the business goal completed.
+The business CLI flushes goal acknowledgement and stage output before waiting for
+the provider. When this output was already relayed, the watcher prints its pause
+summary without repeating the questions; explicit `status` retains the full list.
 Schema-2 retries use the checkpoint's original root selector, including when the
 initial command omitted `--session`; an explicit replacement provider is retained.
 

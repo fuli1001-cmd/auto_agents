@@ -100,6 +100,6 @@ def run(argv, *, cwd, env, log, timeout=None, observation=None, repeat_limit=3, 
             if reason: terminate(child)
             relay()
             return {'ok': child.returncode == 0 and not reason, 'returncode':child.returncode,
-                    'reason':reason,'process':record}
+                    'reason':reason,'process':record,'streamed_output':bool(stream and position)}
         finally:
             terminate(child)

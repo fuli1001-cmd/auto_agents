@@ -31,8 +31,9 @@ def read_until(stream, marker, timeout=15):
     return bytes(result)
 
 
-def launch_terminal(tmp_path, *, supervised=True, flags=()):
+def launch_terminal(tmp_path, *, supervised=True, flags=(), prepare=None):
     root=native_fixture(tmp_path)
+    if prepare is not None:prepare(root)
     (root/'spec.md').write_text('Reference specification must not become the collab goal')
     git(root,'add','spec.md')
     git(root,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','reference fixture')

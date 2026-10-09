@@ -10,6 +10,11 @@ def context_inputs(context, phase, config, store):
     result = {
         "document_language": config.docs.language,
         "frontend_design": config.frontend_design.to_dict(),
+        "runtime_configuration": {
+            "environment_inherited": True,
+            "project_dotenv_present": (context.control_root / ".env").is_file(),
+            "credential_files_excluded_from_workspace": True,
+        },
     }
     root = store.project / ".auto-agents/state/owned/domain" / context.work_id
     root.mkdir(parents=True, exist_ok=True)

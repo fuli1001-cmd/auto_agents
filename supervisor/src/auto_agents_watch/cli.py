@@ -9,7 +9,7 @@ from .store import Store
 from .runner import Runner
 
 
-def readable_result(value, store):
+def readable_result(value, store, *, show_pending=True):
     if 'jobs' in value:
         if not value['jobs']:
             print('没有监督任务。')
@@ -42,7 +42,7 @@ def readable_result(value, store):
             message = '同一操作反复执行，未产生已验证的进展。'
         message = ' '.join(str(message).split())
         print('问题：' + (message if len(message) <= 400 else message[:397] + '…'))
-    if paused:
+    if paused and show_pending:
         for decision in value.get('observation',{}).get('pending_decisions',[]):
             print('待处理：'+decision['question'])
             print('处理命令：'+decision['command'])
@@ -112,7 +112,7 @@ def main(argv=None):
         if args.json:
             print(json.dumps(value,ensure_ascii=False,indent=2))
         else:
-            readable_result(value, store)
+            readable_result(value, store,show_pending=args.action=='status' or not value.get('business_output_streamed'))
         paused=value.get('state')=='STOPPED' and value.get('waiting_for') and not value.get('cancel_requested')
         if value.get('interrupted') and args.action in {'run','resume'}:return 130
         return 0 if paused or value.get('state') in {'DONE','RUNNING','RESTARTING'} or args.action in {'status','cancel','reconcile'} else 3

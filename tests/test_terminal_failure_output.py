@@ -137,3 +137,17 @@ def test_waiting_operator_is_a_successful_pause_with_actionable_question(tmp_pat
     else:
         assert '监督任务已暂停' in output and '是否支持继续生成按钮' in output
         assert '处理命令' in output and '未检测到引擎异常' not in output
+
+
+def test_streamed_waiting_question_is_not_repeated_but_status_keeps_details(tmp_path,monkeypatch,capsys):
+    store=Store(tmp_path/'watch')
+    job=store.create(['auto-agents','collab'],tmp_path/'project',tmp_path/'engine')
+    store.save(job,'STOPPED',waiting_for='user',business_output_streamed=True,
+        reason='Business task is waiting for operator input',observation={'pending_decisions':[
+            {'question':'A previously streamed question','command':'auto-agents answer --session original'}]})
+    monkeypatch.setattr(watch_cli.Runner,'start',lambda *a:store.get(job['id']))
+    assert watch_cli.main(['run','--root',str(store.root),'--engine',job['engine'],'--','auto-agents','collab'])==0
+    output=capsys.readouterr().out
+    assert '监督任务已暂停' in output and 'A previously streamed question' not in output
+    assert watch_cli.main(['status','--root',str(store.root),'--job',job['id']])==0
+    assert 'A previously streamed question' in capsys.readouterr().out

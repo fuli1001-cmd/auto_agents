@@ -164,7 +164,8 @@ def test_bootstrap_auto_supervision_creates_two_new_sessions(tmp_path,command):
     for _ in range(2):
         result=subprocess.run(argv,cwd=ENGINE,env=environment,capture_output=True,text=True,timeout=30)
         assert result.returncode==0 and '监督任务已暂停' in result.stdout,result.stdout+result.stderr
-        assert 'Confirm the fixture' in result.stderr and '处理命令：' in result.stdout
+        assert 'Confirm the fixture' in result.stderr and '处理命令：' in result.stderr
+        assert (result.stdout+result.stderr).count('待处理：')==1
     jobs=Store(tmp_path/'watch').list()
     assert len(jobs)==2 and len({row['root_id'] for row in jobs})==2
     assert all(row['model_calls']==0 and not row.get('fault') for row in jobs)

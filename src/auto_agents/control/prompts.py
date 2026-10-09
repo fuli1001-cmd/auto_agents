@@ -25,6 +25,11 @@ def build(context, phase, *, inputs=None, feedback=None):
         "The controller owns the goal, source, scope, authorization, verification and budget.",
         "Never edit .auto-agents/state or operator configuration. Never commit, reset or push Git.",
         "Use only this workspace. Do not modify the original project, accounts or production data.",
+        "Application runtime configuration is inherited through the process environment and operator bindings. "
+        "Private workspaces intentionally exclude credential files and original runtime databases. "
+        "An absent workspace .env or .data directory alone does not prove configuration is missing. "
+        "Check required variable presence without printing values, and use the inherited configuration. "
+        "Do not request credentials that are already available, copy secrets into artifacts, or switch real backends to fake/mock.",
         "Required goal: " + c["goal"],
         "Authorization and human decisions: "
         + json.dumps(c["authorization"], ensure_ascii=False),

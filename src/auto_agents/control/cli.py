@@ -76,9 +76,6 @@ def ready(project):
 
 
 def main(argv=None):
-    from ..env import load_dotenv
-
-    load_dotenv([Path.cwd() / ".env"])
     try:
         return invoke(argv)
     except ControlError as error:
@@ -96,6 +93,8 @@ def main(argv=None):
 
 
 def invoke(argv=None):
+    from ..env import load_dotenv
+
     arguments = list(sys.argv[1:] if argv is None else argv)
     tools = {
         "prompt-eval",
@@ -107,6 +106,7 @@ def invoke(argv=None):
         "worker",
     }
     if arguments and arguments[0] in tools:
+        load_dotenv([Path.cwd() / ".env"])
         from .project_tools import build_parser, dispatch as dispatch_tool
 
         return dispatch_tool(build_parser().parse_args(arguments))
@@ -122,10 +122,15 @@ def invoke(argv=None):
         )
         return 0
     if args.command == "storage" and not getattr(args, "project", None):
+        load_dotenv([Path.cwd() / ".env"])
         from .project_tools import storage
 
         return storage(args)
     project = Path(args.project).expanduser().resolve()
+    # Explicit process values win; the selected project's defaults precede
+    # unrelated launcher defaults. Private workspaces receive the environment
+    # through ExecutionContext, without copying credential files into Git.
+    load_dotenv([project / ".env", Path.cwd() / ".env"])
     if args.command == "release-worker" and args.wait:
         import time
         from ..run_lock import ProjectRunLock, RunAlreadyActiveError
@@ -416,7 +421,7 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
         config,
         provider=alias,
         auto_approve=getattr(args, "auto_approve", False),
-        print_fn=(lambda *x: None) if args.json else print,
+        print_fn=(lambda *x: None) if args.json else (lambda *x: print(*x, flush=True)),
         max_tasks=getattr(args, "max_tasks", None),
         fresh=bool(
             getattr(args, "fresh", False) or getattr(args, "full_verify", False)
@@ -801,6 +806,7 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                         observer.waiting_for_goal = False
             if not goal.strip():
                 raise ControlError("goal", "A non-empty goal is required")
+            print("目标已接收，正在准备工作区并理解目标……", file=sys.stderr, flush=True)
             checks = (
                 (VerificationSpec(args.verify_command),) if args.verify_command else ()
             )
