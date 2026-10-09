@@ -37,6 +37,7 @@ class Engine:
         offline=False,
         max_tasks=None,
         fresh=False,
+        debug=False,
     ):
         self.project = Path(project).resolve()
         self.store = store
@@ -49,6 +50,7 @@ class Engine:
         self.auto_approve = auto_approve
         self.workspaces = Workspaces(self.project, store)
         self.print = print_fn
+        self.debug = debug
         self.offline = offline
         self.visited = []
         self.task_limit = max_tasks
@@ -112,6 +114,7 @@ class Engine:
         work = self.store.work(work["id"])
         if work["status"] in {"COMPLETED", "CANCELLED"}:
             return work
+        self.print("会话：" + work["id"])
         if self.explicit_provider:
             for node in self.store.works():
                 if node["workflow"] != work["workflow"] or node["status"] in {
@@ -1059,9 +1062,9 @@ class Engine:
                     }
                 )
                 self.store.event(work["id"], "step_entered", self.visited[-1])
-                self.print(
-                    "[" + work["mode"] + "] " + work["phase"] + " (" + work["id"] + ")"
-                )
+                from .display import progress
+
+                self.print(progress(work, context.contract, debug=self.debug))
                 self.step(work, context)
             except ControlError as error:
                 latest = self.store.work(identity)

@@ -63,8 +63,10 @@ def run(argv, *, cwd, env, log, timeout=None, observation=None, repeat_limit=3, 
     started = time.monotonic()
     record = {}
     position = 0
+    failure_summary_streamed = False
+    relay_tail = ''
     def relay():
-        nonlocal position
+        nonlocal position, failure_summary_streamed, relay_tail
         if stream:
             with Path(log).open(errors='replace') as reader:
                 reader.seek(position)
@@ -72,6 +74,9 @@ def run(argv, *, cwd, env, log, timeout=None, observation=None, repeat_limit=3, 
                 position = reader.tell()
             if content:
                 sys.stderr.write(content); sys.stderr.flush()
+                observed = relay_tail + content
+                failure_summary_streamed |= any(line.startswith('执行已停止：') for line in observed.splitlines())
+                relay_tail = observed.rsplit('\n', 1)[-1][-80:]
     with ExitStack() as stack:
         output=stack.enter_context(Path(log).open('w'))
         input_file=None
@@ -100,6 +105,7 @@ def run(argv, *, cwd, env, log, timeout=None, observation=None, repeat_limit=3, 
             if reason: terminate(child)
             relay()
             return {'ok': child.returncode == 0 and not reason, 'returncode':child.returncode,
-                    'reason':reason,'process':record,'streamed_output':bool(stream and position)}
+                    'reason':reason,'process':record,'streamed_output':bool(stream and position),
+                    'failure_summary_streamed':failure_summary_streamed}
         finally:
             terminate(child)

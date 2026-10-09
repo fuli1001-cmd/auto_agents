@@ -44,6 +44,12 @@ auto-agents collab --project /path/to/project --session retained-id --auto-appro
 auto-agents business-status --project /path/to/project --json
 ```
 
+Console progress describes the current task and shows the root session ID once
+at startup. Pauses and failures include a complete resume command. Add
+`--log-mode debug` to include internal phase names and child task IDs; structured
+status and diagnostics retain all IDs. Full failure evidence stays in the
+diagnostic file instead of being repeated by the supervisor.
+
 `run` writes requirements, a frontend prototype when needed, architecture, a
 plan, provider evidence, independently verified task changes, and README.
 `fix` classifies one bounded issue, implements it, verifies real behavior, and

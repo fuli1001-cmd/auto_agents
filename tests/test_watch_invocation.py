@@ -302,8 +302,10 @@ print(json.dumps(result))
         '--provider','fixture','--auto-approve','--session',work['id']],cwd=ENGINE,env=environment,
         capture_output=True,text=True,timeout=30)
     assert result.returncode==0,result.stdout+result.stderr
-    assert '[collab] acceptance ('+work['id']+')' in result.stderr
+    assert '正在执行验收' in result.stderr
+    assert '会话：'+work['id'] in result.stderr
     assert '[run] clarify' not in result.stderr and '[run] prototype' not in result.stderr
+    assert '正在明确需求' not in result.stderr and '正在制作界面原型' not in result.stderr
     final=store.get(first['id'])
     assert len(store.list())==1 and final['state']=='DONE' and not final.get('fault')
     assert final['retained_faults'][-1]['fault']==fault

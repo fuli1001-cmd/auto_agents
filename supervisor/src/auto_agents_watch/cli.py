@@ -10,7 +10,7 @@ from .runner import Runner
 from . import FEATURES
 
 
-def readable_result(value, store, *, show_pending=True):
+def readable_result(value, store, *, show_pending=True, streamed=False):
     if 'jobs' in value:
         if not value['jobs']:
             print('没有监督任务。')
@@ -22,7 +22,8 @@ def readable_result(value, store, *, show_pending=True):
     paused=value.get('state')=='STOPPED' and value.get('waiting_for') and not value.get('cancel_requested')
     print('监督任务已暂停。' if paused else '监督任务' + labels.get(value.get('state'), value.get('state', '已结束')) + '。')
     reason = value.get('reason', '')
-    if reason:
+    fault = value.get('fault') or value.get('subsequent_fault') or {}
+    if reason and not (streamed and value.get('business_failure_streamed') and reason == fault.get('message')):
         explanations = {
             'Engine source has uncommitted changes; candidate admission preserves user work':
                 '引擎仓库有未提交改动，自动修复暂时无法启动；现有改动和会话已保留。',
@@ -34,7 +35,6 @@ def readable_result(value, store, *, show_pending=True):
         }
         summary = ' '.join(str(explanations.get(reason, reason)).split())
         print('原因：' + (summary if len(summary) <= 400 else summary[:397] + '…'))
-    fault = value.get('fault') or value.get('subsequent_fault') or {}
     if not paused and fault.get('message') and fault['message'] != reason:
         evidence = fault.get('evidence') or {}
         seed = evidence.get('issue_seed') or evidence.get('spec_seed') or {}
@@ -116,7 +116,8 @@ def main(argv=None):
         if args.json:
             print(json.dumps(value,ensure_ascii=False,indent=2))
         else:
-            readable_result(value, store,show_pending=args.action=='status' or not value.get('business_output_streamed'))
+            streamed=args.action in {'run','resume'} and bool(value.get('business_output_streamed'))
+            readable_result(value, store,show_pending=not streamed,streamed=streamed)
         paused=value.get('state')=='STOPPED' and value.get('waiting_for') and not value.get('cancel_requested')
         if value.get('interrupted') and args.action in {'run','resume'}:return 130
         return 0 if paused or value.get('state') in {'DONE','RUNNING','RESTARTING'} or args.action in {'status','cancel','reconcile'} else 3

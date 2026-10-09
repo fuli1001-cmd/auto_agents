@@ -433,6 +433,7 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
         provider=alias,
         auto_approve=getattr(args, "auto_approve", False),
         print_fn=(lambda *x: None) if args.json else (lambda *x: print(*x, flush=True)),
+        debug=getattr(args, "log_mode", None) == "debug",
         max_tasks=getattr(args, "max_tasks", None),
         fresh=bool(
             getattr(args, "fresh", False) or getattr(args, "full_verify", False)
@@ -864,18 +865,27 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
         if args.json:
             emit({"ok": result["status"] == "COMPLETED", "work": result})
         else:
-            print("任务状态：" + result["status"] + "；ID：" + result["id"])
+            from .display import resume_command
+
+            labels = {
+                "COMPLETED": "任务已完成。", "READY": "任务已就绪。",
+                "WAITING": "任务已暂停", "BLOCKED": "任务已停止",
+                "CANCELLED": "任务已取消。",
+            }
+            message = labels.get(result["status"], "任务状态：" + result["status"])
+            if result["status"] in {"WAITING", "BLOCKED"}:
+                message += "；会话：" + result["id"]
+            print(message, flush=True)
             from .interaction import pending_decisions
 
             for decision in pending_decisions(store, result):
                 print("待处理：" + decision["question"])
                 print("处理命令：" + decision["command"])
-            if result["status"] == "WAITING":
-                print(
-                    "保留当前会话；处理上述事项后，用原命令加 --session "
-                    + result["id"]
-                    + " 继续。"
-                )
+            if result["status"] in {"WAITING", "BLOCKED"}:
+                print("恢复命令：" + resume_command(
+                    project, result, provider=alias,
+                    auto_approve=getattr(args, "auto_approve", False),
+                ), flush=True)
         if result["status"] == "COMPLETED" and result["result"].get("release_work_id"):
             from .release import ensure_worker
 
@@ -904,8 +914,9 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                         }
                     )
                 )
-            print("执行已停止：" + str(error), file=sys.stderr)
-            print("详细诊断：" + fault["diagnostics_path"], file=sys.stderr)
+            from ..bootstrap import print_failure
+
+            print_failure(str(error), diagnostics=fault["diagnostics_path"])
         return 0 if result["status"] in {"COMPLETED", "WAITING", "READY"} else 3
     raise ControlError("command", "Unsupported command")
 

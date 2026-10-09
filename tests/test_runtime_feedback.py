@@ -70,12 +70,12 @@ print(json.dumps({{'action':'need_user','question':'A legitimate fixture questio
         os.write(master,b'Inspect configured app\n\x04')
         receipt=read_until(child.stderr,'目标已接收'.encode())
         phase=receipt
-        if b'[collab] diagnose' not in phase:phase+=read_until(child.stderr,b'[collab] diagnose')
+        if '正在分析目标'.encode() not in phase:phase+=read_until(child.stderr,'正在分析目标'.encode())
         assert child.poll() is None and not release.exists()
         release.touch()
         output,error=child.communicate(timeout=25)
         assert child.returncode==0,output+error
-        assert b'[collab] diagnose' in phase
+        assert '正在分析目标'.encode() in phase
         assert (output+phase+error).count('待处理：'.encode())==1
         assert b'fixture-private-value' not in output+phase+error
         store=Store(root)
@@ -83,3 +83,43 @@ print(json.dumps({{'action':'need_user','question':'A legitimate fixture questio
         with store.connect() as db:
             assert all('fixture-private-value' not in str(tuple(row)) for row in db.execute('SELECT inputs,result FROM operations'))
     finally:finish(child,master)
+
+
+@pytest.mark.parametrize('log_mode,machine', [('auto',False),('plain',False),('debug',False),('auto',True)])
+def test_nested_progress_names_the_task_and_keeps_ids_in_debug_or_json(
+    tmp_path, monkeypatch, capsys, log_mode, machine
+):
+    from auto_agents.control import cli
+    root=project(tmp_path)
+    save_project_config(root,ProjectConfig('fixture'))
+    monkeypatch.setenv('DISPLAY_TEST_API_KEY','private-display-value')
+    actual=Engine
+    monkeypatch.setattr(cli,'Engine',lambda *a,**kw:actual(*a,**kw,transport=Worker()))
+    arguments=['collab','--project',str(root),'--goal',
+        'Set value to one DISPLAY_TEST_API_KEY=private-display-value',
+        '--auto-approve','--log-mode',log_mode]
+    if machine:arguments.append('--json')
+    assert main(arguments)==0
+    captured=capsys.readouterr()
+    store=Store(root)
+    parent=next(w for w in store.works() if not w['parent'])
+    child=next(w for w in store.works() if w['parent']==parent['id'])
+    if machine:
+        payload=json.loads(captured.out)
+        assert payload['work']['id']==parent['id']
+        assert child['id'] in captured.out
+        assert '正在修复' not in captured.out
+    else:
+        text=captured.out+captured.err
+        assert '正在修复：Set value to one' in text
+        assert '正在审查修复结果' in text and '任务已完成。' in text
+        assert text.count('会话：'+parent['id'])==1
+        assert 'private-display-value' not in text
+        if log_mode=='debug':
+            assert '[fix] implement ('+child['id']+')' in text
+        else:
+            assert child['id'] not in text and '[fix]' not in text
+    with store.connect() as db:
+        events=[json.loads(row[0]) for row in db.execute(
+            "SELECT data FROM events WHERE work=? AND event='step_entered'", (child['id'],))]
+    assert any(event['work_id']==child['id'] and event['phase']=='implement' for event in events)
