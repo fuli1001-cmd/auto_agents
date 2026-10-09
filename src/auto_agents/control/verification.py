@@ -109,6 +109,9 @@ def executor(context, config, specs, *, fresh=False):
             execution_environment=environment,
             **common,
         )
+    # Native artifact caches belong to controller storage. Only the declared
+    # published output belongs in the candidate checkout.
+    getattr(selected, "local", selected).artifact_archive_root = root / "artifacts"
     if context.operation_id:
         diagnostics = (
             context.control_root

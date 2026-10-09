@@ -452,6 +452,58 @@ class Workspaces:
             "executable": bool(path.stat().st_mode & 0o111),
         }
 
+    def installed_repair_paths(self, work, candidate):
+        """Accept exact operator-installed bytes only after owned verification/review."""
+        from .effects import parse_reply
+        from .quality import requires_test_assessment
+        from types import SimpleNamespace
+
+        accepted = set()
+        for identity in work["context"].get("installed_repairs", []):
+            child = self.store.work(identity)
+            contract = self.store.contract(child["contract"])
+            proof = child["result"]
+            declaration = contract.inputs.get("operator_installed_patch", {}).get("files", {})
+            verified = proof.get("verification")
+            reviewed = proof.get("review")
+            revision = proof.get("candidate", {}).get("revision")
+            operations = self.store.operations(identity)
+            receipts = [o for o in operations if o["state"] == "CONFIRMED" and o["consumed"]]
+            verification_receipt = any(
+                o["kind"] == "verify" and o["result"] == verified for o in receipts
+            )
+            review_receipt = any(
+                o["kind"] == "model:review"
+                and parse_reply(o["result"]["text"]) == reviewed for o in receipts
+            )
+            if (
+                child["parent"] != work["id"] or child["status"] != "COMPLETED"
+                or contract.mode != "fix" or not declaration or not revision
+                or not verified or verified.get("ok") is not True
+                or not reviewed or reviewed.get("decision") != "pass"
+                or not verification_receipt or not review_receipt
+                or requires_test_assessment(SimpleNamespace(contract=contract), proof.get("candidate"))
+                and reviewed.get("test_changes_valid") is not True
+            ):
+                raise ControlError("delivery_conflict", "Installed repair lacks its owned verification and review")
+            for name, expected in declaration.items():
+                if name not in candidate["paths"]:
+                    continue
+                if not any(name == scope or name.startswith(scope.rstrip("/") + "/") for scope in contract.scope):
+                    raise ControlError("delivery_conflict", "Installed repair exceeds its frozen scope")
+                blob = subprocess.run(
+                    ["git", "--git-dir", str(self.archive), "show", revision + ":" + name],
+                    capture_output=True,
+                )
+                mode = self.bare("ls-tree", revision, "--", name).split()
+                recorded = {"sha256": hashlib.sha256(blob.stdout).hexdigest(),
+                            "executable": bool(mode and mode[0] == "100755")}
+                changed = self.bare("diff", "--name-only", revision, candidate["revision"], "--", name)
+                if blob.returncode or recorded != expected or changed or self.file_identity(self.project / name) != expected:
+                    raise ControlError("delivery_conflict", "Installed repair changed after review: " + name)
+                accepted.add(name)
+        return accepted
+
     def deliver(self, work, candidate, *, operation=None):
         identity = operation or work["id"]
         journal = self.store.meta("delivery:" + identity)
@@ -483,13 +535,19 @@ class Workspaces:
         staged = set(
             git(self.project, "diff", "--cached", "--name-only", "-z").split("\0")
         )
-        if (dirty | staged | set(base.get("dirty", ()))) & set(paths):
+        installed = self.installed_repair_paths(work, candidate)
+        if staged & set(paths) or ((dirty | set(base.get("dirty", ()))) & set(paths)) - installed:
             raise ControlError(
                 "delivery_conflict",
                 "Candidate overlaps pre-existing product or index changes",
             )
         patch = self.bare("diff", "--binary", source, revision)
-        git(self.project, "apply", "--check", "-", input=patch + "\n")
+        remaining = [name for name in paths if name not in installed]
+        pending_patch = patch if not installed else (
+            self.bare("diff", "--binary", source, revision, "--", *remaining) if remaining else ""
+        )
+        if pending_patch:
+            git(self.project, "apply", "--check", "-", input=pending_patch + "\n")
         before = {name: self.file_identity(self.project / name) for name in paths}
         # Build a commit with a PRIVATE index. Unrelated staged user changes
         # cannot accidentally enter the task's commit.

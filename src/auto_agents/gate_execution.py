@@ -1126,6 +1126,7 @@ class LocalGatePlanExecutor:
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
+        self.artifact_archive_root: Optional[Path] = None
         self.metadata = dict(metadata)
         self.plan_id = f"{run_id or 'gate'}-{uuid.uuid4().hex[:12]}"
         configured_root = gate_config.isolation.worktree_root.strip()
@@ -1470,14 +1471,13 @@ class LocalGatePlanExecutor:
                 f"gate artifacts exceed byte limit {max_bytes}: {total_bytes}"
             )
 
-        archive_root = (
+        archive_root = (self.artifact_archive_root or (
             self.project_root
             / ".auto-agents"
             / "runs"
             / self.plan_id
             / "gate-artifacts"
-            / job_id
-        )
+        )) / job_id
         artifacts: dict[str, str] = {}
         for relative, source in sorted(matches.items()):
             digest = _sha256(source)
