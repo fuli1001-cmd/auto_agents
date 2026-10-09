@@ -1,0 +1,285 @@
+{
+  "version": 1,
+  "contracts": [
+    {
+      "id": "CONTROL-MODES",
+      "trigger": "分别从公共 CLI 启动 run、fix、collab、provider-resolve",
+      "expected": "同一公共入口执行四种业务模式",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_cli.py::test_all_public_modes_share_the_controller"
+      ]
+    },
+    {
+      "id": "CONTROL-GOAL",
+      "trigger": "项目已有 spec.md，但新 collab 未提供本次目标",
+      "expected": "新建目标不采纳历史项目规格",
+      "status": "retained",
+      "tests": [
+        "tests/test_collab_goal_input.py::test_noninteractive_collab_requires_goal_even_when_project_spec_exists"
+      ]
+    },
+    {
+      "id": "CONTROL-TERMINAL",
+      "trigger": "执行对应公共入口或恢复步骤：终端多行输入与 EOF 保留全文",
+      "expected": "终端多行输入与 EOF 保留全文",
+      "status": "retained",
+      "tests": [
+        "tests/test_terminal_submission.py::test_enter_keeps_reading_and_ctrl_d_submits_exact_goal"
+      ]
+    },
+    {
+      "id": "CONTROL-ACCEPTANCE-SCOPE",
+      "trigger": "目标明确只验收已有功能，模型仍建议 action=run",
+      "expected": "已有功能验收不能进入开发流程",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_acceptance_scope.py::test_acceptance_only_cannot_become_a_development_run"
+      ]
+    },
+    {
+      "id": "CONTROL-RUNTIME",
+      "trigger": "执行对应公共入口或恢复步骤：真实工具产物允许、源码仍受保护",
+      "expected": "真实工具产物允许、源码仍受保护",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_acceptance_scope.py::test_tool_runtime_does_not_enter_acceptance_delivery"
+      ]
+    },
+    {
+      "id": "CONTROL-FAILURE-PROJECT",
+      "trigger": "验收已创建对象并返回 accepted=false，用户恢复同一会话",
+      "expected": "验收失败保留同一项目并先诊断",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_acceptance_scope.py::test_failed_acceptance_retains_existing_project_and_diagnoses_before_retry"
+      ]
+    },
+    {
+      "id": "CONTROL-NATIVE-RECOVERY",
+      "trigger": "外部调用已返回，后置校验误拒绝，随后修正规则",
+      "expected": "已知调用结果重新校验而不重发",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_native_result_revalidated_without_redispatch_or_refunding"
+      ]
+    },
+    {
+      "id": "CONTROL-VERIFICATION-RECOVERY",
+      "trigger": "检查已执行且通过，证明解析器误判，随后修正解析器",
+      "expected": "复用已执行的检查结果而不再次执行",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_known_verification_replays_results_not_the_effectful_test"
+      ]
+    },
+    {
+      "id": "CONTROL-VERIFICATION-INPUTS",
+      "trigger": "执行对应公共入口或恢复步骤：临时测试源码也必须保持冻结",
+      "expected": "临时测试源码也必须保持冻结",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_temporary_verification_script_cannot_rewrite_itself"
+      ]
+    },
+    {
+      "id": "CONTROL-UNKNOWN",
+      "trigger": "调用缺少确认终止回执，用户重复恢复或更换 provider",
+      "expected": "未知调用不得重试或切换账户",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_unknown_native_result_never_retries_or_switches_provider"
+      ]
+    },
+    {
+      "id": "CONTROL-AUTHORIZATION",
+      "trigger": "原目标禁止源码修改，模型仍建议 fix",
+      "expected": "模型不能扩大用户的源码修改授权",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_original_no_source_permission_cannot_be_overridden_by_model"
+      ]
+    },
+    {
+      "id": "CONTROL-MIGRATION",
+      "trigger": "旧 schema-2 会话首次使用新特性，或只读查询旧状态",
+      "expected": "旧合同、源码与调用额度升级后不变",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_schema_two_upgrade_preserves_identity_and_readers_do_not_migrate"
+      ]
+    },
+    {
+      "id": "CONTROL-APPROVAL",
+      "trigger": "执行对应公共入口或恢复步骤：原型批准锁定完整包",
+      "expected": "原型批准锁定完整包",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_domains.py::test_variant_approval_copies_complete_package_and_preserves_budget"
+      ]
+    },
+    {
+      "id": "CONTROL-ANSWERS",
+      "trigger": "执行对应公共入口或恢复步骤：回答后保留额度继续原目标",
+      "expected": "回答后保留额度继续原目标",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_operator.py::test_answer_continues_owned_root_without_refunding_calls"
+      ]
+    },
+    {
+      "id": "CONTROL-PERSISTENCE",
+      "trigger": "执行对应公共入口或恢复步骤：持久化升级保留数据库与原目标",
+      "expected": "持久化升级保留数据库与原目标",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_operator.py::test_persistence_upgrade_preserves_goal_status_budget_and_database"
+      ]
+    },
+    {
+      "id": "CONTROL-PARALLEL",
+      "trigger": "执行对应公共入口或恢复步骤：已完成子任务的整合恢复不重调模型",
+      "expected": "已完成子任务的整合恢复不重调模型",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_parallel.py::test_interrupted_integration_reuses_completed_children_without_model_calls"
+      ]
+    },
+    {
+      "id": "CONTROL-PROVIDER",
+      "trigger": "执行对应公共入口或恢复步骤：必需供应商参考不能跳过",
+      "expected": "必需供应商参考不能跳过",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_reference_contracts.py::test_active_provider_requirement_cannot_be_skipped_by_not_required"
+      ]
+    },
+    {
+      "id": "CONTROL-CANCEL",
+      "trigger": "执行对应公共入口或恢复步骤：取消不得丢失未知回执和工作区",
+      "expected": "取消不得丢失未知回执和工作区",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_behaviors.py::test_cancel_preserves_unknown_receipts_and_workspaces"
+      ]
+    },
+    {
+      "id": "CONTROL-CLEANUP",
+      "trigger": "执行对应公共入口或恢复步骤：清理必须保留未知操作的租约",
+      "expected": "清理必须保留未知操作的租约",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_cleanup.py::test_cancel_cannot_delete_cache_used_by_an_unknown_operation"
+      ]
+    },
+    {
+      "id": "CONTROL-WATCH",
+      "trigger": "业务状态已恢复，但监督器仍缓存旧的 STOPPED 故障",
+      "expected": "完整默认入口必须越过监督器的旧缓存故障",
+      "status": "retained",
+      "tests": [
+        "tests/test_watch_invocation.py::test_bootstrap_resumes_recovered_acceptance_past_stale_supervisor_fault"
+      ]
+    },
+    {
+      "id": "CONTROL-RETIREMENT",
+      "trigger": "执行对应公共入口或恢复步骤：旧执行器入口不能恢复旧调度循环",
+      "expected": "旧执行器入口不能恢复旧调度循环",
+      "status": "changed",
+      "tests": [
+        "tests/test_control_behaviors.py::test_retired_facades_cannot_dispatch_old_execution"
+      ],
+      "rationale": "保留命令兼容入口，执行统一由新的单控制器负责；旧私有调度分支退役。"
+    },
+    {
+      "id": "CONTROL-OLD-DEVELOPMENT",
+      "trigger": "仅验收目标的历史开发子任务已有改动",
+      "expected": "必须暂停保留，不能恢复开发执行",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_historical_development_cannot_resume_after_its_source_changed"
+      ]
+    },
+    {
+      "id": "CONTROL-FOCUSED-FIX",
+      "trigger": "模型建议用历史任务、旧原型或宽泛套件修复验收阻断",
+      "expected": "创建子任务之前拒绝，源码和预算边界不扩大",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_acceptance_repairs_need_real_evidence_and_targeted_regressions"
+      ]
+    },
+    {
+      "id": "CONTROL-TERMINAL-CRASH",
+      "trigger": "终止回执已持久化但结算前崩溃",
+      "expected": "依据原始结果恢复，不再次调用模型",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_crash_after_terminal_receipt_recovers_locally_without_another_call"
+      ]
+    },
+    {
+      "id": "CONTROL-LEGACY-RECEIPT",
+      "trigger": "历史失败缺少原始响应",
+      "expected": "保留阻断并说明缺失，不生成成功或自动重发",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_legacy_failed_receipt_without_native_result_stays_blocked"
+      ]
+    },
+    {
+      "id": "CONTROL-NATIVE-IMMUTABLE",
+      "trigger": "重新校验试图更改原始响应字段",
+      "expected": "拒绝更改并保持原始回执字节",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_validation_cannot_replace_the_original_native_payload"
+      ]
+    },
+    {
+      "id": "CONTROL-MODEL-PROTOCOL",
+      "trigger": "验收已创建对象但终止 JSON 不合法",
+      "expected": "不自动重新执行验收创建动作",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_invalid_acceptance_protocol_does_not_repeat_creation"
+      ]
+    },
+    {
+      "id": "CONTROL-DEPENDENCIES",
+      "trigger": "嵌套应用有已安装的共享依赖",
+      "expected": "控制器复用只读绑定，worker 不能移除或修改",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_nested_package_dependency_bindings_are_protected_and_reused"
+      ]
+    },
+    {
+      "id": "CONTROL-SNAPSHOT-OUTCOME",
+      "trigger": "携带已知响应的工作区迁移到离线快照",
+      "expected": "保留合同与原账本，重验不调用模型",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_convergence.py::test_retained_native_result_survives_snapshot_relocation"
+      ]
+    },
+    {
+      "id": "CONTROL-FEATURES",
+      "trigger": "业务核心和监督器特性不兼容",
+      "expected": "业务派发前拒绝，不建立新业务任务",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_feature_protocol.py::test_incompatible_supervisor_refused_before_business_dispatch"
+      ]
+    },
+    {
+      "id": "CONTROL-REAL-RUNTIME",
+      "trigger": "默认入口创建一次、发生阻断、聚焦修复、续验",
+      "expected": "同一项目 ID，创建和外部提交计数均为一次",
+      "status": "retained",
+      "tests": [
+        "tests/test_control_runtime_chain.py::test_real_runtime_failure_fix_and_same_project_resume"
+      ]
+    }
+  ]
+}

@@ -233,12 +233,58 @@ class ExecutionContext:
     provider: str
     environment: dict = field(default_factory=dict)
     operation_id: str = ""
+    verification_workspace: str = "candidate"
+    native_recorder: object = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
 class StageResult:
     action: str
     data: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class NativeOutcome:
+    state: str
+    payload: dict
+    binding: dict
+
+    def __post_init__(self):
+        if self.state not in {"confirmed", "failed", "unknown"} or not isinstance(
+            self.payload, dict
+        ):
+            raise ControlError("receipt", "Invalid native outcome")
+        if not self.binding.get("contract") or not self.binding.get("input_hash"):
+            raise ControlError(
+                "receipt", "Native outcome needs its contract and exact inputs"
+            )
+        object.__setattr__(self, "payload", freeze(self.payload))
+        object.__setattr__(self, "binding", freeze(self.binding))
+
+    def to_dict(self):
+        return {
+            "state": self.state,
+            "payload": thaw(self.payload),
+            "binding": thaw(self.binding),
+        }
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    state: str
+    version: int
+    error: Optional[dict] = None
+
+    def __post_init__(self):
+        if (
+            self.state not in {"pending", "accepted", "rejected", "legacy_unavailable"}
+            or self.version < 1
+        ):
+            raise ControlError("receipt", "Invalid validation result")
+        object.__setattr__(self, "error", freeze(self.error))
+
+    def to_dict(self):
+        return {"state": self.state, "version": self.version, "error": thaw(self.error)}
 
 
 TERMINAL = {Status.COMPLETED.value, Status.CANCELLED.value}

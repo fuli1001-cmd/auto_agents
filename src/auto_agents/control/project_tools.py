@@ -375,7 +375,7 @@ def dispatch(args):
     if args.command == "prototype-preview":
         project_root = Path(args.project).expanduser().resolve()
         if args.port < 0 or args.port > 65535:
-            parser.error("--port must be between 0 and 65535")
+            raise ValueError("--port must be between 0 and 65535")
         return _serve_prototype_gallery(project_root, args.host, args.port)
     raise ValueError("Unsupported project tool")
 

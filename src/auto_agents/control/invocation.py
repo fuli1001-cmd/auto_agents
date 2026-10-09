@@ -1,14 +1,13 @@
 """One read-only rule for selecting existing work or starting a new root."""
 
 from .types import ControlError
+from .policy import FEATURES
 
 NEW_SESSION_COMMANDS = {"fix", "collab", "provider-resolve", "provider-research"}
 
 
 def selected_work(store, args):
-    selectors = [
-        getattr(args, name, None) for name in ("session", "workflow", "run")
-    ]
+    selectors = [getattr(args, name, None) for name in ("session", "workflow", "run")]
     selectors = [value for value in selectors if value]
     if selectors:
         if not store.path.exists():
@@ -20,12 +19,14 @@ def selected_work(store, args):
     if args.command in NEW_SESSION_COMMANDS or not store.path.exists():
         return None
     roots = [
-        work for work in store.works()
+        work
+        for work in store.works()
         if not work["parent"] and work["status"] not in {"COMPLETED", "CANCELLED"}
     ]
     if args.command == "run":
         roots = [
-            work for work in roots
+            work
+            for work in roots
             if work["mode"] == "run"
             and not store.contract(work["contract"]).inputs.get("release_only")
             and not store.contract(work["contract"]).inputs.get("variant_only")
@@ -33,7 +34,12 @@ def selected_work(store, args):
     if len(roots) == 1:
         return roots[0]
     if len(roots) > 1 and args.command in {
-        "run", "resume", "approve", "reject", "answer", "cancel"
+        "run",
+        "resume",
+        "approve",
+        "reject",
+        "answer",
+        "cancel",
     }:
         raise ControlError("selection", "Choose --session or --workflow explicitly")
     return None
@@ -59,13 +65,27 @@ def request(project, argv):
         if mode == "provider_research":
             mode = "provider_resolve"
         if selected["mode"] != mode:
-            raise ControlError("selection", "Requested mode differs from retained work item")
+            raise ControlError(
+                "selection", "Requested mode differs from retained work item"
+            )
     restart = getattr(args, "restart_blocked", False)
     if restart and selected and selected["status"] != "BLOCKED":
         raise ControlError("restart", "Only a blocked run can be restarted")
     return {
-        "ok": True, "schema": 2, "project": str(store.project),
+        "ok": True,
+        "schema": 2,
+        "project": str(store.project),
         "intent": "resume" if selected and not restart else "start",
-        "root_id": store.workflow(selected["workflow"])["root"] if selected and not restart else None,
+        "root_id": store.workflow(selected["workflow"])["root"]
+        if selected and not restart
+        else None,
         "work_id": selected["id"] if selected and not restart else None,
+        "work_revision": selected["revision"] if selected and not restart else None,
+        "contract_id": selected["contract"] if selected and not restart else None,
+        "retry_business": bool(
+            selected
+            and not restart
+            and selected["status"] not in {"COMPLETED", "CANCELLED"}
+        ),
+        "features": list(FEATURES),
     }

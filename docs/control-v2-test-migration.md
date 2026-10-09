@@ -2,8 +2,10 @@
 
 The old driver implementations were removed; their private-method tests cannot
 remain an executable second implementation. This audit maps the retained public
-constraints to behavior tests. It does not claim a one-to-one equivalence of
-old and new test cases. The retirement inventory contains 1280 private-method
+constraints to behavior tests. Public assertions must be migrated even when
+their old private implementation is retired. `schemas/behavior_contracts.json`
+records triggers, expected behavior, executable tests and explicit change reasons;
+`test_behavior_contracts` rejects missing mappings. The historical retirement inventory contains 1280 private-method
 test functions across 73 modules, including tests of deleted recovery branches.
 Original test source remains in Git history. No rejected safety test was removed
 as a workaround to approval review.
@@ -25,7 +27,10 @@ as a workaround to approval review.
 | Public fault summary and complete saved diagnostics | original test_terminal_failure_output, rewritten in place |
 | One-way migration and missing historical proof refusal | test_control_migration and the SDGP rehearsal |
 | Settled cleanup, symlink/inode checks, live cache and unknown lease retention | test_control_cleanup, test_control_boundaries, existing storage/artifact tests |
-| Independent optional watcher and credential-free offline recovery | supervisor/tests, test_control_docker_recovery (explicit local image) |
+| Independent optional watcher and credential-free offline recovery | test_watch_invocation, test_external_maintenance, test_control_docker_recovery (explicit local image) |
+| Existing acceptance cannot adopt development or a historical backlog | test_control_acceptance_scope, test_control_convergence |
+| Confirmed native output survives rejection without redispatch or budget changes | test_control_convergence |
+| Real browser/runtime failure, focused fix and same-project continuation | test_control_runtime_chain (required release gate with local tools) |
 
 Pure legacy DTO, Git, receipt, archive and migration validators remain when needed
 for read-only import. Default CLI execution cannot call the retired

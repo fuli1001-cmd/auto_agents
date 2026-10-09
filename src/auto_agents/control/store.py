@@ -16,6 +16,8 @@ from .types import (
     TRANSITIONS,
     canonical,
     digest,
+    NativeOutcome,
+    ValidationResult,
 )
 
 
@@ -141,6 +143,263 @@ class Store:
                 (key, canonical(value)),
             )
 
+    def has_features(self):
+        with self.connect() as db:
+            tables = {
+                r[0]
+                for r in db.execute(
+                    "SELECT name FROM sqlite_master WHERE name IN ('operation_outcomes','contract_policies')"
+                )
+            }
+            marker = db.execute(
+                "SELECT value FROM control_meta WHERE key='control_features'"
+            ).fetchone()
+        if not tables and marker is None:
+            return False
+        if (
+            tables != {"operation_outcomes", "contract_policies"}
+            or not marker
+            or marker[0] != "1"
+        ):
+            raise ControlError(
+                "feature_schema",
+                "Incomplete or unsupported control features",
+                category="migration",
+            )
+        return True
+
+    def ensure_features(self):
+        """Add recovery metadata without rewriting schema-2 contracts or receipts."""
+        if self.has_features():
+            return
+        if self.readonly:
+            raise ControlError("readonly", "Feature installation requires a writer")
+        from ..run_lock import ProjectRunLock, require_project_run_lock
+        from contextlib import nullcontext
+
+        try:
+            require_project_run_lock(self.project)
+            lock = nullcontext()
+        except RuntimeError:
+            lock = ProjectRunLock(self.project)
+        with lock:
+            if self.has_features():
+                return
+            with self.connect() as db:
+                populated = db.execute("SELECT 1 FROM work_items LIMIT 1").fetchone()
+                if populated:
+                    directory = self.project / ".auto-agents/state/schema-upgrades"
+                    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    backup = directory / (
+                        "control-features-v1-" + uuid.uuid4().hex + ".sqlite3"
+                    )
+                    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    os.close(fd)
+                    with sqlite3.connect(backup) as copy:
+                        db.backup(copy)
+            with self.connect(True) as db:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS contract_policies(contract TEXT PRIMARY KEY REFERENCES contracts(id),payload TEXT NOT NULL,identity TEXT NOT NULL)"
+                )
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS operation_outcomes(operation TEXT PRIMARY KEY REFERENCES operations(id),native_state TEXT NOT NULL,payload TEXT NOT NULL,binding TEXT NOT NULL,identity TEXT NOT NULL,validation TEXT NOT NULL)"
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO control_meta VALUES('control_features','1')"
+                )
+
+    def _policy(self, contract, db):
+        from .policy import WorkflowPolicy
+
+        available = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='contract_policies'"
+        ).fetchone()
+        row = (
+            db.execute(
+                "SELECT payload,identity FROM contract_policies WHERE contract=?",
+                (contract.identity,),
+            ).fetchone()
+            if available
+            else None
+        )
+        if row:
+            payload = json.loads(row["payload"])
+            if digest(payload) != row["identity"]:
+                raise ControlError("integrity", "Workflow policy checksum changed")
+            return WorkflowPolicy(**payload)
+        parent = None
+        if contract.parent_contract:
+            row = db.execute(
+                "SELECT payload FROM contracts WHERE id=?", (contract.parent_contract,)
+            ).fetchone()
+            if not row:
+                raise ControlError("contract", "Missing parent contract")
+            parent = self._policy(Contract.read(json.loads(row[0])), db)
+        return WorkflowPolicy.derive(contract, parent)
+
+    def policy(self, contract, *, persist=False):
+        if persist:
+            self.ensure_features()
+        with self.connect(persist) as db:
+            value = self._policy(contract, db)
+            if persist:
+                db.execute(
+                    "INSERT OR IGNORE INTO contract_policies VALUES(?,?,?)",
+                    (
+                        contract.identity,
+                        canonical(value.to_dict()),
+                        digest(value.to_dict()),
+                    ),
+                )
+            return value
+
+    def outcome(self, identity):
+        if not self.has_features():
+            return None
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM operation_outcomes WHERE operation=?", (identity,)
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        for name in ("payload", "binding", "validation"):
+            value[name] = json.loads(value[name])
+        if (
+            digest(
+                {
+                    "state": value["native_state"],
+                    "payload": value["payload"],
+                    "binding": value["binding"],
+                }
+            )
+            != value["identity"]
+        ):
+            raise ControlError(
+                "integrity",
+                "Native outcome checksum changed",
+                category="reconciliation",
+            )
+        return value
+
+    def record_native(self, identity, payload, binding, *, state="confirmed"):
+        if state not in {"confirmed", "failed", "unknown"}:
+            raise ControlError("receipt", "Invalid native outcome state")
+        self.ensure_features()
+        seal = digest(NativeOutcome(state, payload, binding).to_dict())
+        with self.connect(True) as db:
+            operation = db.execute(
+                "SELECT * FROM operations WHERE id=?", (identity,)
+            ).fetchone()
+            if not operation or operation["consumed"]:
+                raise ControlError("receipt", "Native outcome has no active operation")
+            owner = db.execute(
+                "SELECT contract FROM work_items WHERE id=?", (operation["work"],)
+            ).fetchone()
+            if (
+                binding.get("contract") != owner[0]
+                or binding.get("input_hash") != operation["input_hash"]
+            ):
+                raise ControlError(
+                    "receipt", "Native outcome belongs to different inputs"
+                )
+            old = db.execute(
+                "SELECT identity FROM operation_outcomes WHERE operation=?", (identity,)
+            ).fetchone()
+            if old and old[0] != seal:
+                raise ControlError("receipt", "Native outcomes are immutable")
+            db.execute(
+                "INSERT OR IGNORE INTO operation_outcomes VALUES(?,?,?,?,?,?)",
+                (
+                    identity,
+                    state,
+                    canonical(payload),
+                    canonical(binding),
+                    seal,
+                    canonical({"state": "pending"}),
+                ),
+            )
+            self._event(
+                db,
+                operation["work"],
+                "native_outcome_recorded",
+                {"operation": identity, "native_state": state},
+            )
+
+    def validate_outcome(self, identity, *, error=None, result=None, observation=None):
+        """Publish validation of known inputs without dispatch or budget changes."""
+        from .access import POLICY_VERSION
+
+        with self.connect(True) as db:
+            row = db.execute(
+                "SELECT * FROM operations WHERE id=?", (identity,)
+            ).fetchone()
+            native = db.execute(
+                "SELECT * FROM operation_outcomes WHERE operation=?", (identity,)
+            ).fetchone()
+            if (
+                not row
+                or not native
+                or row["consumed"]
+                or (
+                    native["native_state"] != "confirmed"
+                    and not (native["native_state"] == "failed" and error is not None)
+                )
+            ):
+                raise ControlError(
+                    "receipt", "Validation needs an owned confirmed native outcome"
+                )
+            binding, payload = (
+                json.loads(native["binding"]),
+                json.loads(native["payload"]),
+            )
+            owner = db.execute(
+                "SELECT contract FROM work_items WHERE id=?", (row["work"],)
+            ).fetchone()
+            if (
+                binding["contract"] != owner[0]
+                or binding["input_hash"] != row["input_hash"]
+            ):
+                raise ControlError("receipt", "Validation changed its original inputs")
+            if (
+                result is not None
+                and binding.get("kind") != "verification"
+                and any(result.get(k) != v for k, v in payload.items())
+            ):
+                raise ControlError(
+                    "receipt", "Validation cannot replace the native response"
+                )
+            decision = ValidationResult(
+                "rejected" if error else "accepted", POLICY_VERSION, error
+            ).to_dict()
+            previous = json.loads(native["validation"])
+            if observation is None:
+                observation = previous.get("observation")
+            if observation is not None:
+                decision["observation"] = observation
+            db.execute(
+                "UPDATE operation_outcomes SET validation=? WHERE operation=?",
+                (canonical(decision), identity),
+            )
+            self._event(
+                db,
+                row["work"],
+                "outcome_validation",
+                {
+                    "operation": identity,
+                    "previous_state": row["state"],
+                    "previous_failure": json.loads(row["result"])
+                    if row["state"] in {"FAILED", "UNKNOWN"} and row["result"]
+                    else None,
+                    **decision,
+                },
+            )
+            if result is not None and not error:
+                db.execute(
+                    "UPDATE operations SET state='CONFIRMED',result=? WHERE id=?",
+                    (canonical(result), identity),
+                )
+
     def create_workflow(
         self,
         mode,
@@ -155,6 +414,7 @@ class Store:
         node_limit=15,
         identity=None,
     ):
+        self.ensure_features()
         if (
             type(node_limit) is not int
             or node_limit <= 0
@@ -181,7 +441,9 @@ class Store:
             else (
                 "classify"
                 if mode == "fix"
-                else "research" if mode == "provider_resolve" else "diagnose"
+                else "research"
+                if mode == "provider_resolve"
+                else "diagnose"
             )
         )
         with self.connect(True) as db:
@@ -200,10 +462,21 @@ class Store:
         return self.work(work)
 
     def _insert_work(self, db, contract, parent, phase, limit):
+        from .policy import validate_work
+
+        validate_work(contract.mode, phase, "READY", {})
         db.execute(
             "INSERT OR IGNORE INTO contracts VALUES(?,?)",
             (contract.identity, canonical(contract.to_dict())),
         )
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='contract_policies'"
+        ).fetchone():
+            policy = self._policy(contract, db).to_dict()
+            db.execute(
+                "INSERT OR IGNORE INTO contract_policies VALUES(?,?,?)",
+                (contract.identity, canonical(policy), digest(policy)),
+            )
         db.execute(
             "INSERT INTO work_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
@@ -237,6 +510,7 @@ class Store:
         limit=15,
         operation=None,
     ):
+        self.policy(self.contract(parent["contract"])).route(mode)
         work = uuid.uuid4().hex[:12]
         pc = self.contract(parent["contract"])
         c = Contract(
@@ -259,7 +533,9 @@ class Store:
                 (
                     "clarify"
                     if mode == "run"
-                    else "classify" if mode == "fix" else "research"
+                    else "classify"
+                    if mode == "fix"
+                    else "research"
                 ),
                 limit,
             )
@@ -393,6 +669,40 @@ class Store:
                 self._consume(db, identity)
         return self.work(work["id"])
 
+    def redirect_acceptance(self, parent, child, retained):
+        """Retire a mistaken development route without discarding its evidence."""
+        if child["parent"] != parent["id"] or child["workflow"] != parent["workflow"]:
+            raise ControlError("child_authority", "Child belongs to another parent")
+        state = dict(parent["context"])
+        state.pop("child", None)
+        state.pop("waiting_for", None)
+        state["retained_acceptance_work"] = [
+            *state.get("retained_acceptance_work", []),
+            retained,
+        ]
+        with self.connect(True) as db:
+            if db.execute(
+                "SELECT o.id FROM operations o JOIN work_items w ON w.id=o.work "
+                "WHERE w.workflow=? AND o.state IN ('UNKNOWN','DISPATCHED')",
+                (parent["workflow"],),
+            ).fetchone():
+                raise ControlError(
+                    "outcome_unknown",
+                    "Reconcile external operations before rerouting",
+                    category="reconciliation",
+                )
+            self._transition(
+                db,
+                child,
+                "CANCELLED",
+                context={**child["context"], "superseded_by_acceptance": parent["id"]},
+            )
+            self._transition(
+                db, parent, "READY", phase="acceptance", context=state, failure={}
+            )
+            self._event(db, parent["id"], "acceptance_route_recovered", retained)
+        return self.work(parent["id"])
+
     def _transition(self, db, work, status, **changes):
         current = db.execute(
             "SELECT * FROM work_items WHERE id=?", (work["id"],)
@@ -431,6 +741,41 @@ class Store:
             )
             for k in ("phase", "context", "result", "failure")
         }
+        from .policy import validate_work
+
+        admission = (
+            current["status"] == "READY"
+            and status == "RUNNING"
+            and current["calls"] == 0
+        )
+        validate_work(
+            current["mode"],
+            values["phase"],
+            status,
+            values["context"],
+            previous=None if admission else current["phase"],
+        )
+        if status == "WAITING" and values["context"].get("waiting_for") in {
+            "child",
+            "children",
+        }:
+            children = (
+                values["context"].get("children", [])
+                if values["context"]["waiting_for"] == "children"
+                else [values["context"]["child"]]
+            )
+            for child in children:
+                owned = db.execute(
+                    "SELECT parent,workflow FROM work_items WHERE id=?", (child,)
+                ).fetchone()
+                if (
+                    not owned
+                    or owned["parent"] != work["id"]
+                    or owned["workflow"] != current["workflow"]
+                ):
+                    raise ControlError(
+                        "child_authority", "Waiting child belongs to another parent"
+                    )
         db.execute(
             "UPDATE work_items SET status=?,phase=?,context=?,result=?,failure=?,revision=revision+1,updated=? WHERE id=?",
             (
@@ -453,6 +798,16 @@ class Store:
     def bind_contract(
         self, work, contract, *, next_phase=None, context=None, operation=None
     ):
+        if next_phase:
+            from .policy import validate_work
+
+            validate_work(
+                work["mode"],
+                next_phase,
+                "READY",
+                context or work["context"],
+                previous=work["phase"],
+            )
         if (
             contract.work_id != work["id"]
             or contract.workflow_id != work["workflow"]

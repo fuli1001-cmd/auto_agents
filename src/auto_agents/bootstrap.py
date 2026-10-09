@@ -87,7 +87,8 @@ def main(argv=None):
             project = Path(arg.split("=", 1)[1]).expanduser().resolve()
     managed = bool(
         arguments
-        and arguments[0] in {"run", "fix", "collab", "resume", "provider-resolve", "provider-research"}
+        and arguments[0]
+        in {"run", "fix", "collab", "resume", "provider-resolve", "provider-research"}
     )
     if managed and project and not standalone:
         config_path = project / ".auto-agents/config.json"
@@ -106,6 +107,26 @@ def main(argv=None):
         watcher = shutil.which("auto-agents-watch")
         if watcher and mode != "off":
             from .engine_fault import engine_root
+            from .control.policy import FEATURES
+
+            try:
+                capability = subprocess.run(
+                    [watcher, "capabilities", "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                supported = json.loads(capability.stdout)
+                compatible = capability.returncode == 0 and set(FEATURES).issubset(
+                    supported.get("features", ())
+                )
+            except (OSError, ValueError, subprocess.SubprocessError):
+                compatible = False
+            if not compatible:
+                print_failure(
+                    "Business core and supervisor need compatible control features; upgrade both packages"
+                )
+                return 3
 
             env = {**os.environ, "AUTO_AGENTS_NO_SUPERVISOR": "1"}
             watcher_process = subprocess.Popen(

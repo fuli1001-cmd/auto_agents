@@ -115,3 +115,35 @@ No paid model, media generation or SDGP business operation was executed. The
 existing SDGP session `beb99ded1e85` received only the verified configuration
 location as a non-secret answer with `--no-resume`; its goal, ceiling and one
 consumed call were retained, and it is READY for the user's next invocation.
+
+## Contract and recovery convergence (2026-10-09)
+
+The final complete regression passed **1,496 tests and 57 subtests**, with one
+optional Docker recovery test skipped because no local image was selected.
+A before/after manifest confirmed that all **366 Python/JavaScript/TypeScript/JSON
+source and fixture files** stayed unchanged during that release run. Compilation,
+whitespace checks and undefined-name checks also passed.
+
+The enabled local runtime gate exercised the actual default CLI, watcher, shell
+adapter confinement, Next.js 15.2.4, Chromium headless shell, pytest and SQLite.
+The browser created one project, encountered a capability-reference blocker,
+returned through the retained session, ran a bounded fix and continued the same
+project. Creation and external submission counts were both exactly one, the
+project identity was preserved, and generated browser/build files were not
+delivered as source. The external interface and CLI worker were deterministic
+local fixtures; no model account or paid media service was used.
+
+Recovery regressions additionally covered terminal-receipt crash windows,
+revalidation without model/check redispatch, immutable native payloads, rejected
+or missing legacy results, temporary test-source mutation, imported state,
+malformed acceptance replies, narrowed source authorization and snapshot
+relocation. Missing live runtime inputs remain explicitly unverified in offline
+snapshots. Public behavior mappings are checked from the 31-entry contract
+inventory; these mappings supplement rather than replace the full regression.
+
+The existing SDGP ledger was inspected read-only through a private copy under a
+shared project lock. Session `beb99ded1e85` retained its original contract,
+source and five consumed workflow calls; its ledger bytes did not change. It
+remains blocked on the recorded business acceptance problem. No SDGP application
+configuration, database or provider operation was changed by this work. Schema-2
+feature installation will occur with a backup on its next normal write command.

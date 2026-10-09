@@ -196,3 +196,120 @@ def test_concurrent_resumes_admit_one_job_and_one_maintenance_budget(tmp_path):
     with pytest.raises(RuntimeError,match='Reconcile the previous model call'):
         store.reserve(jobs[1],'implement',max_calls=1)
     assert store.get(jobs[0]['id'])['model_calls']==1
+
+
+@pytest.mark.parametrize('category', ['model', 'verification', 'state', 'provider', 'environment'])
+def test_native_resume_rechecks_cached_business_fault_without_maintenance(tmp_path, category):
+    root=project(tmp_path)
+    business=BusinessStore(root)
+    work=business.create_workflow('collab','Original goal','source')
+    store=Store(tmp_path/'watch')
+    argv=[sys.executable,'-m','auto_agents','collab','--project',str(root),'--session',work['id']]
+    job=store.create(argv,root,ENGINE)
+    fault={'category':category,'message':'obsolete business fault'}
+    store.save(job,'STOPPED',root_id=work['id'],fault=fault,reason=fault['message'],
+               model_calls=2,attempts=1,no_progress=1,needs_maintenance=True)
+
+    class Recheck(Runner):
+        def business(self, retained):
+            assert retained['fault'] is None and retained['needs_maintenance'] is False
+            assert self.env(retained)['AUTO_AGENTS_MAINTENANCE_RESUME']=='1'
+            self.store.save(retained,'STOPPED',reason='current business observed')
+            return False
+        def maintain(self, *_):
+            pytest.fail('A cached business fault triggered engine maintenance')
+
+    result=Recheck(store).start(argv,ENGINE)
+    assert result['id']==job['id'] and len(store.list())==1
+    assert result['reason']=='current business observed'
+    assert result['retained_faults'][-1]['fault']==fault
+    assert (result['model_calls'],result['attempts'],result['no_progress'])==(2,1,1)
+    assert business.work(work['id'])['contract']==work['contract']
+
+
+@pytest.mark.parametrize('blocker', ['cancelled', 'unconfirmed_call'])
+def test_native_business_retry_keeps_cancellation_and_unknown_call_guards(tmp_path, blocker):
+    root=project(tmp_path)
+    work=BusinessStore(root).create_workflow('collab','Original goal','source')
+    store=Store(tmp_path/'watch')
+    argv=[sys.executable,'-m','auto_agents','collab','--project',str(root),'--session',work['id']]
+    job=store.create(argv,root,ENGINE)
+    if blocker=='unconfirmed_call':
+        store.reserve(job,'implement')
+    store.save(job,'STOPPED',root_id=work['id'],fault={'category':'model','message':'retained fault'},
+               cancel_requested=blocker=='cancelled')
+
+    class Refuse(Runner):
+        def business(self, *_):
+            pytest.fail('Business was dispatched before reconciliation or explicit uncancellation')
+        def maintain(self, *_):
+            pytest.fail('Maintenance was dispatched before reconciliation or explicit uncancellation')
+
+    if blocker=='unconfirmed_call':
+        with pytest.raises(RuntimeError,match='Unconfirmed model operation'):
+            Refuse(store).start(argv,ENGINE)
+        assert store.get(job['id'])['model_calls']==1
+    else:
+        assert Refuse(store).start(argv,ENGINE)['cancel_requested']
+    assert len(store.list())==1 and not store.get(job['id']).get('retained_faults')
+
+
+def test_bootstrap_resumes_recovered_acceptance_past_stale_supervisor_fault(tmp_path, monkeypatch):
+    root=native_fixture(tmp_path)
+    # A local provider fixture exercises the actual CLI, watcher and verifier.
+    # No provider account, browser or media request is used by this test project.
+    provider=root/'fixture_provider.py'
+    provider.write_text('''import json,os,sys
+from pathlib import Path
+prompt=sys.stdin.read()
+phase=os.environ['AUTO_AGENTS_STAGE']
+report='.auto-agents/docs/acceptance/result.txt'
+if phase=='diagnose':
+ result={'action':'need_user','question':'Confirm the fixture goal'}
+elif phase=='acceptance':
+ path=Path(report);path.parent.mkdir(parents=True,exist_ok=True);path.write_text('Observed existing value')
+ test=Path('.tmp-tests/test_acceptance.py');test.parent.mkdir(exist_ok=True)
+ test.write_text('import unittest\\nfrom value import VALUE\\nclass Acceptance(unittest.TestCase):\\n def test_value(self): self.assertEqual(VALUE, 0)\\n')
+ result={'accepted':True,'evidence_refs':[report],
+         'checks':[{'command':sys.executable+' -m unittest discover -s .tmp-tests -p test_acceptance.py -v'}]}
+elif phase=='acceptance_review':
+ result={'decision':'pass','reason':'Verified existing value','evidence_refs':[report]}
+else:raise AssertionError(phase)
+print(json.dumps(result))
+''')
+    git(root,'add','fixture_provider.py')
+    git(root,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','local acceptance fixture')
+    monkeypatch.delenv('AUTO_AGENTS_ACCEPTANCE_BUDGET',raising=False)
+    store=Store(tmp_path/'watch')
+    first=Runner(store).start([sys.executable,'-m','auto_agents','collab','--project',str(root),
+        '--provider','fixture','--goal','Observe existing value, no new features','--auto-approve'],ENGINE)
+    business=BusinessStore(root)
+    work=business.work(first['root_id'])
+    assert work['status']=='WAITING' and work['calls']==1
+    recovered=business.transition(work,'READY',phase='acceptance',context={},failure={})
+    fault={'category':'model','message':'Worker changed protected runtime or operator paths'}
+    store.save(first,'STOPPED',fault=fault,reason=fault['message'],waiting_for=None,
+               model_calls=2,attempts=1,no_progress=1)
+    binary=tmp_path/'bin';binary.mkdir()
+    watcher=binary/'auto-agents-watch'
+    watcher.write_text(f'#!{sys.executable}\nimport sys\nsys.path.insert(0,{str(ENGINE / "supervisor/src")!r})\n'
+        'from auto_agents_watch.cli import main\nraise SystemExit(main())\n')
+    watcher.chmod(0o700)
+    environment={**os.environ,'PYTHONPATH':str(ENGINE/'src'),
+        'PATH':str(binary)+os.pathsep+os.environ['PATH'],'AUTO_AGENTS_WATCH_ROOT':str(store.root)}
+    environment.pop('AUTO_AGENTS_NO_SUPERVISOR',None)
+    result=subprocess.run([sys.executable,'-m','auto_agents','collab','--project',str(root),
+        '--provider','fixture','--auto-approve','--session',work['id']],cwd=ENGINE,env=environment,
+        capture_output=True,text=True,timeout=30)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert '[collab] acceptance ('+work['id']+')' in result.stderr
+    assert '[run] clarify' not in result.stderr and '[run] prototype' not in result.stderr
+    final=store.get(first['id'])
+    assert len(store.list())==1 and final['state']=='DONE' and not final.get('fault')
+    assert final['retained_faults'][-1]['fault']==fault
+    assert (final['model_calls'],final['attempts'],final['no_progress'])==(2,1,1)
+    done=business.work(work['id'])
+    assert done['status']=='COMPLETED' and done['calls']==3
+    assert done['contract']==recovered['contract']
+    assert done['result']['verification']['checks'][0]['executed']==1
+    assert (root/'value.py').read_text()=='VALUE = 0\n'

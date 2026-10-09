@@ -7,7 +7,15 @@ import json
 import os
 import uuid
 
-from .types import Contract, ControlError, ExecutionContext, Status, RUN_PHASES, digest
+from .types import (
+    Contract,
+    ControlError,
+    ExecutionContext,
+    Status,
+    RUN_PHASES,
+    digest,
+    VerificationSpec,
+)
 from .effects import Provider, Verifier, parse_reply, compile_checks
 from .prompts import build
 from .workspace import Workspaces, git, product_path
@@ -32,6 +40,7 @@ class Engine:
     ):
         self.project = Path(project).resolve()
         self.store = store
+        self.store.ensure_features()
         self.config = config
         self.provider = provider or config.active_provider
         self.explicit_provider = provider
@@ -62,7 +71,12 @@ class Engine:
         allow_dirty=False,
         max_calls=None,
     ):
-        source = self.workspaces.snapshot(allow_dirty=allow_dirty)
+        from .quality import verification_inputs
+
+        source = self.workspaces.snapshot(
+            allow_dirty=allow_dirty,
+            extra_paths=verification_inputs(self.project, checks),
+        )
         authorization = {
             "auto_approve": self.auto_approve,
             "real": bool((inputs or {}).get("real", True)),
@@ -116,6 +130,34 @@ class Engine:
             self.provider = work["context"]["provider"]
             if isinstance(self.transport, Provider):
                 self.transport.alias = self.provider
+        work = self.recover_acceptance_route(work)
+        if (
+            work["status"] == "BLOCKED"
+            and work["mode"] == "collab"
+            and work["phase"] == "acceptance"
+            and work["failure"].get("code") == "acceptance"
+            and work["context"].get("acceptance_blocker")
+        ):
+            from .quality import artifact_hashes
+
+            blocker = work["context"]["acceptance_blocker"]
+            if not self.store.policy(
+                self.store.contract(work["contract"])
+            ).allow_source_edits:
+                return work
+            workspace = self.context(work).workspace_root
+            if (
+                artifact_hashes(workspace, blocker["evidence_refs"])
+                != blocker["evidence_hashes"]
+            ):
+                raise ControlError(
+                    "acceptance_evidence_changed",
+                    "Retained acceptance evidence changed; reconcile it before retry",
+                    category="reconciliation",
+                )
+            # A failed browser attempt owns its project and receipts. Diagnose
+            # its observed blocker before another attempt can create anything.
+            work = self.advance(work, "diagnose")
         if work["context"].get("waiting_for") == "task_limit":
             state = {k: v for k, v in work["context"].items() if k != "waiting_for"}
             work = self.store.transition(work, "READY", context=state)
@@ -144,15 +186,24 @@ class Engine:
                 queue.append(child)
         for identity in selected - {work["id"]}:
             node = self.store.work(identity)
-            if node["status"] in {"BLOCKED", "RUNNING"} and node["failure"].get(
-                "category"
-            ) not in {"reconciliation", "budget", "migration"}:
+            if (
+                node["status"] in {"BLOCKED", "RUNNING"}
+                and node["failure"].get("category")
+                not in {"reconciliation", "budget", "migration"}
+                or (
+                    node["status"] in {"BLOCKED", "RUNNING"}
+                    and node["failure"].get("category") == "reconciliation"
+                    and self.has_terminal_outcome(node)
+                )
+            ):
                 retries = [
                     o["id"]
                     for o in self.store.operations(identity)
                     if not o["consumed"]
                     and o["state"] == "FAILED"
                     and node["failure"].get("category") in {"provider", "environment"}
+                    and (self.store.outcome(o["id"]) or {}).get("native_state")
+                    != "confirmed"
                 ]
                 node = self.store.transition(
                     node, "READY", failure={}, operations=retries
@@ -165,13 +216,23 @@ class Engine:
                 "budget",
                 "migration",
             }:
-                return work
+                recoverable = work["failure"].get("category") == "reconciliation" and (
+                    self.has_terminal_outcome(work)
+                    or any(
+                        self.has_terminal_outcome(self.store.work(i))
+                        for i in selected - {work["id"]}
+                    )
+                )
+                if not recoverable:
+                    return work
             retries = [
                 o["id"]
                 for o in self.store.operations(work["id"])
                 if not o["consumed"]
                 and o["state"] == "FAILED"
                 and work["failure"].get("category") in {"provider", "environment"}
+                and (self.store.outcome(o["id"]) or {}).get("native_state")
+                != "confirmed"
             ]
             work = self.store.transition(work, "READY", failure={}, operations=retries)
         elif work["status"] == "RUNNING":
@@ -185,6 +246,95 @@ class Engine:
             return self.drive(work["id"])
         finally:
             cleanup.collect(self.store)
+
+    def has_terminal_outcome(self, work):
+        return any(
+            op["state"] in {"DISPATCHED", "UNKNOWN"}
+            and not op["consumed"]
+            and (self.store.outcome(op["id"]) or {}).get("native_state") == "confirmed"
+            for op in self.store.operations(work["id"])
+        )
+
+    def input_references(self, work):
+        result = []
+        while work:
+            answers = work["context"].get("operator_answers", [])
+            if answers and not self.offline:
+                from .interaction import resolved_answers
+
+                resolved_answers(self.project, answers)
+            result.append(
+                {
+                    "work": work["id"],
+                    "answers": answers,
+                    "bindings": work["context"].get("input_bindings", []),
+                }
+            )
+            work = self.store.work(work["parent"]) if work["parent"] else None
+        return result
+
+    def recover_acceptance_route(self, work):
+        """Recover old acceptance-only goals misrouted before implementation."""
+        from ..collab_goal_scope import acceptance_only
+        from .workspace import private_runtime_files
+
+        contract = self.store.contract(work["contract"])
+        if (
+            work["mode"] != "collab"
+            or work["phase"] != "diagnose"
+            or not acceptance_only(contract.goal)
+            or work["context"].get("waiting_for") != "child"
+            or work["failure"].get("category")
+            in {"budget", "reconciliation", "migration"}
+        ):
+            return work
+        child = self.store.work(work["context"]["child"])
+        if child["parent"] != work["id"]:
+            raise ControlError("child_authority", "Child belongs to another parent")
+        if (
+            child["mode"] != "run"
+            or child["phase"] not in RUN_PHASES[:5]
+            or child["status"] not in {"READY", "WAITING", "BLOCKED"}
+            or child["context"].get("child")
+            or child["context"].get("children")
+            or child["failure"].get("category")
+            in {"budget", "reconciliation", "migration"}
+            or any(
+                op["state"] in {"UNKNOWN", "DISPATCHED"}
+                for op in self.store.operations()
+                if self.store.work(op["work"])["workflow"] == work["workflow"]
+            )
+        ):
+            return work
+        if child["failure"] and child["failure"].get("code") != "stage_scope":
+            return work
+        ctx = self.context(child)
+        runtime = private_runtime_files(ctx.workspace_root)
+        if child["failure"].get("code") == "stage_scope" and any(
+            name not in runtime
+            for name in child["failure"].get("details", {}).get("paths", [])
+        ):
+            return work
+        if any(
+            name != "DESIGN.md"
+            and not name.startswith(".auto-agents/docs/")
+            and name not in runtime
+            for name in self.workspaces.changed(ctx.workspace_root, ctx.contract.source)
+        ):
+            return work
+        # Keep the workspace and all operation receipts. In particular, runtime
+        # state may contain paid request identities and must not be reset.
+        return self.store.redirect_acceptance(
+            work,
+            child,
+            {
+                "work_id": child["id"],
+                "workspace": str(ctx.workspace_root),
+                "source": ctx.contract.source,
+                "phase": child["phase"],
+                "reason": "Original goal permits existing-behavior acceptance, not development",
+            },
+        )
 
     def context(self, work):
         contract = self.store.contract(work["contract"])
@@ -210,8 +360,47 @@ class Engine:
             ].get("provider")
             or self.provider
         )
+        from .policy import stage
+
+        self.store.policy(contract, persist=True)
         return ExecutionContext(
-            self.project, path, work["id"], contract, alias, environment
+            self.project,
+            path,
+            work["id"],
+            contract,
+            alias,
+            environment,
+            verification_workspace=stage(work["phase"]).verification_workspace,
+        )
+
+    def record_acceptance_blocker(self, work, context, proposal, *, operation=None):
+        """Preserve failed real acceptance facts for a focused diagnosis on retry."""
+        from .quality import artifact_hashes
+
+        self.validate_evidence(context, proposal["evidence_refs"])
+        reason = proposal.get("reason") or "Original goal acceptance is incomplete"
+        blocker = {
+            **proposal,
+            "accepted": False,
+            "evidence_hashes": artifact_hashes(
+                context.workspace_root, proposal["evidence_refs"]
+            ),
+        }
+        error = ControlError(
+            "acceptance",
+            reason,
+            category="verification",
+            details={
+                "evidence_refs": proposal["evidence_refs"],
+                "external_ids": proposal.get("external_ids", {}),
+            },
+        )
+        return self.store.transition(
+            work,
+            "BLOCKED",
+            failure=error.to_dict(),
+            context={**work["context"], "acceptance_blocker": blocker},
+            operation=operation,
         )
 
     def wait_user(self, work, questions, operation):
@@ -219,8 +408,11 @@ class Engine:
 
         requests, bindings = pending_questions(self.project, work, questions)
         if not requests:
-            raise ControlError("model_output", "Requested inputs are already available; use the recorded operator answers",
-                category="model")
+            raise ControlError(
+                "model_output",
+                "Requested inputs are already available; use the recorded operator answers",
+                category="model",
+            )
         state = {
             **work["context"],
             "input_requests": requests,
@@ -257,6 +449,32 @@ class Engine:
                     category="offline",
                     details={"work_id": work["id"], "phase": kind},
                 )
+        pending = next(
+            (
+                o
+                for o in self.store.operations(work["id"])
+                if o["kind"] == kind and o["ordinal"] == ordinal
+            ),
+            None,
+        )
+        native = self.store.outcome(pending["id"]) if pending else None
+        if (
+            pending
+            and pending["state"] in {"UNKNOWN", "DISPATCHED"}
+            and native
+            and native["native_state"] == "confirmed"
+            and native["binding"].get("kind") == "verification"
+        ):
+            if pending["input_hash"] != digest(inputs):
+                raise ControlError(
+                    "operation_inputs",
+                    "Retained verification inputs changed",
+                    category="reconciliation",
+                )
+            specs = tuple(VerificationSpec.read(s) for s in native["binding"]["checks"])
+            result = self.verifier.revalidate(self.context(work), specs, native)
+            self.store.validate_outcome(pending["id"], result=result)
+            return result, pending["id"]
         operation = self.store.reserve(
             work,
             kind,
@@ -267,6 +485,18 @@ class Engine:
         )
         if not operation.get("new"):
             if operation["state"] == "FAILED":
+                native = self.store.outcome(operation["id"])
+                if (
+                    native
+                    and native["native_state"] == "confirmed"
+                    and native["binding"].get("kind") == "verification"
+                ):
+                    specs = tuple(
+                        VerificationSpec.read(s) for s in native["binding"]["checks"]
+                    )
+                    result = self.verifier.revalidate(self.context(work), specs, native)
+                    self.store.validate_outcome(operation["id"], result=result)
+                    return result, operation["id"]
                 failure = json.loads(operation["result"])
                 raise ControlError(
                     failure["code"],
@@ -278,6 +508,23 @@ class Engine:
         try:
             result = function(operation["id"])
         except ControlError as error:
+            if not self.store.outcome(operation["id"]) and model:
+                self.store.record_native(
+                    operation["id"],
+                    error.to_dict(),
+                    {
+                        "contract": work["contract"],
+                        "input_hash": digest(inputs),
+                    },
+                    state="unknown" if error.category == "reconciliation" else "failed",
+                )
+            native = self.store.outcome(operation["id"])
+            if native and native["native_state"] in {"confirmed", "failed"}:
+                self.store.validate_outcome(
+                    operation["id"],
+                    error=error.to_dict(),
+                    observation=native["validation"].get("observation"),
+                )
             self.store.settle(
                 operation["id"],
                 error.to_dict(),
@@ -300,10 +547,178 @@ class Engine:
             )
             raise
         self.store.settle(operation["id"], result)
+        if self.store.outcome(operation["id"]):
+            self.store.validate_outcome(operation["id"])
         return result, operation["id"]
 
     def verify(self, ctx, specs, identity):
-        return self.verifier.run(replace(ctx, operation_id=identity), specs)
+        if self.offline and ctx.verification_workspace == "owned_runtime":
+            raise ControlError(
+                "runtime_unavailable",
+                "Offline verification cannot restart the live acceptance runtime",
+                category="environment",
+                details={"not_run": True},
+            )
+        operation = next(
+            o for o in self.store.operations(ctx.work_id) if o["id"] == identity
+        )
+
+        def record(payload, sealed, inputs, outputs):
+            self.store.record_native(
+                identity,
+                payload,
+                {
+                    "contract": ctx.contract.identity,
+                    "input_hash": operation["input_hash"],
+                    "checks": [s.to_dict() for s in specs],
+                    "sealed": sealed,
+                    "verification_inputs": inputs,
+                    "outputs": list(outputs),
+                    "kind": "verification",
+                },
+                state="failed"
+                if any(
+                    c["returncode"] != 0
+                    for g in payload["gates"]
+                    for c in g["commands"]
+                )
+                else "confirmed",
+            )
+
+        return self.verifier.run(
+            replace(ctx, operation_id=identity, native_recorder=record), specs
+        )
+
+    def validate_native_model(self, work, context, phase, native):
+        from .quality import workspace_guard, stage_writes, verify_approved, source_seal
+        from .protocol import validate
+
+        binding = native["binding"]
+        if (
+            binding["contract"] != context.contract.identity
+            or binding["phase"] != phase
+        ):
+            raise ControlError(
+                "operation_inputs", "Retained native outcome belongs to different work"
+            )
+        operation = next(
+            o
+            for o in self.store.operations(work["id"])
+            if o["id"] == native["operation"]
+        )
+        if binding["input_hash"] != operation["input_hash"] or binding.get(
+            "operator_refs", []
+        ) != self.input_references(work):
+            raise ControlError(
+                "operation_inputs",
+                "Retained native input bindings changed",
+                category="reconciliation",
+            )
+        after = workspace_guard(context.workspace_root)
+        before = binding["before"]
+        relocated = self.store.meta("workspace_snapshot:" + work["id"], {})
+
+        def unchanged(a, b):
+            def paths(value):
+                return {
+                    p: v
+                    for p, v in value["paths"].items()
+                    if not (p == ".git" and relocated.get("head") == after["head"])
+                }
+
+            return (
+                a["head"] == b["head"]
+                and a["index"] == b["index"]
+                and paths(a) == paths(b)
+            )
+
+        observed = native["validation"].get("observation")
+        required_runtime = set(before.get("private_runtime_paths", ())) | set(
+            (observed or {}).get("private_runtime_paths", ())
+        )
+        if relocated and any(name not in after["paths"] for name in required_runtime):
+            raise ControlError(
+                "runtime_unavailable",
+                "Snapshot omits live private runtime inputs",
+                category="environment",
+                details={"not_run": True},
+            )
+        if observed:
+            names = {
+                p
+                for p in after["paths"]
+                if after["roles"].get(p) in {"source", "evidence"}
+            }
+            if (
+                after["head"] != observed["head"]
+                or after["index"] != observed["index"]
+                or {p: after["paths"][p] for p in names}
+                != {p: value for p, value in observed["paths"].items() if p in names}
+            ):
+                raise ControlError(
+                    "source_changed",
+                    "Retained native result source or evidence changed",
+                    category="reconciliation",
+                )
+        elif native["validation"].get("recovering") and not binding["readonly"]:
+            raise ControlError(
+                "outcome_unknown",
+                "Native result has no completed output observation",
+                category="reconciliation",
+            )
+        try:
+            verify_approved(context.workspace_root, binding["approved"])
+            if binding["readonly"]:
+                if not unchanged(after, before):
+                    raise ControlError(
+                        "readonly",
+                        "Read-only worker changed workspace files",
+                        category="model",
+                    )
+            else:
+                if relocated.get("head") == after["head"]:
+                    before = {
+                        **before,
+                        "paths": {
+                            p: v for p, v in before["paths"].items() if p != ".git"
+                        },
+                    }
+                    after = {
+                        **after,
+                        "paths": {
+                            p: v for p, v in after["paths"].items() if p != ".git"
+                        },
+                    }
+                stage_writes(before, after, phase, binding["scope"])
+            trace = context.workspace_root / ".auto-agents/docs/requirements_trace.json"
+            if trace.exists():
+                from .domain import trace_transition
+
+                trace_transition(context, binding["previous_trace"], trace.read_text())
+            reply = validate(phase, parse_reply(native["payload"].get("text")))
+            from .quality import requires_test_assessment
+
+            if (
+                phase == "review"
+                and requires_test_assessment(context, work["context"].get("candidate"))
+                and "test_changes_valid" not in reply
+            ):
+                raise ControlError(
+                    "model_output",
+                    "Review must explicitly assess changed test inputs",
+                    category="model",
+                )
+            result = {
+                **native["payload"],
+                "workspace_hash": source_seal(context.workspace_root),
+            }
+        except ControlError as error:
+            self.store.validate_outcome(
+                native["operation"], error=error.to_dict(), observation=after
+            )
+            raise
+        self.store.validate_outcome(native["operation"], observation=after)
+        return result
 
     def model(
         self, work, context, phase, *, inputs=None, readonly=True, attachments=()
@@ -318,6 +733,51 @@ class Engine:
         ]
         if retained:
             operation = max(retained, key=lambda op: op["ordinal"])
+            native = self.store.outcome(operation["id"])
+            if (
+                native
+                and native["native_state"] == "confirmed"
+                and (
+                    native["binding"]["input_hash"] != operation["input_hash"]
+                    or native["binding"].get("operator_refs", [])
+                    != self.input_references(work)
+                )
+            ):
+                raise ControlError(
+                    "operation_inputs",
+                    "Retained native input bindings changed",
+                    category="reconciliation",
+                )
+            if operation["state"] == "FAILED" and native is None:
+                failure = operation["result"]
+                raise ControlError(
+                    failure["code"],
+                    failure["message"],
+                    category=failure["category"],
+                    details={
+                        **failure.get("details", {}),
+                        "recovery": "legacy_unavailable",
+                        "operation": operation["id"],
+                    },
+                )
+            if (
+                native
+                and native["native_state"] == "confirmed"
+                and (
+                    operation["state"] != "CONFIRMED"
+                    or native["validation"]["state"] == "rejected"
+                )
+            ):
+                native["validation"]["recovering"] = True
+                result = self.validate_native_model(work, context, phase, native)
+                self.store.validate_outcome(
+                    operation["id"],
+                    result=result,
+                    observation=self.store.outcome(operation["id"])["validation"].get(
+                        "observation"
+                    ),
+                )
+                return validate(phase, parse_reply(result["text"])), operation["id"]
             if operation["state"] in {"UNKNOWN", "DISPATCHED"}:
                 raise ControlError(
                     "outcome_unknown",
@@ -332,7 +792,7 @@ class Engine:
                 result = operation["result"]
                 if result.get("workspace_hash") and result[
                     "workspace_hash"
-                ] != source_seal(context.workspace_root):
+                ] != source_seal(context.workspace_root, legacy=native is None):
                     raise ControlError(
                         "source_changed",
                         "Retained response workspace changed; reconcile its original candidate",
@@ -357,10 +817,18 @@ class Engine:
 
             inputs = {
                 **(inputs or {}),
-                "operator_answers": resolved_answers(self.project, work["context"]["operator_answers"]),
+                "operator_answers": resolved_answers(
+                    self.project, work["context"]["operator_answers"]
+                ),
             }
         prompt = build(
-            context, phase, inputs=inputs, feedback=work["context"].get("feedback")
+            context,
+            phase,
+            inputs={
+                **(inputs or {}),
+                "workflow_policy": self.store.policy(context.contract).to_dict(),
+            },
+            feedback=work["context"].get("feedback"),
         )
 
         def invoke(identity):
@@ -378,6 +846,7 @@ class Engine:
                 owner = self.store.work(owner["parent"]) if owner["parent"] else None
             verify_approved(context.workspace_root, approved)
             before = workspace_guard(context.workspace_root)
+            operator_refs = self.input_references(work)
             trace = context.workspace_root / ".auto-agents/docs/requirements_trace.json"
             previous_trace = trace.read_text() if trace.exists() else ""
             result = self.transport.run(
@@ -388,38 +857,43 @@ class Engine:
                 readonly=readonly,
                 attachments=attachments,
             )
-            after = workspace_guard(context.workspace_root)
-            if readonly and after != before:
-                raise ControlError(
-                    "readonly",
-                    "Read-only worker changed workspace files",
-                    category="model",
-                )
-            if not readonly:
+            scope = (
+                context.contract.scope
+                if phase == "implement" or context.contract.inputs.get("variant_only")
+                else ()
+            )
+            if phase == "acceptance":
                 scope = (
-                    context.contract.scope
-                    if phase == "implement"
-                    or context.contract.inputs.get("variant_only")
-                    else ()
+                    ".auto-agents/docs/acceptance/",
+                    *[
+                        name
+                        for spec in context.contract.checks
+                        for name in spec.outputs
+                    ],
                 )
-                if phase == "acceptance":
-                    scope = (
-                        ".auto-agents/docs/acceptance/",
-                        *[
-                            name
-                            for spec in context.contract.checks
-                            for name in spec.outputs
-                        ],
-                    )
-                if phase == "finalize":
-                    scope = tuple((inputs or {}).get("paths", ()))
-                stage_writes(before, after, phase, scope)
-            if trace.exists():
-                from .domain import trace_transition
-
-                trace_transition(context, previous_trace, trace.read_text())
-            verify_approved(context.workspace_root, approved)
-            return {**result, "workspace_hash": source_seal(context.workspace_root)}
+            if phase == "finalize":
+                scope = tuple((inputs or {}).get("paths", ()))
+            operation = next(
+                o for o in self.store.operations(work["id"]) if o["id"] == identity
+            )
+            self.store.record_native(
+                identity,
+                result,
+                {
+                    "contract": context.contract.identity,
+                    "input_hash": operation["input_hash"],
+                    "phase": phase,
+                    "readonly": readonly,
+                    "scope": list(scope),
+                    "before": before,
+                    "approved": approved,
+                    "previous_trace": previous_trace,
+                    "operator_refs": operator_refs,
+                },
+            )
+            return self.validate_native_model(
+                work, context, phase, self.store.outcome(identity)
+            )
 
         raw, operation = self.effect(
             work,
@@ -436,6 +910,15 @@ class Engine:
         return validate(phase, parse_reply(raw["text"])), operation
 
     def advance(self, work, phase, *, context=None, result=None, operation=None):
+        from .policy import validate_work
+
+        validate_work(
+            work["mode"],
+            phase,
+            "READY",
+            context or work["context"],
+            previous=work["phase"],
+        )
         updated = self.store.transition(
             work,
             "READY",
@@ -582,6 +1065,16 @@ class Engine:
                 self.step(work, context)
             except ControlError as error:
                 latest = self.store.work(identity)
+                for op in reversed(self.store.operations(identity)):
+                    if op["kind"] == "model:" + latest["phase"] and not op["consumed"]:
+                        native = self.store.outcome(op["id"])
+                        if (
+                            native
+                            and native["native_state"] == "confirmed"
+                            and op["state"] == "CONFIRMED"
+                        ):
+                            self.store.validate_outcome(op["id"], error=error.to_dict())
+                        break
                 if (
                     error.code in {"provider_quota", "provider_unavailable"}
                     and context is not None
@@ -603,6 +1096,8 @@ class Engine:
                     continue
                 if (
                     error.category == "verification"
+                    and error.code
+                    in {"tests_failed", "review_failed", "downstream_rejection"}
                     and latest["mode"] == "fix"
                     and latest["phase"] in {"verify", "review"}
                 ):
@@ -637,14 +1132,20 @@ class Engine:
                             latest, "READY", phase="implement", context=state
                         )
                         continue
-                if error.category == "model" and error.code not in {
-                    "readonly",
-                    "stage_scope",
-                    "worker_git",
-                    "approved_contract",
-                    "proof_source_changed",
-                    "source_changed",
-                }:
+                if (
+                    error.category == "model"
+                    and latest["phase"] != "acceptance"
+                    and error.code
+                    not in {
+                        "scope_policy",
+                        "readonly",
+                        "stage_scope",
+                        "worker_git",
+                        "approved_contract",
+                        "proof_source_changed",
+                        "source_changed",
+                    }
+                ):
                     retries = latest["context"].get("protocol_retries", 0)
                     if retries < 2:
                         state = {
@@ -692,6 +1193,28 @@ class Engine:
                 cleanup.collect(self.store, seconds=0.25)
 
     def step(self, work, ctx):
+        from .policy import validate_dispatch
+
+        validate_dispatch(work, ctx.contract, self.store.policy(ctx.contract))
+        if work["phase"] in {
+            "review",
+            "visual_judge",
+            "acceptance_review",
+            "finalize",
+            "artifact_verify",
+            "deliver",
+        }:
+            from .quality import artifact_hashes
+
+            frozen = (
+                work["context"].get("verification", {}).get("verification_inputs", {})
+            )
+            if frozen and artifact_hashes(ctx.workspace_root, frozen) != frozen:
+                raise ControlError(
+                    "proof_source_changed",
+                    "Verified test inputs changed before review or delivery",
+                    category="verification",
+                )
         phase = work["phase"]
         mode = work["mode"]
         state = dict(work["context"])
@@ -903,6 +1426,7 @@ class Engine:
                     operation=operation,
                 )
             if decision == "run_iteration":
+                self.store.policy(contract).route("run_iteration")
                 return self.store.child(
                     work,
                     "run",
@@ -1066,6 +1590,12 @@ class Engine:
             self.store.transition(child, "READY")
             return child
         if phase == "implement":
+            if not self.store.policy(contract).allow_source_edits:
+                raise ControlError(
+                    "scope_policy",
+                    "The original goal forbids source changes",
+                    category="model",
+                )
             proposal, operation = self.model(work, ctx, "implement", readonly=False)
             candidate = self.workspaces.candidate(
                 work, ctx.workspace_root, contract.source, contract.scope
@@ -1399,9 +1929,80 @@ class Engine:
                 work,
                 ctx,
                 "diagnose",
-                inputs={"child_results": state.get("child_results", [])},
+                inputs={
+                    "child_results": state.get("child_results", []),
+                    "acceptance_blocker": state.get("acceptance_blocker"),
+                },
             )
             action = proposal.get("action")
+            from ..collab_goal_scope import acceptance_only
+
+            policy = self.store.policy(contract)
+            bounded_acceptance = policy.kind == "existing_acceptance"
+            if action == "run" and bounded_acceptance:
+                self.store.event(
+                    work["id"],
+                    "diagnostic_route_corrected",
+                    {
+                        "proposed": "run",
+                        "selected": "acceptance",
+                        "reason": "Original goal forbids new requirements, redesign or planning",
+                    },
+                )
+                return self.advance(work, "acceptance", operation=operation)
+            if action in {"fix", "run"}:
+                policy.route(action)
+                if action == "fix" and bounded_acceptance:
+                    issue = proposal.get("issue", {})
+                    if (
+                        not issue.get("reproduction")
+                        or not issue.get("paths")
+                        or issue.get("task_id")
+                        or issue.get("task_ids")
+                        or not (
+                            issue.get("checks") or issue.get("verification_command")
+                        )
+                    ):
+                        raise ControlError(
+                            "model_output",
+                            "A focused acceptance fix needs observed reproduction and targeted checks",
+                            category="model",
+                        )
+                    evidence = issue.get("evidence_refs") or state.get(
+                        "acceptance_blocker", {}
+                    ).get("evidence_refs", [])
+                    if not evidence or any(
+                        not name.startswith(".auto-agents/docs/acceptance/")
+                        for name in evidence
+                    ):
+                        raise ControlError(
+                            "model_output",
+                            "An acceptance fix requires actual acceptance evidence",
+                            category="model",
+                        )
+                    self.validate_evidence(ctx, evidence)
+                    targeted = compile_checks(
+                        issue.get("checks") or [issue["verification_command"]],
+                        self.project,
+                    )
+                    behavior = [
+                        s for s in targeted if s.purpose == "behavior" and s.required
+                    ]
+                    if not behavior or any(
+                        not s.targets
+                        or any(
+                            Path(t.split("::", 1)[0]).suffix
+                            not in {".py", ".js", ".jsx", ".ts", ".tsx", ".cjs", ".mjs"}
+                            or any(c in t for c in "*?[")
+                            for t in s.targets
+                        )
+                        for s in behavior
+                    ):
+                        raise ControlError(
+                            "model_output",
+                            "Focused fixes require exact regression file targets",
+                            category="model",
+                        )
             if action == "need_user":
                 return self.wait_user(work, proposal.get("question"), operation)
             if action == "resume":
@@ -1412,6 +2013,7 @@ class Engine:
                         "Only this parent's blocked child can resume",
                         category="model",
                     )
+                policy.route("resume", child_mode=child["mode"])
                 if child["failure"].get("category") in {
                     "budget",
                     "reconciliation",
@@ -1447,9 +2049,26 @@ class Engine:
                     action,
                     goal,
                     git(ctx.workspace_root, "rev-parse", "HEAD"),
-                    inputs={"parent_goal": contract.goal, "issue": issue},
-                    checks=contract.checks if action == "fix" else (),
-                    scope=contract.scope if action == "fix" else (),
+                    inputs={
+                        "parent_goal": contract.goal,
+                        "issue": issue,
+                        **({"acceptance_only": True} if bounded_acceptance else {}),
+                    },
+                    checks=(
+                        compile_checks(
+                            issue.get("checks") or [issue["verification_command"]],
+                            self.project,
+                        )
+                        if action == "fix" and bounded_acceptance
+                        else contract.checks
+                        if action == "fix"
+                        else ()
+                    ),
+                    scope=tuple(issue["paths"])
+                    if action == "fix" and bounded_acceptance
+                    else contract.scope
+                    if action == "fix"
+                    else (),
                     operation=operation,
                 )
                 if action == "fix" and contract.checks:
@@ -1462,12 +2081,54 @@ class Engine:
                 )
             return self.advance(work, "acceptance", operation=operation)
         if phase == "acceptance":
-            proposal, operation = self.model(work, ctx, "acceptance", readonly=False)
-            if not proposal.get("accepted") or not proposal.get("evidence_refs"):
+            proposal, operation = self.model(
+                work,
+                ctx,
+                "acceptance",
+                readonly=False,
+                inputs={
+                    "retained_acceptance_work": state.get(
+                        "retained_acceptance_work", []
+                    ),
+                    "previous_acceptance": state.get("acceptance_blocker"),
+                },
+            )
+            current_ids = proposal.get("external_ids", {})
+            previous_ids = state.get("acceptance_blocker", {}).get("external_ids", {})
+            if not isinstance(current_ids, dict):
+                raise ControlError(
+                    "acceptance_identity",
+                    "Acceptance needs explicit external identity bindings",
+                    category="reconciliation",
+                )
+            for name, old in previous_ids.items():
+                if name not in current_ids:
+                    current_ids[name] = old
+                new = current_ids[name]
+                if old and (
+                    not isinstance(old, list)
+                    and old != new
+                    or isinstance(old, list)
+                    and (
+                        not isinstance(new, list)
+                        or any(value not in new for value in old)
+                    )
+                ):
+                    raise ControlError(
+                        "acceptance_identity",
+                        "Acceptance replaced a retained project or request identity",
+                        category="reconciliation",
+                    )
+            proposal["external_ids"] = current_ids
+            if not proposal.get("evidence_refs"):
                 raise ControlError(
                     "acceptance",
                     "Original goal acceptance is incomplete",
                     category="verification",
+                )
+            if not proposal.get("accepted"):
+                return self.record_acceptance_blocker(
+                    work, ctx, proposal, operation=operation
                 )
             self.validate_evidence(ctx, proposal["evidence_refs"])
             proposed = compile_checks(proposal.get("checks", []), self.project)

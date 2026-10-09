@@ -50,6 +50,22 @@ plan, provider evidence, independently verified task changes, and README.
 requires independent review. `collab` delegates owned work and returns to the
 original user acceptance. Provider resolution changes only reference artifacts.
 
+For goals explicitly limited to acceptance of existing behavior, `collab` uses
+the current product directly and does not create a development `run` or regenerate
+requirements/prototypes. Acceptance may use untracked files under the owned
+workspace's `.data/`, `.tmp/`, and `.tmp-tests/`; source, credentials, operator
+configuration, and original project data remain protected. Local temp aliases,
+Chromium lock metadata, and ignored, untracked Next.js generated declarations
+are recognized as runtime output. Its checks observe
+that same private runtime under filesystem confinement. Resuming an old mistaken
+development route before implementation returns to acceptance while retaining
+the child workspace, operation receipts, original contract, and call accounting.
+Repeating a native command for an existing session rechecks stopped business
+faults against current business state, preserving the supervisor's fault history
+and spent maintenance budget.
+Failed acceptance retains its reason, evidence hashes and external project/request
+identities. A retry diagnoses that blocker before continuing the same test project.
+
 Frontend prototype approval always requires a human decision. Unknown external
 results require reconciliation before any resend, including a provider change.
 Resume retains the original work, goal, source, verification contract, and call
@@ -114,7 +130,7 @@ Existing low-level verification, storage, provider, and domain tests remain.
 private driver tests and their behavior-level replacements.
 
 ```bash
-python -m pytest -q tests supervisor/tests
+python -m pytest -q tests
 # Optional native integration, using an already available local tool image:
 AUTO_AGENTS_TEST_DOCKER_IMAGE=your-local-tool-image python -m pytest -q tests/test_control_docker_recovery.py
 ```
@@ -122,3 +138,19 @@ AUTO_AGENTS_TEST_DOCKER_IMAGE=your-local-tool-image python -m pytest -q tests/te
 Browser tests need the configured local verification tools. Native acceptance
 used 30 framework provider invocations in total and did not generate paid SDGP
 media. See the acceptance record for the exact scope and limitations.
+
+The convergence release gate runs `tests/test_control_runtime_chain.py` with
+`AUTO_AGENTS_RUNTIME_ACCEPTANCE=1`, `AUTO_AGENTS_TEST_NEXT_MODULES` pointing to
+Next.js 15.2.4 and `AUTO_AGENTS_TEST_CHROME` pointing to a local Chromium executable.
+It exercises the actual CLI, watcher, Next.js, browser and SQLite against a local
+deterministic external interface. Missing tools fail this enabled gate; an
+ordinary skip is not release evidence. One project is created, blocked, repaired
+and resumed without another creation or duplicate external submission.
+
+Public behavior coverage is tracked in `schemas/behavior_contracts.json` and
+checked by `tests/test_behavior_contracts.py`. Core and watcher negotiate control
+features before dispatch. Schema-2 upgrades add policy/outcome metadata under the
+project lock with a backup; frozen contracts and call accounting are unchanged.
+Confirmed native results survive rejected validation and can be revalidated
+locally. Unknown results and legacy failures lacking their native response stay
+blocked for reconciliation.

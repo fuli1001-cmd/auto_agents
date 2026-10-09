@@ -10,46 +10,8 @@ import uuid
 
 from .types import ControlError, digest
 
-EXCLUDED = (
-    ".auto-agents/state/",
-    ".auto-agents/runs/",
-    ".auto-agents/operator/",
-    ".auto-agents/config.json",
-    ".auto-agents/.gitignore",
-    ".conda/",
-    ".venv/",
-    "node_modules/",
-    "workbench/node_modules/",
-    ".data/",
-    ".next/",
-)
-
-
-def product_path(name):
-    path = Path(name)
-    return bool(
-        name
-        and not path.is_absolute()
-        and ".." not in path.parts
-        and not any(name == p.rstrip("/") or name.startswith(p) for p in EXCLUDED)
-        and not any(
-            part
-            in {
-                ".git",
-                ".aws",
-                ".codex",
-                ".claude",
-                "__pycache__",
-                ".pytest_cache",
-                ".mypy_cache",
-                ".ruff_cache",
-                ".vite",
-            }
-            or part == ".env"
-            or part.startswith(".env.")
-            for part in path.parts
-        )
-    )
+from .access import (EXCLUDED, product_path, safe_relative_path, private_runtime_path,
+                     private_runtime_files, file_roles, FileRole)
 
 
 def git(root, *args, input=None):
@@ -169,6 +131,10 @@ class Workspaces:
             if p.is_file()
         )
         files.update(extra_paths)
+        roles = file_roles(self.project, files, evidence=extra_paths)
+        if any(product_path(name) and role == FileRole.PROTECTED for name, role in roles.items()):
+            raise ControlError("source_link", "Product symlinks require an explicit declared input")
+        files = {name for name in files if roles[name] in {FileRole.SOURCE, FileRole.EVIDENCE}}
         with tempfile.TemporaryDirectory(prefix="capture-", dir=self.root) as directory:
             path = Path(directory)
             git(path, "init")
@@ -262,7 +228,10 @@ class Workspaces:
             if not index.is_absolute():
                 index = path / index
             shutil.copy2(self.project / retained["index"], index)
-        for name in (".conda", ".venv", "node_modules", "workbench/node_modules"):
+        dependencies = {".conda", ".venv", "node_modules"}
+        dependencies.update((p.parent / "node_modules").relative_to(path).as_posix()
+                            for p in path.rglob("package.json") if p.is_file())
+        for name in sorted(dependencies):
             dependency = self.project / name
             target = path / name
             if dependency.is_dir() and not target.exists():
@@ -309,6 +278,7 @@ class Workspaces:
         return sorted({x for x in names if product_path(x)})
 
     def candidate(self, work, path, source, scope=()):
+        runtime = private_runtime_files(path)
         forbidden = [
             x
             for x in git(
@@ -316,6 +286,7 @@ class Workspaces:
             ).split("\0")
             if x
             and not product_path(x)
+            and x not in runtime
             and not x.startswith(".auto-agents/state/")
             and x not in {".conda", ".venv", "node_modules", "workbench/node_modules"}
             and not any(
@@ -339,8 +310,10 @@ class Workspaces:
             raise ControlError(
                 "scope", "Worker wrote protected paths", details={"paths": forbidden}
             )
-        paths = self.changed(path, source)
+        paths = [name for name in self.changed(path, source) if name not in runtime]
         from .quality import safe_file
+        for name in paths:
+            safe_file(path, name)
 
         contract = self.store.contract(work["contract"])
         paths = sorted(

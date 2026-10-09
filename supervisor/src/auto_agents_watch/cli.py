@@ -7,6 +7,7 @@ import shlex
 
 from .store import Store
 from .runner import Runner
+from . import FEATURES
 
 
 def readable_result(value, store, *, show_pending=True):
@@ -58,7 +59,7 @@ def main(argv=None):
     separator=argv.index('--') if '--' in argv else len(argv)
     command=argv[separator+1:]
     parser=argparse.ArgumentParser(prog='auto-agents-watch')
-    parser.add_argument('action',choices=['run','status','resume','cancel','retry-publish','reconcile'])
+    parser.add_argument('action',choices=['run','status','resume','cancel','retry-publish','reconcile','capabilities'])
     parser.add_argument('--engine')
     parser.add_argument('--job')
     parser.add_argument('--root')
@@ -67,6 +68,9 @@ def main(argv=None):
     parser.add_argument('--retry-business',action='store_true',
                         help='Recheck the retained business task after fixing its prerequisite')
     args=parser.parse_args(argv[:separator])
+    if args.action=='capabilities':
+        print(json.dumps({'ok':True,'protocol':2,'features':list(FEATURES)}))
+        return 0
     if args.retry_business and args.action!='resume':
         parser.error('--retry-business requires resume')
     try:

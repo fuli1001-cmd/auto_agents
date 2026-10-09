@@ -39,6 +39,16 @@ def validate(phase, value):
     for key in ("issue", "selection"):
         if key in value and not isinstance(value[key], dict):
             invalid(key)
+    if "issue" in value:
+        issue = value["issue"]
+        for key in ("paths", "evidence_refs", "task_ids"):
+            if key in issue and (not isinstance(issue[key], list) or any(not isinstance(x, str) for x in issue[key])):
+                invalid("issue." + key)
+        if "reproduction" in issue and not (isinstance(issue["reproduction"], str) or
+                isinstance(issue["reproduction"], list) and all(isinstance(x, str) for x in issue["reproduction"])):
+            invalid("issue.reproduction")
+        if "checks" in issue and (not isinstance(issue["checks"], list) or any(not isinstance(x, (str, dict)) for x in issue["checks"])):
+            invalid("issue.checks")
     if value.get("persistence_change") is not None and not isinstance(
         value["persistence_change"], dict
     ):

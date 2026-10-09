@@ -15,6 +15,7 @@ import re
 import tempfile
 
 from .store import Store, atomic, digest
+from . import FEATURES
 from .process import run, alive
 from .providers import selection, Driver
 from .sandbox import Docker
@@ -171,6 +172,13 @@ class Runner:
                 successor=self.store.successor(retained,argv)
                 return self.resume(successor['id'])
             self.store.save(retained,argv=list(argv),root_id=request['root_id'] if request else business_root(retained))
+            if request and request.get('retry_business'):
+                # A newly issued native resume is an explicit business retry.
+                # Let the business controller read its current state instead of
+                # replaying this job's cached fault after an operator repair.
+                # resume() still owns cancellation, unknown calls and the lock;
+                # retry_business retains fault history and spent repair credit.
+                return self.resume(retained['id'], retry_business=True)
             if (retained['state'] == 'STOPPED' and not retained.get('candidate')
                     and not retained.get('model_calls') and not retained.get('attempts')
                     and retained.get('reason') == 'Engine source has uncommitted changes; candidate admission preserves user work'):
@@ -207,6 +215,9 @@ class Runner:
                 or value.get('intent') not in {'start','resume'}
                 or value['intent']=='resume' and not value.get('root_id')):
             raise RuntimeError('Business invocation returned an invalid selection contract')
+        required=set(FEATURES)
+        if not required.issubset(value.get('features',())):
+            raise RuntimeError('Business core and supervisor need compatible control features; upgrade both packages')
         return value
 
     def configured(self,job):

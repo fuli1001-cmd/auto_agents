@@ -43,7 +43,11 @@ def status(project):
 
         live = store.project / ".auto-agents/state/owned/workspaces" / w["id"]
         retained = store.meta("workspace_snapshot:" + w["id"], {})
-        input_hash = source_seal(live) if live.is_dir() else retained.get("input_hash")
+        input_hash = (
+            source_seal(live, legacy=True)
+            if live.is_dir()
+            else retained.get("input_hash")
+        )
         records["work_items/" + w["id"]] = {
             **w,
             "goal": contract.goal,
@@ -64,7 +68,59 @@ def status(project):
         "identity": digest(records),
         "records": records,
         "pending_external": pending,
+        "execution": execution_status(store, works),
     }
+
+
+def execution_status(store, works):
+    """Add metadata outside the schema-2 identity and never expose native text."""
+    from .policy import next_action, FEATURES
+
+    result = {}
+    operations = store.operations()
+    for work in works:
+        pending = any(
+            o["state"] in {"DISPATCHED", "UNKNOWN"}
+            for o in operations
+            if store.work(o["work"])["workflow"] == work["workflow"]
+        )
+        outcomes = []
+        for op in operations:
+            if op["work"] != work["id"]:
+                continue
+            native = store.outcome(op["id"])
+            outcomes.append(
+                {
+                    "operation": op["id"],
+                    "consumed": bool(op["consumed"]),
+                    "native_state": native["native_state"]
+                    if native
+                    else "legacy_unavailable",
+                    "validation": native["validation"]["state"]
+                    if native
+                    else "legacy_unavailable",
+                }
+            )
+        action = next_action(work, pending)
+        if (
+            action == "diagnose"
+            and not store.policy(store.contract(work["contract"])).allow_source_edits
+        ):
+            action = "scope_decision"
+        if action == "continue" and any(
+            not o["consumed"]
+            and o["native_state"] == "confirmed"
+            and o["validation"] == "rejected"
+            for o in outcomes
+        ):
+            action = "revalidate"
+        result[work["id"]] = {
+            "policy": store.policy(store.contract(work["contract"])).to_dict(),
+            "next_action": action,
+            "outcomes": outcomes,
+            "features": list(FEATURES),
+        }
+    return result
 
 
 def snapshot(project, destination):
@@ -110,6 +166,7 @@ def snapshot(project, destination):
         (destination / ".auto-agents/config.json").write_text(canonical(data))
     copied = Store(destination)
     from .workspace import Workspaces, git, product_path
+    from .access import file_roles, FileRole
     import tempfile
 
     archive = Workspaces(destination, copied)
@@ -148,8 +205,23 @@ def snapshot(project, destination):
                 for name in spec.outputs
             }
             names |= declared
+            names.update(
+                p.relative_to(live).as_posix()
+                for p in (live / ".auto-agents/docs/acceptance").rglob("*")
+                if p.is_file()
+            )
+            frozen = set()
+            for operation in source.operations(work["id"]):
+                native = source.outcome(operation["id"])
+                if native:
+                    frozen.update(native["binding"].get("verification_inputs", {}))
+            names |= frozen
+            roles = file_roles(live, names, evidence=declared | frozen)
             for name in sorted(names):
-                if not product_path(name):
+                if (
+                    roles[name] in {FileRole.PROTECTED, FileRole.RUNTIME}
+                    and name not in frozen
+                ):
                     continue
                 src = live / name
                 dst = private / name
@@ -163,13 +235,13 @@ def snapshot(project, destination):
                 elif dst.is_file():
                     dst.unlink()
             git(private, "add", "-A")
-            if declared:
+            if declared | frozen:
                 git(
                     private,
                     "add",
                     "-f",
                     "--",
-                    *[name for name in declared if (private / name).is_file()],
+                    *[name for name in declared | frozen if (private / name).is_file()],
                 )
             git(
                 private,
@@ -200,7 +272,7 @@ def snapshot(project, destination):
                 "head": head,
                 "revision": revision,
                 "index": str(saved.relative_to(destination)),
-                "input_hash": source_seal(live),
+                "input_hash": source_seal(live, legacy=True),
             },
         )
     # Workspaces are rematerialized from their immutable revisions by the

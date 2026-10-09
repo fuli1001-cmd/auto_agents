@@ -7,6 +7,7 @@ import os
 import sys
 
 from .types import ControlError, VerificationSpec, canonical
+from .policy import FEATURES
 from .store import Store
 from .engine import Engine
 from .migration import migrate
@@ -118,6 +119,7 @@ def invoke(argv=None):
                 "protocol": 2,
                 "business_schema": 2,
                 "modes": ["run", "fix", "collab", "provider_resolve"],
+                "features": list(FEATURES),
             }
         )
         return 0
@@ -198,13 +200,22 @@ def invoke(argv=None):
 
                 prepared = ready(project)
                 selected = selected_work(prepared, args)
-                root = prepared.workflow(selected["workflow"])["root"] if selected else ""
+                root = (
+                    prepared.workflow(selected["workflow"])["root"] if selected else ""
+                )
                 prepared.set_meta("active_root", root)
             from .observer import Observer
 
             with Observer(project) as observer:
                 try:
-                    return dispatch(project, args, arguments, store=prepared, selected=selected, observer=observer)
+                    return dispatch(
+                        project,
+                        args,
+                        arguments,
+                        store=prepared,
+                        selected=selected,
+                        observer=observer,
+                    )
                 except Exception as error:
                     if not isinstance(error, ControlError):
                         import traceback
@@ -541,7 +552,9 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
             raise ControlError("selection", "Choose a retained work item")
         work = store.work(identity)
         if args.command != "cancel":
-            work = decision_owner(store, work, args.command, request_id=getattr(args,"request_id",None))
+            work = decision_owner(
+                store, work, args.command, request_id=getattr(args, "request_id", None)
+            )
         if args.command == "reject" and (args.variant or args.all_except):
             from .prototypes import reject
 
@@ -629,10 +642,16 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 ],
             }
             requests = work["context"].get("input_requests", [])
-            if args.command == "answer" and work["failure"].get("code") == "operator_input_changed":
+            if (
+                args.command == "answer"
+                and work["failure"].get("code") == "operator_input_changed"
+            ):
                 changed_key = work["failure"].get("details", {}).get("key")
-                requests = [request for request in work["context"].get("question", [])
-                            if request.get("key") == changed_key]
+                requests = [
+                    request
+                    for request in work["context"].get("question", [])
+                    if request.get("key") == changed_key
+                ]
             if args.command == "answer" and requests:
                 from ..operator_inputs import OperatorInputStore, UserInputRequest
 
@@ -655,8 +674,12 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                     + request.key
                     + " is available through its declared binding.",
                     "operator_answers": [
-                        *[answer for answer in work["context"].get("operator_answers", [])
-                          if not isinstance(answer, dict) or answer.get("key") != request.key],
+                        *[
+                            answer
+                            for answer in work["context"].get("operator_answers", [])
+                            if not isinstance(answer, dict)
+                            or answer.get("key") != request.key
+                        ],
                         {
                             "key": request.key,
                             "request_id": request.request_id,
@@ -684,7 +707,11 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
             if waiting:
                 context["waiting_for"] = "user"
             work = store.transition(
-                work, "WAITING" if waiting else "READY", phase=phase, context=context, failure={}
+                work,
+                "WAITING" if waiting else "READY",
+                phase=phase,
+                context=context,
+                failure={},
             )
         if (
             args.command == "answer"
@@ -844,7 +871,11 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 print("待处理：" + decision["question"])
                 print("处理命令：" + decision["command"])
             if result["status"] == "WAITING":
-                print("保留当前会话；处理上述事项后，用原命令加 --session " + result["id"] + " 继续。")
+                print(
+                    "保留当前会话；处理上述事项后，用原命令加 --session "
+                    + result["id"]
+                    + " 继续。"
+                )
         if result["status"] == "COMPLETED" and result["result"].get("release_work_id"):
             from .release import ensure_worker
 
@@ -889,8 +920,12 @@ def decision_owner(store, root, command, *, request_id=None):
         if command == "answer" and request_id:
             requests = state.get("input_requests", [])
             if work["failure"].get("code") == "operator_input_changed":
-                requests = [request for request in state.get("question", [])
-                            if request.get("key") == work["failure"].get("details", {}).get("key")]
+                requests = [
+                    request
+                    for request in state.get("question", [])
+                    if request.get("key")
+                    == work["failure"].get("details", {}).get("key")
+                ]
             if not any(request.get("request_id") == request_id for request in requests):
                 continue
         waiting = state.get("waiting_for")
@@ -898,9 +933,12 @@ def decision_owner(store, root, command, *, request_id=None):
             "user" if command == "answer" else "approval"
         ):
             pending.append(work)
-        elif (command == "answer" and work["status"] == "BLOCKED"
-              and work["failure"].get("code") == "operator_input_changed"
-              and not work["failure"].get("child_id")):
+        elif (
+            command == "answer"
+            and work["status"] == "BLOCKED"
+            and work["failure"].get("code") == "operator_input_changed"
+            and not work["failure"].get("child_id")
+        ):
             pending.append(work)
     if len(pending) != 1:
         raise ControlError(

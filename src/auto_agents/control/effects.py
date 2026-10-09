@@ -12,6 +12,10 @@ from .types import ControlError, VerificationSpec, canonical
 
 
 def parse_reply(text):
+    if not isinstance(text, str):
+        raise ControlError(
+            "model_output", "Provider result text must be a string", category="model"
+        )
     text = text.strip()
     if text.startswith("```"):
         text = "\n".join(text.splitlines()[1:-1])
@@ -182,6 +186,8 @@ def compile_checks(values, project):
             ".tsx",
             ".js",
             ".jsx",
+            ".mjs",
+            ".cjs",
             ".sh",
             ".go",
             ".rs",
@@ -294,7 +300,9 @@ class Provider:
             purpose=(
                 "fix_converse"
                 if phase == "classify"
-                else "collab" if phase == "diagnose" else phase
+                else "collab"
+                if phase == "diagnose"
+                else phase
             ),
             sandbox_mode="read-only" if readonly else "workspace-write",
             record_execution_incidents=False,
@@ -345,7 +353,8 @@ class Verifier:
         self.config = config
         self.fresh = fresh
 
-    def run(self, context, specs):
+    def run(self, context, specs, *, on_native=None):
+        on_native = on_native or context.native_recorder
         from ..gates import run_commands, run_gate_plan
         from .proof import launches, executed_count
 
@@ -365,21 +374,114 @@ class Verifier:
         from contextlib import nullcontext
         from .verification import executor
 
-        with (
-            executor(context, self.config, specs, fresh=self.fresh)
-            if self.config
-            else nullcontext(None)
-        ) as selected:
-            return self._run(context, specs, selected, sealed, outputs)
+        from .quality import verification_inputs
 
-    def _run(self, context, specs, selected, sealed, outputs):
+        frozen_inputs = verification_inputs(context.workspace_root, specs)
+        native_gates = []
+        try:
+            with (
+                executor(context, self.config, specs, fresh=self.fresh)
+                if self.config and context.verification_workspace == "candidate"
+                else nullcontext(None)
+            ) as selected:
+                result = self._run(
+                    context,
+                    specs,
+                    selected,
+                    sealed,
+                    outputs,
+                    frozen_inputs,
+                    native_gates,
+                )
+        except ControlError as error:
+            if on_native and native_gates and error.category != "reconciliation":
+                on_native({"gates": native_gates}, sealed, frozen_inputs, outputs)
+            raise
+        if on_native:
+            on_native({"gates": native_gates}, sealed, frozen_inputs, outputs)
+        return result
+
+    def revalidate(self, context, specs, native):
+        from .types import digest
+
+        binding = native["binding"]
+        if binding["contract"] != context.contract.identity or binding["checks"] != [
+            s.to_dict() for s in specs
+        ]:
+            raise ControlError(
+                "operation_inputs",
+                "Verification contract changed",
+                category="reconciliation",
+            )
+        return self._run(
+            context,
+            specs,
+            None,
+            binding["sealed"],
+            tuple(binding["outputs"]),
+            binding["verification_inputs"],
+            [],
+            replay=native["payload"]["gates"],
+        )
+
+    def _run(
+        self,
+        context,
+        specs,
+        selected,
+        sealed,
+        outputs,
+        frozen_inputs,
+        native_gates,
+        replay=None,
+    ):
         from ..gates import run_commands, run_gate_plan
         from .proof import launches, executed_count
         from .quality import source_seal, artifact_hashes
 
+        from .quality import verification_inputs
+        from types import SimpleNamespace
+
+        def capture(gate):
+            native_gates.append(
+                {
+                    "ok": gate.ok,
+                    "summary": gate.summary,
+                    "commands": [
+                        {
+                            key: getattr(c, key)
+                            for key in (
+                                "command",
+                                "returncode",
+                                "stdout",
+                                "stderr",
+                                "cleanup_incomplete",
+                                "infrastructure_error",
+                                "infrastructure_failure_id",
+                            )
+                        }
+                        for c in gate.commands
+                    ],
+                }
+            )
+
         reports = []
-        for spec in specs:
-            if selected:
+        for index, spec in enumerate(specs):
+            if replay is not None:
+                if index >= len(replay):
+                    raise ControlError(
+                        "verification_incomplete",
+                        "Retained verification did not execute every check",
+                        category="reconciliation",
+                    )
+                value = replay[index]
+                gate = SimpleNamespace(
+                    ok=value["ok"],
+                    summary=value["summary"],
+                    commands=[SimpleNamespace(**c) for c in value["commands"]],
+                )
+                capture(gate)
+            elif selected:
                 gate = run_gate_plan(
                     [spec.command],
                     [],
@@ -388,6 +490,7 @@ class Verifier:
                     gate_executor=selected,
                     command_timeout_seconds=spec.timeout,
                 )
+                capture(gate)
             else:
                 import tempfile
                 import sys
@@ -449,6 +552,7 @@ class Verifier:
                             category="reconciliation",
                             details={"scratch": str(scratch)},
                         )
+                capture(gate)
                 after = workspace_guard(context.workspace_root)
                 if before["head"] != after["head"] or before["index"] != after["index"]:
                     raise ControlError(
@@ -463,6 +567,12 @@ class Verifier:
                     category="reconciliation",
                     details={"command": spec.command},
                 )
+            if verification_inputs(context.workspace_root, specs) != frozen_inputs:
+                raise ControlError(
+                    "proof_source_changed",
+                    "Verification changed its frozen test inputs",
+                    category="verification",
+                )
             if source_seal(context.workspace_root, outputs) != sealed:
                 raise ControlError(
                     "proof_source_changed",
@@ -471,7 +581,7 @@ class Verifier:
                 )
             command = gate.commands[0]
             output = command.stdout + "\n" + command.stderr
-            summary_output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output)
+            summary_output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
             if command.infrastructure_error:
                 raise ControlError(
                     "verification_infrastructure",
@@ -494,7 +604,9 @@ class Verifier:
                         category="verification",
                     )
                 if gate.ok and (
-                    re.search(r"(?<![=\w])\b[1-9]\d* (?:failed|errors?)\b", summary_output)
+                    re.search(
+                        r"(?<![=\w])\b[1-9]\d* (?:failed|errors?)\b", summary_output
+                    )
                     or re.search(r"^FAILED \(", summary_output, re.M)
                 ):
                     raise ControlError(
@@ -531,6 +643,7 @@ class Verifier:
             "checks": reports,
             "behavior_checks": sum(s.purpose == "behavior" for s in specs),
             "source_hash": sealed,
+            "verification_inputs": frozen_inputs,
             "outputs": artifact_hashes(context.workspace_root, outputs),
             "environment_hash": getattr(
                 getattr(selected, "result_cache", None), "environment_fingerprint", ""

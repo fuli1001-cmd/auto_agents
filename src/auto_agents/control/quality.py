@@ -3,17 +3,16 @@
 from pathlib import Path
 import json
 from .types import ControlError
-from .workspace import product_path, git
+from .workspace import product_path, git, private_runtime_files
 from .types import digest
+from .access import file_roles, linked_ancestor, legacy_product_path
 
 
 def safe_file(workspace, name):
     """Artifact paths must have owned ancestors, including ignored files."""
     root = Path(workspace).resolve()
     path = root / name
-    if not product_path(name) or any(
-        part.is_symlink() for part in [path, *path.parents] if part != root.parent
-    ):
+    if not product_path(name) or linked_ancestor(root, path):
         raise ControlError(
             "artifact_path", "Artifact leaves its owned workspace: " + str(name)
         )
@@ -46,11 +45,7 @@ def workspace_guard(workspace):
         ".next",
     }
     for current, dirs, files in os.walk(root, followlinks=False):
-        links = [
-            name
-            for name in dirs
-            if (Path(current) / name).is_symlink() and name not in caches
-        ]
+        links = [name for name in dirs if (Path(current) / name).is_symlink()]
         dirs[:] = [
             name
             for name in dirs
@@ -73,7 +68,23 @@ def workspace_guard(workspace):
             else:
                 continue
             paths[relative] = digest(value)
-    return {**observation, "paths": paths}
+    # Ignored build directories can contain explicitly tracked source inputs.
+    tracked = set(git(root, "ls-files", "-z").split("\0"))
+    paths.update(
+        {
+            name: value
+            for name, value in observation["paths"].items()
+            if name in tracked
+            and name not in paths
+            and any(p in caches for p in Path(name).parts)
+        }
+    )
+    return {
+        **observation,
+        "paths": paths,
+        "private_runtime_paths": sorted(private_runtime_files(root)),
+        "roles": {name: role.value for name, role in file_roles(root, paths).items()},
+    }
 
 
 def validate_plan(tasks):
@@ -174,47 +185,31 @@ def artifact_hashes(workspace, paths):
     return hashes
 
 
-def source_seal(workspace, outputs=()):
+def source_seal(workspace, outputs=(), *, legacy=False):
     observed = workspace_guard(Path(workspace))
     tracked = set(git(workspace, "ls-files", "-z").split("\0"))
     return digest(
         {
             name: value
             for name, value in observed["paths"].items()
-            if product_path(name)
+            if (legacy_product_path(name) if legacy else product_path(name))
             and name not in set(outputs)
+            and not (
+                legacy
+                and any(
+                    p in {".next", ".conda", ".venv", "node_modules"}
+                    for p in Path(name).parts
+                )
+            )
+            and (legacy or observed["roles"].get(name) != "runtime")
             and (name in tracked or Path(name).parts[0] not in {".tmp", ".tmp-tests"})
         }
     )
 
 
-STAGE_PATHS = {
-    "clarify": (
-        ".auto-agents/docs/project_brief.md",
-        ".auto-agents/docs/requirements.md",
-        ".auto-agents/docs/requirements_trace.json",
-        ".auto-agents/project-rules.md",
-    ),
-    "prototype": (
-        ".auto-agents/docs/frontend_prototype/",
-        ".auto-agents/docs/frontend_design/",
-        "DESIGN.md",
-    ),
-    "design": (".auto-agents/docs/architecture.md", "DESIGN.md"),
-    "plan": (".auto-agents/docs/task_plan.json",),
-    "provider_research": (
-        ".auto-agents/docs/provider_references.md",
-        ".auto-agents/docs/provider_references/",
-        ".auto-agents/docs/provider_references.lock.json",
-    ),
-    "research": (
-        ".auto-agents/docs/provider_references.md",
-        ".auto-agents/docs/provider_references/",
-        ".auto-agents/docs/provider_references.lock.json",
-    ),
-    "readme": ("README.md",),
-    "acceptance": (".auto-agents/docs/acceptance/",),
-}
+from .policy import STAGES
+
+STAGE_PATHS = {name: spec.writes for name, spec in STAGES.items() if spec.writes}
 
 
 def stage_writes(before, after, phase, scope=()):
@@ -222,6 +217,18 @@ def stage_writes(before, after, phase, scope=()):
 
     changes = changed_guard_paths(before, after)
     allowed = scope or STAGE_PATHS.get(phase)
+    runtime = set()
+    if phase == "acceptance":
+        # New, changed and deleted private data are allowed. Tracked files and
+        # links outside private runtime remain subject to the ordinary guard.
+        old = set(before.get("private_runtime_paths", ()))
+        new = set(after.get("private_runtime_paths", ()))
+        runtime = {
+            p
+            for p in old | new
+            if (p not in before["paths"] or p in old)
+            and (p not in after["paths"] or p in new)
+        }
     if "<HEAD>" in changes or "<index>" in changes:
         raise ControlError(
             "worker_git",
@@ -229,7 +236,11 @@ def stage_writes(before, after, phase, scope=()):
             category="model",
         )
     protected = [
-        p for p in changes if p not in {"<HEAD>", "<index>"} and not product_path(p)
+        p
+        for p in changes
+        if p not in {"<HEAD>", "<index>"}
+        and p not in runtime
+        and (not product_path(p) or after.get("roles", {}).get(p) == "protected")
     ]
     if protected:
         raise ControlError(
@@ -242,7 +253,8 @@ def stage_writes(before, after, phase, scope=()):
         invalid = [
             p
             for p in changes
-            if product_path(p)
+            if p not in runtime
+            and product_path(p)
             and not any(
                 p == s.rstrip("/") or p.startswith(s.rstrip("/") + "/") for s in allowed
             )
@@ -254,6 +266,37 @@ def stage_writes(before, after, phase, scope=()):
                 category="model",
                 details={"paths": invalid},
             )
+
+
+def verification_inputs(workspace, specs):
+    """Freeze the exact launch inputs, including untracked temporary tests."""
+    root = Path(workspace)
+    names = set()
+    for spec in specs:
+        from .proof import launches
+
+        targets = spec.targets or tuple(
+            t for invocation in launches(spec.command) for t in invocation["targets"]
+        )
+        for selector in targets:
+            pattern = selector.split("::", 1)[0]
+            if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+                raise ControlError(
+                    "verification_spec", "Verification input leaves its workspace"
+                )
+            for path in root.glob(pattern):
+                if path.is_dir():
+                    names.update(
+                        p.relative_to(root).as_posix()
+                        for p in path.rglob("*")
+                        if p.is_file()
+                        and "__pycache__" not in p.parts
+                        and p.suffix
+                        in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+                    )
+                elif path.is_file():
+                    names.add(path.relative_to(root).as_posix())
+    return artifact_hashes(workspace, sorted(names))
 
 
 def verify_approved(workspace, approved):
@@ -368,9 +411,8 @@ def verify_review(proposal, context, candidate):
             proposal.get("reason", "Review rejected"),
             category="verification",
         )
-    paths = candidate.get("paths", []) if candidate else []
     if (
-        any(p.startswith("tests/") for p in paths)
+        requires_test_assessment(context, candidate)
         and proposal.get("test_changes_valid") is not True
     ):
         raise ControlError(
@@ -378,3 +420,18 @@ def verify_review(proposal, context, candidate):
             "Test changes require explicit independent assessment",
             category="verification",
         )
+
+
+def requires_test_assessment(context, candidate):
+    paths = candidate.get("paths", []) if candidate else []
+    targets = {
+        t.split("::", 1)[0] for spec in context.contract.checks for t in spec.targets
+    }
+    return any(
+        "tests" in Path(p).parts
+        or Path(p).name.startswith("test_")
+        or ".test." in Path(p).name
+        or ".spec." in Path(p).name
+        or p in targets
+        for p in paths
+    )
