@@ -54,12 +54,20 @@ auto-agents resume --project /path/to/project --workflow workflow-id
 新建 `collab` 未传 `--goal` 或 `--spec-file` 时，交互终端先询问本次目标；项目已有
 `spec.md` 也不会跳过询问，该文件仍留在工作目录中作为参考。自动化调用必须明确提供
 目标或目标文件。`--session` 继续已冻结的原目标，不重新输入；要更换目标须新建会话。
+终端目标支持多行与空段落：Enter 换行，最后在新行按 Ctrl+D 提交；Windows 控制台
+使用 Ctrl+Z 后按 Enter。Ctrl+C 取消当前执行；空输入不创建任务、不调用模型。
+提示写入 stderr，`--json` 的 stdout 保持机器可读。Ctrl+D 不替换 stdin，后续读取
+仍使用原终端。
 
 批准或拒绝后用原运行命令继续；回答默认自动续跑，`--no-resume` 只保存回答。待决定的子任务可通过根任务 ID 定位。
 
 等待时终端会列出每个待回答问题或审批事项及具体处理命令；并行子任务显示各自的 ID。
 保存回答后用原命令加 `--session` 继续。普通回答按已保存的输入引用提供给模型，秘密值
 通过声明的绑定提供，不写入模型提示；回答被另外修改时会要求核对，而不会悄悄换用新值。
+输入变更导致暂停时，可用原 request ID 再次明确回答；新引用替换同一问题的旧引用，
+不会重置调用数。通过父会话处理子任务问题时，只选择实际拥有问题的子任务。
+并行子任务同时等待时，可通过父会话 ID 配合 `--request-id` 指定一个问题，其他待办
+继续保留；无需另建会话。
 
 ```bash
 auto-agents approve --project /path/to/project --session existing-id --gate prototype

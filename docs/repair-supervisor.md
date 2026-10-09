@@ -80,6 +80,13 @@ Startup and the initial interactive goal prompt also emit heartbeats. A failed
 new admission cannot acquire the previous goal's identity. Duplicate lock refusal
 preserves the existing owner's job, and inherited locks cannot adopt live children
 from an earlier owner.
+Ctrl+C propagates through the launcher to the watcher. The watcher stops owned
+business groups and registered native children while it still holds the project
+descriptor, records STOPPED and returns exit 130 without a traceback. Pending
+model outcomes and their counters remain retained; interruption is not a receipt
+or a refund. `resume` explicitly acknowledges an interrupted watcher job, while
+unknown calls must first be reconciled. Status/cancel commands remain inspectable
+with exit 0.
 
 Only an evidenced engine fault enters repair. Business failure, missing test
 infrastructure, operator decisions, migration conflicts and unknown request

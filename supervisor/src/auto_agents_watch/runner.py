@@ -8,6 +8,8 @@ import os
 import shutil
 import subprocess
 import sys
+import signal
+import threading
 import time
 import re
 import tempfile
@@ -217,6 +219,29 @@ class Runner:
         if self.store.get(job['id']).get('cancel_requested'):
             raise RuntimeError('Cancelled; checkpoint and candidate retained')
 
+    def quiesce(self,job):
+        return subprocess.run([sys.executable,'-m','auto_agents','quiesce','--project',job['project']],
+            env=self.env(job),pass_fds=(self.fd,),capture_output=True,text=True,timeout=15)
+
+    def interrupted(self,job):
+        # The project descriptor is still held here, so only our recorded
+        # native children can be stopped. Unknown model results stay unknown.
+        main_thread=threading.current_thread() is threading.main_thread()
+        handler=signal.signal(signal.SIGINT,signal.SIG_IGN) if main_thread else None
+        try:
+            try:
+                result=self.quiesce(job)
+                quiesced=result.returncode==0
+                cleanup_error=None
+            except (OSError,subprocess.SubprocessError) as error:
+                quiesced=False
+                cleanup_error=str(error)
+            self.store.save(job,'STOPPED',reason='Interrupted; checkpoint and unconfirmed calls retained',
+                interrupted=True,cancel_requested=True,waiting_for=None,
+                process=None,quiesced=quiesced,interruption_cleanup_error=cleanup_error)
+        finally:
+            if main_thread:signal.signal(signal.SIGINT,handler)
+
     def business(self,job):
         self.check_cancelled(job)
         observation=self.directory/'observation.json'
@@ -235,8 +260,7 @@ class Runner:
         self.store.save(job,process=None,observation=value,root_id=value.get('root_subject') or job.get('root_id'))
         if self.store.get(job['id']).get('cancel_requested'):result['reason']='cancelled'
         if result['reason'] or value.get('fault'):
-            cleanup=subprocess.run([sys.executable,'-m','auto_agents','quiesce','--project',job['project']],
-                env=self.env(job),pass_fds=(self.fd,),capture_output=True,text=True,timeout=15)
+            cleanup=self.quiesce(job)
             if cleanup.returncode:
                 self.store.save(job,'STOPPED',reason='Owned business children have not quiesced; evidence retained')
                 return False
@@ -480,18 +504,23 @@ class Runner:
             return job
         try:
             with self.locked(job):
-                if explicit:self.store.acknowledge_resume(job)
-                if retry_business:
-                    self._rechecking_business = True
-                    self.store.save(job, needs_maintenance=False, fault=None,
-                        retained_faults=[*job.get('retained_faults', []),
-                                         {'fault': job.get('fault'), 'reason': job.get('reason'),
-                                          'resume_token': job.get('resume_token')}])
-                if (job.get('needs_maintenance') or job.get('fault') and not job.get('runtime_argv')) and job['state'] in {'STOPPED','REPAIRING','VERIFYING','RESTARTING'}:
-                    self.maintain(job)
-                while self.business(job):
-                    self.maintain(job)
-                if job['state']=='DONE':self.clean_completed(job)
+                try:
+                    if explicit:
+                        self.store.acknowledge_resume(job)
+                        self.store.save(job,interrupted=False)
+                    if retry_business:
+                        self._rechecking_business = True
+                        self.store.save(job, needs_maintenance=False, fault=None,
+                            retained_faults=[*job.get('retained_faults', []),
+                                             {'fault': job.get('fault'), 'reason': job.get('reason'),
+                                              'resume_token': job.get('resume_token')}])
+                    if (job.get('needs_maintenance') or job.get('fault') and not job.get('runtime_argv')) and job['state'] in {'STOPPED','REPAIRING','VERIFYING','RESTARTING'}:
+                        self.maintain(job)
+                    while self.business(job):
+                        self.maintain(job)
+                    if job['state']=='DONE':self.clean_completed(job)
+                except KeyboardInterrupt:
+                    self.interrupted(job)
         except ProjectBusyError:
             raise
         except Exception as error:

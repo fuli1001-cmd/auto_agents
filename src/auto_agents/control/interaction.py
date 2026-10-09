@@ -4,6 +4,32 @@ from ..operator_inputs import UserInputRequest, OperatorInputStore
 from .types import ControlError, digest
 
 
+def read_multiline(prompt, *, stream=None, output=None):
+    """Read one terminal submission through EOF, without replacing stdin."""
+    import os
+    import sys
+
+    stream = sys.stdin if stream is None else stream
+    output = sys.stderr if output is None else output
+    submit = "Ctrl+Z 后按 Enter" if os.name == "nt" else "Ctrl+D"
+    print(prompt + "\n可输入多行；输入完成后，换行并按 " + submit + " 提交；Ctrl+C 取消。",
+          file=output, flush=True)
+    lines = []
+    while True:
+        try:
+            line = stream.readline()
+        except EOFError:
+            break
+        if not line:
+            break
+        lines.append(line)
+        if not line.endswith("\n"):
+            # readline returns a non-terminated final line only after EOF;
+            # do not start another terminal read and demand another Ctrl+D.
+            break
+    return "".join(lines).strip()
+
+
 def owned_work(store, root):
     queue = [root]
     seen = set()
@@ -61,7 +87,7 @@ def resolved_answers(project, answers):
         record = store.get(answer["key"])
         if not record or answer.get("revision") and answer["revision"] != record.get("revision"):
             raise ControlError("operator_input_changed", "Recorded operator answer changed; reconcile it before continuing",
-                category="operator")
+                category="operator", details={"key": answer["key"]})
         projected = dict(answer)
         if record.get("kind") == "secret" or record.get("sensitivity") == "secret":
             projected["available"] = bool(record.get("present"))

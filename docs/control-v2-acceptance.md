@@ -72,3 +72,26 @@ signatures without finding other missing required arguments. Compilation and
 whitespace checks passed. Temporary tool directories and full-suite working
 directories were released; these results do not claim native Docker or live SDGP
 business completion for the new changes.
+
+## Terminal compatibility follow-up (2026-10-09)
+
+The legacy session reader accepted multiple lines until terminal EOF. The new
+entrypoint had used single-line `input()`, which submitted on Enter and treated
+Ctrl+D as an input exception. The thin UI now reads one EOF-delimited submission:
+paragraphs and indentation are preserved, prompts explain the submit keys, and
+machine stdout stays JSON. Real PTY tests cover standalone and watched entrypoints,
+repeated reads, partial final lines, empty input and Ctrl+C without model dispatch.
+
+The interaction audit also corrected watched Ctrl+C tracebacks and stale job
+state, owned-child cleanup, outdated answer references, explicit input revision
+reconciliation and request-ID selection through a parent with parallel children.
+Cancellation preserves unconfirmed operations and accounting. These changes add
+no retired orchestrator, recursive repair or extra workflow authority.
+
+The full run passed **1,413 tests and 57 subtests**; one optional Docker recovery
+test was skipped because no local test image was selected. Final follow-up checks
+covered the EOF edge and parent answer changes added during that run: **44 focused
+tests** passed. The wider terminal/control suite passed **191 tests and 8 subtests**.
+Compilation, whitespace checks and a 324-call constructor signature audit passed.
+Tests used a local deterministic shell provider, not paid model or media services.
+Pinned Vitest tools and suite directories were temporary and released at exit.

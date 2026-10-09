@@ -109,14 +109,15 @@ def test_new_goal_prompt_reports_waiting_without_claiming_previous_root(tmp_path
     observation=tmp_path/'observation.json'
     (tmp_path/'spec.md').write_text('Project reference must not replace the interactive collab goal')
     monkeypatch.setenv('AUTO_AGENTS_OBSERVATION_FILE',str(observation))
-    monkeypatch.setattr(sys.stdin,'isatty',lambda:True)
-    def interrupted_input(prompt):
-        value=json.loads(observation.read_text())
-        assert value['status']=='waiting' and value['waiting_for']=='user'
-        assert value['phase']=='goal' and not value['root_subject']
-        assert value['heartbeat_at'] and value['steps']==[]
-        raise KeyboardInterrupt
-    monkeypatch.setattr('builtins.input',interrupted_input)
+    class InterruptedInput:
+        def isatty(self):return True
+        def readline(self):
+            value=json.loads(observation.read_text())
+            assert value['status']=='waiting' and value['waiting_for']=='user'
+            assert value['phase']=='goal' and not value['root_subject']
+            assert value['heartbeat_at'] and value['steps']==[]
+            raise KeyboardInterrupt
+    monkeypatch.setattr(sys,'stdin',InterruptedInput())
     with pytest.raises(KeyboardInterrupt):
         main(['collab','--project',str(tmp_path)])
     assert store.work(old['id'])==before and len(store.works())==1

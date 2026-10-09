@@ -130,3 +130,72 @@ print(json.dumps(result))
     assert business.work(before['id'])['calls']==3
     assert business.work(before['id'])['max_calls']==before['max_calls']
     assert business.workflow(before['workflow'])['max_calls']==4
+
+
+def test_changed_answer_can_be_explicitly_reconciled_without_stale_references(tmp_path,capsys):
+    root=project(tmp_path)
+    config=ProjectConfig('fixture');save_project_config(root,config)
+    store=Store(root)
+    class Question(Worker):
+        def run(self,ctx,phase,*a,**kw):
+            return {'text':json.dumps({'decision':'need_user','question':'Choose the design'})}
+    engine=Engine(root,store,config,transport=Question(),print_fn=lambda *a:None)
+    waiting=engine.start('fix','Choose design',max_calls=4)
+    request=waiting['context']['input_requests'][0]
+    args=['answer','--project',str(root),'--session',waiting['id'],'--request-id',request['request_id'],'--no-resume']
+    assert main([*args,'--value','Original decision'])==0
+    inputs=OperatorInputStore(root)
+    typed=UserInputRequest.from_dict(request)
+    inputs.save_answer(typed,'External replacement')
+    blocked=engine.resume(waiting['id'])
+    assert blocked['status']=='BLOCKED' and blocked['failure']['code']=='operator_input_changed'
+    calls=blocked['calls']
+    assert main([*args,'--value','Confirmed replacement'])==0
+    capsys.readouterr()
+    ready=store.work(waiting['id'])
+    assert ready['status']=='READY' and not ready['failure'] and ready['calls']==calls
+    assert len(ready['context']['operator_answers'])==1
+    assert resolved_answers(root,ready['context']['operator_answers'])[0]['value']=='Confirmed replacement'
+
+
+def test_reconciling_a_child_answer_through_root_selects_only_the_leaf(tmp_path,capsys):
+    root=project(tmp_path)
+    save_project_config(root,ProjectConfig('fixture'))
+    store=Store(root)
+    parent=store.create_workflow('collab','Original goal','source')
+    child=store.child(parent,'fix','Child goal','source')
+    parent=store.work(parent['id'])
+    request=UserInputRequest.from_dict({'key':'decision.child','kind':'text','question':'Choose',
+        'purpose':'test','why_required':'needed'})
+    record=OperatorInputStore(root).save_answer(request,'Old value')
+    child=store.transition(child,'RUNNING')
+    failure={'code':'operator_input_changed','category':'operator','message':'changed','details':{'key':request.key}}
+    child=store.transition(child,'BLOCKED',failure=failure,context={'question':[request.to_dict()],
+        'operator_answers':[{'key':request.key,'revision':record['revision']}]})
+    store.transition(parent,'BLOCKED',failure={**failure,'child_id':child['id']})
+    assert main(['answer','--project',str(root),'--session',parent['id'],
+        '--request-id',request.request_id,'--value','Confirmed value','--no-resume'])==0
+    capsys.readouterr()
+    assert store.work(child['id'])['status']=='READY'
+    assert resolved_answers(root,store.work(child['id'])['context']['operator_answers'])[0]['value']=='Confirmed value'
+
+
+def test_request_id_selects_one_parallel_question_through_parent(tmp_path,capsys):
+    root=project(tmp_path);save_project_config(root,ProjectConfig('fixture'))
+    store=Store(root);parent=store.create_workflow('collab','Parent goal','source')
+    children=[]
+    for _ in range(2):
+        child=store.child(parent,'fix','Child','source');parent=store.work(parent['id'])
+        request=UserInputRequest.from_dict({'key':'decision.'+child['id'],'kind':'text',
+            'question':'Choose','purpose':'test','why_required':'needed'})
+        child=store.transition(child,'RUNNING')
+        child=store.transition(child,'WAITING',context={'waiting_for':'user','input_requests':[request.to_dict()]})
+        children.append((child,request))
+    store.transition(parent,'WAITING',context={'waiting_for':'children','children':[child['id'] for child,request in children]})
+    chosen,request=children[0]
+    assert main(['answer','--project',str(root),'--session',parent['id'],'--request-id',request.request_id,
+        '--value','My decision','--no-resume'])==0
+    capsys.readouterr()
+    assert store.work(chosen['id'])['status']=='READY'
+    assert store.work(children[1][0]['id'])['status']=='WAITING'
+    assert store.workflow(parent['workflow'])['calls']==0

@@ -28,6 +28,7 @@ def readable_result(value, store):
             'Original business task completed': '原任务已完成。',
             'Business task stopped without an engine defect': '业务流程已停止，未检测到引擎异常。',
             'Business task is waiting for operator input': '业务等待用户处理待办事项，会话已保留。',
+            'Interrupted; checkpoint and unconfirmed calls retained': '已中断；会话进度和未确认的调用已保留。',
             'Execution health is uncertain; checkpoint retained': '无法确认运行状态，已保存恢复检查点。',
         }
         summary = ' '.join(str(explanations.get(reason, reason)).split())
@@ -113,7 +114,11 @@ def main(argv=None):
         else:
             readable_result(value, store)
         paused=value.get('state')=='STOPPED' and value.get('waiting_for') and not value.get('cancel_requested')
+        if value.get('interrupted') and args.action in {'run','resume'}:return 130
         return 0 if paused or value.get('state') in {'DONE','RUNNING','RESTARTING'} or args.action in {'status','cancel','reconcile'} else 3
+    except KeyboardInterrupt:
+        print('监督执行已中断；未确认的调用需要核对后再继续。',file=sys.stderr)
+        return 130
     except (OSError,RuntimeError,ValueError) as error:
         if args.json:
             print(json.dumps({'ok':False,'reason':str(error)},ensure_ascii=False),file=sys.stderr)

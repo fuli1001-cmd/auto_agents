@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -107,7 +108,7 @@ def main(argv=None):
             from .engine_fault import engine_root
 
             env = {**os.environ, "AUTO_AGENTS_NO_SUPERVISOR": "1"}
-            return subprocess.call(
+            watcher_process = subprocess.Popen(
                 [
                     watcher,
                     "run",
@@ -120,7 +121,25 @@ def main(argv=None):
                     *arguments,
                 ],
                 env=env,
+                start_new_session=os.name != "nt",
             )
+            try:
+                return watcher_process.wait()
+            except KeyboardInterrupt:
+                try:
+                    watcher_process.send_signal(signal.SIGINT)
+                    watcher_process.wait(timeout=30)
+                except ProcessLookupError:
+                    pass
+                except subprocess.TimeoutExpired:
+                    watcher_process.terminate()
+                    try:
+                        watcher_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        watcher_process.kill()
+                        watcher_process.wait()
+                print_failure("已中断；会话进度和未确认的调用已保留。")
+                return 130
         if mode != "off":
             print("监督程序未安装，本次独立运行。", file=sys.stderr)
     from .control.cli import main as dispatch

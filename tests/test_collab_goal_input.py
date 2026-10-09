@@ -85,13 +85,13 @@ def test_real_terminal_goal_passes_through_bootstrap_and_watcher(tmp_path):
             '--provider','fixture','--auto-approve'],cwd=ENGINE,env=environment,stdin=slave,
             stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         os.close(slave);slave=None
-        os.write(master,'用户输入的本次协作目标\n'.encode())
+        os.write(master,'用户输入的本次协作目标\n\n保留第二段内容\n'.encode()+b'\x04')
         output,error=child.communicate(timeout=30)
         assert child.returncode==0,output+error
-        assert '请输入目标或问题' in error and '监督任务已暂停' in output
+        assert '请输入目标或问题' in error and 'Ctrl+D' in error and '监督任务已暂停' in output
         store=Store(root)
         works=store.works()
-        assert len(works)==1 and store.contract(works[0]['contract']).goal=='用户输入的本次协作目标'
+        assert len(works)==1 and store.contract(works[0]['contract']).goal=='用户输入的本次协作目标\n\n保留第二段内容'
         assert works[0]['calls']==1 and works[0]['status']=='WAITING'
     finally:
         if child and child.poll() is None:child.kill();child.communicate()
