@@ -567,9 +567,45 @@ def validate_prototype_manifest(
     for page in pages:
         if isinstance(page, Mapping) and str(page.get("html_ref", "")).strip():
             allowed_files.add((project_root / str(page["html_ref"])).resolve())
+    # Standalone pages may be shipped with declared evidence, provenance and
+    # verification files. A declaration cannot authorize external paths or
+    # replace page registration and its HTML dependency checks.
+    from .control.access import linked_ancestor, product_path
+
+    artifacts = payload.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        errors.append("frontend prototype manifest artifacts must be an array")
+        artifacts = []
+    for index, ref in enumerate(artifacts, start=1):
+        prefix = f"frontend prototype artifacts[{index}]"
+        if not isinstance(ref, str) or not product_path(ref):
+            errors.append(f"{prefix} must be an owned workspace-relative file path")
+            continue
+        path = project_root / ref
+        if linked_ancestor(project_root, path):
+            errors.append(f"{prefix} must not use symbolic links")
+            continue
+        candidate = path.resolve()
+        try:
+            candidate.relative_to(prototype_root)
+        except ValueError:
+            errors.append(f"{prefix} must stay inside the prototype directory")
+            continue
+        if not candidate.is_file():
+            errors.append(f"{prefix} must reference an existing file")
+            continue
+        if candidate.suffix.lower() in {".html", ".htm"} and candidate not in allowed_files:
+            errors.append(f"{prefix} HTML must be registered in pages or index_ref")
+            continue
+        allowed_files.add(candidate)
     if prototype_root.is_dir():
         for artifact in prototype_root.rglob("*"):
-            if artifact.is_file() and artifact.resolve() not in allowed_files:
+            if artifact.is_symlink():
+                errors.append(
+                    "frontend prototype directory must not contain symbolic links: "
+                    f"{artifact.relative_to(project_root).as_posix()}"
+                )
+            elif artifact.is_file() and artifact.resolve() not in allowed_files:
                 errors.append(
                     "frontend prototype directory contains an unreferenced or non-standalone "
                     f"artifact: {artifact.relative_to(project_root).as_posix()}"

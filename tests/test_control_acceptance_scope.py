@@ -160,7 +160,7 @@ def test_runtime_exceptions_do_not_authorize_links_or_tracked_files(tmp_path, ki
 
 
 @pytest.mark.parametrize("kind", ["chrome_lock", "chrome_cookie", "local_directory", "local_file", "local_dangling"])
-def test_acceptance_allows_private_tool_metadata_and_local_aliases(tmp_path, kind):
+def test_acceptance_and_prototype_allow_private_tool_metadata_and_local_aliases(tmp_path, kind):
     root = project(tmp_path)
     private = root / ".tmp-tests/profile"
     private.mkdir(parents=True)
@@ -181,8 +181,7 @@ def test_acceptance_allows_private_tool_metadata_and_local_aliases(tmp_path, kin
         link.symlink_to(target, target_is_directory=kind == "local_directory")
     assert link.relative_to(root).as_posix() in private_runtime_files(root)
     stage_writes(before, workspace_guard(root), "acceptance", (".auto-agents/docs/acceptance/",))
-    with pytest.raises(ControlError):
-        stage_writes(before, workspace_guard(root), "prototype")
+    stage_writes(before, workspace_guard(root), "prototype")
 
 
 @pytest.mark.parametrize("kind", ["outside", "tracked_target", "fake_chrome_lock"])

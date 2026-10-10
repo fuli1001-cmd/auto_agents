@@ -218,9 +218,11 @@ def stage_writes(before, after, phase, scope=()):
     changes = changed_guard_paths(before, after)
     allowed = scope or STAGE_PATHS.get(phase)
     runtime = set()
-    if phase == "acceptance":
-        # New, changed and deleted private data are allowed. Tracked files and
-        # links outside private runtime remain subject to the ordinary guard.
+    if phase in {"acceptance", "prototype"}:
+        # Prototype tooling may use private scratch, while only acceptance may
+        # write private databases or generated application declarations. Both
+        # observations must classify a path as runtime; tracked inputs and
+        # escaping links remain subject to the ordinary guard.
         old = set(before.get("private_runtime_paths", ()))
         new = set(after.get("private_runtime_paths", ()))
         runtime = {
@@ -228,6 +230,7 @@ def stage_writes(before, after, phase, scope=()):
             for p in old | new
             if (p not in before["paths"] or p in old)
             and (p not in after["paths"] or p in new)
+            and (phase == "acceptance" or p.startswith((".tmp/", ".tmp-tests/")))
         }
     if "<HEAD>" in changes or "<index>" in changes:
         raise ControlError(

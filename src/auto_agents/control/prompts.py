@@ -52,7 +52,7 @@ def build(context, phase, *, inputs=None, feedback=None):
         )
     instructions = {
         "clarify": 'Produce requirements and measurable acceptance from the spec. Write .auto-agents/docs/project_brief.md and .auto-agents/docs/requirements.md. Return {"artifacts":[paths],"frontend":boolean,"questions":[]}. Ask only about missing user decisions.',
-        "prototype": 'Produce a static frontend prototype for the approved requirements. Write standalone HTML with viewport meta tags under .auto-agents/docs/frontend_prototype/, including home.html and manifest.json. The manifest declares pages:[{id,title,route,requirement_ids,html_ref}], viewports:[WIDTHxHEIGHT] and index_ref. All refs are workspace-relative; embed assets rather than loading remote/script dependencies. Declare every package artifact. If a design catalog is supplied, return selection:{candidates:[{slug,score,rationale,risks}],selected_slug} with three candidates and one highest-scoring choice; preserve exact upstream DESIGN.md bytes. Return {"artifacts":[paths],"selection":selection}. Do not implement the product yet.',
+        "prototype": 'Produce a static frontend prototype for the approved requirements. Write standalone HTML with viewport meta tags under .auto-agents/docs/frontend_prototype/, including home.html and manifest.json. The manifest declares pages:[{id,title,route,requirement_ids,html_ref}], viewports:[WIDTHxHEIGHT], index_ref and artifacts:[every package file path, including supporting assets, evidence and verification scripts]. All refs are workspace-relative; embed assets rather than loading remote/script dependencies. Register every HTML file in pages or index_ref. If a design catalog is supplied, return selection:{candidates:[{slug,score,rationale,risks}],selected_slug} with three candidates and one highest-scoring choice; preserve exact upstream DESIGN.md bytes. Return {"artifacts":[paths],"selection":selection}. Do not implement the product yet.',
         "design": 'Write .auto-agents/docs/architecture.md with concrete interfaces and constraints. Preserve an existing approved or upstream DESIGN.md exactly. If no DESIGN.md exists, you may create it. Return {"artifacts":[paths]}.',
         "plan": 'Write .auto-agents/docs/task_plan.json. Return {"tasks":[{"task_id":"T1","goal":"bounded verifiable slice","paths":[paths],"depends_on":[],"checks":[{"command":"project test command","purpose":"behavior"}]}],"checks":[release checks]}. Include every required behavior. Do not introduce unsupported selectors or modify operator config.',
         "provider_research": 'Review required external provider references using primary sources, preserve account configuration and write .auto-agents/docs/provider_references.md. Return {"artifacts":[paths],"references":[{"url":"primary source URL","claim":"supported fact"}]}. If no external provider is required, return {"not_required":true,"reason":"specific justification"}.',
@@ -69,6 +69,16 @@ def build(context, phase, *, inputs=None, feedback=None):
         "acceptance_review": 'Independently inspect the recorded user-facing acceptance evidence and provenance against each original criterion. Return {"decision":"pass|revise","reason":"semantic findings","evidence_refs":[verified evidence paths]}. Reject mock/placeholder output for a real goal.',
     }
     lines.append(instructions[phase])
+    if phase == "prototype":
+        lines.append(
+            "Use untracked files under this workspace's .tmp/ or .tmp-tests/ real "
+            "directories for temporary browser profiles, downloads, tooling dependencies "
+            "and test scripts. Temporary aliases must stay inside private runtime. "
+            "Do not change tracked files under temporary directories, product source, "
+            "credentials, databases or controller state. "
+            "Temporary files are private tooling, not deliverables; write and declare "
+            "durable prototype assets and evidence inside the allowed prototype package."
+        )
     if c["mode"] == "collab" and phase in {"diagnose", "acceptance"}:
         from ..collab_goal_scope import acceptance_only, INSTRUCTION
 

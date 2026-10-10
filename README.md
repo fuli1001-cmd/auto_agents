@@ -55,6 +55,11 @@ plan, provider evidence, independently verified task changes, and README.
 `fix` classifies one bounded issue, implements it, verifies real behavior, and
 requires independent review. `collab` delegates owned work and returns to the
 original user acceptance. Provider resolution changes only reference artifacts.
+Prototype generation may use untracked `.tmp/` and `.tmp-tests/` files for browser
+profiles, downloads and local tooling; these stay out of candidate commits.
+Tracked temporary files, product source, databases and controller state remain protected.
+The prototype manifest's `artifacts` lists supporting assets, evidence and scripts
+inside its package; HTML files must be registered as pages or the index.
 
 For goals explicitly limited to acceptance of existing behavior, `collab` uses
 the current product directly and does not create a development `run` or regenerate
