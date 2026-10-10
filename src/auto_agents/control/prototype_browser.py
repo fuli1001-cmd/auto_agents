@@ -19,6 +19,7 @@ import threading
 import time
 
 from .types import ControlError, digest
+from .prototype_pages import page_file
 
 TEST_ENVIRONMENT = r"""(now => {
  const RealDate=Date;
@@ -391,6 +392,9 @@ def run(files, scope, evidence, *, baseline=False):
     """Return real observations, or fail closed. Evidence stays outside workers."""
     evidence = Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
+    baseline_files = {page_file(page) for page in scope.get("baseline_pages", [])}
+    for check in scope["checks"]:
+        page_file(check["page"])
     checks = [c for c in scope["checks"] if not baseline or c["kind"] == "preservation"]
     if baseline and scope["mode"] == "create":
         return {"executed": 0, "failures": [], "observations": {}, "screenshots": {}}
@@ -411,11 +415,13 @@ def run(files, scope, evidence, *, baseline=False):
         def observe_repair(page, key):
             if "repair_regions" not in scope:
                 return
+            name = page_file(page)
             options = {
                 "mutable": [
-                    r["selector"] for r in scope["repair_regions"] if r["page"] == page
+                    r["selector"] for r in scope["repair_regions"]
+                    if page_file(r["page"]) == name
                 ],
-                "geometry": [g for g in scope["repair_geometry"] if g["page"] == page],
+                "geometry": [g for g in scope["repair_geometry"] if page_file(g["page"]) == name],
             }
             repair_observations[key] = digest(snapshot(browser, options))
 
@@ -436,7 +442,10 @@ def run(files, scope, evidence, *, baseline=False):
                 }
                 pages = sorted(
                     set(scope.get("baseline_pages", []))
-                    | {c["page"] for c in checks}
+                    | {
+                        c["page"] for c in scope["checks"]
+                        if not baseline or page_file(c["page"]) in files
+                    }
                     | {
                         c["page"]
                         for c in scope["changes"]
@@ -444,16 +453,17 @@ def run(files, scope, evidence, *, baseline=False):
                     }
                 )
                 if not baseline:
-                    pages = [p for p in pages if p not in removed]
+                    pages = [p for p in pages if page_file(p) not in removed]
                 for page in pages:
-                    if page not in files:
+                    name = page_file(page)
+                    if name not in files:
                         failures.append({"page": page, "reason": "missing page"})
                         continue
                     browser.navigate(origin + "/" + page, viewport)
                     if scope.get("repair_has_original"):
                         for region in scope.get("repair_regions", []):
                             if (
-                                region["page"] != page
+                                page_file(region["page"]) != name
                                 or scope["repair_original"]
                                 and region["kind"] == "add"
                                 or not scope["repair_original"]
@@ -473,7 +483,7 @@ def run(files, scope, evidence, *, baseline=False):
                                 )
                     for change in scope["changes"]:
                         if (
-                            change["page"] != page
+                            page_file(change["page"]) != name
                             or baseline
                             and change["kind"] == "add"
                         ):
@@ -503,7 +513,7 @@ def run(files, scope, evidence, *, baseline=False):
                             if change.get("whole_page"):
                                 continue
                             if (
-                                change["page"] != page
+                                page_file(change["page"]) != name
                                 or change["kind"] == "add"
                                 and baseline
                                 or change["kind"] == "remove"
@@ -523,11 +533,11 @@ def run(files, scope, evidence, *, baseline=False):
                                 )
                     options = {
                         "mutable": [
-                            c["selector"] for c in scope["changes"] if c["page"] == page
+                            c["selector"] for c in scope["changes"] if page_file(c["page"]) == name
                         ],
-                        "geometry": [c for c in scope["geometry"] if c["page"] == page],
+                        "geometry": [c for c in scope["geometry"] if page_file(c["page"]) == name],
                     }
-                    if baseline or page in scope.get("baseline_pages", []):
+                    if baseline or name in baseline_files:
                         observations[viewport + "/" + page + "/initial"] = snapshot(
                             browser, options
                         )
@@ -545,7 +555,8 @@ def run(files, scope, evidence, *, baseline=False):
                         shot.read_bytes()
                     ).hexdigest()
                 for check in checks:
-                    if check["page"] not in files:
+                    name = page_file(check["page"])
+                    if name not in files:
                         failures.append(
                             {
                                 "check": check["id"],
@@ -564,12 +575,12 @@ def run(files, scope, evidence, *, baseline=False):
                             "mutable": [
                                 c["selector"]
                                 for c in scope["changes"]
-                                if c["page"] == check["page"]
+                                if page_file(c["page"]) == name
                             ],
                             "geometry": [
                                 c
                                 for c in scope["geometry"]
-                                if c["page"] == check["page"]
+                                if page_file(c["page"]) == name
                             ],
                         }
                         if check["kind"] == "preservation":

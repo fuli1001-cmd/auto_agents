@@ -18,6 +18,7 @@ import time
 from .types import ControlError, digest, canonical
 from .quality import artifact_hashes, safe_file
 from .workspace import git
+from .prototype_pages import page_file
 
 CANONICAL = ".auto-agents/docs/frontend_prototype"
 PREPARED = ".auto-agents/docs/prototype_preparation/repaired"
@@ -319,6 +320,33 @@ def check_schema(value, baseline, inputs):
         fail("Malformed prototype scope", reason=str(error))
 
 
+def historical_requirement_ids(ctx, baseline, trace):
+    """Read preservation identities from admitted bytes, never candidate files."""
+    manifests = [base64.b64decode(baseline.get("original", {}).get("manifest.json", ""))]
+    manifests.extend(
+        git(ctx.workspace_root, "show", baseline["source"] + ":" + name)
+        for name in sorted(baseline["history"])
+        if name.endswith("/manifest.json")
+    )
+    identities = set()
+    for raw in manifests:
+        try:
+            manifest = json.loads(raw)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("pages"), list):
+            continue
+        for page in manifest["pages"]:
+            refs = page.get("requirement_ids") if isinstance(page, dict) else None
+            if isinstance(refs, list):
+                identities.update(ref for ref in refs if isinstance(ref, str) and ref.strip())
+    inactive = {
+        row["id"] for row in trace.get("requirements", [])
+        if row.get("status", "active") != "active"
+    }
+    return sorted(identities - inactive)
+
+
 def _check_schema(value, baseline, inputs):
     required = {
         "version",
@@ -401,6 +429,14 @@ def _check_schema(value, baseline, inputs):
         fail("Changed prototypes need explicit regions")
     known_evidence = set(inputs) | set(baseline["history"]) | {"goal"}
     known_evidence |= {CANONICAL + "/" + p for p in baseline["original"]}
+    product_evidence = known_evidence - {
+        "goal", ".auto-agents/docs/requirements.md", ".auto-agents/docs/requirements_trace.json",
+    }
+    frontend_evidence = set(baseline["history"]) | {
+        CANONICAL + "/" + p for p in baseline["original"]
+    } | {
+        p for p in inputs if Path(p).suffix.lower() in {".html", ".htm", ".jsx", ".tsx", ".vue", ".svelte", ".astro"}
+    }
 
     def evidence(row):
         refs = row.get("evidence")
@@ -414,11 +450,21 @@ def _check_schema(value, baseline, inputs):
                 record=row.get("id"),
             )
 
-    def reqs(row):
+    def reqs(row, *, preserved=False):
         refs = row.get("requirement_ids")
-        if not isinstance(refs, list) or not refs or not set(refs) <= set(active):
+        allowed = set(active)
+        if preserved:
+            allowed.update(baseline.get("historical_requirements", []))
+        if (
+            not isinstance(refs, list)
+            or any(not isinstance(ref, str) for ref in refs)
+            or (not preserved and not refs)
+            or not set(refs) <= allowed
+        ):
             fail(
-                "Scope change needs active requirement identities", record=row.get("id")
+                "Preserved flows need admitted requirement identities"
+                if preserved else "Scope change needs active requirement identities",
+                record=row.get("id"),
             )
 
     for row in changes.values():
@@ -451,6 +497,7 @@ def _check_schema(value, baseline, inputs):
         relative(row["page"])
         if (
             not row["page"].endswith(".html")
+            or page_file(row["page"]) != row["page"]
             or not isinstance(row["files"], list)
             or not row["files"]
         ):
@@ -549,7 +596,8 @@ def _check_schema(value, baseline, inputs):
                 or region["kind"] not in {"add", "change", "remove"}
             ):
                 fail("Baseline repairs need bounded regions")
-            relative(region["page"])
+            if page_file(region["page"]) != region["page"]:
+                fail("Repair regions must name package HTML files")
         for name in row.get("files", []):
             relative(name)
         for geometry in row.get("geometry", []):
@@ -564,7 +612,8 @@ def _check_schema(value, baseline, inputs):
                 or not set(geometry["properties"]) <= {"x", "y", "width", "height"}
             ):
                 fail("Baseline repair geometry must be explicit")
-            relative(geometry["page"])
+            if page_file(geometry["page"]) != geometry["page"]:
+                fail("Repair geometry must name package HTML files")
     for row in flows.values():
         if (
             set(row) != {"id", "page", "requirement_ids", "evidence", "checks"}
@@ -572,15 +621,20 @@ def _check_schema(value, baseline, inputs):
             or not set(row["checks"]) <= set(checks)
         ):
             fail("Each inventoried flow needs executable checks")
-        relative(row["page"])
-        reqs(row)
+        page_file(row["page"])
         evidence(row)
+        preserved = baseline["has_frontend"] and all(
+            checks[i].get("kind") == "preservation" for i in row["checks"]
+        )
+        if preserved and not set(row["evidence"]) & product_evidence:
+            fail("Preserved flows require existing product evidence", record=row["id"])
+        reqs(row, preserved=preserved)
         if (
             baseline["has_frontend"]
-            and row["evidence"] != ["goal"]
+            and set(row["evidence"]) & frontend_evidence
             and not any(checks[i]["kind"] == "preservation" for i in row["checks"])
         ):
-            fail("Existing flows need preservation checks")
+            fail("Existing flows need preservation checks", record=row["id"])
     if baseline["has_frontend"] and not any(
         c["kind"] == "preservation" for c in checks.values()
     ):
@@ -593,14 +647,15 @@ def _check_schema(value, baseline, inputs):
             or row["kind"] not in {"preservation", "new"}
         ):
             fail("Checks must map back to their exact flow")
-        relative(row["page"])
+        page_file(row["page"])
+        if page_file(row["page"]) != page_file(flows[row["flow"]]["page"]):
+            fail("Checks must stay on their flow's same HTML file", record=row["id"])
         if (
-            row["page"] != flows[row["flow"]]["page"]
-            or not isinstance(row["steps"], list)
+            not isinstance(row["steps"], list)
             or not isinstance(row["asserts"], list)
             or not row["asserts"]
         ):
-            fail("Checks need actual browser assertions")
+            fail("Checks need actual browser assertions", record=row["id"])
         for step in row["steps"]:
             if (
                 not isinstance(step, dict)
@@ -649,7 +704,8 @@ def _check_schema(value, baseline, inputs):
             or not set(row["properties"]) <= {"x", "y", "width", "height"}
         ):
             fail("Layout shifts need exact properties, regions and causal changes")
-        relative(row["page"])
+        if page_file(row["page"]) != row["page"]:
+            fail("Geometry must name package HTML files")
     # Every changed requirement is covered by a new behavior oracle. Preservation
     # checks are still mandatory, even for a user-authorized full restyle.
     covered = {
@@ -658,8 +714,12 @@ def _check_schema(value, baseline, inputs):
         if any(checks[i]["kind"] == "new" for i in f["checks"])
         for req in f["requirement_ids"]
     }
-    if any(not set(c["requirement_ids"]) <= covered for c in changes.values()):
-        fail("New requirements need new behavior checks")
+    uncovered = [
+        {"change": c["id"], "requirement_ids": sorted(set(c["requirement_ids"]) - covered)}
+        for c in changes.values() if not set(c["requirement_ids"]) <= covered
+    ]
+    if uncovered:
+        fail("New requirements need new behavior checks", uncovered=uncovered)
     return value
 
 
@@ -809,7 +869,7 @@ def repair_bounds(plan):
         declared = repair.get("regions")
         if declared is None:
             unique = {
-                (c["page"], r["selector"])
+                (page_file(c["page"]), r["selector"])
                 for c in checks
                 for r in [*c["steps"], *c["asserts"]]
                 if SELECTOR.fullmatch(r["selector"])
@@ -820,7 +880,7 @@ def repair_bounds(plan):
             ]
         regions.extend(declared)
         geometry.extend(repair.get("geometry", []))
-        files.update(repair.get("files", [c["page"] for c in checks]))
+        files.update(repair.get("files", [page_file(c["page"]) for c in checks]))
     return regions, geometry, files
 
 
@@ -1071,6 +1131,7 @@ def step(engine, work, ctx):
             for r in trace.get("requirements", [])
             if r.get("status", "active") == "active"
         ]
+        baseline["historical_requirements"] = historical_requirement_ids(ctx, baseline, trace)
         inherited = ctx.contract.inputs.get("prototype_parent_scope") or state.get(
             "prototype_previous_scope"
         )
@@ -1465,20 +1526,24 @@ def step(engine, work, ctx):
                 for c in plan["changes"]
                 if c.get("whole_page") or plan["mode"] == "redesign"
             }
+            excluded_keys = {
+                "/" + page + "/initial"
+                for page in {
+                    *[p for p in value["baseline"] if p.endswith(".html")],
+                    *[c["page"] for c in plan["checks"]],
+                    *[c["page"] for c in plan["changes"]],
+                }
+                if page_file(page) in excluded_pages
+            } | {
+                "/" + c["id"] for c in plan["checks"]
+                if page_file(c["page"]) in excluded_pages
+            }
 
             def preserved(observations):
                 return {
                     k: v
                     for k, v in observations.items()
-                    if not any(
-                        k.endswith("/" + page + "/initial")
-                        or any(
-                            k.endswith("/" + c["id"])
-                            for c in plan["checks"]
-                            if c["page"] == page
-                        )
-                        for page in excluded_pages
-                    )
+                    if not any(k.endswith(suffix) for suffix in excluded_keys)
                 }
 
             if preserved(report["observations"]) != preserved(

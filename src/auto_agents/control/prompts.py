@@ -75,6 +75,27 @@ def build(context, phase, *, inputs=None, feedback=None):
     lines.append(instructions[phase])
     if phase == "prototype_prepare":
         lines.append(
+            "Requirement bindings distinguish requested changes from preserved behavior. "
+            "Every change and every flow with a new check needs nonempty requirement_ids "
+            "from admitted_baseline.active_requirements. Every requirement ID on a change "
+            "must also appear on a flow with a new behavior check. "
+            "A preservation-only flow may cite admitted_baseline.historical_requirements "
+            "without turning those historical IDs into current requirements; a preserved "
+            "auxiliary flow with no requirement identity may use requirement_ids:[], "
+            "with concrete implementation or admitted prototype/history evidence and "
+            "executable preservation checks. Goal or current requirement documents alone "
+            "do not establish an existing flow. Citing current requirements or backend "
+            "code for a new UI flow does not make that flow preexisting. Do not invent "
+            "identities or edit the requirements trace to satisfy these bindings."
+        )
+        lines.append(
+            "Flows and checks may declare relative state URLs such as home.html?state=error "
+            "or home.html#loading. Each check must stay on its flow's same HTML file; "
+            "query parameters and fragments are frozen test inputs. Changes, repair regions "
+            "and geometry must name actual package HTML files without URL parameters. "
+            "All declared states retain the same file's scope and preservation constraints."
+        )
+        lines.append(
             "For removal/redesign changes, also provide permission: an exact excerpt of the current user goal or recorded user decision explicitly authorizing that deletion or full redesign. Goal evidence alone never grants permission. Geometry entries may name html/body solely for causally required coordinate/size shifts; appearance remains protected. A structural baseline repair may list flow_ids:['package-structure']; the original manifest must actually fail validation and the repaired one must pass. If a design catalog is supplied for a new frontend, return selection:{candidates:[{slug,score,rationale,risks}],selected_slug} with three candidates and one highest-scoring selection. This selection and its exact upstream bytes will be frozen before candidate generation. Existing frontends keep their established design source."
         )
         lines.append("Retain all admitted manifest viewports; the candidate must use exactly the frozen viewport list. Explicit removal of an entire page may use whole_page:true only on a remove change whose permission excerpt names that admitted page and authorizes its removal. A local removal never grants a redesign of other pages. Redesign still preserves unchanged pages and every non-retired behavior.")
