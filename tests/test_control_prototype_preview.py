@@ -62,7 +62,7 @@ def frontend(tmp_path):
                 reply = json.loads(result["text"])
                 prefix = reply["artifacts"][0].rsplit("/", 1)[0]
                 package = ctx.workspace_root / prefix
-                (package / "nested").mkdir()
+                (package / "nested").mkdir(exist_ok=True)
                 (package / "nested/home.html").write_text(
                     '<html><meta name="viewport" content="width=device-width">Nested page</html>'
                 )
@@ -92,11 +92,16 @@ def test_prototype_pause_prints_a_runnable_preview_command_without_a_port(fronte
     args = parser().parse_args(command[1:])
     assert args.project == str(root) and args.session == work["id"] and args.port == 0
     assert "端口自动选择" in decision["preview_instructions"]
+    reject = parser().parse_args(shlex.split(decision["reject_command"])[1:])
+    assert reject.command == "reject" and reject.gate == "prototype"
+    assert reject.project == str(root) and reject.session == work["id"] and reject.reason.strip()
     calls = engine.store.workflow(work["workflow"])["calls"]
     assert main(["run", "--project", str(root), "--session", work["id"], "--auto-approve"]) == 0
     output = capsys.readouterr().out
     assert "查看原型：" + decision["preview_command"] in output
     assert "查看说明：" + decision["preview_instructions"] in output
+    assert "拒绝原型：" + decision["reject_command"] in output
+    assert "拒绝说明：" + decision["reject_instructions"] in output
     assert engine.store.workflow(work["workflow"])["calls"] == calls
 
 
@@ -112,6 +117,8 @@ def test_supervisor_status_preserves_preview_instructions(frontend, tmp_path, ca
     output = capsys.readouterr().out
     assert "查看原型：auto-agents prototype preview" in output
     assert "端口自动选择" in output and "--session " + work["id"] in output
+    assert "拒绝原型：auto-agents reject" in output and "--reason " in output
+    assert "拒绝后执行恢复命令重新设计" in output
 
 
 def test_preview_serves_baseline_and_candidates_side_by_side_without_mutation(frontend):

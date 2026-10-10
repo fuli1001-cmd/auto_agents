@@ -71,6 +71,22 @@ def context_inputs(context, phase, config, store):
             ),
         ).build(task)
         result["repository_map"] = mapping.text
+    if phase == "prototype":
+        from ..frontend_design import discover_existing_frontend
+
+        docs = context.workspace_root / ".auto-agents/docs"
+        result["prototype_preservation"] = {
+            "frontend_source_refs": list(discover_existing_frontend(context.workspace_root).evidence),
+            "prototype_manifest_refs": sorted({
+                path.relative_to(context.workspace_root).as_posix()
+                for pattern in (
+                    "frontend_prototype/manifest.json",
+                    "frontend_prototype_variants/*/manifest.json",
+                    "frontend_prototype_variants/*/frontend_prototype/manifest.json",
+                )
+                for path in docs.glob(pattern) if path.is_file()
+            }),
+        }
     if phase == "prototype" and config.frontend_design.mode != "off":
         from ..frontend_design import (
             AwesomeDesignCatalogClient,

@@ -87,10 +87,18 @@ The browser gallery compares current candidates, the previous prototype, and
 historical versions retained in the session's source. Omit `--port` to select an
 available port, then open the URL printed by the preview command. Press Ctrl+C
 to stop the preview before approving and resuming.
+The pause also prints a rejection command with `--reason`. Rejection saves the
+feedback and returns to the proposal's own stage; run the resume command to
+generate a revision, which requires review again. Original contracts and spent
+call counts are retained. Prototype revision instructions include existing
+frontend source and historical manifests, and request a preservation report
+with browser checks. Feedback and structural validation alone do not guarantee
+that every existing behavior has been preserved.
 
 ```bash
 auto-agents prototype preview --project /path/to/project --session retained-id
 auto-agents approve --project /path/to/project --session retained-id --gate prototype
+auto-agents reject --project /path/to/project --session retained-id --gate prototype --reason 'Restore missing existing interactions and preserve unrelated behavior'
 auto-agents answer --project /path/to/project --session retained-id --from-env ANSWER --no-resume
 auto-agents verify --project /path/to/project --level release --fresh
 auto-agents cancel --project /path/to/project --session retained-id

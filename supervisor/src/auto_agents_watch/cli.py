@@ -50,6 +50,9 @@ def readable_result(value, store, *, show_pending=True, streamed=False):
                 print('查看原型：'+decision['preview_command'])
                 print('查看说明：'+decision.get('preview_instructions',''))
             print('处理命令：'+decision['command'])
+            if decision.get('reject_command'):
+                print('拒绝原型：'+decision['reject_command'])
+                print('拒绝说明：'+decision.get('reject_instructions',''))
     if value.get('id'):
         directory = store.root / 'jobs' / value['id']
         print('日志：' + str(directory / 'business.log'))

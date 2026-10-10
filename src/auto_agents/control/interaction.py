@@ -78,6 +78,12 @@ def pending_decisions(store, root):
                     preview_command=shlex.join([prefix[0], "prototype", "preview", *prefix[1:]]),
                     preview_instructions="端口自动选择，无需指定。启动后在浏览器打开终端打印的地址，"
                     "可并排比较原型；按 Ctrl+C 退出预览后再审批。",
+                    reject_command=shlex.join([
+                        prefix[0], "reject", *prefix[1:], "--gate", gate,
+                        "--reason", "请填写拒绝原因及需要保留或恢复的功能",
+                    ]),
+                    reject_instructions="用 --reason 填写具体意见；拒绝后执行恢复命令重新设计，"
+                    "新原型仍需审阅，原会话和已消耗调用次数保留。",
                 )
             result.append(decision)
     return result

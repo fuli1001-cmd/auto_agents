@@ -748,12 +748,29 @@ class Store:
             and status == "RUNNING"
             and current["calls"] == 0
         )
+        previous_context = json.loads(current["context"])
+        # A recorded human gate owns its return phase. Rejecting it may return
+        # to that phase, without allowing arbitrary backward stage transitions.
+        rejection = (
+            current["status"] == "WAITING"
+            and status == "READY"
+            and previous_context.get("waiting_for") == "approval"
+            and previous_context.get("approval_phase") == values["phase"]
+            and bool(previous_context.get("approval"))
+            and not any(
+                key in values["context"]
+                for key in ("waiting_for", "approval", "approval_phase")
+            )
+            and previous_context["approval"] not in values["context"].get("approvals", {})
+            and isinstance(values["context"].get("feedback"), str)
+            and bool(values["context"]["feedback"].strip())
+        )
         validate_work(
             current["mode"],
             values["phase"],
             status,
             values["context"],
-            previous=None if admission else current["phase"],
+            previous=None if admission or rejection else current["phase"],
         )
         if status == "WAITING" and values["context"].get("waiting_for") in {
             "child",

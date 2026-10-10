@@ -551,6 +551,10 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
             work = decision_owner(
                 store, work, args.command, request_id=getattr(args, "request_id", None)
             )
+        if args.command in {"approve", "reject"} and args.gate and (
+            args.gate != work["context"].get("approval")
+        ):
+            raise ControlError("approval", "Gate differs from the pending decision")
         if args.command == "reject" and (args.variant or args.all_except):
             from .prototypes import reject
 
@@ -599,8 +603,6 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 ),
                 "automatic": False,
             }
-            if args.gate and args.gate != work["context"]["approval"]:
-                raise ControlError("approval", "Gate differs from the pending decision")
             context["approvals"] = {
                 **context.get("approvals", {}),
                 work["context"]["approval"]: receipt,
@@ -627,7 +629,7 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                     text = os.environ.get(args.from_env, "")
                 elif getattr(args, "from_file", None):
                     text = Path(args.from_file).read_text()
-            if not text:
+            if not text.strip():
                 raise ControlError("input", "Supply an answer or rejection reason")
             context = {
                 **work["context"],
@@ -689,11 +691,21 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 }
             context.pop("waiting_for", None)
             if args.command == "reject":
+                gate = work["context"].get("approval")
+                context.pop("approval", None)
                 context["approvals"] = {
                     k: v
                     for k, v in context.get("approvals", {}).items()
-                    if k != work["context"].get("approval")
+                    if k != gate
                 }
+                if gate == "prototype":
+                    from .prototypes import candidates
+
+                    context["variants"] = [
+                        {**row, "status": "rejected", "reason": text}
+                        if row["status"] == "candidate" else row
+                        for row in candidates(engine, work)
+                    ]
             phase = (
                 context.pop("approval_phase", work["phase"])
                 if args.command == "reject"
@@ -879,6 +891,9 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                     print("查看原型：" + decision["preview_command"])
                     print("查看说明：" + decision["preview_instructions"])
                 print("处理命令：" + decision["command"])
+                if decision.get("reject_command"):
+                    print("拒绝原型：" + decision["reject_command"])
+                    print("拒绝说明：" + decision["reject_instructions"])
             if result["status"] in {"WAITING", "BLOCKED"}:
                 print("恢复命令：" + resume_command(
                     project, result, provider=alias,

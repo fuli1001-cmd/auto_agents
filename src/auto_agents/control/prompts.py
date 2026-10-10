@@ -71,6 +71,17 @@ def build(context, phase, *, inputs=None, feedback=None):
     lines.append(instructions[phase])
     if phase == "prototype":
         lines.append(
+            "Preserve existing product behavior unless the approved requirements explicitly change it. "
+            "Inspect the existing frontend implementation and tests, historical prototype manifests "
+            "and the current package before editing. A newer prototype may already have omitted "
+            "features; do not use it as the sole behavioral baseline. Inventory the affected flows, "
+            "restore every omission named in operator feedback, and retain unrelated interactions. "
+            "Write a preservation report inside the prototype package mapping each existing flow "
+            "to the proposed interaction and actual browser checks/evidence. Exercise the preserved "
+            "flows as well as the new requirements; file existence and screenshots alone do not "
+            "prove their behavior. Declare the report and evidence as package artifacts."
+        )
+        lines.append(
             "Use untracked files under this workspace's .tmp/ or .tmp-tests/ real "
             "directories for temporary browser profiles, downloads, tooling dependencies "
             "and test scripts. Temporary aliases must stay inside private runtime. "

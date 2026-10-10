@@ -1348,6 +1348,19 @@ class Engine:
                     proposal = validate_prototype(
                         ctx, proposal, self.config, self.store, operation
                     )
+                    if state.get("variants") and not contract.inputs.get("variant_only"):
+                        from .quality import artifact_hashes
+
+                        state["variants"] = [
+                            *state["variants"],
+                            {
+                                "id": "revision-" + operation[:12],
+                                "name": "修改后的原型",
+                                "path": ".auto-agents/docs/frontend_prototype/home.html",
+                                "status": "candidate",
+                                "hashes": artifact_hashes(ctx.workspace_root, proposal["artifacts"]),
+                            },
+                        ]
                 if phase == "clarify":
                     state["frontend"] = bool(proposal.get("frontend"))
             candidate = self.workspaces.candidate(
