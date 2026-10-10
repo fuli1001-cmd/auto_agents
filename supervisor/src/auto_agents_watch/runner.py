@@ -523,7 +523,7 @@ class Runner:
                         self.store.save(job,interrupted=False)
                     if retry_business:
                         self._rechecking_business = True
-                        self.store.save(job, needs_maintenance=False, fault=None,
+                        self.store.save(job, needs_maintenance=False, fault=None, pending_external=[],
                             retained_faults=[*job.get('retained_faults', []),
                                              {'fault': job.get('fault'), 'reason': job.get('reason'),
                                               'resume_token': job.get('resume_token')}])
@@ -566,6 +566,19 @@ class Runner:
             try:exported=json.loads(proc.stdout)
             except (ValueError,TypeError):exported={}
             if proc.returncode or exported.get('ok') is not True:
+                error=exported.get('error')
+                if isinstance(error,dict) and error.get('category')=='reconciliation':
+                    history=list(job.get('retained_faults',[]))
+                    if job.get('fault'):
+                        history.append({'fault':job['fault'],'reason':job.get('reason'),
+                                        'resume_token':job.get('resume_token')})
+                    details=error.get('details') or {}
+                    self.store.save(job,'STOPPED',reason=error['message'],
+                        fault={'type':'ControlError','category':error['category'],
+                               'code':error.get('code'),'message':error['message'],'evidence':details},
+                        pending_external=details.get('pending_external',[]),
+                        needs_maintenance=False,retained_faults=history)
+                    raise RuntimeError(error['message'])
                 reason=exported.get('error') or proc.stderr.strip() or proc.stdout.strip()
                 reason=str(reason)[-4000:] or 'Snapshot process returned no diagnostic output'
                 raise RuntimeError(f'Business snapshot failed (exit {proc.returncode}): {reason}')

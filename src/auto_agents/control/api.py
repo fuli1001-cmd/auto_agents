@@ -135,6 +135,7 @@ def snapshot(project, destination):
             "outcome_unknown",
             "Unconfirmed external operations require reconciliation",
             category="reconciliation",
+            details={"pending_external": current["pending_external"]},
         )
     destination.mkdir(parents=True)
     snapshot_source(project, destination)

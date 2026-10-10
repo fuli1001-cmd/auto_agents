@@ -45,6 +45,24 @@ def test_successful_stage_transition_and_receipt_consumption_are_atomic(tmp_path
     assert store.operations(work["id"])[0]["consumed"]
 
 
+def test_snapshot_refusal_identifies_unconfirmed_calls_without_changing_state(tmp_path):
+    from auto_agents.control.types import ControlError
+
+    store = Store(tmp_path / "project")
+    work = store.create_workflow("run", "Original goal", "source", max_calls=4)
+    work = store.transition(work, "RUNNING")
+    op = store.reserve(work, "model:clarify", 0, {}, model=True)
+    before = status(store.project)
+    destination = tmp_path / "copy"
+    with pytest.raises(ControlError) as caught:
+        snapshot(store.project, destination)
+    assert caught.value.category == "reconciliation"
+    assert caught.value.details["pending_external"] == [{
+        "id": op["id"], "subject": work["id"], "phase": "model:clarify", "state": "DISPATCHED",
+    }]
+    assert not destination.exists() and status(store.project) == before
+
+
 def test_snapshot_preserves_uncommitted_bytes_and_original_head(tmp_path):
     from auto_agents.control.workspace import git
 

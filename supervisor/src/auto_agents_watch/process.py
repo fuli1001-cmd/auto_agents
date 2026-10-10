@@ -42,6 +42,8 @@ def cycle(observation, limit=3):
         if not row.get('counted', True): continue
         if row['progress_seq'] != progress: continue
         counts[row['step_id']] = counts.get(row['step_id'], 0) + 1
+    if observation.get('step_id'):
+        return counts.get(observation['step_id'], 0) >= limit
     return any(count >= limit for count in counts.values())
 
 

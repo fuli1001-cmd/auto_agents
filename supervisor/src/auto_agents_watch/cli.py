@@ -32,6 +32,7 @@ def readable_result(value, store, *, show_pending=True, streamed=False):
             'Business task is waiting for operator input': '业务等待用户处理待办事项，会话已保留。',
             'Interrupted; checkpoint and unconfirmed calls retained': '已中断；会话进度和未确认的调用已保留。',
             'Execution health is uncertain; checkpoint retained': '无法确认运行状态，已保存恢复检查点。',
+            'Unconfirmed external operations require reconciliation': '存在未确认的业务调用，核对结果或确认原调用已取消后才能继续。',
         }
         summary = ' '.join(str(explanations.get(reason, reason)).split())
         print('原因：' + (summary if len(summary) <= 400 else summary[:397] + '…'))
@@ -58,6 +59,15 @@ def readable_result(value, store, *, show_pending=True, streamed=False):
                 print('拒绝说明：'+decision.get('reject_instructions',''))
     if value.get('id'):
         directory = store.root / 'jobs' / value['id']
+        for operation in value.get('pending_external',[]):
+            command=shlex.join(['auto-agents','reconcile-call','--project',value['project'],
+                                '--call',operation['id']])
+            print('核对调用：'+operation['id']+' ('+operation['phase']+')')
+            print('提交原调用结果：'+command+' --result receipt.json')
+            print('若已确认原调用取消：'+command+' --confirm-cancelled')
+        if value.get('pending_external'):
+            print('核对后继续：'+shlex.join(['auto-agents-watch','resume','--root',str(store.root),
+                                          '--job',value['id'],'--retry-business']))
         print('日志：' + str(directory / 'business.log'))
         print('查看完整诊断：auto-agents-watch status --root ' + shlex.quote(str(store.root))
               + ' --job ' + shlex.quote(value['id']) + ' --json')

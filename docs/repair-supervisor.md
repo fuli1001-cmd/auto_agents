@@ -76,6 +76,13 @@ work, approvals and verified improvement count as milestones. Repeated steps
 without a milestone can request a checkpoint. Waiting for a user suspends cycle
 detection. Heartbeat loss and timeouts stop with evidence; neither alone proves
 an engine bug. No model continually interprets workflow health.
+
+An operator approval, rejection or answer starts a fresh loop-detection window;
+steps before that decision cannot stop the revised attempt. Automatic retries
+retain their step history across process restarts, and repetition in an earlier
+phase cannot stop a newly entered phase. These observation boundaries do not
+add verified milestones or refund calls.
+
 Startup and the initial interactive goal prompt also emit heartbeats. A failed
 new admission cannot acquire the previous goal's identity. Duplicate lock refusal
 preserves the existing owner's job, and inherited locks cannot adopt live children
@@ -155,6 +162,11 @@ never refunds the original call. An unconfirmed maintenance call uses
 `auto-agents-watch reconcile --job JOB --result FILE`; its receipt identifies the
 job and original call and supplies a confirmed result. Neither reconciliation
 path blindly resends a possibly completed request.
+
+If snapshot export finds an unconfirmed business call, the watcher records a
+reconciliation stop, retains the original fault in its history, and shows the
+call ID with both reconciliation commands. After reconciling the call, use
+`auto-agents-watch resume --job JOB --retry-business` to recheck the retained task.
 
 ## Git publication across computers
 

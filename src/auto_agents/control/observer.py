@@ -93,11 +93,24 @@ class Observer:
         )
         progress = milestones(store, root["workflow"])
         with store.connect() as db:
+            # Human feedback starts a new attempt, without inventing a verified
+            # milestone or discarding automatic retries across process restarts.
+            # Older histories record the same boundary as WAITING -> READY;
+            # completed children in those histories already supply milestones.
+            boundary = db.execute(
+                "SELECT COALESCE(MAX(id),0) FROM events WHERE event='transition' "
+                "AND work IN (SELECT id FROM work_items WHERE workflow=?) AND ("
+                "json_extract(data,'$.operator_decision')=1 OR ("
+                "json_type(data,'$.operator_decision') IS NULL "
+                "AND json_extract(data,'$.from')='WAITING' "
+                "AND json_extract(data,'$.to')='READY'))",
+                (root["workflow"],),
+            ).fetchone()[0]
             events = [
                 dict(x)
                 for x in db.execute(
-                    "SELECT work,data,id FROM events WHERE event='step_entered' AND work IN (SELECT id FROM work_items WHERE workflow=?) ORDER BY id DESC LIMIT 32",
-                    (root["workflow"],),
+                    "SELECT work,data,id FROM events WHERE event='step_entered' AND id>? AND work IN (SELECT id FROM work_items WHERE workflow=?) ORDER BY id DESC LIMIT 32",
+                    (boundary, root["workflow"]),
                 )
             ]
         steps = [json.loads(x["data"]) for x in reversed(events)]

@@ -483,7 +483,8 @@ def test_explicit_business_recheck_keeps_fault_history_and_spent_budget(tmp_path
     watch = Store(tmp_path / 'watch')
     job = watch.create([], tmp_path / 'project', tmp_path / 'engine')
     original = {'category': 'verification', 'message': 'missing prerequisite'}
-    watch.save(job, 'STOPPED', fault=original, model_calls=2, attempts=1, no_progress=1, needs_maintenance=True)
+    watch.save(job, 'STOPPED', fault=original, model_calls=2, attempts=1, no_progress=1, needs_maintenance=True,
+               pending_external=[{'id': 'previously-reconciled-call'}])
     runner = Runner(watch)
     monkeypatch.setattr(runner, 'maintain', lambda *_: pytest.fail('Explicit business recheck ran maintenance'))
 
@@ -496,6 +497,7 @@ def test_explicit_business_recheck_keeps_fault_history_and_spent_budget(tmp_path
     assert result['retained_faults'][-1]['fault'] == original
     assert (result['model_calls'], result['attempts'], result['no_progress']) == (2, 1, 1)
     assert result['needs_maintenance'] is False
+    assert result['pending_external'] == []
 
 def test_business_recheck_without_original_selector_resumes_checkpoint_root(tmp_path, monkeypatch):
     from auto_agents_watch.runner import Runner
@@ -606,6 +608,75 @@ def test_supervisor_publishes_only_complete_snapshot(tmp_path, monkeypatch):
         result = runner.export_snapshot(job, snapshot)
     assert result['snapshot'] == str(snapshot) and (snapshot / 'complete').read_text() == 'receipt'
     assert not list(runner.directory.glob('.snapshot-*'))
+
+
+def test_pending_business_call_stops_repair_as_reconciliation_and_shows_recovery(tmp_path, monkeypatch, capsys):
+    from auto_agents_watch.runner import Runner
+    from auto_agents_watch import runner as module
+    from auto_agents_watch.cli import readable_result
+
+    watch = Store(tmp_path / 'watch')
+    project = tmp_path / 'project with spaces'
+    job = watch.create(['business', '--project', str(project)], project, tmp_path / 'engine')
+    runner = Runner(watch)
+    runner.directory = watch.root / 'jobs' / job['id']
+    original = {'category': 'engine', 'message': 'Repeated business step without verified progress'}
+    watch.save(job, 'STOPPED', fault=original, needs_maintenance=True, model_calls=2, attempts=1, no_progress=1)
+    pending = [{'id': 'original-operation', 'subject': 'original-work',
+                'phase': 'model:prototype_prepare', 'state': 'DISPATCHED'}]
+
+    def execute(argv, **kwargs):
+        assert 'snapshot' in argv
+        return SimpleNamespace(returncode=3, stderr='', stdout=json.dumps({'ok': False, 'error': {
+            'category': 'reconciliation', 'code': 'outcome_unknown',
+            'message': 'Unconfirmed external operations require reconciliation',
+            'details': {'pending_external': pending},
+        }}))
+    monkeypatch.setattr(module.subprocess, 'run', execute)
+    with runner.locked(job):
+        with pytest.raises(RuntimeError, match='reconciliation'):
+            runner.export_snapshot(job, runner.directory / 'project')
+    stopped = watch.get(job['id'])
+    assert stopped['state'] == 'STOPPED' and stopped['fault']['category'] == 'reconciliation'
+    assert stopped['pending_external'] == pending and not stopped['needs_maintenance']
+    assert stopped['retained_faults'][-1]['fault'] == original
+    assert (stopped['model_calls'], stopped['attempts'], stopped['no_progress']) == (2, 1, 1)
+    assert not stopped.get('candidate') and not (runner.directory / 'project').exists()
+    readable_result(stopped, watch)
+    output = capsys.readouterr().out
+    assert 'auto-agents reconcile-call' in output and '--call original-operation' in output
+    assert '--result' in output and '--confirm-cancelled' in output and '--retry-business' in output
+    assert not list(runner.directory.glob('.snapshot-*'))
+
+
+def test_snapshot_cli_retains_real_unconfirmed_call_without_engine_repair(tmp_path):
+    from auto_agents_watch.runner import Runner
+    from auto_agents.control import Store as BusinessStore
+    from auto_agents.control.api import status
+    from test_control_engine import project
+
+    root = project(tmp_path)
+    business = BusinessStore(root)
+    work = business.create_workflow('run', 'Original goal', 'source', max_calls=4)
+    work = business.transition(work, 'RUNNING')
+    operation = business.reserve(work, 'model:prototype_prepare', 0, {}, model=True)
+    before = status(root)
+    watch = Store(tmp_path / 'watch')
+    job = watch.create([sys.executable, '-m', 'auto_agents', 'run', '--project', str(root)],
+                       root, Path(__file__).resolve().parents[1])
+    watch.save(job, 'STOPPED', needs_maintenance=True,
+               fault={'category': 'engine', 'message': 'Retained cycle fault'})
+    runner = Runner(watch, sandbox_factory=lambda *args, **kwargs: pytest.fail('Unconfirmed call triggered Docker'))
+    runner.directory = watch.root / 'jobs' / job['id']
+    with runner.locked(job):
+        with pytest.raises(RuntimeError, match='reconciliation'):
+            runner.export_snapshot(job, runner.directory / 'project')
+    stopped = runner.resume(job['id'])
+    assert stopped['fault']['category'] == 'reconciliation' and not stopped['needs_maintenance']
+    assert stopped['pending_external'][0]['id'] == operation['id']
+    assert stopped['model_calls'] == 0 and stopped['attempts'] == 0
+    assert status(root) == before and business.workflow(work['workflow'])['calls'] == 1
+    assert not list(runner.directory.glob('.snapshot-*')) and not (runner.directory / 'project').exists()
 
 def test_supervisor_snapshot_cli_inherits_ownership_without_overwriting_fault(tmp_path):
     from auto_agents_watch.runner import Runner

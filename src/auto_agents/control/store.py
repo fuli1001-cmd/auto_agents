@@ -850,7 +850,20 @@ class Store:
             db,
             work["id"],
             "transition",
-            {"from": current["status"], "to": status, "phase": values["phase"]},
+            {
+                "from": current["status"],
+                "to": status,
+                "phase": values["phase"],
+                "operator_decision": (
+                    (
+                        current["status"] == "WAITING"
+                        and previous_context.get("waiting_for") in {"user", "approval"}
+                        and status == "READY"
+                    )
+                    or previous_context.get("operator_answers", [])
+                    != values["context"].get("operator_answers", [])
+                ),
+            },
         )
 
     def bind_contract(
