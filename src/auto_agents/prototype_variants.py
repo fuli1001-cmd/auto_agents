@@ -568,7 +568,7 @@ def preview_root_for_variant(project_root: Path, entry: Mapping[str, object]) ->
 
 
 def gallery_html(project_root: Path, registry: Mapping[str, object]) -> str:
-    variants = registry_variants(registry, statuses=LIVE_VARIANT_STATUSES)
+    variants = registry_variants(registry, statuses=LIVE_VARIANT_STATUSES | {"baseline"})
     data: List[Dict[str, object]] = []
     for entry in variants:
         prototype = entry.get("prototype", {})
@@ -580,11 +580,15 @@ def gallery_html(project_root: Path, registry: Mapping[str, object]) -> str:
             filename = Path(str(raw.get("html_ref", ""))).name
             if not filename:
                 continue
+            prefix = f"/variants/{entry['id']}/"
+            preview_url = raw.get("preview_url")
+            if not isinstance(preview_url, str) or not preview_url.startswith(prefix):
+                preview_url = prefix + filename
             pages.append(
                 {
                     "id": str(raw.get("id", "")),
                     "title": str(raw.get("title", raw.get("id", ""))),
-                    "url": f"/variants/{entry['id']}/{filename}",
+                    "url": preview_url,
                 }
             )
         decision = entry.get("design_decision", {})

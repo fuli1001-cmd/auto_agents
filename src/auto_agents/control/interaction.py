@@ -70,9 +70,16 @@ def pending_decisions(store, root):
         elif state.get("waiting_for") == "approval":
             gate = state.get("approval", "")
             command = [prefix[0], "approve", *prefix[1:], "--gate", gate]
-            result.append({"work_id": work["id"], "kind": "approval",
+            decision = {"work_id": work["id"], "kind": "approval",
                 "question": "请审阅并批准：" + gate, "gate": gate,
-                "command": shlex.join(command)})
+                "command": shlex.join(command)}
+            if gate == "prototype":
+                decision.update(
+                    preview_command=shlex.join([prefix[0], "prototype", "preview", *prefix[1:]]),
+                    preview_instructions="端口自动选择，无需指定。启动后在浏览器打开终端打印的地址，"
+                    "可并排比较原型；按 Ctrl+C 退出预览后再审批。",
+                )
+            result.append(decision)
     return result
 
 

@@ -3,7 +3,10 @@
 from pathlib import Path
 import functools
 import http.server
+import json
 import shutil
+import subprocess
+import urllib.parse
 import uuid
 
 from .types import ControlError
@@ -11,16 +14,16 @@ from .workspace import git
 from .quality import artifact_hashes
 
 
-def owner(store):
+def owner(store, identity=None):
     selected = [
         w
-        for w in store.works()
+        for w in ([store.work(identity)] if identity else store.works())
         if w["mode"] == "run"
         and w["context"].get("frontend")
         and w["status"] not in {"COMPLETED", "CANCELLED"}
     ]
     if len(selected) != 1:
-        raise ControlError("selection", "Choose a unique active frontend run")
+        raise ControlError("selection", "Choose an active frontend run with --session")
     return selected[0]
 
 
@@ -197,21 +200,161 @@ def reject(engine, work, identities=(), *, all_except="", reason=""):
     )
 
 
-def preview(root, *, host="127.0.0.1", port=0):
+def preview_file(workspace, ref, revision=""):
+    """Serve owned package files, including immutable source versions."""
+    from .quality import safe_file
+    from .access import product_path
+
+    if not product_path(ref):
+        return None
+    if revision:
+        entry = git(workspace, "ls-tree", "-z", revision, "--", ref)
+        if not entry.startswith(("100644 blob ", "100755 blob ")):
+            return None
+        result = subprocess.run(
+            ["git", "-C", str(workspace), "show", revision + ":" + ref],
+            capture_output=True,
+        )
+        return result.stdout if result.returncode == 0 else None
+    try:
+        path = safe_file(workspace, ref)
+    except ControlError:
+        return None
+    return path.read_bytes() if path.is_file() else None
+
+
+def preview_gallery(engine, work):
+    """Build a comparison view without writing or approving any artifacts."""
+    workspace = engine.context(work).workspace_root
+    canonical = ".auto-agents/docs/frontend_prototype"
+    source = engine.store.contract(work["contract"]).source
+    entries, routes = [], {}
+
+    def package(row, prefix, revision=""):
+        raw = preview_file(workspace, prefix + "/manifest.json", revision)
+        if raw is None:
+            return
+        try:
+            manifest = json.loads(raw)
+        except ValueError as error:
+            raise ControlError("prototype_manifest", "Prototype manifest is invalid") from error
+        if not isinstance(manifest, dict):
+            raise ControlError("prototype_manifest", "Prototype manifest must be an object")
+        raw_pages = manifest.get("pages", [])
+        artifacts = manifest.get("artifacts", [])
+        if not isinstance(raw_pages, list) or not isinstance(artifacts, list):
+            raise ControlError("prototype_manifest", "Prototype pages and artifacts must be arrays")
+        pages = [
+            p for p in raw_pages
+            if isinstance(p, dict) and isinstance(p.get("html_ref"), str)
+        ]
+        index = manifest.get("index_ref")
+        if isinstance(index, str) and index and not any(p.get("html_ref") == index for p in pages):
+            pages.append({"id": "index", "title": "原型总览", "html_ref": index})
+        refs = {p["html_ref"] for p in pages}
+        refs.update(ref for ref in artifacts if isinstance(ref, str))
+        refs.add(prefix + "/manifest.json")
+        urls = {}
+        from .access import product_path
+
+        for ref in refs:
+            if not isinstance(ref, str) or not product_path(ref):
+                continue
+            try:
+                relative = Path(ref).relative_to(prefix).as_posix()
+            except ValueError:
+                continue
+            url = "/variants/" + row["id"] + "/" + relative
+            routes[url] = (workspace, ref, revision)
+            urls[ref] = urllib.parse.quote(url, safe="/")
+            if prefix == canonical and not revision:
+                # Keep existing direct links to the current package working.
+                routes["/" + relative] = (workspace, ref, revision)
+        entries.append(
+            {
+                **row,
+                "prototype": {"pages": [
+                    {**p, "preview_url": urls[p["html_ref"]]}
+                    for p in pages if p["html_ref"] in urls
+                ]},
+            }
+        )
+
+    from ..prototype_variants import load_registry, preview_root_for_variant
+
+    registry = load_registry(engine.store.project, include_virtual_legacy=False)
+    for row in registry.get("variants", []):
+        if not isinstance(row, dict) or row.get("status") != "approved":
+            continue
+        try:
+            prefix = preview_root_for_variant(engine.store.project, row).relative_to(
+                engine.store.project
+            ).as_posix()
+        except ValueError:
+            continue
+        package(
+            {"id": "history-" + row["id"], "name": "历史原型 · " + row.get("name", row["id"]),
+             "status": "baseline"},
+            prefix, source,
+        )
+    package(
+        {"id": "baseline", "name": "本轮开始前的原型", "status": "baseline"},
+        canonical, source,
+    )
+    for row in candidates(engine, work):
+        if row["status"] in {"candidate", "approved"}:
+            package(row, Path(row["path"]).parent.as_posix())
+    if not entries:
+        raise ControlError("prototype", "No prototype package is available to preview")
+    from ..prototype_variants import gallery_html
+
+    return gallery_html(workspace, {"variants": entries}).encode("utf-8"), routes
+
+
+class PrototypeGalleryHandler(http.server.BaseHTTPRequestHandler):
+    def __init__(self, *args, gallery, routes, **kwargs):
+        self.gallery, self.routes = gallery, routes
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        import mimetypes
+
+        path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+        if path == "/":
+            payload, content_type = self.gallery, "text/html; charset=utf-8"
+        elif path in self.routes:
+            workspace, ref, revision = self.routes[path]
+            payload = preview_file(workspace, ref, revision)
+            content_type = mimetypes.guess_type(ref)[0] or "application/octet-stream"
+        else:
+            payload = None
+        if payload is None:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def preview(engine, work, *, host="127.0.0.1", port=0):
     if not 0 <= port <= 65535:
         raise ControlError("port", "Invalid preview port")
+    gallery, routes = preview_gallery(engine, work)
     handler = functools.partial(
-        http.server.SimpleHTTPRequestHandler, directory=str(root)
+        PrototypeGalleryHandler, gallery=gallery, routes=routes
     )
     server = http.server.ThreadingHTTPServer((host, port), handler)
     print(
-        "Prototype: http://"
+        "原型对比：http://"
         + host
         + ":"
         + str(server.server_address[1])
-        + "/home.html",
+        + "/",
         flush=True,
     )
+    print("在浏览器打开上述地址；按 Ctrl+C 停止预览，然后执行审批命令。", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

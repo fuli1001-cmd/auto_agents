@@ -447,7 +447,7 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
     if args.command == "prototype" or args.command == "prototype-preview":
         from . import prototypes
 
-        work = prototypes.owner(store)
+        work = prototypes.owner(store, getattr(args, "session", None))
         action = getattr(args, "prototype_command", "preview")
         if action == "list":
             emit({"ok": True, "variants": prototypes.candidates(engine, work)})
@@ -466,12 +466,7 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 }
             )
             return 0
-        return prototypes.preview(
-            engine.context(work).workspace_root
-            / ".auto-agents/docs/frontend_prototype",
-            host=args.host,
-            port=args.port,
-        )
+        return prototypes.preview(engine, work, host=args.host, port=args.port)
     if args.command == "inputs":
         from ..operator_inputs import OperatorInputStore, UserInputRequest
 
@@ -880,6 +875,9 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
 
             for decision in pending_decisions(store, result):
                 print("待处理：" + decision["question"])
+                if decision.get("preview_command"):
+                    print("查看原型：" + decision["preview_command"])
+                    print("查看说明：" + decision["preview_instructions"])
                 print("处理命令：" + decision["command"])
             if result["status"] in {"WAITING", "BLOCKED"}:
                 print("恢复命令：" + resume_command(

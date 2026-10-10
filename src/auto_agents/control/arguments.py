@@ -284,6 +284,8 @@ def build_parser() -> argparse.ArgumentParser:
     prototype_preview.add_argument(
         "--port", type=int, default=0, help="Bind port. Defaults to an available port."
     )
+    for command in (preview_parser, prototype_preview, prototype_list, prototype_generate):
+        command.add_argument("--session", help="Select the frontend run session.")
 
     status_parser = subparsers.add_parser(
         "status", help="Show the current orchestrator state."

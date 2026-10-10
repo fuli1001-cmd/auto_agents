@@ -46,6 +46,9 @@ def readable_result(value, store, *, show_pending=True, streamed=False):
     if paused and show_pending:
         for decision in value.get('observation',{}).get('pending_decisions',[]):
             print('待处理：'+decision['question'])
+            if decision.get('preview_command'):
+                print('查看原型：'+decision['preview_command'])
+                print('查看说明：'+decision.get('preview_instructions',''))
             print('处理命令：'+decision['command'])
     if value.get('id'):
         directory = store.root / 'jobs' / value['id']

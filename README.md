@@ -82,7 +82,14 @@ results require reconciliation before any resend, including a provider change.
 Resume retains the original work, goal, source, verification contract, and call
 limits. A newer global plan does not replace a retained task's checks.
 
+At prototype approval, the console prints a preview command for that session.
+The browser gallery compares current candidates, the previous prototype, and
+historical versions retained in the session's source. Omit `--port` to select an
+available port, then open the URL printed by the preview command. Press Ctrl+C
+to stop the preview before approving and resuming.
+
 ```bash
+auto-agents prototype preview --project /path/to/project --session retained-id
 auto-agents approve --project /path/to/project --session retained-id --gate prototype
 auto-agents answer --project /path/to/project --session retained-id --from-env ANSWER --no-resume
 auto-agents verify --project /path/to/project --level release --fresh
