@@ -765,7 +765,7 @@ class Store:
             )
             for k in ("phase", "context", "result", "failure")
         }
-        from .policy import validate_work
+        from .policy import BOUNDED_RETRIES, validate_work
 
         admission = (
             current["status"] == "READY"
@@ -863,6 +863,15 @@ class Store:
                     or previous_context.get("operator_answers", [])
                     != values["context"].get("operator_answers", [])
                 ),
+                "bounded_retry": {
+                    key: values["context"][key]
+                    for key, limit in BOUNDED_RETRIES.items()
+                    if type(previous_context.get(key, 0)) is int
+                    and type(values["context"].get(key)) is int
+                    and 0 <= previous_context.get(key, 0) < limit
+                    and values["context"][key] == previous_context.get(key, 0) + 1
+                    and status == "READY"
+                },
             },
         )
 

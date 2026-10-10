@@ -19,6 +19,7 @@ from .types import (
 from .effects import Provider, Verifier, parse_reply, compile_checks
 from .prompts import build
 from .workspace import Workspaces, git, product_path
+from .policy import BOUNDED_RETRIES
 from . import cleanup
 
 
@@ -1141,7 +1142,8 @@ class Engine:
                         "prototype_scope_review",
                     }
                     and error.code in {"prototype_scope", "prototype_checks_failed"}
-                    and latest["context"].get("prototype_repairs", 0) < 2
+                    and latest["context"].get("prototype_repairs", 0)
+                    < BOUNDED_RETRIES["prototype_repairs"]
                 ):
                     state = {
                         **latest["context"],
@@ -1248,7 +1250,7 @@ class Engine:
                     }
                 ):
                     retries = latest["context"].get("protocol_retries", 0)
-                    if retries < 2:
+                    if retries < BOUNDED_RETRIES["protocol_retries"]:
                         state = {
                             **latest["context"],
                             "feedback": error.to_dict(),

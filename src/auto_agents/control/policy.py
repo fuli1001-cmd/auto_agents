@@ -12,6 +12,10 @@ FEATURES = (
     "prototype_scope_v1",
 )
 
+# These corrections have their own finite allowance. Their admitted retry must
+# not also spend a watchdog repetition before the corrected result is known.
+BOUNDED_RETRIES = {"prototype_repairs": 2, "protocol_retries": 2}
+
 
 @dataclass(frozen=True)
 class WorkflowPolicy:

@@ -31,6 +31,55 @@ def milestones(store, workflow):
     return items
 
 
+def step_history(store, workflow, limit=32):
+    """Count ordinary reentries while preserving finite correction allowances."""
+    with store.connect() as db:
+        # A confirmed cancellation is an operator decision too. Read its
+        # consumed receipt so existing reconciliations need no state rewrite.
+        # Older human decisions have only their WAITING -> READY transition;
+        # completed children in those histories already supply milestones.
+        boundary = db.execute(
+            "SELECT COALESCE(MAX(id),0) FROM ("
+            "SELECT id FROM events WHERE event='transition' "
+            "AND work IN (SELECT id FROM work_items WHERE workflow=?) AND ("
+            "json_extract(data,'$.operator_decision')=1 OR ("
+            "json_type(data,'$.operator_decision') IS NULL "
+            "AND json_extract(data,'$.from')='WAITING' "
+            "AND json_extract(data,'$.to')='READY')) UNION ALL "
+            "SELECT e.id FROM events e JOIN operations o "
+            "ON o.id=json_extract(e.data,'$.operation') "
+            "WHERE e.event='operation_settled' AND o.state='FAILED' "
+            "AND o.consumed=1 AND json_extract(o.result,'$.code')='provider_cancelled' "
+            "AND o.work IN (SELECT id FROM work_items WHERE workflow=?))",
+            (workflow, workflow),
+        ).fetchone()[0]
+        # Include the transitions before the oldest retained step, where its
+        # retry may have been admitted. The preceding step bounds that scan.
+        preceding = db.execute(
+            "SELECT id FROM events WHERE event='step_entered' AND id>? "
+            "AND work IN (SELECT id FROM work_items WHERE workflow=?) "
+            "ORDER BY id DESC LIMIT 1 OFFSET ?",
+            (boundary, workflow, limit),
+        ).fetchone()
+        events = db.execute(
+            "SELECT work,event,data FROM events WHERE id>? "
+            "AND event IN ('transition','step_entered') "
+            "AND work IN (SELECT id FROM work_items WHERE workflow=?) ORDER BY id",
+            (preceding[0] if preceding else boundary, workflow),
+        ).fetchall()
+    steps, retries = [], {}
+    for row in events:
+        data = json.loads(row["data"])
+        if row["event"] == "transition":
+            if data.get("bounded_retry"):
+                retries[row["work"]] = data["phase"]
+        else:
+            if retries.pop(row["work"], None) == data["phase"]:
+                data["counted"] = False
+            steps.append(data)
+    return steps[-limit:]
+
+
 class Observer:
     def __init__(self, project):
         self.project = Path(project).resolve()
@@ -92,28 +141,7 @@ class Observer:
             root,
         )
         progress = milestones(store, root["workflow"])
-        with store.connect() as db:
-            # Human feedback starts a new attempt, without inventing a verified
-            # milestone or discarding automatic retries across process restarts.
-            # Older histories record the same boundary as WAITING -> READY;
-            # completed children in those histories already supply milestones.
-            boundary = db.execute(
-                "SELECT COALESCE(MAX(id),0) FROM events WHERE event='transition' "
-                "AND work IN (SELECT id FROM work_items WHERE workflow=?) AND ("
-                "json_extract(data,'$.operator_decision')=1 OR ("
-                "json_type(data,'$.operator_decision') IS NULL "
-                "AND json_extract(data,'$.from')='WAITING' "
-                "AND json_extract(data,'$.to')='READY'))",
-                (root["workflow"],),
-            ).fetchone()[0]
-            events = [
-                dict(x)
-                for x in db.execute(
-                    "SELECT work,data,id FROM events WHERE event='step_entered' AND id>? AND work IN (SELECT id FROM work_items WHERE workflow=?) ORDER BY id DESC LIMIT 32",
-                    (boundary, root["workflow"]),
-                )
-            ]
-        steps = [json.loads(x["data"]) for x in reversed(events)]
+        steps = step_history(store, root["workflow"])
         from ..engine_fault import engine_root
         import subprocess
 

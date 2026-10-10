@@ -77,11 +77,17 @@ without a milestone can request a checkpoint. Waiting for a user suspends cycle
 detection. Heartbeat loss and timeouts stop with evidence; neither alone proves
 an engine bug. No model continually interprets workflow health.
 
-An operator approval, rejection or answer starts a fresh loop-detection window;
-steps before that decision cannot stop the revised attempt. Automatic retries
-retain their step history across process restarts, and repetition in an earlier
-phase cannot stop a newly entered phase. These observation boundaries do not
-add verified milestones or refund calls.
+An operator approval, rejection, answer or confirmed call cancellation starts a
+fresh loop-detection window; steps before that decision cannot stop the revised
+attempt. Automatic retries retain their step history across process restarts,
+and repetition in an earlier phase cannot stop a newly entered phase. These
+observation boundaries do not add verified milestones or refund calls.
+
+The controller's finite prototype and protocol corrections retain their original
+limit of two retries. Each admitted correction exempts its next step entry once
+from watchdog repetition, including across process restarts. Later ordinary
+reentries still count; exhausted corrections stop with their business validation
+failure.
 
 Startup and the initial interactive goal prompt also emit heartbeats. A failed
 new admission cannot acquire the previous goal's identity. Duplicate lock refusal
