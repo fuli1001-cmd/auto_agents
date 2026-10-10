@@ -776,6 +776,8 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 operations = [
                     o["id"] for o in pending if o["state"] in {"CONFIRMED", "FAILED"}
                 ]
+                if context.get("prototype_scope"):
+                    context["prototype_previous_scope"] = context["prototype_scope"]
                 for key in RESET_FIELDS:
                     context.pop(key, None)
             if waiting:
@@ -1005,9 +1007,10 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
 
 
 def decision_owner(store, root, command, *, request_id=None):
-    """Locate a pending decision through owned child links, without a repair path."""
+    """Locate an owned question, approval, or blocked prototype correction."""
     pending = []
     from .interaction import owned_work
+    from .prototype_scope import PHASES
 
     for work in owned_work(store, root):
         state = work["context"]
@@ -1030,7 +1033,15 @@ def decision_owner(store, root, command, *, request_id=None):
         elif (
             command == "answer"
             and work["status"] == "BLOCKED"
-            and work["failure"].get("code") == "operator_input_changed"
+            and (
+                work["failure"].get("code") == "operator_input_changed"
+                or (
+                    work["phase"] in PHASES
+                    and work["failure"].get("category") == "verification"
+                    and work["failure"].get("code")
+                    in {"prototype_scope", "prototype_checks_failed"}
+                )
+            )
             and not work["failure"].get("child_id")
         ):
             pending.append(work)
