@@ -16,6 +16,10 @@ def progress(work, contract, *, debug=False):
     labels = {
         "clarify": "正在明确需求",
         "prototype": "正在制作界面原型",
+        "prototype_prepare": "正在核对原型基线和修改范围",
+        "prototype_scope_review": "正在独立审查原型修改范围",
+        "prototype_verify": "正在验证原型保留流程和新功能",
+        "prototype_review": "正在独立审查原型变化",
         "design": "正在设计实现方案",
         "plan": "正在安排实现任务",
         "provider_research": "正在核对供应商能力",

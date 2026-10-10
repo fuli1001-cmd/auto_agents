@@ -20,7 +20,7 @@ else:
 
 
 class Boundary:
-    def __init__(self, workspace, scratch, *, readonly=False):
+    def __init__(self, workspace, scratch, *, readonly=False, writable_paths=None):
         self.root = Path(workspace).resolve()
         self.scratch = Path(scratch).resolve()
         self.readonly = readonly
@@ -29,6 +29,14 @@ class Boundary:
             [str(self.scratch)] if readonly else [str(self.root), str(self.scratch)]
         )
         self.scratch.mkdir(parents=True, exist_ok=True)
+        if not readonly and writable_paths is not None:
+            from .quality import safe_file
+
+            self.roots = [str(self.scratch)]
+            for name in writable_paths:
+                path = safe_file(self.root, name)
+                path.mkdir(parents=True, exist_ok=True)
+                self.roots.append(str(path))
 
     def command(self, argv):
         launcher = Path(__file__).resolve()

@@ -135,6 +135,12 @@ class Engine:
                 self.transport.alias = self.provider
         work = self.recover_acceptance_route(work)
         if (
+            work["status"] == "WAITING"
+            and work["context"].get("approval") == "prototype"
+            and not work["context"].get("prototype_certificate")
+        ):
+            work = self.store.upgrade_prototype_gate(work)
+        if (
             work["status"] == "BLOCKED"
             and work["mode"] == "collab"
             and work["phase"] == "acceptance"
@@ -171,6 +177,8 @@ class Engine:
             child_ids = parent["context"].get("children", []) or (
                 [parent["context"]["child"]] if parent["context"].get("child") else []
             )
+            if parent["context"].get("prototype_addon"):
+                child_ids = [*child_ids, parent["context"]["prototype_addon"]]
             for child_id in child_ids:
                 if child_id in selected:
                     raise ControlError(
@@ -240,10 +248,14 @@ class Engine:
             work = self.store.transition(work, "READY", failure={}, operations=retries)
         elif work["status"] == "RUNNING":
             work = self.store.transition(work, "READY")
-        if work["status"] == "READY" and work["context"].get("waiting_for") in {
-            "child",
-            "children",
-        }:
+        if work["status"] == "READY" and (
+            work["context"].get("waiting_for")
+            in {
+                "child",
+                "children",
+            }
+            or work["context"].get("prototype_addon")
+        ):
             work = self.store.transition(work, "WAITING")
         try:
             return self.drive(work["id"])
@@ -579,13 +591,15 @@ class Engine:
                     "outputs": list(outputs),
                     "kind": "verification",
                 },
-                state="failed"
-                if any(
-                    c["returncode"] != 0
-                    for g in payload["gates"]
-                    for c in g["commands"]
-                )
-                else "confirmed",
+                state=(
+                    "failed"
+                    if any(
+                        c["returncode"] != 0
+                        for g in payload["gates"]
+                        for c in g["commands"]
+                    )
+                    else "confirmed"
+                ),
             )
 
         return self.verifier.run(
@@ -876,6 +890,28 @@ class Engine:
                 )
             if phase == "finalize":
                 scope = tuple((inputs or {}).get("paths", ()))
+            if phase == "prototype_prepare":
+                scope = (".auto-agents/docs/prototype_preparation/",)
+            if phase == "prototype" and work["context"].get("prototype_scope"):
+                from .prototype_scope import get, CANONICAL
+
+                frozen = get(self.store, "scope", work["context"]["prototype_scope"])[
+                    "scope"
+                ]
+                prefix = CANONICAL + (
+                    "_variants/" + context.contract.inputs["variant_only"]
+                    if context.contract.inputs.get("variant_only")
+                    else ""
+                )
+                scope = (
+                    (prefix + "/",)
+                    if frozen["mode"] == "create"
+                    else tuple(
+                        prefix + "/" + p
+                        for p in {"manifest.json"}
+                        | {p for c in frozen["changes"] for p in c["files"]}
+                    )
+                )
             operation = next(
                 o for o in self.store.operations(work["id"]) if o["id"] == identity
             )
@@ -912,7 +948,9 @@ class Engine:
         )
         return validate(phase, parse_reply(raw["text"])), operation
 
-    def advance(self, work, phase, *, context=None, result=None, operation=None):
+    def advance(
+        self, work, phase, *, context=None, result=None, operation=None, operations=()
+    ):
         from .policy import validate_work
 
         validate_work(
@@ -929,6 +967,7 @@ class Engine:
             context=context or work["context"],
             failure={},
             operation=operation,
+            operations=operations,
         )
         return updated
 
@@ -965,6 +1004,20 @@ class Engine:
             if work["status"] in {"COMPLETED", "CANCELLED", "BLOCKED"}:
                 return work
             if work["status"] == "WAITING":
+                if work["context"].get("prototype_addon"):
+                    child = self.drive(work["context"]["prototype_addon"])
+                    if child["status"] == "COMPLETED":
+                        from .prototypes import finish_generation
+
+                        work = finish_generation(self, work, child)
+                        continue
+                    if child["status"] == "BLOCKED":
+                        return self.store.transition(
+                            work,
+                            "BLOCKED",
+                            failure={**child["failure"], "child_id": child["id"]},
+                        )
+                    return work
                 if work["context"].get("waiting_for") == "children":
                     ids = work["context"]["children"]
                     maximum = max(1, self.parallel_workers)
@@ -1078,6 +1131,51 @@ class Engine:
                         ):
                             self.store.validate_outcome(op["id"], error=error.to_dict())
                         break
+                if (
+                    latest["phase"]
+                    in {
+                        "prototype_prepare",
+                        "prototype",
+                        "prototype_verify",
+                        "prototype_review",
+                        "prototype_scope_review",
+                    }
+                    and error.code in {"prototype_scope", "prototype_checks_failed"}
+                    and latest["context"].get("prototype_repairs", 0) < 2
+                ):
+                    state = {
+                        **latest["context"],
+                        "feedback": error.to_dict(),
+                        "prototype_repairs": latest["context"].get(
+                            "prototype_repairs", 0
+                        )
+                        + 1,
+                    }
+                    preparing = latest["phase"] in {
+                        "prototype_prepare",
+                        "prototype_scope_review",
+                    }
+                    state.pop(
+                        (
+                            "prototype_prepared_initialized"
+                            if preparing
+                            else "prototype_candidate_initialized"
+                        ),
+                        None,
+                    )
+                    operations = [
+                        o["id"]
+                        for o in self.store.operations(identity)
+                        if not o["consumed"] and o["state"] in {"CONFIRMED", "FAILED"}
+                    ]
+                    self.store.transition(
+                        latest,
+                        "READY",
+                        phase="prototype_prepare" if preparing else "prototype",
+                        context=state,
+                        operations=operations,
+                    )
+                    continue
                 if (
                     error.code in {"provider_quota", "provider_unavailable"}
                     and context is not None
@@ -1222,13 +1320,18 @@ class Engine:
         mode = work["mode"]
         state = dict(work["context"])
         contract = ctx.contract
-        if phase in RUN_PHASES[:5] or phase in {"readme", "research"}:
-            if (
-                phase == "prototype"
-                and not state.get("frontend")
-                and not contract.inputs.get("variant_only")
-            ):
-                return self.advance(work, "design")
+        from .prototype_scope import PHASES, step as prototype_step
+
+        if phase in PHASES:
+            return prototype_step(self, work, ctx)
+        if phase in {
+            "clarify",
+            "design",
+            "plan",
+            "provider_research",
+            "readme",
+            "research",
+        }:
             if phase == "plan":
                 from ..requirements import load_requirements_trace
                 from ..validation import validate_active_persistence_target_readiness
@@ -1342,37 +1445,21 @@ class Engine:
 
                     validate_provider_documents(ctx, proposal, self.store, operation)
                 self.validate_artifacts(ctx, phase, proposal)
-                if phase == "prototype":
-                    from .domain import validate_prototype
-
-                    proposal = validate_prototype(
-                        ctx, proposal, self.config, self.store, operation
-                    )
-                    if state.get("variants") and not contract.inputs.get("variant_only"):
-                        from .quality import artifact_hashes
-
-                        state["variants"] = [
-                            *state["variants"],
-                            {
-                                "id": "revision-" + operation[:12],
-                                "name": "修改后的原型",
-                                "path": ".auto-agents/docs/frontend_prototype/home.html",
-                                "status": "candidate",
-                                "hashes": artifact_hashes(ctx.workspace_root, proposal["artifacts"]),
-                            },
-                        ]
                 if phase == "clarify":
-                    state["frontend"] = bool(proposal.get("frontend"))
+                    from ..frontend_design import discover_existing_frontend
+
+                    state["frontend"] = bool(
+                        proposal.get("frontend")
+                        or discover_existing_frontend(ctx.workspace_root).evidence
+                        or (
+                            ctx.workspace_root
+                            / ".auto-agents/docs/frontend_prototype/manifest.json"
+                        ).is_file()
+                    )
             candidate = self.workspaces.candidate(
                 work, ctx.workspace_root, contract.source, contract.scope
             )
             state["candidate"] = candidate
-            if contract.inputs.get("variant_only"):
-                return self.complete(
-                    work,
-                    {"candidate": candidate, "artifacts": proposal["artifacts"]},
-                    operation=operation,
-                )
             if mode == "provider_resolve":
                 return self.advance(
                     work,
@@ -1389,14 +1476,15 @@ class Engine:
                 if phase != "readme"
                 else "verify"
             )
+            if phase == "clarify" and state.get("frontend"):
+                next_phase = "prototype_prepare"
             gate = {
                 "clarify": "requirements",
-                "prototype": "prototype",
                 "design": "architecture",
             }.get(phase)
-            if gate and (
-                gate == "prototype"
-                or gate in self.config.approvals.enabled
+            if (
+                gate
+                and gate in self.config.approvals.enabled
                 and not contract.authorization.get("auto_approve")
             ):
                 return self.store.transition(
@@ -2076,15 +2164,13 @@ class Engine:
                             self.project,
                         )
                         if action == "fix" and bounded_acceptance
-                        else contract.checks
-                        if action == "fix"
-                        else ()
+                        else contract.checks if action == "fix" else ()
                     ),
-                    scope=tuple(issue["paths"])
-                    if action == "fix" and bounded_acceptance
-                    else contract.scope
-                    if action == "fix"
-                    else (),
+                    scope=(
+                        tuple(issue["paths"])
+                        if action == "fix" and bounded_acceptance
+                        else contract.scope if action == "fix" else ()
+                    ),
                     operation=operation,
                 )
                 if action == "fix" and contract.checks:

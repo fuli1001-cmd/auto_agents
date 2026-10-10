@@ -7,6 +7,7 @@ from auto_agents.control.engine import Engine
 from auto_agents.models import ProjectConfig
 from auto_agents.config import save_project_config
 from test_control_engine import Worker, project
+from test_control_domains import Frontend as DomainFrontend
 
 
 def test_public_init_status_and_storage_are_same_schema(tmp_path, capsys):
@@ -35,51 +36,12 @@ def test_frontend_prototype_is_mandatory_and_approval_preserves_caps(tmp_path, c
     config = ProjectConfig("fixture")
     save_project_config(root, config)
 
-    class Frontend(Worker):
-        def run(self, ctx, phase, prompt, output, **kwargs):
-            if phase == "prototype":
-                path = (
-                    ctx.workspace_root
-                    / ".auto-agents/docs/frontend_prototype/home.html"
-                )
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    '<html><meta name="viewport" content="width=device-width">Prototype</html>'
-                )
-                manifest = {
-                    "pages": [
-                        {
-                            "id": "home",
-                            "title": "Home",
-                            "route": "/",
-                            "requirement_ids": ["REQ-001"],
-                            "html_ref": ".auto-agents/docs/frontend_prototype/home.html",
-                        }
-                    ],
-                    "index_ref": ".auto-agents/docs/frontend_prototype/home.html",
-                    "viewports": ["1440x900"],
-                }
-                (path.parent / "manifest.json").write_text(json.dumps(manifest))
-                data = {
-                    "artifacts": [
-                        ".auto-agents/docs/frontend_prototype/home.html",
-                        ".auto-agents/docs/frontend_prototype/manifest.json",
-                    ]
-                }
-                return {"text": json.dumps(data)}
-            result = super().run(ctx, phase, prompt, output, **kwargs)
-            if phase == "clarify":
-                data = json.loads(result["text"])
-                data["frontend"] = True
-                result["text"] = json.dumps(data)
-            return result
-
     store = Store(root)
     engine = Engine(
         root,
         store,
         config,
-        transport=Frontend(),
+        transport=DomainFrontend(),
         auto_approve=True,
         print_fn=lambda *a: None,
     )

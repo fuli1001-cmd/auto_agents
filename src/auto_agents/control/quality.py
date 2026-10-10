@@ -218,7 +218,7 @@ def stage_writes(before, after, phase, scope=()):
     changes = changed_guard_paths(before, after)
     allowed = scope or STAGE_PATHS.get(phase)
     runtime = set()
-    if phase in {"acceptance", "prototype"}:
+    if phase in {"acceptance", "prototype", "prototype_prepare"}:
         # Prototype tooling may use private scratch, while only acceptance may
         # write private databases or generated application declarations. Both
         # observations must classify a path as runtime; tracked inputs and

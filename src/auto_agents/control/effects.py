@@ -272,7 +272,27 @@ class Provider:
         from .confinement import Boundary
 
         boundary = Boundary(
-            context.workspace_root, Path(output).parent, readonly=readonly
+            context.workspace_root,
+            Path(output).parent,
+            readonly=readonly,
+            writable_paths=(
+                [".auto-agents/docs/prototype_preparation", ".tmp", ".tmp-tests"]
+                if phase == "prototype_prepare"
+                else (
+                    [
+                        ".auto-agents/docs/frontend_prototype"
+                        + (
+                            "_variants/" + context.contract.inputs["variant_only"]
+                            if context.contract.inputs.get("variant_only")
+                            else ""
+                        ),
+                        ".tmp",
+                        ".tmp-tests",
+                    ]
+                    if phase == "prototype"
+                    else None
+                )
+            ),
         )
         if settings.kind != "mock":
             boundary.check()
@@ -300,9 +320,7 @@ class Provider:
             purpose=(
                 "fix_converse"
                 if phase == "classify"
-                else "collab"
-                if phase == "diagnose"
-                else phase
+                else "collab" if phase == "diagnose" else phase
             ),
             sandbox_mode="read-only" if readonly else "workspace-write",
             record_execution_incidents=False,
@@ -349,6 +367,20 @@ class Provider:
 
 
 class Verifier:
+    def prototype(self, context, files, scope, evidence, *, baseline=False):
+        from .prototype_browser import run
+        from .quality import workspace_guard
+
+        before = workspace_guard(context.workspace_root)
+        result = run(files, scope, evidence, baseline=baseline)
+        if workspace_guard(context.workspace_root) != before:
+            raise ControlError(
+                "proof_source_changed",
+                "Prototype verification changed its workspace inputs",
+                category="verification",
+            )
+        return result
+
     def __init__(self, config=None, *, fresh=False):
         self.config = config
         self.fresh = fresh

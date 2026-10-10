@@ -71,23 +71,41 @@ def context_inputs(context, phase, config, store):
             ),
         ).build(task)
         result["repository_map"] = mapping.text
-    if phase == "prototype":
+    if phase in {
+        "prototype",
+        "prototype_prepare",
+        "prototype_scope_review",
+        "prototype_review",
+    }:
         from ..frontend_design import discover_existing_frontend
 
         docs = context.workspace_root / ".auto-agents/docs"
         result["prototype_preservation"] = {
-            "frontend_source_refs": list(discover_existing_frontend(context.workspace_root).evidence),
-            "prototype_manifest_refs": sorted({
-                path.relative_to(context.workspace_root).as_posix()
-                for pattern in (
-                    "frontend_prototype/manifest.json",
-                    "frontend_prototype_variants/*/manifest.json",
-                    "frontend_prototype_variants/*/frontend_prototype/manifest.json",
-                )
-                for path in docs.glob(pattern) if path.is_file()
-            }),
+            "frontend_source_refs": list(
+                discover_existing_frontend(context.workspace_root).evidence
+            ),
+            "prototype_manifest_refs": sorted(
+                {
+                    path.relative_to(context.workspace_root).as_posix()
+                    for pattern in (
+                        "frontend_prototype/manifest.json",
+                        "frontend_prototype_variants/*/manifest.json",
+                        "frontend_prototype_variants/*/frontend_prototype/manifest.json",
+                    )
+                    for path in docs.glob(pattern)
+                    if path.is_file()
+                }
+            ),
         }
-    if phase == "prototype" and config.frontend_design.mode != "off":
+    state = store.work(context.work_id)["context"]
+    new_frontend = False
+    if phase == "prototype_prepare" and state.get("prototype_seed"):
+        from .prototype_scope import get
+
+        new_frontend = not get(store, "seed", state["prototype_seed"])["has_frontend"]
+    if (
+        phase == "prototype" and not state.get("prototype_scope") or new_frontend
+    ) and config.frontend_design.mode != "off":
         from ..frontend_design import (
             AwesomeDesignCatalogClient,
             FrontendDesignUnavailable,
@@ -289,6 +307,15 @@ def validate_prototype(context, proposal, config, store, operation):
     inputs = (retained.get("inputs") or {}).get("inputs", {})
     catalog = inputs.get("design_catalog")
     source = {"kind": "user", "refs": inputs.get("user_design_assets", [])}
+    scope_id = store.work(context.work_id)["context"].get("prototype_scope")
+    previous_lock = (
+        context.workspace_root / ".auto-agents/docs/frontend_design.lock.json"
+    )
+    if scope_id and previous_lock.is_file():
+        from .prototype_scope import get
+
+        if get(store, "scope", scope_id)["scope"]["mode"] != "create":
+            source = json.loads(previous_lock.read_text()).get("source", source)
     if catalog:
         snapshot = CatalogSnapshot(
             catalog["repository"],

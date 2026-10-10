@@ -172,12 +172,12 @@ def test_prototype_tooling_reaches_approval_without_delivery_or_redispatch(
         assert native["validation"]["state"] == "rejected"
         calls = list(worker.calls)
         work = engine.resume(work["id"])
-        assert worker.calls == calls
+        assert [c for c in worker.calls if c[1] == "prototype"] == [c for c in calls if c[1] == "prototype"]
         assert store.outcome(operation["id"])["payload"] == native["payload"]
     assert work["status"] == "WAITING", work["failure"]
     assert work["context"]["approval"] == "prototype"
     assert [phase for _, phase in worker.calls] == ["clarify", "prototype"]
-    assert store.workflow(work["workflow"])["calls"] == 2
+    assert store.workflow(work["workflow"])["calls"] == 5
     assert store.outcome(operation["id"])["validation"]["state"] == "accepted"
     workspace = engine.context(work).workspace_root
     assert (workspace / ".tmp/prototype-tools/tool.py").is_file()
@@ -204,7 +204,7 @@ def test_prototype_tooling_reaches_approval_without_delivery_or_redispatch(
     assert validate_frontend_design_artifacts(workspace, lock, require_approved=True) == []
     evidence_ref = ".auto-agents/docs/frontend_prototype/evidence/results.json"
     assert evidence_ref in lock["artifact_sha256"]
-    assert worker.calls == calls and store.workflow(work["workflow"])["calls"] == 2
+    assert worker.calls == calls and store.workflow(work["workflow"])["calls"] == 5
     (workspace / evidence_ref).write_text("changed after approval")
     errors = validate_frontend_design_artifacts(workspace, lock, require_approved=True)
     assert any("drifted" in error for error in errors)

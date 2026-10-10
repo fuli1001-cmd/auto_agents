@@ -39,9 +39,12 @@ def owned_work(store, root):
             raise ControlError("work_cycle", "Owned work graph contains a cycle")
         seen.add(work["id"])
         yield work
-        for identity in work["context"].get("children", []) or (
+        child_ids = work["context"].get("children", []) or (
             [work["context"]["child"]] if work["context"].get("child") else []
-        ):
+        )
+        if work["context"].get("prototype_addon"):
+            child_ids = [*child_ids, work["context"]["prototype_addon"]]
+        for identity in child_ids:
             child = store.work(identity)
             if child["parent"] != work["id"]:
                 raise ControlError("child_authority", "Child belongs to another parent")
@@ -57,6 +60,8 @@ def pending_decisions(store, root):
         if work["status"] != "WAITING":
             continue
         state = work["context"]
+        if state.get("prototype_addon"):
+            continue
         prefix = ["auto-agents", "--project", str(store.project), "--session", work["id"]]
         if state.get("waiting_for") == "user":
             for raw in state.get("input_requests", []):
@@ -75,6 +80,8 @@ def pending_decisions(store, root):
                 "command": shlex.join(command)}
             if gate == "prototype":
                 decision.update(
+                    scope_summary=state.get("prototype_scope_summary", "待补做范围验证；恢复会话后才可批准"),
+                    baseline_repairs=state.get("prototype_baseline_repairs", "待核对"),
                     preview_command=shlex.join([prefix[0], "prototype", "preview", *prefix[1:]]),
                     preview_instructions="端口自动选择，无需指定。启动后在浏览器打开终端打印的地址，"
                     "可并排比较原型；按 Ctrl+C 退出预览后再审批。",

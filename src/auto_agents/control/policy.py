@@ -5,7 +5,12 @@ import re
 
 from .types import ControlError
 
-FEATURES = ("contract_policy_v1", "validated_outcome_v1", "explicit_retry_v1")
+FEATURES = (
+    "contract_policy_v1",
+    "validated_outcome_v1",
+    "explicit_retry_v1",
+    "prototype_scope_v1",
+)
 
 
 @dataclass(frozen=True)
@@ -79,7 +84,7 @@ PRODUCT = frozenset({"run", "fix"})
 STAGES = {
     "clarify": StageSpec(
         frozenset({"run"}),
-        frozenset({"prototype"}),
+        frozenset({"prototype", "prototype_prepare"}),
         (
             ".auto-agents/docs/project_brief.md",
             ".auto-agents/docs/requirements.md",
@@ -89,12 +94,27 @@ STAGES = {
     ),
     "prototype": StageSpec(
         frozenset({"run"}),
-        frozenset({"design"}),
+        frozenset({"design", "prototype_prepare", "prototype_verify"}),
         (
             ".auto-agents/docs/frontend_prototype/",
             ".auto-agents/docs/frontend_design/",
             "DESIGN.md",
         ),
+    ),
+    "prototype_prepare": StageSpec(
+        frozenset({"run"}),
+        frozenset({"prototype_scope_review", "design"}),
+        (".auto-agents/docs/prototype_preparation/",),
+    ),
+    "prototype_scope_review": StageSpec(
+        frozenset({"run"}), frozenset({"prototype", "prototype_prepare"})
+    ),
+    "prototype_verify": StageSpec(
+        frozenset({"run"}),
+        frozenset({"prototype_review", "prototype", "prototype_prepare"}),
+    ),
+    "prototype_review": StageSpec(
+        frozenset({"run"}), frozenset({"design", "prototype", "prototype_prepare"})
     ),
     "design": StageSpec(
         frozenset({"run"}),

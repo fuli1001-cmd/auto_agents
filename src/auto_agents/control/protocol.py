@@ -30,7 +30,7 @@ def validate(phase, value):
         or any(not isinstance(x, (str, dict)) for x in value["checks"])
     ):
         invalid("checks")
-    for key in ("accepted", "frontend", "not_required", "test_changes_valid"):
+    for key in ("accepted", "frontend", "not_required", "test_changes_valid", "coverage_complete"):
         if key in value and type(value[key]) is not bool:
             invalid(key)
     for key in ("reason", "summary", "decision", "action", "verification_command"):

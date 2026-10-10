@@ -25,7 +25,7 @@ def test_rejected_prototype_is_regenerated_with_feedback_and_original_contract(
                  "--gate", "prototype", "--reason", reason]) == 0
     capsys.readouterr()
     ready = engine.store.work(work["id"])
-    assert ready["status"] == "READY" and ready["phase"] == "prototype"
+    assert ready["status"] == "READY" and ready["phase"] == "prototype_prepare"
     assert ready["context"]["feedback"] == reason
     assert "approval" not in ready["context"] and "waiting_for" not in ready["context"]
     assert ready["contract"] == before["contract"]
@@ -47,10 +47,11 @@ def test_rejected_prototype_is_regenerated_with_feedback_and_original_contract(
     revised = engine.resume(work["id"])
     assert revised["status"] == "WAITING", revised["failure"]
     assert revised["context"]["approval"] == "prototype"
-    assert len(prompts) == 1 and prompts[0][0] == "prototype" and reason in prompts[0][1]
-    assert "Preserve existing product behavior" in prompts[0][1]
+    assert [p for p, _ in prompts] == ["prototype_prepare", "prototype_scope_review", "prototype", "prototype_review"]
+    assert all(reason in prompt for _, prompt in prompts)
+    assert "Preserve existing product behavior" in next(prompt for phase, prompt in prompts if phase == "prototype")
     assert revised["contract"] == before["contract"] and revised["max_calls"] == before["max_calls"]
-    assert engine.store.workflow(work["workflow"])["calls"] == calls + 1
+    assert engine.store.workflow(work["workflow"])["calls"] == calls + 4
     operations = [o for o in engine.store.operations(work["id"]) if o["kind"] == "model:prototype"]
     assert len(operations) == 2 and operations[1]["ordinal"] == operations[0]["ordinal"] + 1
     assert engine.store.outcome(old["id"])["payload"] == native["payload"]

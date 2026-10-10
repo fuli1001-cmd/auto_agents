@@ -83,17 +83,28 @@ Resume retains the original work, goal, source, verification contract, and call
 limits. A newer global plan does not replace a retained task's checks.
 
 At prototype approval, the console prints a preview command for that session.
-The browser gallery compares current candidates, the previous prototype, and
+The browser gallery compares current candidates, the original and repaired baseline, and
 historical versions retained in the session's source. Omit `--port` to select an
 available port, then open the URL printed by the preview command. Press Ctrl+C
 to stop the preview before approving and resuming.
 The pause also prints a rejection command with `--reason`. Rejection saves the
 feedback and returns to the proposal's own stage; run the resume command to
 generate a revision, which requires review again. Original contracts and spent
-call counts are retained. Prototype revision instructions include existing
-frontend source and historical manifests, and request a preservation report
-with browser checks. Feedback and structural validation alone do not guarantee
-that every existing behavior has been preserved.
+call counts are retained. Iterations first inventory existing flows and repair
+evidenced baseline omissions, then independently review and freeze the allowed
+regions, exact editable files, causal layout changes and browser assertions.
+Generation is confined to the candidate package. Controller-run Chrome/Chromium
+checks exercise old and new behavior and compare unaffected DOM, defaults and
+styles before an independent result review and human approval. Chrome/Chromium
+must be installed; missing tools, skipped/empty checks and stale certificates
+cannot pass. Clear scopes continue automatically; ambiguity and scope expansion
+require a specific user decision. An iteration without UI changes can reuse the
+verified baseline without a generation call. All review calls share the existing budget.
+Old pending prototypes receive these checks on resume without replaying their
+original producer calls. See [incremental prototype contracts](docs/prototype-scope.md)
+for the scope rules, evidence and compatibility behavior. Flow coverage still
+requires independent semantic review; browser assertions alone cannot establish
+that an inventory is complete.
 
 ```bash
 auto-agents prototype preview --project /path/to/project --session retained-id

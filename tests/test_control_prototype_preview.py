@@ -31,10 +31,12 @@ def frontend(tmp_path):
     prefix = ".auto-agents/docs/frontend_prototype"
     old = root / prefix
     old.mkdir(parents=True)
-    (old / "home.html").write_text("<html>Previous prototype</html>")
+    previous = '<html><head><meta name="viewport" content="width=device-width"></head><body><main id="fixture-content">Previous prototype</main><aside id="fixture-stable">Retained</aside></body></html>'
+    (old / "home.html").write_text(previous)
     (old / "manifest.json").write_text(json.dumps({
-        "pages": [{"id": "home", "title": "Previous home", "html_ref": prefix + "/home.html"}],
+        "pages": [{"id": "home", "title": "Previous home", "route": "/", "requirement_ids": ["REQ-001"], "html_ref": prefix + "/home.html"}],
         "index_ref": prefix + "/home.html",
+        "viewports": ["800x600"],
     }))
     history_prefix = ".auto-agents/docs/frontend_prototype_variants/legacy-old/frontend_prototype"
     history = root / history_prefix
@@ -58,13 +60,20 @@ def frontend(tmp_path):
     class Pages(Frontend):
         def run(self, ctx, phase, *args, **kwargs):
             result = super().run(ctx, phase, *args, **kwargs)
+            if phase == "prototype_prepare":
+                reply = json.loads(result["text"])
+                scope = reply["scope"]
+                scope["changes"].append({"id": "nested", "kind": "add", "page": "nested/home.html", "selector": "#nested", "files": ["nested/home.html", "nested/report.json"], "requirement_ids": ["REQ-001"], "evidence": ["goal"], "because": [], "reason": "Requested second page"})
+                scope["flows"].append({"id": "nested", "page": "nested/home.html", "requirement_ids": ["REQ-001"], "evidence": ["goal"], "checks": ["nested"]})
+                scope["checks"].append({"id": "nested", "flow": "nested", "page": "nested/home.html", "kind": "new", "steps": [], "asserts": [{"selector": "#nested", "property": "text", "equals": "Nested page"}]})
+                result["text"] = json.dumps(reply)
             if phase == "prototype":
                 reply = json.loads(result["text"])
                 prefix = reply["artifacts"][0].rsplit("/", 1)[0]
                 package = ctx.workspace_root / prefix
                 (package / "nested").mkdir(exist_ok=True)
                 (package / "nested/home.html").write_text(
-                    '<html><meta name="viewport" content="width=device-width">Nested page</html>'
+                    '<html><meta name="viewport" content="width=device-width"><p id="nested">Nested page</p></html>'
                 )
                 (package / "nested/report.json").write_text('{"observed": true}')
                 manifest = json.loads((package / "manifest.json").read_text())
@@ -142,7 +151,7 @@ def test_preview_serves_baseline_and_candidates_side_by_side_without_mutation(fr
                 return response.read()
 
         assert read("/") == gallery
-        assert read("/variants/baseline/home.html") == b"<html>Previous prototype</html>"
+        assert b"Previous prototype" in read("/variants/baseline/home.html")
         assert read("/variants/history-legacy-old/home.html") == b"<html>Historical prototype</html>"
         assert b"Current prototype" in read("/variants/initial/home.html")
         assert b"Another layout" in read("/variants/" + variant + "/home.html")

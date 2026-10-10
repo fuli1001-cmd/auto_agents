@@ -388,9 +388,11 @@ class Store:
                 {
                     "operation": identity,
                     "previous_state": row["state"],
-                    "previous_failure": json.loads(row["result"])
-                    if row["state"] in {"FAILED", "UNKNOWN"} and row["result"]
-                    else None,
+                    "previous_failure": (
+                        json.loads(row["result"])
+                        if row["state"] in {"FAILED", "UNKNOWN"} and row["result"]
+                        else None
+                    ),
                     **decision,
                 },
             )
@@ -441,9 +443,7 @@ class Store:
             else (
                 "classify"
                 if mode == "fix"
-                else "research"
-                if mode == "provider_resolve"
-                else "diagnose"
+                else "research" if mode == "provider_resolve" else "diagnose"
             )
         )
         with self.connect(True) as db:
@@ -533,9 +533,7 @@ class Store:
                 (
                     "clarify"
                     if mode == "run"
-                    else "classify"
-                    if mode == "fix"
-                    else "research"
+                    else "classify" if mode == "fix" else "research"
                 ),
                 limit,
             )
@@ -589,6 +587,32 @@ class Store:
                 },
             )
         return [self.work(x) for x in children]
+
+    def upgrade_prototype_gate(self, work):
+        """Adopt unapproved schema-2 candidates without changing their receipts."""
+        state = dict(work["context"])
+        if (
+            work["status"] != "WAITING"
+            or state.get("approval") != "prototype"
+            or state.get("prototype_certificate")
+        ):
+            raise ControlError(
+                "prototype_migration",
+                "Only an unvalidated pending prototype can be adopted",
+            )
+        if any(
+            o["state"] in {"UNKNOWN", "DISPATCHED"} for o in self.operations(work["id"])
+        ):
+            raise ControlError(
+                "outcome_unknown",
+                "Reconcile prototype operations before adopting scope checks",
+                category="reconciliation",
+            )
+        for key in ("waiting_for", "approval", "approval_phase"):
+            state.pop(key, None)
+        state["prototype_legacy_candidate"] = True
+        state["frontend"] = True
+        return self.transition(work, "READY", phase="prototype_prepare", context=state)
 
     def addon(self, parent, goal, source, *, scope, inputs, phase):
         """An explicit operator artifact request shares the original call budget."""
@@ -752,7 +776,7 @@ class Store:
         # A recorded human gate owns its return phase. Rejecting it may return
         # to that phase, without allowing arbitrary backward stage transitions.
         rejection = (
-            current["status"] == "WAITING"
+            current["status"] in {"WAITING", "BLOCKED"}
             and status == "READY"
             and previous_context.get("waiting_for") == "approval"
             and previous_context.get("approval_phase") == values["phase"]
@@ -761,16 +785,33 @@ class Store:
                 key in values["context"]
                 for key in ("waiting_for", "approval", "approval_phase")
             )
-            and previous_context["approval"] not in values["context"].get("approvals", {})
+            and previous_context["approval"]
+            not in values["context"].get("approvals", {})
             and isinstance(values["context"].get("feedback"), str)
             and bool(values["context"]["feedback"].strip())
+        )
+        prototype_migration = (
+            current["status"] == "WAITING"
+            and status == "READY"
+            and previous_context.get("approval") == "prototype"
+            and not previous_context.get("prototype_certificate")
+            and values["phase"] == "prototype_prepare"
+            and values["context"].get("prototype_legacy_candidate") is True
+            and not any(
+                k in values["context"]
+                for k in ("waiting_for", "approval", "approval_phase")
+            )
         )
         validate_work(
             current["mode"],
             values["phase"],
             status,
             values["context"],
-            previous=None if admission or rejection else current["phase"],
+            previous=(
+                None
+                if admission or rejection or prototype_migration
+                else current["phase"]
+            ),
         )
         if status == "WAITING" and values["context"].get("waiting_for") in {
             "child",

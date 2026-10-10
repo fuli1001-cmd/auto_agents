@@ -615,6 +615,40 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
         else:
             if work["status"] not in {"WAITING", "BLOCKED"}:
                 raise ControlError("input", "Work item is not waiting")
+            if (
+                args.command == "answer"
+                and (
+                    work["context"].get("waiting_for") == "approval"
+                    or work["context"].get("waiting_for") != "user"
+                    and work["status"] == "WAITING"
+                    and work["failure"].get("code") != "operator_input_changed"
+                )
+            ):
+                raise ControlError(
+                    "input",
+                    "Use approve or reject for an approval gate; answer requires a pending user question",
+                )
+            if (
+                args.command == "reject"
+                and work["context"].get("waiting_for") != "approval"
+            ):
+                raise ControlError("approval", "No pending approval to reject")
+            from .prototype_scope import PHASES, RESET_FIELDS
+
+            if (
+                args.command == "answer"
+                and work["phase"] in PHASES
+                and work["status"] == "BLOCKED"
+                and any(
+                    o["state"] in {"UNKNOWN", "DISPATCHED"} and not o["consumed"]
+                    for o in store.operations(work["id"])
+                )
+            ):
+                raise ControlError(
+                    "outcome_unknown",
+                    "Reconcile existing prototype operations before changing decisions",
+                    category="reconciliation",
+                )
             text = (
                 getattr(args, "text", "")
                 or getattr(args, "reason", "")
@@ -694,24 +728,56 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 gate = work["context"].get("approval")
                 context.pop("approval", None)
                 context["approvals"] = {
-                    k: v
-                    for k, v in context.get("approvals", {}).items()
-                    if k != gate
+                    k: v for k, v in context.get("approvals", {}).items() if k != gate
                 }
                 if gate == "prototype":
                     from .prototypes import candidates
 
+                    if context.get("prototype_scope"):
+                        context["prototype_previous_scope"] = context["prototype_scope"]
+
+                    addon_id = context.pop("prototype_addon", None)
+                    context.pop("prototype_addon_name", None)
+                    if addon_id:
+                        addon = store.work(addon_id)
+                        if addon["status"] not in {"COMPLETED", "CANCELLED"}:
+                            store.transition(addon, "CANCELLED")
+
                     context["variants"] = [
-                        {**row, "status": "rejected", "reason": text}
-                        if row["status"] == "candidate" else row
+                        (
+                            {**row, "status": "rejected", "reason": text}
+                            if row["status"] == "candidate"
+                            else row
+                        )
                         for row in candidates(engine, work)
                     ]
+                    for key in RESET_FIELDS:
+                        context.pop(key, None)
             phase = (
                 context.pop("approval_phase", work["phase"])
                 if args.command == "reject"
                 else work["phase"]
             )
             waiting = bool(context.get("input_requests"))
+            reset_scope = context.get("prototype_scope_reset_on_answer", False) or (
+                work["status"] == "BLOCKED" and work["phase"] in PHASES
+            )
+            operations = []
+            if args.command == "answer" and not waiting and reset_scope:
+                context.pop("prototype_scope_reset_on_answer", None)
+                phase = "prototype_prepare"
+                pending = [o for o in store.operations(work["id"]) if not o["consumed"]]
+                if any(o["state"] in {"UNKNOWN", "DISPATCHED"} for o in pending):
+                    raise ControlError(
+                        "outcome_unknown",
+                        "Reconcile existing prototype operations before changing decisions",
+                        category="reconciliation",
+                    )
+                operations = [
+                    o["id"] for o in pending if o["state"] in {"CONFIRMED", "FAILED"}
+                ]
+                for key in RESET_FIELDS:
+                    context.pop(key, None)
             if waiting:
                 context["waiting_for"] = "user"
             work = store.transition(
@@ -720,6 +786,7 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 phase=phase,
                 context=context,
                 failure={},
+                operations=operations,
             )
         if (
             args.command == "answer"
@@ -887,6 +954,9 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
 
             for decision in pending_decisions(store, result):
                 print("待处理：" + decision["question"])
+                if decision.get("scope_summary"):
+                    print("原型修改范围：" + decision["scope_summary"])
+                    print("基线补全：" + decision["baseline_repairs"])
                 if decision.get("preview_command"):
                     print("查看原型：" + decision["preview_command"])
                     print("查看说明：" + decision["preview_instructions"])

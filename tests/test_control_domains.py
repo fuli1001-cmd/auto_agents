@@ -16,6 +16,87 @@ from test_control_engine import project, Worker
 
 class Frontend(Worker):
     def run(self, ctx, phase, *a, **kw):
+        if phase in {"prototype_scope_review", "prototype_review"}:
+            return {
+                "text": json.dumps(
+                    {
+                        "decision": "pass",
+                        "coverage_complete": True,
+                        "reason": "Compared source, declared regions and real browser observations",
+                    }
+                )
+            }
+        if phase == "prototype_prepare":
+            from auto_agents.control.prototype_scope import CANONICAL, PREPARED
+
+            owned, _ = json.JSONDecoder().raw_decode(
+                a[0].split("Owned inputs:\n", 1)[1]
+            )
+            existing = owned["admitted_baseline"]["has_frontend"]
+            scope = {
+                "version": 1,
+                "mode": "incremental" if existing else "create",
+                "reason": "Change only the fixture content",
+                "repairs": [],
+                "geometry": [],
+                "viewports": ["800x600"],
+                "changes": [
+                    {
+                        "id": "content",
+                        "kind": "change" if existing else "add",
+                        "page": "home.html",
+                        "selector": "#fixture-content",
+                        "files": ["home.html"],
+                        "requirement_ids": ["REQ-001"],
+                        "evidence": ["goal"],
+                        "because": [],
+                        "reason": "Requested content",
+                    }
+                ],
+                "flows": [
+                    {
+                        "id": "content",
+                        "page": "home.html",
+                        "requirement_ids": ["REQ-001"],
+                        "evidence": ["goal"],
+                        "checks": ["new", *(["preserved"] if existing else [])],
+                    }
+                ],
+                "checks": [
+                    {
+                        "id": "new",
+                        "flow": "content",
+                        "page": "home.html",
+                        "kind": "new",
+                        "steps": [],
+                        "asserts": [
+                            {
+                                "selector": "#fixture-content",
+                                "property": "count",
+                                "equals": 1,
+                            }
+                        ],
+                    }
+                ],
+            }
+            if existing:
+                scope["checks"].append(
+                    {
+                        "id": "preserved",
+                        "flow": "content",
+                        "page": "home.html",
+                        "kind": "preservation",
+                        "steps": [],
+                        "asserts": [
+                            {
+                                "selector": "#fixture-stable",
+                                "property": "text",
+                                "equals": "Retained",
+                            }
+                        ],
+                    }
+                )
+            return {"text": json.dumps({"scope": scope})}
         if phase == "prototype":
             prefix = ".auto-agents/docs/frontend_prototype"
             if ctx.contract.inputs.get("variant_only"):
@@ -23,9 +104,9 @@ class Frontend(Worker):
             path = ctx.workspace_root / prefix
             path.mkdir(parents=True, exist_ok=True)
             (path / "home.html").write_text(
-                '<html><meta name="viewport" content="width=device-width">'
+                '<html><head><meta name="viewport" content="width=device-width"></head><body><main id="fixture-content">'
                 + ctx.contract.goal
-                + "</html>"
+                + '</main><aside id="fixture-stable">Retained</aside></body></html>'
             )
             manifest = {
                 "pages": [
@@ -38,7 +119,7 @@ class Frontend(Worker):
                     }
                 ],
                 "index_ref": prefix + "/home.html",
-                "viewports": ["1440x900"],
+                "viewports": ["800x600"],
             }
             (path / "manifest.json").write_text(json.dumps(manifest))
             return {
