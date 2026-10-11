@@ -68,6 +68,7 @@ def main(argv=None):
         "migrate-state",
         "checkpoint",
         "reconcile-call",
+        "extend-budget",
         "quiesce",
     }
     if arguments and arguments[0] in public:

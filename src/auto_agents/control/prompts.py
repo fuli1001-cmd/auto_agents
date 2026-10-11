@@ -117,7 +117,10 @@ def build(context, phase, *, inputs=None, feedback=None):
             "All declared states retain the same file's scope and preservation constraints. "
             "Dynamic regions may be absent in empty/default states and appear after frozen "
             "actions; each required region must be observed in every viewport. Regions "
-            "remain unique and bounded whenever present. The controller waits up to two "
+            "remain unique and bounded whenever present. A region introduced only in the "
+            "candidate uses kind:add, including related additions with because dependencies; "
+            "kind:linkage modifies a region that exists in the repaired baseline states. "
+            "The controller waits up to two "
             "seconds for all frozen postconditions to hold together, without weakening them."
         )
         lines.append(

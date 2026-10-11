@@ -693,6 +693,59 @@ class Store:
                 self._consume(db, identity)
         return self.work(work["id"])
 
+    def extend_budget(self, work, limit, *, reason):
+        """Apply one explicit operator grant without refunding model calls."""
+        if type(limit) is not int or not 0 < limit < 2**63:
+            raise ControlError("budget", "Call limit must be a positive supported integer")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ControlError("budget", "Budget extension requires an explicit operator reason")
+        with self.connect(True) as db:
+            current = db.execute("SELECT * FROM work_items WHERE id=?", (work["id"],)).fetchone()
+            if not current or current["revision"] != work["revision"]:
+                raise ControlError("stale_revision", "Work item changed after it was read")
+            if current["status"] in {"RUNNING", "COMPLETED", "CANCELLED"}:
+                raise ControlError("budget", "Only idle unfinished work can extend its call limit")
+            previous = current["max_calls"]
+            if limit < max(previous, current["calls"]):
+                raise ControlError("budget", "New call limit cannot lower the retained limit or used calls")
+            workflow = db.execute("SELECT * FROM workflows WHERE id=?", (current["workflow"],)).fetchone()
+            failure, context = json.loads(current["failure"]), json.loads(current["context"])
+            pending = db.execute(
+                "SELECT o.id FROM operations o JOIN work_items w ON w.id=o.work "
+                "WHERE w.workflow=? AND o.state IN ('UNKNOWN','DISPATCHED') LIMIT 1",
+                (current["workflow"],),
+            ).fetchone()
+            imported = db.execute(
+                "SELECT key FROM control_meta WHERE key LIKE 'unassigned_call:%' "
+                "AND json_extract(value,'$.state') IN ('dispatched','unknown') LIMIT 1",
+            ).fetchone()
+            reopened = bool(
+                current["status"] == "BLOCKED"
+                and failure.get("category") == "budget" and failure.get("code") == "budget"
+                and not failure.get("child_id") and not failure.get("details", {}).get("child_id")
+                and not context.get("waiting_for") and not context.get("approval")
+                and current["calls"] < limit
+                and (workflow["max_calls"] is None or workflow["calls"] < workflow["max_calls"])
+                and not pending and not imported
+            )
+            status = "READY" if reopened else current["status"]
+            changed = limit != previous
+            if changed or reopened:
+                self._transition(db, work, status, failure={} if reopened else failure)
+                db.execute("UPDATE work_items SET max_calls=? WHERE id=?", (limit, work["id"]))
+                self._event(db, work["id"], "budget_extended", {
+                    "previous_max_calls": previous, "max_calls": limit, "calls": current["calls"],
+                    "contract": current["contract"], "reason": reason.strip(), "reopened": reopened,
+                })
+            result = {
+                "ok": True, "work_id": work["id"], "scope": "work_item",
+                "previous_max_calls": previous, "max_calls": limit, "calls": current["calls"],
+                "remaining_calls": limit - current["calls"], "status": status,
+                "workflow_max_calls": workflow["max_calls"], "workflow_calls": workflow["calls"],
+                "changed": changed, "reopened": reopened,
+            }
+        return result
+
     def redirect_acceptance(self, parent, child, retained):
         """Retire a mistaken development route without discarding its evidence."""
         if child["parent"] != parent["id"] or child["workflow"] != parent["workflow"]:

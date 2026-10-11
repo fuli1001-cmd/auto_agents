@@ -817,6 +817,7 @@ def build_parser() -> argparse.ArgumentParser:
         "resume-check",
         "migrate-state",
         "reconcile-call",
+        "extend-budget",
         "quiesce",
         "checkpoint",
         "upgrade",
@@ -836,6 +837,10 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--call", required=True)
             command.add_argument("--result")
             command.add_argument("--confirm-cancelled", action="store_true")
+        if name == "extend-budget":
+            command.add_argument("--session", required=True, help="Exact retained work item to receive the operator grant.")
+            command.add_argument("--limit", required=True, type=int, help="New total model-call limit for this work item; used calls remain counted.")
+            command.add_argument("--reason", required=True, help="Record the operator's explicit budget authorization.")
         if name == "quiesce":
             command.add_argument("--process-file")
         if name == "checkpoint":

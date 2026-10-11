@@ -22,6 +22,7 @@ PUBLIC = {
     "checkpoint",
     "migrate-state",
     "reconcile-call",
+    "extend-budget",
     "quiesce",
     "capabilities",
 }
@@ -346,6 +347,9 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                         ],
                     }
                 )
+        return 0
+    if args.command == "extend-budget":
+        emit(store.extend_budget(store.work(args.session), args.limit, reason=args.reason))
         return 0
     if args.command == "reconcile-call":
         operations = [o for o in store.operations() if o["id"] == args.call]
