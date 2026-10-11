@@ -313,9 +313,9 @@ def seed(engine, work, ctx):
     return identity, value
 
 
-def check_schema(value, baseline, inputs):
+def check_schema(value, baseline, inputs, *, original_path=None):
     try:
-        return _check_schema(value, baseline, inputs)
+        return _check_schema(value, baseline, inputs, original_path=original_path)
     except (KeyError, TypeError, ValueError, RecursionError) as error:
         fail("Malformed prototype scope", reason=str(error))
 
@@ -347,7 +347,7 @@ def historical_requirement_ids(ctx, baseline, trace):
     return sorted(identities - inactive)
 
 
-def _check_schema(value, baseline, inputs):
+def _check_schema(value, baseline, inputs, *, original_path=None):
     required = {
         "version",
         "mode",
@@ -429,6 +429,14 @@ def _check_schema(value, baseline, inputs):
         fail("Changed prototypes need explicit regions")
     known_evidence = set(inputs) | set(baseline["history"]) | {"goal"}
     known_evidence |= {CANONICAL + "/" + p for p in baseline["original"]}
+    # The controller supplies this read-only snapshot path to the producer.
+    # Accept only its exact admitted files, without resolving arbitrary paths
+    # or rewriting the producer's retained receipt. Keep their original
+    # provenance when checking preservation below.
+    snapshot_evidence = {
+        str(Path(original_path) / p): CANONICAL + "/" + p
+        for p in baseline["original"]
+    } if original_path is not None else {}
     product_evidence = known_evidence - {
         "goal", ".auto-agents/docs/requirements.md", ".auto-agents/docs/requirements_trace.json",
     }
@@ -440,15 +448,23 @@ def _check_schema(value, baseline, inputs):
 
     def evidence(row):
         refs = row.get("evidence")
+        invalid = [
+            ref for ref in refs
+            if not isinstance(ref, str)
+            or snapshot_evidence.get(ref, ref) not in known_evidence
+        ] if isinstance(refs, list) else refs
         if (
             not isinstance(refs, list)
             or not refs
-            or any(r not in known_evidence for r in refs)
+            or invalid
         ):
             fail(
                 "Scope evidence must identify admitted source or current requirements",
                 record=row.get("id"),
+                invalid_evidence=invalid,
+                hint="Use exact admitted_baseline.inputs/history keys, canonical original files, original_path/admitted-file, or goal",
             )
+        return [snapshot_evidence.get(ref, ref) for ref in refs]
 
     def reqs(row, *, preserved=False):
         refs = row.get("requirement_ids")
@@ -581,6 +597,14 @@ def _check_schema(value, baseline, inputs):
         ):
             fail("Baseline repairs must identify preserved flows")
         evidence(row)
+        if (
+            "package-structure" in row["flow_ids"]
+            and baseline.get("original_manifest_errors") == []
+        ):
+            fail(
+                "Package-structure repair requires an invalid admitted manifest",
+                record=row["id"],
+            )
         if row["evidence"] == ["goal"]:
             fail("Baseline repairs require existing product evidence")
         if any(
@@ -622,16 +646,16 @@ def _check_schema(value, baseline, inputs):
         ):
             fail("Each inventoried flow needs executable checks")
         page_file(row["page"])
-        evidence(row)
+        refs = evidence(row)
         preserved = baseline["has_frontend"] and all(
             checks[i].get("kind") == "preservation" for i in row["checks"]
         )
-        if preserved and not set(row["evidence"]) & product_evidence:
+        if preserved and not set(refs) & product_evidence:
             fail("Preserved flows require existing product evidence", record=row["id"])
         reqs(row, preserved=preserved)
         if (
             baseline["has_frontend"]
-            and set(row["evidence"]) & frontend_evidence
+            and set(refs) & frontend_evidence
             and not any(checks[i]["kind"] == "preservation" for i in row["checks"])
         ):
             fail("Existing flows need preservation checks", record=row["id"])
@@ -656,7 +680,7 @@ def _check_schema(value, baseline, inputs):
             or not row["asserts"]
         ):
             fail("Checks need actual browser assertions", record=row["id"])
-        for step in row["steps"]:
+        for index, step in enumerate(row["steps"]):
             if (
                 not isinstance(step, dict)
                 or set(step) - {"action", "selector", "value"}
@@ -667,7 +691,11 @@ def _check_schema(value, baseline, inputs):
             ):
                 fail("Unsupported browser action")
             if step["action"] != "click" and "value" not in step:
-                fail("Browser action needs its frozen input")
+                fail(
+                    "Browser action needs its frozen input",
+                    check=row["id"], step=index + 1,
+                    action=step["action"], selector=step["selector"],
+                )
             if step["action"] == "press" and not isinstance(step["value"], str):
                 fail("Browser key must be text")
         for rule in row["asserts"]:
@@ -1121,6 +1149,10 @@ def step(engine, work, ctx):
         # On rejection the original immutable admission remains the source. A
         # rejected candidate can never become a new behavioral baseline.
         baseline = dict(baseline)
+        original_path = evidence_dir(engine, work, "source-" + seed_id) / "original"
+        baseline["original_manifest_errors"] = manifest_errors(
+            original_path.parent, original_path.name, engine.config
+        )
         trace = json.loads(
             safe_file(
                 ctx.workspace_root, ".auto-agents/docs/requirements_trace.json"
@@ -1171,9 +1203,7 @@ def step(engine, work, ctx):
                         for name, data in decoded(baseline["original"]).items()
                     },
                 },
-                "original_path": str(
-                    evidence_dir(engine, work, "source-" + seed_id) / "original"
-                ),
+                "original_path": str(original_path),
                 "repair_path": PREPARED,
                 "previous_frozen_scope": (
                     record_input(engine, work, inherited_value)
@@ -1188,7 +1218,10 @@ def step(engine, work, ctx):
                 work, "RUNNING", context={**state, "prototype_seed": seed_id}
             )
             return engine.wait_user(updated, proposal["questions"], op)
-        plan = check_schema(proposal.get("scope"), baseline, baseline["inputs"])
+        plan = check_schema(
+            proposal.get("scope"), baseline, baseline["inputs"],
+            original_path=original_path,
+        )
         for repair in plan["repairs"]:
             regions, geometry, files = repair_bounds({**plan, "repairs": [repair]})
             repair.setdefault("regions", regions)

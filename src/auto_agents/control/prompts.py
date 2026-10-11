@@ -75,6 +75,24 @@ def build(context, phase, *, inputs=None, feedback=None):
     lines.append(instructions[phase])
     if phase == "prototype_prepare":
         lines.append(
+            "Evidence refs must be exact admitted_baseline.inputs/history keys, canonical "
+            "original file refs, or exact admitted file paths under the supplied read-only "
+            "original_path. Snapshot refs retain the same preservation obligations as "
+            "canonical refs. repair_path and arbitrary absolute paths are not admitted evidence. "
+            "admitted_baseline.original_manifest_errors is the controller's original package "
+            "validation: an empty list means no package-structure repair is needed. Manifest "
+            "refs are workspace-relative; for the original snapshot their workspace is the "
+            "parent of original_path, not original_path itself. Keep repaired manifest refs "
+            "relative to the model workspace and inside repair_path."
+        )
+        lines.append(
+            "Every browser action other than click requires an explicit frozen value. "
+            "For check, use a boolean value:true to select a radio/checkbox or value:false "
+            "to clear a checkbox; never omit it. fill/select take the intended value, "
+            "seek takes seconds, and press takes a key string such as Enter. "
+            "Do not replace behavioral assertions with existence or success-message checks."
+        )
+        lines.append(
             "Requirement bindings distinguish requested changes from preserved behavior. "
             "Every change and every flow with a new check needs nonempty requirement_ids "
             "from admitted_baseline.active_requirements. Every requirement ID on a change "
