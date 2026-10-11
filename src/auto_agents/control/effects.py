@@ -10,6 +10,13 @@ from dataclasses import asdict, replace
 
 from .types import ControlError, VerificationSpec, canonical
 
+QUOTA_REJECTION = re.compile(
+    r"(?:usage[_ -]?limit|quota|credits?|rate[_ -]?limit)[_ -]*(?:exceeded|exhausted|depleted|reached)"
+    r"|(?:hit|reached|exceeded|exhausted|out of).{0,30}(?:usage[_ -]?limit|quota|credits?)"
+    r"|insufficient[_ -]?(?:quota|credits?)|rate[_ -]?limited|too many requests"
+    r"|额度(?:不足|耗尽|用尽|超限)", re.I,
+)
+
 
 def parse_reply(text):
     if not isinstance(text, str):
@@ -336,10 +343,27 @@ class Provider:
         admit(alias, phase)
         result = adapter.run(request)
         text = (result.summary or result.stdout).strip()
+        detail = (result.stderr or text)[-2000:]
+        quota = bool(
+            re.search(r"quota|usage[_ -]?limit|rate.limit|credits|额度", detail, re.I)
+        )
+        # A native provider error can cause the progress supervisor to stop
+        # the CLI before it exits itself. An explicit quota rejection is still
+        # a known failure if cleanup completed; idle/interrupt/network failures
+        # remain uncertain even when their output happens to mention quota.
+        confirmed_quota = bool(
+            result.termination
+            and result.termination.reason == "provider_error"
+            # Production acceptance may already have dispatched external work.
+            and phase != "acceptance"
+            and quota
+            and QUOTA_REJECTION.search(result.stderr.strip().rsplit("\n", 1)[-1])
+        )
         if (
             result.cleanup_incomplete
             or result.termination
             and result.termination.reason not in {"", "completed"}
+            and not confirmed_quota
         ):
             raise ControlError(
                 "outcome_unknown",
@@ -347,11 +371,7 @@ class Provider:
                 category="reconciliation",
                 details={"provider": alias},
             )
-        if not result.ok:
-            detail = (result.stderr or text)[-2000:]
-            quota = bool(
-                re.search(r"quota|usage limit|rate.limit|credits|额度", detail, re.I)
-            )
+        if not result.ok or confirmed_quota:
             raise ControlError(
                 "provider_quota" if quota else "provider_failed",
                 detail or "Provider failed",

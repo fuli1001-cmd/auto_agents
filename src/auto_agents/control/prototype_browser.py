@@ -232,7 +232,7 @@ def package_server(files):
             self.send_header("Content-Length", str(len(data)))
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'self' data: blob: 'unsafe-inline'; connect-src 'none'; form-action 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; sandbox allow-scripts allow-same-origin",
+                "default-src 'self' data: blob: 'unsafe-inline'; connect-src 'none'; form-action 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; sandbox allow-scripts allow-same-origin allow-forms",
             )
             self.end_headers()
             self.wfile.write(data)
@@ -295,6 +295,18 @@ def snapshot(browser, options):
     return normalize(browser.evaluate(SNAPSHOT + "(" + json.dumps(options) + ")"))
 
 
+def ready(browser, expression):
+    """Wait for an action's preconditions; never retry an input dispatch."""
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            return browser.evaluate(expression)
+        except ControlError as error:
+            if error.category == "environment" or time.monotonic() >= deadline:
+                raise
+        browser.evaluate("new Promise(resolve=>setTimeout(resolve,50))")
+
+
 def action(browser, step):
     op, selector = step["action"], step["selector"]
     element = element_expression(selector)
@@ -302,10 +314,16 @@ def action(browser, step):
     if op == "click":
         # Real input dispatch, rather than invoking a handler on a disabled or
         # invisible element, catches the common prototype success-toast proxy.
-        box = browser.evaluate(
-            "(()=>{const e="
+        box = ready(browser,
+            "(async()=>{const e="
             + element
-            + ";if(e.disabled)throw Error('disabled');e.scrollIntoView({block:'center',inline:'center'});const r=e.getBoundingClientRect();if(!r.width||!r.height||getComputedStyle(e).visibility==='hidden')throw Error('invisible');return {x:r.x+r.width/2,y:r.y+r.height/2}})()"
+            + ";if(e.disabled)throw Error('disabled');e.scrollIntoView({block:'center',inline:'center',behavior:'instant'});const before=e.getBoundingClientRect();"
+            + "await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));"
+            + "if(!e.isConnected||e.disabled)throw Error('detached or disabled');const r=e.getBoundingClientRect();"
+            + "if(!r.width||!r.height||getComputedStyle(e).visibility==='hidden')throw Error('invisible');"
+            + "if(['x','y','width','height'].some(k=>Math.abs(r[k]-before[k])>.5))throw Error('unstable click target');"
+            + "const x=r.x+r.width/2,y=r.y+r.height/2,hit=document.elementFromPoint(x,y);"
+            + "if(hit!==e&&!e.contains(hit))throw Error('obscured click target');return {x,y}})()"
         )
         for kind in ("mousePressed", "mouseReleased"):
             browser.call(
@@ -313,15 +331,15 @@ def action(browser, step):
                 {"type": kind, **box, "button": "left", "clickCount": 1},
             )
     elif op in {"fill", "select", "check", "seek"}:
-        browser.evaluate(
+        ready(browser,
             "(()=>{const e="
             + element
             + ";if(e.disabled||e.readOnly&&e.type!=='range')throw Error('disabled or readonly');if("
             + json.dumps(op)
-            + "!=='seek'){e.scrollIntoView({block:'center'});if(!e.getClientRects().length)throw Error('invisible')}return true})()"
+            + "==='seek'){if(!(e instanceof HTMLMediaElement))throw Error('seek requires a video or audio element');if(!e.readyState)throw Error('media metadata is not ready')}else{e.scrollIntoView({block:'center'});if(!e.getClientRects().length)throw Error('invisible')}return true})()"
         )
         if op == "select":
-            browser.evaluate(
+            ready(browser,
                 "(()=>{const e="
                 + element
                 + ";const o=Array.from(e.options||[]).find(o=>o.value==="
@@ -341,22 +359,35 @@ def action(browser, step):
             + ";e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return true})()"
         )
     elif op == "press":
-        browser.evaluate("(" + element + ").focus()")
+        ready(browser, "(()=>{const e=" + element + ";if(e.disabled||!e.getClientRects().length)throw Error('disabled or invisible');e.focus()})()")
+        key = step["value"]
+        native_keys = {
+            "Enter": ("Enter", 13, "\r"), "Tab": ("Tab", 9, ""),
+            "Escape": ("Escape", 27, ""), "Backspace": ("Backspace", 8, ""),
+            "Delete": ("Delete", 46, ""), "Space": ("Space", 32, " "),
+            " ": ("Space", 32, " "), "ArrowLeft": ("ArrowLeft", 37, ""),
+            "ArrowUp": ("ArrowUp", 38, ""), "ArrowRight": ("ArrowRight", 39, ""),
+            "ArrowDown": ("ArrowDown", 40, ""), "Home": ("Home", 36, ""),
+            "End": ("End", 35, ""), "PageUp": ("PageUp", 33, ""),
+            "PageDown": ("PageDown", 34, ""),
+        }
+        params = {"key": " " if key == "Space" else key, "text": key if len(key) == 1 else ""}
+        if key in native_keys:
+            code, virtual_key, text = native_keys[key]
+            # key alone emits a DOM event but does not invoke native Enter,
+            # Space, Tab or Escape behavior in Chromium.
+            params.update(code=code, windowsVirtualKeyCode=virtual_key, text=text)
         for kind in ("keyDown", "keyUp"):
             browser.call(
                 "Input.dispatchKeyEvent",
-                {
-                    "type": kind,
-                    "key": step["value"],
-                    "text": step["value"] if len(step["value"]) == 1 else "",
-                },
+                {**params, "type": kind, "text": params["text"] if kind == "keyDown" else ""},
             )
     browser.evaluate(
         "new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r(true))))"
     )
 
 
-def assertion(browser, rule):
+def assertion_expression(rule):
     selector, prop = rule["selector"], rule["property"]
     if prop == "count":
         expression = "document.querySelectorAll(" + json.dumps(selector) + ").length"
@@ -377,15 +408,30 @@ def assertion(browser, rule):
             + expressions[prop]
             + "})()"
         )
-    actual = browser.evaluate(expression)
-    expected = rule["equals"]
-    if actual != expected or type(actual) is not type(expected):
-        raise ControlError(
-            "prototype_checks_failed",
-            "Browser assertion failed",
-            category="verification",
-            details={"assertion": rule, "actual": actual},
-        )
+    return expression
+
+
+def assertions(browser, rules):
+    # Native submit handlers and progress UI can complete asynchronously. Poll
+    # the unchanged frozen expectations together, so assertions from mutually
+    # exclusive states cannot be combined into an invented passing state.
+    expression = "[" + ",".join(assertion_expression(rule) for rule in rules) + "]"
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            actuals = browser.evaluate(expression)
+            for rule, actual in zip(rules, actuals, strict=True):
+                expected = rule["equals"]
+                if actual != expected or type(actual) is not type(expected):
+                    raise ControlError(
+                        "prototype_checks_failed", "Browser assertion failed",
+                        category="verification", details={"assertion": rule, "actual": actual},
+                    )
+            return
+        except ControlError as error:
+            if error.category == "environment" or time.monotonic() >= deadline:
+                raise
+        browser.evaluate("new Promise(resolve=>setTimeout(resolve,50))")
 
 
 def run(files, scope, evidence, *, baseline=False):
@@ -411,10 +457,86 @@ def run(files, scope, evidence, *, baseline=False):
     ):
         browser = Chrome(Path(scratch))
         browser.origin = origin
+        seen_repairs, seen_changes = set(), set()
+
+        def region_observation(selector):
+            return browser.evaluate(
+                "(()=>{const es=document.querySelectorAll("
+                + json.dumps(selector)
+                + ");const e=es[0];return {count:es.length,bounded:es.length===1&&e!==document.body&&e!==document.documentElement&&e.querySelectorAll('*').length<Math.max(1,document.body.querySelectorAll('*').length*.8)}})()"
+            )
+
+        def applicable_changes(page):
+            return [
+                change for change in scope["changes"]
+                if page_file(change["page"]) == page_file(page)
+                and not (baseline and change["kind"] == "add")
+            ]
+
+        def needs_changed_region(change):
+            return not (
+                not baseline and change["kind"] == "remove"
+                or scope.get("repair_original") and any(
+                    region["kind"] == "add"
+                    and page_file(region["page"]) == page_file(change["page"])
+                    and region["selector"] == change["selector"]
+                    for region in scope.get("repair_regions", [])
+                )
+            )
+
+        def validate_changed_regions(page):
+            for change in applicable_changes(page):
+                observed = region_observation(change["selector"])
+                removing = not baseline and change["kind"] == "remove"
+                if removing and observed["count"] or observed["count"] > 1:
+                    raise ControlError(
+                        "prototype_scope", "Changed region is duplicated or not removed",
+                        category="verification",
+                        details={"page": page, "selector": change["selector"], "expected": 0 if removing else 1, "actual": observed["count"]},
+                    )
+                if not observed["count"]:
+                    continue
+                seen_changes.add(change["id"])
+                if (
+                    scope["mode"] not in {"create", "redesign"}
+                    and not change.get("whole_page") and not observed["bounded"]
+                ):
+                    raise ControlError(
+                        "prototype_scope", "Local changes cannot authorize the entire page",
+                        category="verification",
+                        details={"page": page, "selector": change["selector"]},
+                    )
+
+        def active_repairs(page):
+            if not scope.get("repair_has_original"):
+                return []
+            return [
+                region for region in scope.get("repair_regions", [])
+                if page_file(region["page"]) == page_file(page)
+                and not (scope["repair_original"] and region["kind"] == "add")
+                and not (not scope["repair_original"] and region["kind"] == "remove")
+            ]
+
+        def validate_repair_regions(page):
+            for region in active_repairs(page):
+                observed = region_observation(region["selector"])
+                if not observed["count"]:
+                    # Pagination/card creation can materialize a bounded node
+                    # only after a frozen action. Absence masks no existing UI.
+                    continue
+                seen_repairs.add((page_file(page), region["selector"], region["kind"]))
+                if observed["count"] != 1 or not observed["bounded"]:
+                    raise ControlError(
+                        "prototype_scope",
+                        "Baseline repair region must be unique and cannot authorize the entire page",
+                        category="verification",
+                        details={"page": page, "selector": region["selector"], **observed},
+                    )
 
         def observe_repair(page, key):
             if "repair_regions" not in scope:
                 return
+            validate_repair_regions(page)
             name = page_file(page)
             options = {
                 "mutable": [
@@ -435,6 +557,8 @@ def run(files, scope, evidence, *, baseline=False):
                 },
             )
             for viewport in scope["viewports"]:
+                seen_repairs.clear()
+                seen_changes.clear()
                 removed = {
                     c["page"]
                     for c in scope["changes"]
@@ -460,77 +584,7 @@ def run(files, scope, evidence, *, baseline=False):
                         failures.append({"page": page, "reason": "missing page"})
                         continue
                     browser.navigate(origin + "/" + page, viewport)
-                    if scope.get("repair_has_original"):
-                        for region in scope.get("repair_regions", []):
-                            if (
-                                page_file(region["page"]) != name
-                                or scope["repair_original"]
-                                and region["kind"] == "add"
-                                or not scope["repair_original"]
-                                and region["kind"] == "remove"
-                            ):
-                                continue
-                            bounded = browser.evaluate(
-                                "(()=>{const e="
-                                + element_expression(region["selector"])
-                                + ";return e!==document.body&&e!==document.documentElement&&e.querySelectorAll('*').length<Math.max(1,document.body.querySelectorAll('*').length*.8)})()"
-                            )
-                            if not bounded:
-                                raise ControlError(
-                                    "prototype_scope",
-                                    "Baseline repairs cannot authorize the entire page",
-                                    category="verification",
-                                )
-                    for change in scope["changes"]:
-                        if (
-                            page_file(change["page"]) != name
-                            or baseline
-                            and change["kind"] == "add"
-                        ):
-                            continue
-                        count = browser.evaluate(
-                            "document.querySelectorAll("
-                            + json.dumps(change["selector"])
-                            + ").length"
-                        )
-                        expected = (
-                            0 if not baseline and change["kind"] == "remove" else 1
-                        )
-                        if count != expected:
-                            raise ControlError(
-                                "prototype_scope",
-                                "Changed region is missing, duplicated or not removed",
-                                category="verification",
-                                details={
-                                    "page": page,
-                                    "selector": change["selector"],
-                                    "expected": expected,
-                                    "actual": count,
-                                },
-                            )
-                    if scope["mode"] not in {"create", "redesign"}:
-                        for change in scope["changes"]:
-                            if change.get("whole_page"):
-                                continue
-                            if (
-                                page_file(change["page"]) != name
-                                or change["kind"] == "add"
-                                and baseline
-                                or change["kind"] == "remove"
-                                and not baseline
-                            ):
-                                continue
-                            bounded = browser.evaluate(
-                                "(()=>{const e="
-                                + element_expression(change["selector"])
-                                + ";return e!==document.body&&e!==document.documentElement&&e.querySelectorAll('*').length<Math.max(1,document.body.querySelectorAll('*').length*.8)})()"
-                            )
-                            if not bounded:
-                                raise ControlError(
-                                    "prototype_scope",
-                                    "Local changes cannot authorize the entire page",
-                                    category="verification",
-                                )
+                    validate_changed_regions(page)
                     options = {
                         "mutable": [
                             c["selector"] for c in scope["changes"] if page_file(c["page"]) == name
@@ -569,8 +623,9 @@ def run(files, scope, evidence, *, baseline=False):
                     try:
                         for step in check["steps"]:
                             action(browser, step)
-                        for rule in check["asserts"]:
-                            assertion(browser, rule)
+                        validate_changed_regions(check["page"])
+                        assertions(browser, check["asserts"])
+                        validate_changed_regions(check["page"])
                         options = {
                             "mutable": [
                                 c["selector"]
@@ -612,6 +667,32 @@ def run(files, scope, evidence, *, baseline=False):
                                 "error": error.to_dict(),
                             }
                         )
+                for change in scope["changes"]:
+                    if (
+                        change in applicable_changes(change["page"])
+                        and needs_changed_region(change)
+                        and change["id"] not in seen_changes
+                    ):
+                        failures.append({
+                            "page": change["page"], "viewport": viewport,
+                            "error": ControlError(
+                                "prototype_scope", "Changed region was never observed in frozen states",
+                                category="verification", details={"selector": change["selector"], "change": change["id"]},
+                            ).to_dict(),
+                        })
+                for region in scope.get("repair_regions", []):
+                    if region not in active_repairs(region["page"]):
+                        continue
+                    if (page_file(region["page"]), region["selector"], region["kind"]) not in seen_repairs:
+                        failures.append({
+                            "page": region["page"], "viewport": viewport,
+                            "error": ControlError(
+                                "prototype_scope",
+                                "Baseline repair region was never observed in frozen states",
+                                category="verification",
+                                details={"selector": region["selector"]},
+                            ).to_dict(),
+                        })
         finally:
             browser.close()
     return {

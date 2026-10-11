@@ -89,7 +89,10 @@ def build(context, phase, *, inputs=None, feedback=None):
             "Every browser action other than click requires an explicit frozen value. "
             "For check, use a boolean value:true to select a radio/checkbox or value:false "
             "to clear a checkbox; never omit it. fill/select take the intended value, "
-            "seek takes seconds, and press takes a key string such as Enter. "
+            "seek targets the actual video/audio element and takes seconds; a range slider "
+            "uses fill with its intended value. press takes a key string such as Enter. "
+            "text assertions compare exact trimmed textContent, including source case and "
+            "whitespace; they do not insert rendered line breaks or apply CSS text-transform. "
             "Do not replace behavioral assertions with existence or success-message checks."
         )
         lines.append(
@@ -111,7 +114,11 @@ def build(context, phase, *, inputs=None, feedback=None):
             "or home.html#loading. Each check must stay on its flow's same HTML file; "
             "query parameters and fragments are frozen test inputs. Changes, repair regions "
             "and geometry must name actual package HTML files without URL parameters. "
-            "All declared states retain the same file's scope and preservation constraints."
+            "All declared states retain the same file's scope and preservation constraints. "
+            "Dynamic regions may be absent in empty/default states and appear after frozen "
+            "actions; each required region must be observed in every viewport. Regions "
+            "remain unique and bounded whenever present. The controller waits up to two "
+            "seconds for all frozen postconditions to hold together, without weakening them."
         )
         lines.append(
             "For removal/redesign changes, also provide permission: an exact excerpt of the current user goal or recorded user decision explicitly authorizing that deletion or full redesign. Goal evidence alone never grants permission. Geometry entries may name html/body solely for causally required coordinate/size shifts; appearance remains protected. A structural baseline repair may list flow_ids:['package-structure']; the original manifest must actually fail validation and the repaired one must pass. If a design catalog is supplied for a new frontend, return selection:{candidates:[{slug,score,rationale,risks}],selected_slug} with three candidates and one highest-scoring selection. This selection and its exact upstream bytes will be frozen before candidate generation. Existing frontends keep their established design source."
