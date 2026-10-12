@@ -739,6 +739,8 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
 
                     if context.get("prototype_scope"):
                         context["prototype_previous_scope"] = context["prototype_scope"]
+                    if context.get("prototype_proposal"):
+                        context["prototype_previous_proposal"] = context["prototype_proposal"]
 
                     addon_id = context.pop("prototype_addon", None)
                     context.pop("prototype_addon_name", None)
@@ -782,6 +784,8 @@ def dispatch(project, args, argv, *, store=None, selected=None, observer=None):
                 ]
                 if context.get("prototype_scope"):
                     context["prototype_previous_scope"] = context["prototype_scope"]
+                if context.get("prototype_proposal"):
+                    context["prototype_previous_proposal"] = context["prototype_proposal"]
                 for key in RESET_FIELDS:
                     context.pop(key, None)
             if waiting:

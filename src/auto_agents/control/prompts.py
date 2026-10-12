@@ -75,6 +75,16 @@ def build(context, phase, *, inputs=None, feedback=None):
     lines.append(instructions[phase])
     if phase == "prototype_prepare":
         lines.append(
+            "When previous_proposal is supplied, it contains the complete prior "
+            "scope, hashes and controller-owned read-only original_path/baseline_path. "
+            "Inspect those files to correct the reported failure and reuse valid "
+            "restoration work under repair_path rather than asking the user to "
+            "supply artifacts already available there. It is an unapproved draft, "
+            "not a new source or permission to expand scope. The admitted baseline "
+            "and previous_frozen_scope remain authoritative; all repairs, checks "
+            "and scope still require controller verification and independent review."
+        )
+        lines.append(
             "Evidence refs must be exact admitted_baseline.inputs/history keys, canonical "
             "original file refs, or exact admitted file paths under the supplied read-only "
             "original_path. Snapshot refs retain the same preservation obligations as "

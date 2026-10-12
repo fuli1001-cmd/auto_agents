@@ -982,6 +982,39 @@ def record_input(engine, work, value):
     return public
 
 
+def previous_proposal_input(engine, work, ctx, seed_id, baseline):
+    """Hand off an unapproved draft without changing the admitted source."""
+    state = work["context"]
+    identity = state.get("prototype_proposal") or state.get("prototype_previous_proposal")
+    if identity:
+        value = get(engine.store, "proposal", identity)
+    else:
+        # Older feedback cleared the proposal ref. Its controller browser
+        # operation still binds the exact proposal, even after consumption.
+        value = None
+        for operation in reversed(engine.store.operations(work["id"])):
+            if operation["kind"] != "prototype_browser:baseline" or not operation.get("inputs"):
+                continue
+            candidate = get(engine.store, "proposal", operation["inputs"]["scope"])
+            if candidate["seed"] == seed_id:
+                value = candidate
+                identity = operation["inputs"]["scope"]
+                break
+        if value is None:
+            return None
+    if (
+        value["seed"] != seed_id
+        or value["source"] != baseline["source"]
+        or value["original"] != baseline["original"]
+    ):
+        fail("Previous prototype proposal belongs to a different admission")
+    validate_inputs(ctx, value)
+    root = evidence_dir(engine, work, "proposal-" + identity)
+    install(root, "original", decoded(value["original"]))
+    install(root, "repaired", decoded(value["baseline"]))
+    return record_input(engine, work, value)
+
+
 def certificate(engine, work, ctx, files, scope_id, browser, review):
     scope = get(engine.store, "scope", scope_id)
     return put(
@@ -1190,6 +1223,7 @@ def step(engine, work, ctx):
             install(ctx.workspace_root, PREPARED, decoded(baseline["original"]))
             state.update(prototype_seed=seed_id, prototype_prepared_initialized=True)
             work = engine.store.transition(work, "RUNNING", context=state)
+        previous_proposal = previous_proposal_input(engine, work, ctx, seed_id, baseline)
         proposal, op = engine.model(
             work,
             ctx,
@@ -1205,6 +1239,7 @@ def step(engine, work, ctx):
                 },
                 "original_path": str(original_path),
                 "repair_path": PREPARED,
+                "previous_proposal": previous_proposal,
                 "previous_frozen_scope": (
                     record_input(engine, work, inherited_value)
                     if inherited_value

@@ -1,10 +1,13 @@
 """Scope feedback reaches blocked prototype work through the public CLI."""
 
+import copy
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -173,3 +176,88 @@ def test_feedback_after_candidate_failure_keeps_frozen_preservation_oracles(tmp_
     engine.transport = Weakened()
     blocked = engine.resume(work["id"])
     assert blocked["status"] == "BLOCKED" and "weaken frozen behavior checks" in blocked["failure"]["message"]
+
+
+@pytest.mark.parametrize("recovery", ["automatic", "feedback", "legacy-feedback"])
+def test_prepare_recovery_receives_the_previous_proposal_and_repaired_files(tmp_path, capsys, recovery):
+    from auto_agents.control import prototype_scope as scope
+    from test_control_prototype_contract import HTML, Iteration, setup
+
+    class MissingStep(Iteration):
+        def run(self, ctx, phase, prompt, *args, **kwargs):
+            if phase == "prototype_prepare" and getattr(self, "correct", False):
+                owned, _ = json.JSONDecoder().raw_decode(prompt.split("Owned inputs:\n", 1)[1])
+                previous = owned.get("previous_proposal")
+                if previous is None:
+                    return {"text": json.dumps({"questions": ["Provide the missing previous proposal and repaired files"]})}
+                self.previous = previous
+                repaired = Path(previous["baseline_path"])
+                assert (repaired / "home.html").read_text() == HTML
+                assert previous["baseline_hashes"]["home.html"] == hashlib.sha256(HTML.encode()).hexdigest()
+                assert (Path(owned["original_path"]) / "home.html").read_text() == original
+                assert "baseline" not in previous and "original" not in previous
+                value = copy.deepcopy(previous["scope"])
+                check = next(c for c in value["checks"] if c["id"] == "duration-confirmation")
+                assert check["steps"] == [{"action": "click", "selector": "#confirm"}]
+                check["steps"].insert(0, {"action": "click", "selector": "#assess"})
+                scope.install(ctx.workspace_root, scope.PREPARED, scope.package(repaired.parent, repaired.name))
+                return {"text": json.dumps({"scope": value})}
+            result = super().run(ctx, phase, prompt, *args, **kwargs)
+            if phase == "prototype_prepare":
+                value = json.loads(result["text"])
+                next(c for c in value["scope"]["checks"] if c["id"] == "duration-confirmation")["steps"].pop(0)
+                result["text"] = json.dumps(value)
+                if recovery == "automatic":
+                    self.correct = True
+            return result
+
+    original = HTML.replace('<option value="auto" selected>Smart estimate</option>', "")
+    worker = MissingStep(mode="reuse", repair=True)
+    root, engine = setup(tmp_path, worker, original=original)
+    save_project_config(root, engine.config)
+    work = engine.start("run", "Restore the missing smart duration option and preserve confirmation")
+    if recovery != "automatic":
+        assert work["status"] == "BLOCKED" and work["phase"] == "prototype_scope_review", work["failure"]
+        proposal_id = work["context"]["prototype_proposal"]
+        previous = scope.get(engine.store, "proposal", proposal_id)
+        calls = work["calls"]
+        assert main(["answer", "--project", str(root), "--session", work["id"],
+                     "--value", "Correct the missing assessment click; keep the prior repaired files and complete scope", "--no-resume"]) == 0
+        capsys.readouterr()
+        ready = engine.store.work(work["id"])
+        assert ready["context"].get("prototype_previous_proposal") == proposal_id
+        assert ready["calls"] == calls and ready["max_calls"] == work["max_calls"]
+        assert scope.get(engine.store, "proposal", proposal_id) == previous
+        if recovery == "legacy-feedback":
+            # Older feedback already cleared the context ref, but its own
+            # browser operation still binds the content-addressed proposal.
+            state = dict(ready["context"])
+            state.pop("prototype_previous_proposal")
+            engine.store.transition(ready, "READY", context=state)
+        worker.correct = True
+        work = engine.resume(work["id"])
+    assert work["status"] == "WAITING" and work["context"].get("approval") == "prototype", work["failure"]
+    frozen = scope.get(engine.store, "scope", work["context"]["prototype_scope"])
+    assert scope.decoded(frozen["original"])["home.html"].decode() == original
+    assert (root / scope.CANONICAL / "home.html").read_text() == original
+    assert frozen["seed"] == worker.previous["seed"]
+    assert frozen["scope"]["repairs"] == worker.previous["scope"]["repairs"]
+
+
+@pytest.mark.parametrize("field", ["seed", "source", "original"])
+def test_previous_proposal_cannot_replace_a_different_admission(tmp_path, field):
+    from auto_agents.control import prototype_scope as scope
+
+    store = Store(tmp_path)
+    value = {"seed": "admitted-seed", "source": "admitted-source", "original": {"home.html": "original-bytes"}}
+    identity = scope.put(store, "proposal", value)
+    baseline = copy.deepcopy(value)
+    if field == "original":
+        baseline[field] = {"home.html": "different-original-bytes"}
+    else:
+        baseline[field] = "different-admission"
+    engine = SimpleNamespace(store=store)
+    work = {"context": {"prototype_previous_proposal": identity}}
+    with pytest.raises(ControlError, match="different admission"):
+        scope.previous_proposal_input(engine, work, None, baseline["seed"], baseline)
+    assert scope.get(store, "proposal", identity) == value
